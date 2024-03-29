@@ -1,6 +1,6 @@
 use std::collections::LinkedList;
 
-use crate::element_traits::{sink_is_compatible_with_src, Element};
+use crate::element_traits::{sink_is_compatible_with_src, Data, Element};
 
 pub struct Pipeline {
     elements: LinkedList<Box<dyn Element>>,
@@ -16,10 +16,8 @@ impl Pipeline {
     // TODO: Return Result<>
     pub fn link_element(&mut self, element: impl Element + 'static) {
         let arch = element.get_architecture();
-        if self.elements.is_empty() {
-            if !arch.sinks.has_none() {
-                panic!("First element is not a source!");
-            }
+        if self.elements.is_empty() && !arch.sinks.has_none() {
+            panic!("First element is not a source!");
         }
 
         if let Some(back_element) = self.elements.back() {
@@ -37,5 +35,11 @@ impl Pipeline {
     }
 
     pub fn run(&self) {
+        for _ in 0..3 {
+            let mut dat = Data::None;
+            for element in self.elements.iter() {
+                dat = element.run(dat);
+            }
+        }
     }
 }

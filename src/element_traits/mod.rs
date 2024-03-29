@@ -11,10 +11,7 @@ pub enum Sinks {
 
 impl Sinks {
     pub fn has_none(&self) -> bool {
-        match self {
-            Sinks::None => true,
-            _ => false,
-        }
+        matches!(self, Sinks::None)
     }
 }
 
@@ -26,22 +23,17 @@ pub enum Srcs {
 
 impl Srcs {
     pub fn has_none(&self) -> bool {
-        match self {
-            Srcs::None => true,
-            _ => false,
-        }
+        matches!(self, Srcs::None)
     }
 }
 
 pub fn sink_is_compatible_with_src(sink: Sinks, src: Srcs) -> bool {
     match sink {
         Sinks::One(format) => {
-            return src == Srcs::One(format);
+            src == Srcs::One(format);
         }
-        Sinks::None => unreachable!(),
+        _ => false,
     }
-
-    false
 }
 
 pub struct ElementArchitecture {
@@ -55,7 +47,13 @@ pub enum ElementType {
     TextSrc,
 }
 
+pub enum Data {
+    Text(String),
+    None,
+}
+
 pub trait Element {
     fn get_type(&self) -> ElementType;
     fn get_architecture(&self) -> ElementArchitecture;
+    fn run(&self, input: Data) -> Data;
 }

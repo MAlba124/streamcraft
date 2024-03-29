@@ -8,4 +8,6 @@ fn main() {
 
     pipeline.link_element(texttest);
     pipeline.link_element(stdoutlog);
+
+    pipeline.run();
 }

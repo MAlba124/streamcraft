@@ -1,4 +1,4 @@
-use crate::element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs};
+use crate::element_traits::{CommonFormat, Data, Element, ElementArchitecture, ElementType, Sinks, Srcs};
 
 pub struct StdoutLog {}
 
@@ -18,6 +18,15 @@ impl Element for StdoutLog {
             sinks: Sinks::One(CommonFormat::Text),
             srcs: Srcs::None,
         }
+    }
+
+    fn run(&self, input: Data) -> Data {
+        match input {
+            Data::Text(s) => print!("{s}"),
+            _ => panic!("Invalid input data"),
+        }
+
+        Data::None
     }
 }
 
@@ -39,5 +48,9 @@ impl Element for TextTestSrc {
             sinks: Sinks::None,
             srcs: Srcs::One(CommonFormat::Text),
         }
+    }
+
+    fn run(&self, _input: Data) -> Data {
+        Data::Text(String::from("Test\n"))
     }
 }
