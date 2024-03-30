@@ -1,3 +1,7 @@
+use crossbeam_channel::Receiver;
+
+use crate::pipeline::{self, Data, Parent};
+
 #[derive(PartialEq)]
 pub enum CommonFormat {
     Text,
@@ -29,9 +33,7 @@ impl Srcs {
 
 pub fn sink_is_compatible_with_src(sink: Sinks, src: Srcs) -> bool {
     match sink {
-        Sinks::One(format) => {
-            src == Srcs::One(format);
-        }
+        Sinks::One(format) => src == Srcs::One(format),
         _ => false,
     }
 }
@@ -47,13 +49,30 @@ pub enum ElementType {
     TextSrc,
 }
 
-pub enum Data {
-    Text(String),
-    None,
+#[derive(Debug)]
+pub enum Error {
+    NoSources,
+    Incompatible,
 }
 
-pub trait Element {
+impl std::error::Error for Error {}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::NoSources => "Last element in pipeline does not have any sources",
+                Self::Incompatible => "Element is incompatible with the current pipeline",
+            }
+        )
+    }
+}
+
+pub trait Element: Sync + Send {
     fn get_type(&self) -> ElementType;
     fn get_architecture(&self) -> ElementArchitecture;
-    fn run(&self, input: Data) -> Data;
+    fn run(&mut self, data_receiver: Option<Receiver<Data>>) -> Result<(), pipeline::error::Error>;
+    fn set_parent(&mut self, parent: Parent);
 }

@@ -1,13 +1,12 @@
 use streamcraft::{elements::text::{StdoutLog, TextTestSrc}, pipeline::Pipeline};
 
 fn main() {
-    let mut pipeline = Pipeline::new();
-
-    let texttest = TextTestSrc::new();
     let stdoutlog = StdoutLog::new();
 
-    pipeline.link_element(texttest);
-    pipeline.link_element(stdoutlog);
+    let mut texttest = TextTestSrc::new();
+    texttest.link_sink_element(stdoutlog);
 
-    pipeline.run();
+    let mut pipeline = Pipeline::new(texttest);
+
+    pipeline.run().expect("Error occured running pipeline");
 }

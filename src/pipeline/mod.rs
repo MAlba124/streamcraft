@@ -1,45 +1,90 @@
-use std::collections::LinkedList;
+use std::thread::JoinHandle;
 
-use crate::element_traits::{sink_is_compatible_with_src, Data, Element};
+use crate::element_traits::Element;
+
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded,};
+
+pub mod error;
+
+use error::Error;
+
+pub enum Data {
+    Text(String),
+    None,
+}
+
+pub enum Message {}
+
+#[derive(Default)]
+pub struct Parent {
+    msg_sender: Option<Sender<Message>>,
+    msg_receiver: Option<Receiver<Message>>,
+}
+
+impl Parent {
+    pub fn new(msg_sender: Sender<Message>, msg_receiver: Receiver<Message>) -> Self {
+        Self {
+            msg_sender: Some(msg_sender),
+            msg_receiver: Some(msg_receiver),
+        }
+    }
+
+    pub fn recv_msg(&self) -> Option<Result<Message, TryRecvError>> {
+        if let Some(receiver) = &self.msg_receiver {
+            return Some(receiver.try_recv());
+        }
+        None
+    }
+}
+
+#[derive(Default)]
+pub struct SinkPipe {
+    pub element: Option<Box<dyn Element>>,
+    pub thread_handle: Option<JoinHandle<()>>,
+    pub data_sender: Option<Sender<Data>>,
+    pub msg_sender: Option<Sender<Message>>,
+    pub msg_receiver: Option<Receiver<Message>>,
+}
+
+impl SinkPipe {
+    pub fn set_element(&mut self, element: impl Element + 'static) {
+        self.element = Some(Box::new(element));
+    }
+}
 
 pub struct Pipeline {
-    elements: LinkedList<Box<dyn Element>>,
+    head: SinkPipe,
 }
 
 impl Pipeline {
-    pub fn new() -> Self {
+    pub fn new(element: impl Element + 'static) -> Self {
+        let mut head = SinkPipe::default();
+        head.set_element(element);
         Self {
-            elements: LinkedList::new(),
+            head,
         }
     }
 
-    // TODO: Return Result<>
-    pub fn link_element(&mut self, element: impl Element + 'static) {
-        let arch = element.get_architecture();
-        if self.elements.is_empty() && !arch.sinks.has_none() {
-            panic!("First element is not a source!");
-        }
+    // TODO: Move the thread spawning to a different function (perhaps `init()`) and later send a
+    // message to the head giving a "start" signal?
+    pub fn run(&mut self) -> Result<(), Error> {
+        let (data_sender, data_receiver) = bounded(0);
+        let (_my_msg_sender, msg_receiver) = unbounded();
+        let (msg_sender, _my_msg_receiver) = unbounded();
+        let parent = Parent::new(msg_sender, msg_receiver.clone());
+        let mut sink_element = self.head.element.take().unwrap(); // TODO: handle `None`
+        sink_element.set_parent(parent);
+        let data_receiver_clone = data_receiver.clone();
 
-        if let Some(back_element) = self.elements.back() {
-            let back_arch = back_element.get_architecture();
-            if back_arch.srcs.has_none() {
-                panic!("Last element in pipeline does not have any sources!");
+        self.head.thread_handle = Some(std::thread::spawn(move || {
+            match sink_element.run(Some(data_receiver_clone)) {
+                Ok(_) => {}
+                Err(e) => println!("Error occured running sink element: {e}"),
             }
+        }));
 
-            if !sink_is_compatible_with_src(arch.sinks, back_arch.srcs) {
-                panic!("Element is incompatible with the current pipeline!");
-            }
-        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-        self.elements.push_back(Box::new(element));
-    }
-
-    pub fn run(&self) {
-        for _ in 0..3 {
-            let mut dat = Data::None;
-            for element in self.elements.iter() {
-                dat = element.run(dat);
-            }
-        }
+        Ok(())
     }
 }
