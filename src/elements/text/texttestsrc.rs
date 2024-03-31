@@ -103,7 +103,7 @@ impl Element for TextTestSrc {
         self.sink.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(Some(data_receiver_clone)) {
                 Ok(_) => {}
-                Err(e) => debug_log!("Error occured running sink element: {e}"),
+                Err(e) => debug_log!("Error occurred running sink element: {e}"),
             }
         }));
         self.sink.msg_sender = Some(my_msg_sender);

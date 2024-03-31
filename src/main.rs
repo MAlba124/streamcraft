@@ -1,4 +1,4 @@
-// StreamCraft - general puropse data/multimedia pipeline framework
+// StreamCraft - general purpose data/multimedia pipeline framework
 // Copyright (C) 2024  MAlba124 <marlhan@proton.me>
 //
 // StreamCraft is free software: you can redistribute it and/or modify
@@ -27,5 +27,5 @@ fn main() {
 
     let mut pipeline = Pipeline::new(texttest);
 
-    pipeline.run().expect("Error occured running pipeline");
+    pipeline.run().expect("Error occurred running pipeline");
 }

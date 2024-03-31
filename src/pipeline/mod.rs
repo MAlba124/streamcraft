@@ -93,7 +93,7 @@ impl Pipeline {
         self.head.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(Some(data_receiver_clone)) {
                 Ok(_) => {}
-                Err(e) => println!("Error occured running sink element: {e}"),
+                Err(e) => println!("Error occurred running sink element: {e}"),
             }
         }));
 
