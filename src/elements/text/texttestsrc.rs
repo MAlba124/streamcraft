@@ -1,82 +1,8 @@
 use crate::{
-    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
-    pipeline::{Data, Parent, SinkPipe},
+    debug_log, element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs}, pipeline::{Data, Parent, SinkPipe}
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
-
-pub struct StdoutLog {
-    parent: Parent,
-}
-
-impl StdoutLog {
-    pub fn new() -> Self {
-        Self {
-            parent: Parent::default(),
-        }
-    }
-
-    fn run_loop(&self, data_receiver: &Receiver<Data>) -> bool {
-        while let Some(res) = self.parent.recv_msg() {
-            match res {
-                Ok(msg) => {
-                    println!("STDOUTLOG: Got message from parent");
-                }
-                Err(e) if e.is_empty() => break,
-                Err(e) => {
-                    println!("STDOUTLOG: {e}");
-                    return false;
-                }
-            }
-        }
-
-        match data_receiver.recv() {
-            Ok(data) => {
-                match data {
-                    Data::Text(s) => print!("STDOUTLOG: {s}"),
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                println!("STDOUTLOG: Failed to receive data from src: {e}");
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-impl Element for StdoutLog {
-    fn get_type(&self) -> ElementType {
-        ElementType::TextSink
-    }
-
-    fn get_architecture(&self) -> ElementArchitecture {
-        ElementArchitecture {
-            sinks: Sinks::One(CommonFormat::Text),
-            srcs: Srcs::None,
-        }
-    }
-
-    fn run(
-        &mut self,
-        data_receiver: Option<Receiver<Data>>,
-    ) -> Result<(), crate::pipeline::error::Error> {
-        if let Some(data_receiver) = data_receiver {
-            while self.run_loop(&data_receiver) {}
-        }
-
-        println!("STDOUTLOG: Finished");
-        Ok(())
-    }
-
-    fn set_parent(&mut self, parent: Parent) {
-        self.parent = parent;
-    }
-}
-
-/* ************************************************************************************* */
 
 pub struct TextTestSrc {
     sink: SinkPipe,
@@ -100,11 +26,11 @@ impl TextTestSrc {
         while let Some(res) = self.parent.recv_msg() {
             match res {
                 Ok(msg) => {
-                    println!("TEXTTESTSRC: Got message from parent");
+                    debug_log!("TEXTTESTSRC: Got message from parent");
                 }
                 Err(e) if e.is_empty() => break,
                 Err(e) => {
-                    println!("TEXTTESTSRC: {e}");
+                    debug_log!("TEXTTESTSRC: {e}");
                     return false;
                 }
             }
@@ -112,10 +38,10 @@ impl TextTestSrc {
         if let Some(receiver) = &self.sink.msg_receiver {
             loop {
                 match receiver.try_recv() {
-                    Ok(_) => println!("TEXTTESTSRC: Received emssage from sink"),
+                    Ok(_) => debug_log!("TEXTTESTSRC: Received emssage from sink"),
                     Err(e) if e.is_empty() => break,
                     Err(e) => {
-                        println!("TEXTTESTSRC: Failed to receive msg from sink: {e}");
+                        debug_log!("TEXTTESTSRC: Failed to receive msg from sink: {e}");
                         return false;
                     }
                 }
@@ -125,7 +51,7 @@ impl TextTestSrc {
         if let Some(sender) = &self.sink.data_sender {
             match sender.send(Data::Text(String::from("Test\n"))) {
                 Err(e) => {
-                    println!("TEXTTESTSRC: {e}");
+                    debug_log!("TEXTTESTSRC: {e}");
                     return false;
                 }
                 _ => {}
@@ -163,7 +89,7 @@ impl Element for TextTestSrc {
         self.sink.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(Some(data_receiver_clone)) {
                 Ok(_) => {}
-                Err(e) => println!("Error occured running sink element: {e}"),
+                Err(e) => debug_log!("Error occured running sink element: {e}"),
             }
         }));
         self.sink.msg_sender = Some(my_msg_sender);
@@ -173,7 +99,7 @@ impl Element for TextTestSrc {
         let mut i = 0;
         while self.run_loop() { i += 1; }
 
-        println!("TEXTTESTSRC: Finished iterations={i}");
+        debug_log!("TEXTTESTSRC: Finished iterations={i}");
         // TODO: Join sink thread
 
         Ok(())
