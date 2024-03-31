@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 
 use crate::element_traits::Element;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 pub mod error;
 
@@ -32,26 +32,22 @@ pub enum Message {
     Quit,
 }
 
+pub enum Datagram {
+    Message(Message),
+    Data(Data),
+}
+
 #[derive(Default)]
 pub struct Parent {
     #[allow(dead_code)]
     msg_sender: Option<Sender<Message>>,
-    msg_receiver: Option<Receiver<Message>>,
 }
 
 impl Parent {
-    pub fn new(msg_sender: Sender<Message>, msg_receiver: Receiver<Message>) -> Self {
+    pub fn new(msg_sender: Sender<Message>) -> Self {
         Self {
             msg_sender: Some(msg_sender),
-            msg_receiver: Some(msg_receiver),
         }
-    }
-
-    pub fn recv_msg(&self) -> Option<Result<Message, TryRecvError>> {
-        if let Some(receiver) = &self.msg_receiver {
-            return Some(receiver.try_recv());
-        }
-        None
     }
 }
 
@@ -59,7 +55,7 @@ impl Parent {
 pub struct SinkPipe {
     pub element: Option<Box<dyn Element>>,
     pub thread_handle: Option<JoinHandle<()>>,
-    pub data_sender: Option<Sender<Data>>,
+    pub datagram_sender: Option<Sender<Datagram>>,
     pub msg_sender: Option<Sender<Message>>,
     pub msg_receiver: Option<Receiver<Message>>,
 }
@@ -70,8 +66,8 @@ impl SinkPipe {
     }
 
     pub fn send_quit(&self) -> Result<(), Error> {
-        match self.msg_sender.as_ref() {
-            Some(msg_sender) => msg_sender.send(Message::Quit).map_err(|_| Error::MessageSinkFailed),
+        match self.datagram_sender.as_ref() {
+            Some(msg_sender) => msg_sender.send(Datagram::Message(Message::Quit)).map_err(|_| Error::MessageSinkFailed),
             None => Err(Error::NoSinkMessageSender),
         }
     }
@@ -86,7 +82,7 @@ impl SinkPipe {
     }
 
     pub fn drop_data_sender(&mut self) {
-        self.data_sender.take();
+        self.datagram_sender.take();
     }
 }
 
@@ -104,23 +100,21 @@ impl Pipeline {
     // TODO: Move the thread spawning to a different function (perhaps `init()`) and later send a
     // message to the head giving a "start" signal?
     pub fn run(&mut self) -> Result<(), Error> {
-        let (data_sender, data_receiver) = bounded(0);
-        let (my_msg_sender, msg_receiver) = unbounded();
+        let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
-        let parent = Parent::new(msg_sender, msg_receiver.clone());
+        let parent = Parent::new(msg_sender);
         let mut sink_element = self.head.element.take().unwrap(); // TODO: handle `None`
         sink_element.set_parent(parent);
-        let data_receiver_clone = data_receiver.clone();
+        let datagram_receiver_clone = datagram_receiver.clone();
 
         self.head.thread_handle = Some(std::thread::spawn(move || {
-            match sink_element.run(Some(data_receiver_clone)) {
+            match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
                 Err(e) => println!("PIPELINE: Error occurred running sink element: {e}"),
             }
         }));
-        self.head.msg_sender = Some(my_msg_sender);
         self.head.msg_receiver = Some(my_msg_receiver);
-        self.head.data_sender = Some(data_sender);
+        self.head.datagram_sender = Some(datagram_sender);
 
         std::thread::sleep(std::time::Duration::from_millis(1));
 

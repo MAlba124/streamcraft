@@ -16,7 +16,7 @@
 use crate::{
     debug_log,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
-    pipeline::{Data, Parent},
+    pipeline::{Data, Datagram, Parent},
 };
 
 use crossbeam_channel::Receiver;
@@ -32,27 +32,20 @@ impl StdoutLog {
         }
     }
 
-    fn run_loop(&self, data_receiver: &Receiver<Data>) -> bool {
-        while let Some(res) = self.parent.recv_msg() {
-            match res {
-                Ok(msg) => {
-                    match msg {
-                        crate::pipeline::Message::Quit => return false,
-                    }
-                }
-                Err(e) if e.is_empty() => break,
-                Err(e) => {
-                    debug_log!("{e}");
-                    return false;
-                }
-            }
-        }
-
-        // TODO: Check also messages
+    fn run_loop(&self, data_receiver: &Receiver<Datagram>) -> bool {
         match data_receiver.recv() {
-            Ok(data) => {
-                if let Data::Text(s) = data {
-                    print!("{s}");
+            Ok(datagram) => {
+                match datagram {
+                    Datagram::Message(msg) => {
+                        match msg {
+                            crate::pipeline::Message::Quit => return false,
+                        }
+                    }
+                    Datagram::Data(data) => {
+                        if let Data::Text(s) = data {
+                            print!("{s}");
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -79,14 +72,10 @@ impl Element for StdoutLog {
 
     fn run(
         &mut self,
-        data_receiver: Option<Receiver<Data>>,
+        parent_datagram_receiver: Receiver<Datagram>,
     ) -> Result<(), crate::pipeline::error::Error> {
-        if let Some(data_receiver) = data_receiver {
-            while self.run_loop(&data_receiver) {}
-            debug_log!("Finished");
-        }
-
-
+        while self.run_loop(&parent_datagram_receiver) {}
+        debug_log!("Finished");
         Ok(())
     }
 

@@ -16,7 +16,7 @@
 use crate::{
     debug_log,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
-    pipeline::{Data, Parent, SinkPipe},
+    pipeline::{Data, Datagram, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
@@ -39,23 +39,7 @@ impl TextTestSrc {
         self.sink.set_element(sink);
     }
 
-    fn run_loop(&self) -> bool {
-        while let Some(res) = self.parent.recv_msg() {
-            match res {
-                Ok(msg) => {
-                    match msg {
-                        crate::pipeline::Message::Quit => {
-                            return false;
-                        }
-                    }
-                }
-                Err(e) if e.is_empty() => break,
-                Err(e) => {
-                    debug_log!("{e}");
-                    return false;
-                }
-            }
-        }
+    fn run_loop(&self, datagram_receiver: &Receiver<Datagram>) -> bool {
         if let Some(receiver) = &self.sink.msg_receiver {
             loop {
                 match receiver.try_recv() {
@@ -69,10 +53,27 @@ impl TextTestSrc {
             }
         }
 
-        if let Some(sender) = &self.sink.data_sender {
-            if let Err(e) = sender.send(Data::Text(String::from("Test\n"))) {
+        if let Some(sender) = &self.sink.datagram_sender {
+            if let Err(e) = sender.send(Datagram::Data(Data::Text(String::from("Test\n")))) {
                 debug_log!("{e}");
                 return false;
+            }
+        }
+
+        loop {
+            match datagram_receiver.try_recv() {
+                Ok(datagram) => {
+                    match datagram {
+                        Datagram::Message(msg) => {
+                            match msg {
+                                crate::pipeline::Message::Quit => return false,
+                            }
+                        }
+                        Datagram::Data(_) => {}
+                    }
+                }
+                Err(e) if e.is_empty() => break,
+                Err(_) => return false,
             }
         }
 
@@ -94,28 +95,26 @@ impl Element for TextTestSrc {
 
     fn run(
         &mut self,
-        _data_receiver: Option<Receiver<Data>>,
+        parent_datagram_receiver: Receiver<Datagram>,
     ) -> Result<(), crate::pipeline::error::Error> {
-        let (data_sender, data_receiver) = bounded(0);
-        let (my_msg_sender, msg_receiver) = unbounded();
+        let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
-        let parent = Parent::new(msg_sender, msg_receiver.clone());
+        let parent = Parent::new(msg_sender);
         let mut sink_element = self.sink.element.take().unwrap(); // TODO: handle `None`
         sink_element.set_parent(parent);
-        let data_receiver_clone = data_receiver.clone();
+        let datagram_receiver_clone = datagram_receiver.clone();
 
         self.sink.thread_handle = Some(std::thread::spawn(move || {
-            match sink_element.run(Some(data_receiver_clone)) {
+            match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
                 Err(e) => debug_log!("Error occurred running sink element: {e}"),
             }
         }));
-        self.sink.msg_sender = Some(my_msg_sender);
         self.sink.msg_receiver = Some(my_msg_receiver);
-        self.sink.data_sender = Some(data_sender);
+        self.sink.datagram_sender = Some(datagram_sender);
 
         let mut i = 0;
-        while self.run_loop() {
+        while self.run_loop(&parent_datagram_receiver) {
             i += 1;
         }
 

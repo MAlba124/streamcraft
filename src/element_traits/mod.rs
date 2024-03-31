@@ -15,7 +15,7 @@
 
 use crossbeam_channel::Receiver;
 
-use crate::pipeline::{self, Data, Parent};
+use crate::pipeline::{self, Datagram, Parent};
 
 #[derive(PartialEq)]
 pub enum CommonFormat {
@@ -64,6 +64,7 @@ pub enum ElementType {
     TextSrc,
 }
 
+// TODO: Separate to `error.rs`
 #[derive(Debug)]
 pub enum Error {
     NoSources,
@@ -88,6 +89,6 @@ impl std::fmt::Display for Error {
 pub trait Element: Sync + Send {
     fn get_type(&self) -> ElementType;
     fn get_architecture(&self) -> ElementArchitecture;
-    fn run(&mut self, data_receiver: Option<Receiver<Data>>) -> Result<(), pipeline::error::Error>;
+    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), pipeline::error::Error>;
     fn set_parent(&mut self, parent: Parent);
 }
