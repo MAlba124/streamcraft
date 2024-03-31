@@ -1,5 +1,7 @@
 use crate::{
-    debug_log, element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs}, pipeline::{Data, Parent, SinkPipe}
+    debug_log,
+    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
+    pipeline::{Data, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
@@ -97,7 +99,9 @@ impl Element for TextTestSrc {
         self.sink.data_sender = Some(data_sender);
 
         let mut i = 0;
-        while self.run_loop() { i += 1; }
+        while self.run_loop() {
+            i += 1;
+        }
 
         debug_log!("TEXTTESTSRC: Finished iterations={i}");
         // TODO: Join sink thread

@@ -1,2 +1,2 @@
-pub mod texttestsrc;
 pub mod stdoutlog;
+pub mod texttestsrc;

@@ -1,4 +1,7 @@
-use streamcraft::{elements::text::{stdoutlog::StdoutLog, texttestsrc::TextTestSrc}, pipeline::Pipeline};
+use streamcraft::{
+    elements::text::{stdoutlog::StdoutLog, texttestsrc::TextTestSrc},
+    pipeline::Pipeline,
+};
 
 fn main() {
     let stdoutlog = StdoutLog::new();

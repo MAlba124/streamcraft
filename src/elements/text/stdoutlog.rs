@@ -1,5 +1,7 @@
 use crate::{
-    debug_log, element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs}, pipeline::{Data, Parent, SinkPipe}
+    debug_log,
+    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
+    pipeline::{Data, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
@@ -30,12 +32,10 @@ impl StdoutLog {
         }
 
         match data_receiver.recv() {
-            Ok(data) => {
-                match data {
-                    Data::Text(s) => print!("{s}"),
-                    _ => {}
-                }
-            }
+            Ok(data) => match data {
+                Data::Text(s) => print!("{s}"),
+                _ => {}
+            },
             Err(e) => {
                 debug_log!("Failed to receive data from src: {e}");
                 return false;

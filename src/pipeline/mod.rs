@@ -2,7 +2,7 @@ use std::thread::JoinHandle;
 
 use crate::element_traits::Element;
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded,};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 
 pub mod error;
 
@@ -60,9 +60,7 @@ impl Pipeline {
     pub fn new(element: impl Element + 'static) -> Self {
         let mut head = SinkPipe::default();
         head.set_element(element);
-        Self {
-            head,
-        }
+        Self { head }
     }
 
     // TODO: Move the thread spawning to a different function (perhaps `init()`) and later send a
