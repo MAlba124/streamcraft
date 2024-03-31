@@ -28,7 +28,9 @@ pub enum Data {
     None,
 }
 
-pub enum Message {}
+pub enum Message {
+    Quit,
+}
 
 #[derive(Default)]
 pub struct Parent {
@@ -66,6 +68,26 @@ impl SinkPipe {
     pub fn set_element(&mut self, element: impl Element + 'static) {
         self.element = Some(Box::new(element));
     }
+
+    pub fn send_quit(&self) -> Result<(), Error> {
+        match self.msg_sender.as_ref() {
+            Some(msg_sender) => msg_sender.send(Message::Quit).map_err(|_| Error::MessageSinkFailed),
+            None => Err(Error::NoSinkMessageSender),
+        }
+    }
+
+    pub fn join_thread(&mut self) -> Result<(), Error> {
+        match self.thread_handle.take() {
+            Some(join_handle) => {
+                join_handle.join().map_err(|_| Error::FailedToJoinThread)
+            }
+            None => Err(Error::NoThreadHandle)
+        }
+    }
+
+    pub fn drop_data_sender(&mut self) {
+        self.data_sender.take();
+    }
 }
 
 pub struct Pipeline {
@@ -82,9 +104,9 @@ impl Pipeline {
     // TODO: Move the thread spawning to a different function (perhaps `init()`) and later send a
     // message to the head giving a "start" signal?
     pub fn run(&mut self) -> Result<(), Error> {
-        let (_data_sender, data_receiver) = bounded(0);
-        let (_my_msg_sender, msg_receiver) = unbounded();
-        let (msg_sender, _my_msg_receiver) = unbounded();
+        let (data_sender, data_receiver) = bounded(0);
+        let (my_msg_sender, msg_receiver) = unbounded();
+        let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender, msg_receiver.clone());
         let mut sink_element = self.head.element.take().unwrap(); // TODO: handle `None`
         sink_element.set_parent(parent);
@@ -93,11 +115,17 @@ impl Pipeline {
         self.head.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(Some(data_receiver_clone)) {
                 Ok(_) => {}
-                Err(e) => println!("Error occurred running sink element: {e}"),
+                Err(e) => println!("PIPELINE: Error occurred running sink element: {e}"),
             }
         }));
+        self.head.msg_sender = Some(my_msg_sender);
+        self.head.msg_receiver = Some(my_msg_receiver);
+        self.head.data_sender = Some(data_sender);
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        self.head.send_quit()?;
+        self.head.join_thread()?;
 
         Ok(())
     }

@@ -35,8 +35,10 @@ impl StdoutLog {
     fn run_loop(&self, data_receiver: &Receiver<Data>) -> bool {
         while let Some(res) = self.parent.recv_msg() {
             match res {
-                Ok(_msg) => {
-                    debug_log!("Got message prom parent");
+                Ok(msg) => {
+                    match msg {
+                        crate::pipeline::Message::Quit => return false,
+                    }
                 }
                 Err(e) if e.is_empty() => break,
                 Err(e) => {
@@ -46,6 +48,7 @@ impl StdoutLog {
             }
         }
 
+        // TODO: Check also messages
         match data_receiver.recv() {
             Ok(data) => {
                 if let Data::Text(s) = data {
@@ -80,9 +83,10 @@ impl Element for StdoutLog {
     ) -> Result<(), crate::pipeline::error::Error> {
         if let Some(data_receiver) = data_receiver {
             while self.run_loop(&data_receiver) {}
+            debug_log!("Finished");
         }
 
-        debug_log!("Finished");
+
         Ok(())
     }
 

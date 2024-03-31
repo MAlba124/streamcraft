@@ -14,12 +14,22 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 #[derive(Debug)]
-pub enum Error {}
+pub enum Error {
+    NoThreadHandle,
+    FailedToJoinThread,
+    NoSinkMessageSender,
+    MessageSinkFailed,
+}
 
 impl std::error::Error for Error {}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "")
+        write!(f, "{}", match self {
+            Self::NoThreadHandle => "No thread handle",
+            Self::FailedToJoinThread => "Failed to join thread",
+            Self::NoSinkMessageSender => "No sink message sender",
+            Self::MessageSinkFailed => "MessageSinkFailed",
+        })
     }
 }

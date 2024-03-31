@@ -42,12 +42,16 @@ impl TextTestSrc {
     fn run_loop(&self) -> bool {
         while let Some(res) = self.parent.recv_msg() {
             match res {
-                Ok(_msg) => {
-                    debug_log!("TEXTTESTSRC: Got message from parent");
+                Ok(msg) => {
+                    match msg {
+                        crate::pipeline::Message::Quit => {
+                            return false;
+                        }
+                    }
                 }
                 Err(e) if e.is_empty() => break,
                 Err(e) => {
-                    debug_log!("TEXTTESTSRC: {e}");
+                    debug_log!("{e}");
                     return false;
                 }
             }
@@ -55,10 +59,10 @@ impl TextTestSrc {
         if let Some(receiver) = &self.sink.msg_receiver {
             loop {
                 match receiver.try_recv() {
-                    Ok(_) => debug_log!("TEXTTESTSRC: Received emssage from sink"),
+                    Ok(_) => debug_log!("Received emssage from sink"),
                     Err(e) if e.is_empty() => break,
                     Err(e) => {
-                        debug_log!("TEXTTESTSRC: Failed to receive msg from sink: {e}");
+                        debug_log!("Failed to receive msg from sink: {e}");
                         return false;
                     }
                 }
@@ -67,7 +71,7 @@ impl TextTestSrc {
 
         if let Some(sender) = &self.sink.data_sender {
             if let Err(e) = sender.send(Data::Text(String::from("Test\n"))) {
-                debug_log!("TEXTTESTSRC: {e}");
+                debug_log!("{e}");
                 return false;
             }
         }
@@ -115,8 +119,12 @@ impl Element for TextTestSrc {
             i += 1;
         }
 
-        debug_log!("TEXTTESTSRC: Finished iterations={i}");
-        // TODO: Join sink thread
+        debug_log!("Finished iterations={i}");
+
+        self.sink.send_quit()?;
+        self.sink.drop_data_sender();
+
+        self.sink.join_thread()?;
 
         Ok(())
     }
