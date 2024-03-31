@@ -1,10 +1,10 @@
 use crate::{
     debug_log,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
-    pipeline::{Data, Parent, SinkPipe},
+    pipeline::{Data, Parent},
 };
 
-use crossbeam_channel::{bounded, unbounded, Receiver};
+use crossbeam_channel::Receiver;
 
 pub struct StdoutLog {
     parent: Parent,
@@ -20,7 +20,7 @@ impl StdoutLog {
     fn run_loop(&self, data_receiver: &Receiver<Data>) -> bool {
         while let Some(res) = self.parent.recv_msg() {
             match res {
-                Ok(msg) => {
+                Ok(_msg) => {
                     debug_log!("Got message prom parent");
                 }
                 Err(e) if e.is_empty() => break,
@@ -32,9 +32,10 @@ impl StdoutLog {
         }
 
         match data_receiver.recv() {
-            Ok(data) => match data {
-                Data::Text(s) => print!("{s}"),
-                _ => {}
+            Ok(data) => {
+                if let Data::Text(s) = data {
+                    print!("{s}");
+                }
             },
             Err(e) => {
                 debug_log!("Failed to receive data from src: {e}");

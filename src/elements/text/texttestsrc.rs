@@ -27,7 +27,7 @@ impl TextTestSrc {
     fn run_loop(&self) -> bool {
         while let Some(res) = self.parent.recv_msg() {
             match res {
-                Ok(msg) => {
+                Ok(_msg) => {
                     debug_log!("TEXTTESTSRC: Got message from parent");
                 }
                 Err(e) if e.is_empty() => break,
@@ -51,12 +51,9 @@ impl TextTestSrc {
         }
 
         if let Some(sender) = &self.sink.data_sender {
-            match sender.send(Data::Text(String::from("Test\n"))) {
-                Err(e) => {
+            if let Err(e) = sender.send(Data::Text(String::from("Test\n"))) {
                     debug_log!("TEXTTESTSRC: {e}");
                     return false;
-                }
-                _ => {}
             }
         }
 

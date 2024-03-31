@@ -17,6 +17,7 @@ pub enum Message {}
 
 #[derive(Default)]
 pub struct Parent {
+    #[allow(dead_code)]
     msg_sender: Option<Sender<Message>>,
     msg_receiver: Option<Receiver<Message>>,
 }
@@ -66,7 +67,7 @@ impl Pipeline {
     // TODO: Move the thread spawning to a different function (perhaps `init()`) and later send a
     // message to the head giving a "start" signal?
     pub fn run(&mut self) -> Result<(), Error> {
-        let (data_sender, data_receiver) = bounded(0);
+        let (_data_sender, data_receiver) = bounded(0);
         let (_my_msg_sender, msg_receiver) = unbounded();
         let (msg_sender, _my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender, msg_receiver.clone());
