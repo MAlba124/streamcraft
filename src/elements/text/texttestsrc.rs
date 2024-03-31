@@ -52,8 +52,8 @@ impl TextTestSrc {
 
         if let Some(sender) = &self.sink.data_sender {
             if let Err(e) = sender.send(Data::Text(String::from("Test\n"))) {
-                    debug_log!("TEXTTESTSRC: {e}");
-                    return false;
+                debug_log!("TEXTTESTSRC: {e}");
+                return false;
             }
         }
 

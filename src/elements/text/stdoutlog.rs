@@ -36,7 +36,7 @@ impl StdoutLog {
                 if let Data::Text(s) = data {
                     print!("{s}");
                 }
-            },
+            }
             Err(e) => {
                 debug_log!("Failed to receive data from src: {e}");
                 return false;
