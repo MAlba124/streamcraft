@@ -1,4 +1,3 @@
-// StreamCraft - general purpose data/multimedia pipeline framework
 // Copyright (C) 2024  MAlba124 <marlhan@proton.me>
 //
 // StreamCraft is free software: you can redistribute it and/or modify
