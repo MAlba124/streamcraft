@@ -16,7 +16,7 @@
 use crate::{
     debug_log,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
-    pipeline::{Data, Datagram, Parent, SinkPipe},
+    pipeline::{error::Error, Data, Datagram, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
@@ -96,11 +96,14 @@ impl Element for TextTestSrc {
     fn run(
         &mut self,
         parent_datagram_receiver: Receiver<Datagram>,
-    ) -> Result<(), crate::pipeline::error::Error> {
+    ) -> Result<(), Error> {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);
-        let mut sink_element = self.sink.element.take().unwrap(); // TODO: handle `None`
+        let mut sink_element = match self.sink.element.take() {
+            Some(elm) => elm,
+            None => return Err(Error::NoSinkElement),
+        };
         sink_element.set_parent(parent);
         let datagram_receiver_clone = datagram_receiver.clone();
 

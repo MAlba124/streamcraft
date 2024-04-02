@@ -19,6 +19,7 @@ pub enum Error {
     FailedToJoinThread,
     NoSinkMessageSender,
     MessageSinkFailed,
+    NoSinkElement,
 }
 
 impl std::error::Error for Error {}
@@ -29,7 +30,8 @@ impl std::fmt::Display for Error {
             Self::NoThreadHandle => "No thread handle",
             Self::FailedToJoinThread => "Failed to join thread",
             Self::NoSinkMessageSender => "No sink message sender",
-            Self::MessageSinkFailed => "MessageSinkFailed",
+            Self::MessageSinkFailed => "Message sink failed",
+            Self::NoSinkElement => "No sink element",
         })
     }
 }

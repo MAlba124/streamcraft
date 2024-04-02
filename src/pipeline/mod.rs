@@ -97,13 +97,16 @@ impl Pipeline {
         Self { head }
     }
 
-    // TODO: Move the thread spawning to a different function (perhaps `init()`) and later send a
-    // message to the head giving a "start" signal?
-    pub fn run(&mut self) -> Result<(), Error> {
+    fn init(&mut self) -> Result<(), Error> {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);
-        let mut sink_element = self.head.element.take().unwrap(); // TODO: handle `None`
+        let mut sink_element = match self.head.element.take() {
+            Some(elm) => elm,
+            None => {
+                return Err(Error::NoSinkElement);
+            }
+        };
         sink_element.set_parent(parent);
         let datagram_receiver_clone = datagram_receiver.clone();
 
@@ -115,6 +118,12 @@ impl Pipeline {
         }));
         self.head.msg_receiver = Some(my_msg_receiver);
         self.head.datagram_sender = Some(datagram_sender);
+
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        self.init()?;
 
         std::thread::sleep(std::time::Duration::from_millis(1));
 
