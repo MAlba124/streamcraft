@@ -23,14 +23,14 @@ pub enum CommonFormat {
 }
 
 #[derive(PartialEq)]
-pub enum Sinks {
+pub enum Sink {
     One(CommonFormat),
     None,
 }
 
-impl Sinks {
+impl Sink {
     pub fn has_none(&self) -> bool {
-        matches!(self, Sinks::None)
+        matches!(self, Sink::None)
     }
 }
 
@@ -46,15 +46,15 @@ impl Srcs {
     }
 }
 
-pub fn sink_is_compatible_with_src(sink: Sinks, src: Srcs) -> bool {
+pub fn sink_is_compatible_with_src(sink: Sink, src: Srcs) -> bool {
     match sink {
-        Sinks::One(format) => src == Srcs::One(format),
+        Sink::One(format) => src == Srcs::One(format),
         _ => false,
     }
 }
 
 pub struct ElementArchitecture {
-    pub sinks: Sinks,
+    pub sink: Sink,
     pub srcs: Srcs,
 }
 
@@ -62,28 +62,6 @@ pub struct ElementArchitecture {
 pub enum ElementType {
     TextSink,
     TextSrc,
-}
-
-// TODO: Separate to `error.rs`
-#[derive(Debug)]
-pub enum Error {
-    NoSources,
-    Incompatible,
-}
-
-impl std::error::Error for Error {}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::NoSources => "Last element in pipeline does not have any sources",
-                Self::Incompatible => "Element is incompatible with the current pipeline",
-            }
-        )
-    }
 }
 
 pub trait Element: Sync + Send {

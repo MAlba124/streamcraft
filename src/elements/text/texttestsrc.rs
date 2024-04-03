@@ -15,7 +15,7 @@
 
 use crate::{
     debug_log,
-    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
+    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
     pipeline::{error::Error, Data, Datagram, Parent, SinkPipe},
 };
 
@@ -88,7 +88,7 @@ impl Element for TextTestSrc {
 
     fn get_architecture(&self) -> ElementArchitecture {
         ElementArchitecture {
-            sinks: Sinks::None,
+            sink: Sink::None,
             srcs: Srcs::One(CommonFormat::Text),
         }
     }

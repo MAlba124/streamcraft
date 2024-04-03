@@ -15,7 +15,7 @@
 
 use crate::{
     debug_log,
-    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sinks, Srcs},
+    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
     pipeline::{Data, Datagram, Parent},
 };
 
@@ -65,7 +65,7 @@ impl Element for StdoutLog {
 
     fn get_architecture(&self) -> ElementArchitecture {
         ElementArchitecture {
-            sinks: Sinks::One(CommonFormat::Text),
+            sink: Sink::One(CommonFormat::Text),
             srcs: Srcs::None,
         }
     }
