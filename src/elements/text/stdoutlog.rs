@@ -37,6 +37,7 @@ impl StdoutLog {
             Ok(datagram) => match datagram {
                 Datagram::Message(msg) => match msg {
                     crate::pipeline::Message::Quit => return false,
+                    _ => unreachable!(),
                 },
                 Datagram::Data(data) => {
                     if let Data::Text(s) = data {

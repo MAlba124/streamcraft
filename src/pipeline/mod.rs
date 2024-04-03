@@ -29,7 +29,10 @@ pub enum Data {
 }
 
 pub enum Message {
+    Start,
+    Iter,
     Quit,
+    Finished,
 }
 
 pub enum Datagram {
@@ -49,6 +52,13 @@ impl Parent {
             msg_sender: Some(msg_sender),
         }
     }
+
+    // TODO: Return error
+    pub fn send_finished(&self) {
+        if let Some(msg_sender) = &self.msg_sender {
+            msg_sender.send(Message::Finished).unwrap();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -56,7 +66,6 @@ pub struct SinkPipe {
     pub element: Option<Box<dyn Element>>,
     pub thread_handle: Option<JoinHandle<()>>,
     pub datagram_sender: Option<Sender<Datagram>>,
-    pub msg_sender: Option<Sender<Message>>,
     pub msg_receiver: Option<Receiver<Message>>,
 }
 
@@ -97,7 +106,7 @@ impl Pipeline {
         Self { head }
     }
 
-    fn init(&mut self) -> Result<(), Error> {
+    pub fn init(&mut self) -> Result<(), Error> {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);
@@ -123,13 +132,44 @@ impl Pipeline {
     }
 
     pub fn run(&mut self) -> Result<(), Error> {
-        self.init()?;
+        if self.head.thread_handle.is_none() {
+            return Err(Error::PipelineNotReady);
+        }
 
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Some(datagram_sender) = &self.head.datagram_sender {
+            datagram_sender.send(Datagram::Message(Message::Start)).unwrap();
+        }
 
-        self.head.send_quit()?;
-        self.head.join_thread()?;
+        if let Some(msg_receiver) = &self.head.msg_receiver {
+            loop {
+                // TODO: Handle error
+                match msg_receiver.recv().unwrap() {
+                    Message::Finished => break,
+                    _ => println!("Got invalid message from sink"),
+                }
+            }
+        }
 
         Ok(())
     }
+
+    pub fn iter(&self) -> Result<(), Error> {
+        if self.head.thread_handle.is_none() {
+            return Err(Error::PipelineNotReady);
+        }
+
+        if let Some(datagram_sender) = &self.head.datagram_sender {
+            datagram_sender.send(Datagram::Message(Message::Iter)).unwrap(); // TODO: Handle error
+        } else {
+            return Err(Error::NoSinkDatagramSender);
+        }
+
+        Ok(())
+    }
+
+    pub fn de_init(&mut self) -> Result<(), Error> {
+        self.head.send_quit()?;
+        self.head.join_thread()
+    }
 }
+

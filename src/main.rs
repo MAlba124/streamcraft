@@ -25,6 +25,11 @@ fn main() {
     texttest.link_sink_element(stdoutlog);
 
     let mut pipeline = Pipeline::new(texttest);
+    pipeline.init().expect("Failed to initalize pipeline");
 
-    pipeline.run().expect("Error occurred running pipeline");
+    for _ in 0..3 {
+        pipeline.iter().expect("Failed to iterate pipeline");
+    }
+
+    pipeline.de_init().expect("Failed to de-init pipeline");
 }

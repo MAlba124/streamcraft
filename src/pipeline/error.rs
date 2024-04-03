@@ -20,6 +20,8 @@ pub enum Error {
     NoSinkMessageSender,
     MessageSinkFailed,
     NoSinkElement,
+    PipelineNotReady,
+    NoSinkDatagramSender,
 }
 
 impl std::error::Error for Error {}
@@ -35,6 +37,8 @@ impl std::fmt::Display for Error {
                 Self::NoSinkMessageSender => "No sink message sender",
                 Self::MessageSinkFailed => "Message sink failed",
                 Self::NoSinkElement => "No sink element",
+                Self::PipelineNotReady => "Pipeline is not ready",
+                Self::NoSinkDatagramSender => "No sink datagram sender",
             }
         )
     }

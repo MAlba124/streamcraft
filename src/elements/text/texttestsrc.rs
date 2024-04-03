@@ -24,6 +24,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver};
 pub struct TextTestSrc {
     sink: SinkPipe,
     parent: Parent,
+    iter_mode: bool,
 }
 
 impl TextTestSrc {
@@ -31,6 +32,7 @@ impl TextTestSrc {
         Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
+            iter_mode: false,
         }
     }
 
@@ -39,7 +41,7 @@ impl TextTestSrc {
         self.sink.set_element(sink);
     }
 
-    fn run_loop(&self, datagram_receiver: &Receiver<Datagram>) -> bool {
+    fn run_loop(&mut self, datagram_receiver: &Receiver<Datagram>) -> bool {
         if let Some(receiver) = &self.sink.msg_receiver {
             loop {
                 match receiver.try_recv() {
@@ -65,6 +67,9 @@ impl TextTestSrc {
                 Ok(datagram) => match datagram {
                     Datagram::Message(msg) => match msg {
                         crate::pipeline::Message::Quit => return false,
+                        crate::pipeline::Message::Start => self.iter_mode = false,
+                        crate::pipeline::Message::Iter => self.iter_mode = true,
+                        _ => println!("Received Finished from pipeline... hmm"),
                     },
                     Datagram::Data(_) => {}
                 },
@@ -75,21 +80,8 @@ impl TextTestSrc {
 
         true
     }
-}
 
-impl Element for TextTestSrc {
-    fn get_type(&self) -> ElementType {
-        ElementType::TextSrc
-    }
-
-    fn get_architecture(&self) -> ElementArchitecture {
-        ElementArchitecture {
-            sink: Sink::None,
-            srcs: Srcs::One(CommonFormat::Text),
-        }
-    }
-
-    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
+    fn init(&mut self) -> Result<(), Error> {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);
@@ -109,19 +101,76 @@ impl Element for TextTestSrc {
         self.sink.msg_receiver = Some(my_msg_receiver);
         self.sink.datagram_sender = Some(datagram_sender);
 
-        let mut i = 0;
-        while self.run_loop(&parent_datagram_receiver) {
-            i += 1;
-        }
+        Ok(())
+    }
 
-        debug_log!("Finished iterations={i}");
-
+    fn quit(&mut self) -> Result<(), Error> {
         self.sink.send_quit()?;
         self.sink.drop_data_sender();
 
         self.sink.join_thread()?;
 
         Ok(())
+    }
+}
+
+impl Element for TextTestSrc {
+    fn get_type(&self) -> ElementType {
+        ElementType::TextSrc
+    }
+
+    fn get_architecture(&self) -> ElementArchitecture {
+        ElementArchitecture {
+            sink: Sink::None,
+            srcs: Srcs::One(CommonFormat::Text),
+        }
+    }
+
+    // TODO: Perform one iteration when receiving Iter message
+    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
+        self.init()?;
+
+        // TODO: Make function to wait for a speciffic message
+        while let Ok(datagram) = parent_datagram_receiver.recv() {
+            match datagram {
+                Datagram::Message(msg) => match msg {
+                    crate::pipeline::Message::Start => {
+                        self.iter_mode = false;
+                        break;
+                    }
+                    crate::pipeline::Message::Iter => {
+                        self.iter_mode = true;
+                        break;
+                    }
+                    crate::pipeline::Message::Quit => return self.quit(),
+                    _ => {}
+                },
+                Datagram::Data(_) => todo!(),
+            }
+        }
+
+        while self.run_loop(&parent_datagram_receiver) {
+            if self.iter_mode {
+                while let Ok(datagram) = parent_datagram_receiver.recv() {
+                    match datagram {
+                        Datagram::Message(msg) => match msg {
+                            crate::pipeline::Message::Start => {
+                                self.iter_mode = false;
+                                break;
+                            }
+                            crate::pipeline::Message::Iter => break,
+                            crate::pipeline::Message::Quit => return self.quit(),
+                            _ => {}
+                        },
+                        Datagram::Data(_) => todo!(),
+                    }
+                }
+            }
+        }
+
+        self.parent.send_finished();
+
+        self.quit()
     }
 
     fn set_parent(&mut self, parent: Parent) {
