@@ -13,4 +13,5 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
+#[cfg(feature = "elements-text")]
 pub mod text;

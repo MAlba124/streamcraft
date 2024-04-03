@@ -13,5 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
+#[cfg(feature = "element-stdoutlog")]
 pub mod stdoutlog;
+#[cfg(feature = "element-texttestsrc")]
 pub mod texttestsrc;
