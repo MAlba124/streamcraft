@@ -62,16 +62,12 @@ impl TextTestSrc {
 
         loop {
             match datagram_receiver.try_recv() {
-                Ok(datagram) => {
-                    match datagram {
-                        Datagram::Message(msg) => {
-                            match msg {
-                                crate::pipeline::Message::Quit => return false,
-                            }
-                        }
-                        Datagram::Data(_) => {}
-                    }
-                }
+                Ok(datagram) => match datagram {
+                    Datagram::Message(msg) => match msg {
+                        crate::pipeline::Message::Quit => return false,
+                    },
+                    Datagram::Data(_) => {}
+                },
                 Err(e) if e.is_empty() => break,
                 Err(_) => return false,
             }
@@ -93,10 +89,7 @@ impl Element for TextTestSrc {
         }
     }
 
-    fn run(
-        &mut self,
-        parent_datagram_receiver: Receiver<Datagram>,
-    ) -> Result<(), Error> {
+    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);

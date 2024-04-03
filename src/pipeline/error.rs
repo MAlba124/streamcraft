@@ -26,12 +26,16 @@ impl std::error::Error for Error {}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", match self {
-            Self::NoThreadHandle => "No thread handle",
-            Self::FailedToJoinThread => "Failed to join thread",
-            Self::NoSinkMessageSender => "No sink message sender",
-            Self::MessageSinkFailed => "Message sink failed",
-            Self::NoSinkElement => "No sink element",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::NoThreadHandle => "No thread handle",
+                Self::FailedToJoinThread => "Failed to join thread",
+                Self::NoSinkMessageSender => "No sink message sender",
+                Self::MessageSinkFailed => "Message sink failed",
+                Self::NoSinkElement => "No sink element",
+            }
+        )
     }
 }

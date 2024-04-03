@@ -67,17 +67,17 @@ impl SinkPipe {
 
     pub fn send_quit(&self) -> Result<(), Error> {
         match self.datagram_sender.as_ref() {
-            Some(msg_sender) => msg_sender.send(Datagram::Message(Message::Quit)).map_err(|_| Error::MessageSinkFailed),
+            Some(msg_sender) => msg_sender
+                .send(Datagram::Message(Message::Quit))
+                .map_err(|_| Error::MessageSinkFailed),
             None => Err(Error::NoSinkMessageSender),
         }
     }
 
     pub fn join_thread(&mut self) -> Result<(), Error> {
         match self.thread_handle.take() {
-            Some(join_handle) => {
-                join_handle.join().map_err(|_| Error::FailedToJoinThread)
-            }
-            None => Err(Error::NoThreadHandle)
+            Some(join_handle) => join_handle.join().map_err(|_| Error::FailedToJoinThread),
+            None => Err(Error::NoThreadHandle),
         }
     }
 

@@ -67,6 +67,9 @@ pub enum ElementType {
 pub trait Element: Sync + Send {
     fn get_type(&self) -> ElementType;
     fn get_architecture(&self) -> ElementArchitecture;
-    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), pipeline::error::Error>;
+    fn run(
+        &mut self,
+        parent_datagram_receiver: Receiver<Datagram>,
+    ) -> Result<(), pipeline::error::Error>;
     fn set_parent(&mut self, parent: Parent);
 }

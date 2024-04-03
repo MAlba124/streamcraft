@@ -34,20 +34,16 @@ impl StdoutLog {
 
     fn run_loop(&self, data_receiver: &Receiver<Datagram>) -> bool {
         match data_receiver.recv() {
-            Ok(datagram) => {
-                match datagram {
-                    Datagram::Message(msg) => {
-                        match msg {
-                            crate::pipeline::Message::Quit => return false,
-                        }
-                    }
-                    Datagram::Data(data) => {
-                        if let Data::Text(s) = data {
-                            print!("{s}");
-                        }
+            Ok(datagram) => match datagram {
+                Datagram::Message(msg) => match msg {
+                    crate::pipeline::Message::Quit => return false,
+                },
+                Datagram::Data(data) => {
+                    if let Data::Text(s) = data {
+                        print!("{s}");
                     }
                 }
-            }
+            },
             Err(e) => {
                 debug_log!("Failed to receive data from src: {e}");
                 return false;
