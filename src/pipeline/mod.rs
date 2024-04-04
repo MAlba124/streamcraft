@@ -28,9 +28,10 @@ pub enum Data {
     None,
 }
 
+#[derive(Debug)]
 pub enum Message {
-    Start,
     Iter,
+    IterFin,
     Quit,
     Finished,
 }
@@ -42,7 +43,6 @@ pub enum Datagram {
 
 #[derive(Default)]
 pub struct Parent {
-    #[allow(dead_code)]
     msg_sender: Option<Sender<Message>>,
 }
 
@@ -53,14 +53,23 @@ impl Parent {
         }
     }
 
-    pub fn send_finished(&self) -> Result<(), Error> {
-        if let Some(msg_sender) = &self.msg_sender {
-            msg_sender
-                .send(Message::Finished)
-                .map_err(|_| Error::MessageSinkFailed)?
+    fn send_msg(&self, msg: Message) -> Result<(), Error> {
+        match self.msg_sender.as_ref() {
+            Some(msg_sender) => {
+                msg_sender.send(msg).map_err(|_| Error::MessageParentFailed)
+            }
+            None => {
+                Err(Error::NoParentMessageSender)
+            }
         }
+    }
 
-        Err(Error::NoSinkMessageSender)
+    pub fn send_finished(&self) -> Result<(), Error> {
+        self.send_msg(Message::Finished)
+    }
+
+    pub fn send_iter_fin(&self) -> Result<(), Error> {
+        self.send_msg(Message::IterFin)
     }
 }
 
@@ -134,30 +143,6 @@ impl Pipeline {
         Ok(())
     }
 
-    pub fn run(&mut self) -> Result<(), Error> {
-        if self.head.thread_handle.is_none() {
-            return Err(Error::PipelineNotReady);
-        }
-
-        if let Some(datagram_sender) = &self.head.datagram_sender {
-            datagram_sender
-                .send(Datagram::Message(Message::Start))
-                .unwrap();
-        }
-
-        if let Some(msg_receiver) = &self.head.msg_receiver {
-            loop {
-                // TODO: Handle error
-                match msg_receiver.recv().unwrap() {
-                    Message::Finished => break,
-                    _ => println!("Got invalid message from sink"),
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn iter(&self) -> Result<(), Error> {
         if self.head.thread_handle.is_none() {
             return Err(Error::PipelineNotReady);
@@ -171,7 +156,17 @@ impl Pipeline {
             return Err(Error::NoSinkDatagramSender);
         }
 
-        Ok(())
+        if let Some(message_receiver) = &self.head.msg_receiver {
+            match message_receiver
+                .recv()
+                .map_err(|_| Error::ReceiveFromSinkFailed)?
+            {
+                Message::IterFin | Message::Finished => Ok(()),
+                _ => Err(Error::ReceivedInvalidDatagramFromSink),
+            }
+        } else {
+            Err(Error::NoSinkMessageReceiver)
+        }
     }
 
     pub fn de_init(&mut self) -> Result<(), Error> {

@@ -24,7 +24,6 @@ use crossbeam_channel::{bounded, unbounded, Receiver};
 pub struct TextTestSrc {
     sink: SinkPipe,
     parent: Parent,
-    iter_mode: bool,
 }
 
 impl TextTestSrc {
@@ -32,7 +31,6 @@ impl TextTestSrc {
         Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
-            iter_mode: false,
         }
     }
 
@@ -41,7 +39,8 @@ impl TextTestSrc {
         self.sink.set_element(sink);
     }
 
-    fn run_loop(&mut self, datagram_receiver: &Receiver<Datagram>) -> bool {
+    fn run_loop(&mut self) -> bool {
+        // TODO: move this somewhere else
         if let Some(receiver) = &self.sink.msg_receiver {
             loop {
                 match receiver.try_recv() {
@@ -59,22 +58,6 @@ impl TextTestSrc {
             if let Err(e) = sender.send(Datagram::Data(Data::Text(String::from("Test\n")))) {
                 debug_log!("{e}");
                 return false;
-            }
-        }
-
-        loop {
-            match datagram_receiver.try_recv() {
-                Ok(datagram) => match datagram {
-                    Datagram::Message(msg) => match msg {
-                        crate::pipeline::Message::Quit => return false,
-                        crate::pipeline::Message::Start => self.iter_mode = false,
-                        crate::pipeline::Message::Iter => self.iter_mode = true,
-                        _ => println!("Received Finished from pipeline... hmm"),
-                    },
-                    Datagram::Data(_) => {}
-                },
-                Err(e) if e.is_empty() => break,
-                Err(_) => return false,
             }
         }
 
@@ -130,45 +113,26 @@ impl Element for TextTestSrc {
     fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
         self.init()?;
 
-        // TODO: Make function to wait for a speciffic message
-        while let Ok(datagram) = parent_datagram_receiver.recv() {
-            match datagram {
+        loop {
+            match parent_datagram_receiver
+                .recv()
+                .map_err(|_| Error::FailedToRecvFromParent)?
+            {
                 Datagram::Message(msg) => match msg {
-                    crate::pipeline::Message::Start => {
-                        self.iter_mode = false;
-                        break;
-                    }
                     crate::pipeline::Message::Iter => {
-                        self.iter_mode = true;
-                        break;
+                        if !self.run_loop() {
+                            break;
+                        }
+                        self.parent.send_iter_fin()?;
                     }
-                    crate::pipeline::Message::Quit => return self.quit(),
-                    _ => {}
+                    crate::pipeline::Message::Quit => break,
+                    _ => return Err(Error::ReceivedInvalidDatagramFromParent),
                 },
-                Datagram::Data(_) => todo!(),
+                _ => return Err(Error::ReceivedInvalidDatagramFromParent),
             }
         }
 
-        while self.run_loop(&parent_datagram_receiver) {
-            if self.iter_mode {
-                while let Ok(datagram) = parent_datagram_receiver.recv() {
-                    match datagram {
-                        Datagram::Message(msg) => match msg {
-                            crate::pipeline::Message::Start => {
-                                self.iter_mode = false;
-                                break;
-                            }
-                            crate::pipeline::Message::Iter => break,
-                            crate::pipeline::Message::Quit => return self.quit(),
-                            _ => {}
-                        },
-                        Datagram::Data(_) => todo!(),
-                    }
-                }
-            }
-        }
-
-        self.parent.send_finished();
+        self.parent.send_finished()?;
 
         self.quit()
     }

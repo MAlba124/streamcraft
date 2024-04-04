@@ -18,10 +18,17 @@ pub enum Error {
     NoThreadHandle,
     FailedToJoinThread,
     NoSinkMessageSender,
+    NoSinkMessageReceiver,
     MessageSinkFailed,
     NoSinkElement,
     PipelineNotReady,
     NoSinkDatagramSender,
+    FailedToRecvFromParent,
+    ReceivedInvalidDatagramFromParent,
+    ReceivedInvalidDatagramFromSink,
+    ReceiveFromSinkFailed,
+    MessageParentFailed,
+    NoParentMessageSender,
 }
 
 impl std::error::Error for Error {}
@@ -35,10 +42,17 @@ impl std::fmt::Display for Error {
                 Self::NoThreadHandle => "No thread handle",
                 Self::FailedToJoinThread => "Failed to join thread",
                 Self::NoSinkMessageSender => "No sink message sender",
+                Self::NoSinkMessageReceiver => "No sink message receiver",
                 Self::MessageSinkFailed => "Message sink failed",
                 Self::NoSinkElement => "No sink element",
                 Self::PipelineNotReady => "Pipeline is not ready",
                 Self::NoSinkDatagramSender => "No sink datagram sender",
+                Self::FailedToRecvFromParent => "Failed to recv from parent",
+                Self::ReceivedInvalidDatagramFromParent => "Received invalid datagram from parent",
+                Self::ReceivedInvalidDatagramFromSink => "Received invalid datagram from sink",
+                Self::ReceiveFromSinkFailed => "Receive from sink failed",
+                Self::MessageParentFailed => "Message parent failed",
+                Self::NoParentMessageSender => "No parent message sender",
             }
         )
     }
