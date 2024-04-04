@@ -53,11 +53,14 @@ impl Parent {
         }
     }
 
-    // TODO: Return error
-    pub fn send_finished(&self) {
+    pub fn send_finished(&self) -> Result<(), Error> {
         if let Some(msg_sender) = &self.msg_sender {
-            msg_sender.send(Message::Finished).unwrap();
+            msg_sender
+                .send(Message::Finished)
+                .map_err(|_| Error::MessageSinkFailed)?
         }
+
+        Err(Error::NoSinkMessageSender)
     }
 }
 
@@ -137,7 +140,9 @@ impl Pipeline {
         }
 
         if let Some(datagram_sender) = &self.head.datagram_sender {
-            datagram_sender.send(Datagram::Message(Message::Start)).unwrap();
+            datagram_sender
+                .send(Datagram::Message(Message::Start))
+                .unwrap();
         }
 
         if let Some(msg_receiver) = &self.head.msg_receiver {
@@ -159,7 +164,9 @@ impl Pipeline {
         }
 
         if let Some(datagram_sender) = &self.head.datagram_sender {
-            datagram_sender.send(Datagram::Message(Message::Iter)).unwrap(); // TODO: Handle error
+            datagram_sender
+                .send(Datagram::Message(Message::Iter))
+                .map_err(|_| Error::MessageSinkFailed)?;
         } else {
             return Err(Error::NoSinkDatagramSender);
         }
@@ -172,4 +179,3 @@ impl Pipeline {
         self.head.join_thread()
     }
 }
-
