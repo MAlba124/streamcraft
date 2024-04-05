@@ -14,9 +14,7 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    debug_log,
-    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
-    pipeline::{error::Error, Data, Datagram, Parent, SinkPipe},
+    debug_log, element_def, element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs}, pipeline::{error::Error, Data, Datagram, Parent, SinkPipe}
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
@@ -96,15 +94,6 @@ impl TextTestSrc {
 
         Ok(())
     }
-
-    fn quit(&mut self) -> Result<(), Error> {
-        self.sink.send_quit()?;
-        self.sink.drop_data_sender();
-
-        self.sink.join_thread()?;
-
-        Ok(())
-    }
 }
 
 impl Element for TextTestSrc {
@@ -142,12 +131,23 @@ impl Element for TextTestSrc {
             }
         }
 
-        self.parent.send_finished()?;
+        self.parent.send_finished()
 
-        self.quit()
+        // self.quit()
     }
 
     fn set_parent(&mut self, parent: Parent) {
         self.parent = parent;
     }
+
+    fn cleanup(&mut self) -> Result<(), crate::pipeline::error::Error> {
+        self.sink.send_quit()?;
+        self.sink.drop_data_sender();
+
+        self.sink.join_thread()
+    }
+}
+
+element_def! {
+    TextTestSrc
 }

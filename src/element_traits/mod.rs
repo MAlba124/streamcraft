@@ -72,4 +72,17 @@ pub trait Element: Sync + Send {
         parent_datagram_receiver: Receiver<Datagram>,
     ) -> Result<(), pipeline::error::Error>;
     fn set_parent(&mut self, parent: Parent);
+    fn cleanup(&mut self) -> Result<(), pipeline::error::Error>;
+}
+
+// TODO: Make it so elements are NOT valid when this macro is not used.
+#[macro_export]
+macro_rules! element_def {
+    ($element:ty) => {
+        impl Drop for $element {
+            fn drop(&mut self) {
+                self.cleanup();
+            }
+        }
+    }
 }
