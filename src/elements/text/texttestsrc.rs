@@ -110,7 +110,6 @@ impl Element for TextTestSrc {
         }
     }
 
-    // TODO: Perform one iteration when receiving Iter message
     fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
         self.init()?;
 
