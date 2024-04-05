@@ -55,12 +55,8 @@ impl Parent {
 
     fn send_msg(&self, msg: Message) -> Result<(), Error> {
         match self.msg_sender.as_ref() {
-            Some(msg_sender) => {
-                msg_sender.send(msg).map_err(|_| Error::MessageParentFailed)
-            }
-            None => {
-                Err(Error::NoParentMessageSender)
-            }
+            Some(msg_sender) => msg_sender.send(msg).map_err(|_| Error::MessageParentFailed),
+            None => Err(Error::NoParentMessageSender),
         }
     }
 

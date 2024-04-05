@@ -22,7 +22,9 @@ fn main() {
     let stdoutlog = StdoutLog::new();
 
     let mut texttest = TextTestSrc::new();
-    texttest.link_sink_element(stdoutlog).expect("Failed to add sink element");
+    texttest
+        .link_sink_element(stdoutlog)
+        .expect("Failed to add sink element");
 
     let mut pipeline = Pipeline::new(texttest);
     pipeline.init().expect("Failed to initalize pipeline");

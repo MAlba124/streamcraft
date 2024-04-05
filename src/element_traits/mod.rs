@@ -84,5 +84,5 @@ macro_rules! element_def {
                 self.cleanup();
             }
         }
-    }
+    };
 }
