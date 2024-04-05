@@ -34,9 +34,19 @@ impl TextTestSrc {
         }
     }
 
-    // TODO: Check if sink element is valid
-    pub fn link_sink_element(&mut self, sink: impl Element + 'static) {
-        self.sink.set_element(sink);
+    pub fn link_sink_element(&mut self, sink: impl Element + 'static) -> Result<(), Error> {
+        if sink.get_type() != ElementType::TextSink {
+            return Err(Error::InvalidSinkType);
+        }
+
+        if let Sink::One(format) = sink.get_architecture().sink {
+            if format == CommonFormat::Text {
+                self.sink.set_element(sink);
+                return Ok(());
+            }
+        }
+
+        Err(Error::InvalidSinkType)
     }
 
     fn run_loop(&mut self) -> bool {

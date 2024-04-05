@@ -29,6 +29,7 @@ pub enum Error {
     ReceiveFromSinkFailed,
     MessageParentFailed,
     NoParentMessageSender,
+    InvalidSinkType,
 }
 
 impl std::error::Error for Error {}
@@ -53,6 +54,7 @@ impl std::fmt::Display for Error {
                 Self::ReceiveFromSinkFailed => "Receive from sink failed",
                 Self::MessageParentFailed => "Message parent failed",
                 Self::NoParentMessageSender => "No parent message sender",
+                Self::InvalidSinkType => "Invalid sink type",
             }
         )
     }

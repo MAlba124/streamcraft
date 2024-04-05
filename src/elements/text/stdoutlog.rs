@@ -72,7 +72,6 @@ impl Element for StdoutLog {
         parent_datagram_receiver: Receiver<Datagram>,
     ) -> Result<(), crate::pipeline::error::Error> {
         while self.run_loop(&parent_datagram_receiver) {}
-        debug_log!("Finished");
         Ok(())
     }
 
