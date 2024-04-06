@@ -56,7 +56,7 @@ impl StdoutLog {
 }
 
 impl Element for StdoutLog {
-    fn get_type(&self) -> ElementType {
+    fn get_sink_type(&self) -> ElementType {
         ElementType::TextSink
     }
 

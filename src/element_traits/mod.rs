@@ -62,10 +62,11 @@ pub struct ElementArchitecture {
 pub enum ElementType {
     TextSink,
     TextSrc,
+    BytesSrc,
 }
 
 pub trait Element: Sync + Send {
-    fn get_type(&self) -> ElementType;
+    fn get_sink_type(&self) -> ElementType;
     fn get_architecture(&self) -> ElementArchitecture;
     fn run(
         &mut self,

@@ -35,7 +35,7 @@ impl TextTestSrc {
     }
 
     pub fn link_sink_element(&mut self, sink: impl Element + 'static) -> Result<(), Error> {
-        if sink.get_type() != ElementType::TextSink {
+        if sink.get_sink_type() != ElementType::TextSink {
             return Err(Error::InvalidSinkType);
         }
 
@@ -99,7 +99,7 @@ impl TextTestSrc {
 }
 
 impl Element for TextTestSrc {
-    fn get_type(&self) -> ElementType {
+    fn get_sink_type(&self) -> ElementType {
         ElementType::TextSrc
     }
 
@@ -133,8 +133,6 @@ impl Element for TextTestSrc {
         }
 
         self.parent.send_finished()
-
-        // self.quit()
     }
 
     fn set_parent(&mut self, parent: Parent) {
