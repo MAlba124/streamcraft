@@ -79,11 +79,17 @@ pub trait Element: Sync + Send {
 // TODO: Make it so elements are NOT valid when this macro is not used.
 #[macro_export]
 macro_rules! element_def {
-    ($element:ty) => {
+    ($element:ty, $name:literal) => {
         impl Drop for $element {
             fn drop(&mut self) {
-                self.cleanup();
+                if let Err(e) = self.cleanup() {
+                    $crate::error!("Failed to drop: {e}");
+                }
             }
+        }
+
+        $crate::define_log_info! {
+            $name
         }
     };
 }

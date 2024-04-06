@@ -14,8 +14,9 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    debug_log, element_def,
+    debug, element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
+    error,
     pipeline::{error::Error, Data, Datagram, Parent, SinkPipe},
 };
 
@@ -54,10 +55,10 @@ impl TextTestSrc {
         if let Some(receiver) = &self.sink.msg_receiver {
             loop {
                 match receiver.try_recv() {
-                    Ok(_) => debug_log!("Received emssage from sink"),
+                    Ok(_) => debug!("Received emssage from sink"),
                     Err(e) if e.is_empty() => break,
                     Err(e) => {
-                        debug_log!("Failed to receive msg from sink: {e}");
+                        error!("Failed to receive msg from sink: {e}");
                         return false;
                     }
                 }
@@ -66,7 +67,7 @@ impl TextTestSrc {
 
         if let Some(sender) = &self.sink.datagram_sender {
             if let Err(e) = sender.send(Datagram::Data(Data::Text(String::from("Test\n")))) {
-                debug_log!("{e}");
+                error!("{e}");
                 return false;
             }
         }
@@ -88,7 +89,7 @@ impl TextTestSrc {
         self.sink.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
-                Err(e) => debug_log!("Error occurred running sink element: {e}"),
+                Err(e) => debug!("Error occurred running sink element: {e}"),
             }
         }));
         self.sink.msg_receiver = Some(my_msg_receiver);
@@ -148,5 +149,6 @@ impl Element for TextTestSrc {
 }
 
 element_def! {
-    TextTestSrc
+    TextTestSrc,
+    "texttestsrc"
 }

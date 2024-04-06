@@ -14,7 +14,7 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    debug_log, element_def,
+    debug, element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
     pipeline::{Data, Datagram, Parent},
 };
@@ -46,7 +46,7 @@ impl StdoutLog {
                 }
             },
             Err(e) => {
-                debug_log!("Failed to receive data from src: {e}");
+                debug!("Failed to receive data from src: {e}");
                 return false;
             }
         }
@@ -85,5 +85,6 @@ impl Element for StdoutLog {
 }
 
 element_def! {
-    StdoutLog
+    StdoutLog,
+    "stdoutlog"
 }
