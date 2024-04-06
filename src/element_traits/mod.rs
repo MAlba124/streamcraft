@@ -20,6 +20,7 @@ use crate::pipeline::{self, Datagram, Parent};
 #[derive(PartialEq)]
 pub enum CommonFormat {
     Text,
+    Bytes,
 }
 
 #[derive(PartialEq)]
@@ -63,6 +64,7 @@ pub enum ElementType {
     TextSink,
     TextSrc,
     BytesSrc,
+    BytesSink,
 }
 
 pub trait Element: Sync + Send {

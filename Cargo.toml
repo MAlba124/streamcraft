@@ -5,6 +5,9 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/MAlba124/streamcraft"
 
+[lib]
+name = "streamcraft"
+
 [dependencies]
 crossbeam-channel = "0.5.12"
 
@@ -14,4 +17,7 @@ elements-text = []
 element-stdoutlog = ["elements-text"]
 element-texttestsrc = ["elements-text"]
 all-elements-text = ["element-stdoutlog", "element-texttestsrc"]
-elements-all = ["all-elements-text"]
+elements-io = []
+element-filesrc = ["elements-io"]
+all-elements-io = ["element-filesrc"]
+elements-all = ["all-elements-text", "all-elements-io"]
