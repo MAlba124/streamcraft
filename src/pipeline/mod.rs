@@ -15,7 +15,7 @@
 
 use std::thread::JoinHandle;
 
-use crate::element_traits::Element;
+use crate::{define_log_info, element_traits::Element, error};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
@@ -111,16 +111,12 @@ impl SinkPipe {
 
     pub fn try_recv_msg(&self) -> Result<Option<Message>, Error> {
         match &self.msg_receiver {
-            Some(receiver) => {
-                match receiver.try_recv() {
-                    Ok(msg) => Ok(Some(msg)),
-                    Err(e) if e.is_empty() => Ok(None),
-                    Err(_e) => return Err(Error::ReceiveFromSinkFailed),
-                }
-            }
-            None => {
-                Err(Error::NoSinkMessageReceiver)
-            }
+            Some(receiver) => match receiver.try_recv() {
+                Ok(msg) => Ok(Some(msg)),
+                Err(e) if e.is_empty() => Ok(None),
+                Err(_e) => return Err(Error::ReceiveFromSinkFailed),
+            },
+            None => Err(Error::NoSinkMessageReceiver),
         }
     }
 }
@@ -186,9 +182,19 @@ impl Pipeline {
             Err(Error::NoSinkMessageReceiver)
         }
     }
+}
 
-    pub fn de_init(&mut self) -> Result<(), Error> {
-        self.head.send_quit()?;
-        self.head.join_thread()
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        if let Err(e) = self.head.send_quit() {
+            error!("{}", e);
+        }
+        if let Err(e) = self.head.join_thread() {
+            error!("{}", e);
+        }
     }
+}
+
+define_log_info! {
+    "pipeline"
 }

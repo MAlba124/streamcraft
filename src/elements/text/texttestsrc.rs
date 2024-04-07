@@ -117,8 +117,8 @@ impl Element for TextTestSrc {
         }
 
         match self.sink.try_recv_msg()? {
-            Some(_msg) => {},
-            None => {},
+            Some(_msg) => {}
+            None => {}
         }
 
         self.parent.send_finished()

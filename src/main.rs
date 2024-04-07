@@ -32,6 +32,4 @@ fn main() {
     for _ in 0..3 {
         pipeline.iter().expect("Failed to iterate pipeline");
     }
-
-    pipeline.de_init().expect("Failed to de-init pipeline");
 }
