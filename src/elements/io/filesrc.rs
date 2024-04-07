@@ -13,25 +13,39 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+};
+
 use crate::{
-    element_def,
+    debug, element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
     error,
-    pipeline::{error::Error, Datagram, Parent, SinkPipe},
+    pipeline::{error::Error, Data, Datagram, Message, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
 
+///```text
+/// +--------------------+
+/// |               _____|
+/// |  FileSrc     | src |----> Bytes
+/// |               ^^^^^|
+/// +--------------------+
+///```
 pub struct FileSrc {
     sink: SinkPipe,
     parent: Parent,
+    reader: BufReader<File>,
 }
 
 impl FileSrc {
-    pub fn new() -> Self {
+    pub fn new(file: File) -> Self {
         Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
+            reader: BufReader::new(file),
         }
     }
 
@@ -48,10 +62,6 @@ impl FileSrc {
         }
 
         Err(Error::InvalidSinkType)
-    }
-
-    fn run_loop(&mut self) -> bool {
-        true
     }
 
     fn init(&mut self) -> Result<(), Error> {
@@ -72,6 +82,29 @@ impl FileSrc {
         self.sink.datagram_sender = Some(datagram_sender);
 
         Ok(())
+    }
+
+    fn run_loop(&mut self) -> bool {
+        let buf = match self.reader.fill_buf() {
+            Ok(buf) => buf.to_vec(),
+            Err(_) => return false,
+        };
+
+        if buf.is_empty() {
+            return false;
+        }
+
+        self.reader.consume(buf.len());
+
+        if self
+            .sink
+            .send_datagram(Datagram::Data(Data::Bytes(buf)))
+            .is_err()
+        {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -96,21 +129,21 @@ impl Element for FileSrc {
                 .map_err(|_| Error::FailedToRecvFromParent)?
             {
                 Datagram::Message(msg) => match msg {
-                    crate::pipeline::Message::Iter => {
+                    Message::Iter => {
                         if !self.run_loop() {
+                            debug!("Finished");
                             break;
                         }
                         self.parent.send_iter_fin()?;
                     }
-                    crate::pipeline::Message::Quit => break,
+                    Message::Quit => break,
                     _ => return Err(Error::ReceivedInvalidDatagramFromParent),
                 },
                 _ => return Err(Error::ReceivedInvalidDatagramFromParent),
             }
 
-            match self.sink.try_recv_msg()? {
-                Some(_msg) => {}
-                None => {}
+            while let Some(_msg) = self.sink.try_recv_msg()? {
+                // TODO: Handle messages
             }
         }
 
@@ -121,7 +154,7 @@ impl Element for FileSrc {
         self.parent = parent;
     }
 
-    fn cleanup(&mut self) -> Result<(), crate::pipeline::error::Error> {
+    fn cleanup(&mut self) -> Result<(), Error> {
         self.sink.send_quit()?;
         self.sink.drop_data_sender();
 

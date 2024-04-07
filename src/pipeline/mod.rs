@@ -25,6 +25,7 @@ use error::Error;
 
 pub enum Data {
     Text(String),
+    Bytes(Vec<u8>),
     None,
 }
 
@@ -114,10 +115,21 @@ impl SinkPipe {
             Some(receiver) => match receiver.try_recv() {
                 Ok(msg) => Ok(Some(msg)),
                 Err(e) if e.is_empty() => Ok(None),
-                Err(_e) => return Err(Error::ReceiveFromSinkFailed),
+                Err(_e) => Err(Error::ReceiveFromSinkFailed),
             },
             None => Err(Error::NoSinkMessageReceiver),
         }
+    }
+
+    pub fn send_datagram(&mut self, datagram: Datagram) -> Result<(), Error> {
+        match &self.datagram_sender {
+            Some(datagram_sender) => datagram_sender
+                .send(datagram)
+                .map_err(|_| Error::FailedToSendDatagramToSink)?,
+            None => return Err(Error::NoSinkDatagramSender),
+        }
+
+        Ok(())
     }
 }
 
@@ -136,12 +148,7 @@ impl Pipeline {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);
-        let mut sink_element = match self.head.element.take() {
-            Some(elm) => elm,
-            None => {
-                return Err(Error::NoSinkElement);
-            }
-        };
+        let mut sink_element = self.head.take_element()?;
         sink_element.set_parent(parent);
         let datagram_receiver_clone = datagram_receiver.clone();
 
@@ -175,7 +182,8 @@ impl Pipeline {
                 .recv()
                 .map_err(|_| Error::ReceiveFromSinkFailed)?
             {
-                Message::IterFin | Message::Finished => Ok(()),
+                Message::IterFin => Ok(()),
+                Message::Finished => Err(Error::NoSinkElement),
                 _ => Err(Error::ReceivedInvalidDatagramFromSink),
             }
         } else {
@@ -189,6 +197,7 @@ impl Drop for Pipeline {
         if let Err(e) = self.head.send_quit() {
             error!("{}", e);
         }
+
         if let Err(e) = self.head.join_thread() {
             error!("{}", e);
         }

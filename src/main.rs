@@ -25,9 +25,10 @@ fn main() {
     texttest
         .link_sink_element(stdoutlog)
         .expect("Failed to add sink element");
+    texttest.set_text_to_send("Custom set text to send\n".to_string());
 
     let mut pipeline = Pipeline::new(texttest);
-    pipeline.init().expect("Failed to initalize pipeline");
+    pipeline.init().expect("Failed to initialize pipeline");
 
     for _ in 0..3 {
         pipeline.iter().expect("Failed to iterate pipeline");

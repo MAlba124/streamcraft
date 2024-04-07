@@ -30,6 +30,7 @@ pub enum Error {
     MessageParentFailed,
     NoParentMessageSender,
     InvalidSinkType,
+    FailedToSendDatagramToSink,
 }
 
 impl std::error::Error for Error {}
@@ -55,6 +56,7 @@ impl std::fmt::Display for Error {
                 Self::MessageParentFailed => "Message parent failed",
                 Self::NoParentMessageSender => "No parent message sender",
                 Self::InvalidSinkType => "Invalid sink type",
+                Self::FailedToSendDatagramToSink => "Failed to send datagram to sink",
             }
         )
     }

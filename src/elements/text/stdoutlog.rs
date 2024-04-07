@@ -25,6 +25,19 @@ pub struct StdoutLog {
     parent: Parent,
 }
 
+impl Default for StdoutLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+///```text
+///           +--------------------+
+///           |______              |
+/// Text ---->| sink |  StdoutLog  |
+///           |^^^^^^              |
+///           +--------------------+
+///```
 impl StdoutLog {
     pub fn new() -> Self {
         Self {

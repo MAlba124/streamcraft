@@ -13,8 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
+// TODO: Write tests for this!!!!
+
 use crate::{
-    debug, element_def,
+    element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
     error,
     pipeline::{error::Error, Data, Datagram, Message, Parent, SinkPipe},
@@ -22,53 +24,29 @@ use crate::{
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
 
-/// Text src that sends a [`Data::Text`] packet to the src.
-///
 ///```text
-/// +--------------------+
-/// |               _____|
-/// |  TextTestSrc | src |----> Text
-/// |               ^^^^^|
-/// +--------------------+
+///            +---------------------------+
+///            |______                _____|
+/// Bytes ---->| sink |  Bytes2Text  | src |----> Text
+///            |^^^^^^                ^^^^^|
+///            +---------------------------+
 ///```
-///
-/// # Example
-/// ```
-///use streamcraft::{
-///    elements::text::{stdoutlog::StdoutLog, texttestsrc::TextTestSrc},
-///    pipeline::Pipeline,
-///};
-///
-///let stdoutlog = StdoutLog::new();
-///let mut texttest = TextTestSrc::new();
-///texttest.link_sink_element(stdoutlog).unwrap();
-///texttest.set_text_to_send("Texttestsrc example".to_string());
-///
-///let mut pipeline = Pipeline::new(texttest);
-///pipeline.init().unwrap();
-///
-///for _ in 0..3 {
-///    pipeline.iter().unwrap(); // This will print "Texttestsrc example" to stdout
-///}
-/// ```
-pub struct TextTestSrc {
+pub struct Bytes2Text {
     sink: SinkPipe,
     parent: Parent,
-    text_to_send: String,
 }
 
-impl Default for TextTestSrc {
+impl Default for Bytes2Text {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TextTestSrc {
+impl Bytes2Text {
     pub fn new() -> Self {
         Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
-            text_to_send: String::from("Test\n"),
         }
     }
 
@@ -88,22 +66,6 @@ impl TextTestSrc {
         Err(Error::InvalidSinkType)
     }
 
-    /// Set the text to send to sink
-    pub fn set_text_to_send(&mut self, text: String) {
-        self.text_to_send = text;
-    }
-
-    fn run_loop(&mut self) -> bool {
-        if let Some(sender) = &self.sink.datagram_sender {
-            if let Err(e) = sender.send(Datagram::Data(Data::Text(self.text_to_send.clone()))) {
-                error!("{e}");
-                return false;
-            }
-        }
-
-        true
-    }
-
     fn init(&mut self) -> Result<(), Error> {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
@@ -115,7 +77,7 @@ impl TextTestSrc {
         self.sink.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
-                Err(e) => debug!("Error occurred running sink element: {e}"),
+                Err(e) => error!("{e}"),
             }
         }));
         self.sink.msg_receiver = Some(my_msg_receiver);
@@ -123,16 +85,33 @@ impl TextTestSrc {
 
         Ok(())
     }
+
+    fn run_loop(&mut self, buf: Vec<u8>) -> bool {
+        let text = match String::from_utf8(buf) {
+            Ok(t) => Data::Text(t),
+            Err(e) => {
+                error!("String conversion failed: {e}");
+                return false;
+            }
+        };
+
+        if let Err(e) = self.sink.send_datagram(Datagram::Data(text)) {
+            error!("{}", e);
+            return false;
+        }
+
+        true
+    }
 }
 
-impl Element for TextTestSrc {
+impl Element for Bytes2Text {
     fn get_sink_type(&self) -> ElementType {
-        ElementType::TextSrc
+        ElementType::BytesSink
     }
 
     fn get_architecture(&self) -> ElementArchitecture {
         ElementArchitecture {
-            sink: Sink::None,
+            sink: Sink::One(CommonFormat::Bytes),
             srcs: Srcs::One(CommonFormat::Text),
         }
     }
@@ -146,16 +125,20 @@ impl Element for TextTestSrc {
                 .map_err(|_| Error::FailedToRecvFromParent)?
             {
                 Datagram::Message(msg) => match msg {
-                    Message::Iter => {
-                        if !self.run_loop() {
-                            break;
-                        }
-                        self.parent.send_iter_fin()?;
-                    }
                     Message::Quit => break,
                     _ => return Err(Error::ReceivedInvalidDatagramFromParent),
                 },
-                _ => return Err(Error::ReceivedInvalidDatagramFromParent),
+                Datagram::Data(data) => match data {
+                    Data::Bytes(bytes) => {
+                        if !self.run_loop(bytes) {
+                            break;
+                        }
+                    }
+                    _ => {
+                        error!("Received invalid data type");
+                        break;
+                    }
+                },
             }
 
             while let Some(_msg) = self.sink.try_recv_msg()? {
@@ -179,6 +162,6 @@ impl Element for TextTestSrc {
 }
 
 element_def! {
-    TextTestSrc,
-    "texttestsrc"
+    Bytes2Text,
+    "bytes2text"
 }
