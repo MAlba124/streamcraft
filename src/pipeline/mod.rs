@@ -71,7 +71,7 @@ impl Parent {
 
 #[derive(Default)]
 pub struct SinkPipe {
-    pub element: Option<Box<dyn Element>>,
+    element: Option<Box<dyn Element>>,
     pub thread_handle: Option<JoinHandle<()>>,
     pub datagram_sender: Option<Sender<Datagram>>,
     pub msg_receiver: Option<Receiver<Message>>,
@@ -80,6 +80,13 @@ pub struct SinkPipe {
 impl SinkPipe {
     pub fn set_element(&mut self, element: impl Element + 'static) {
         self.element = Some(Box::new(element));
+    }
+
+    pub fn take_element(&mut self) -> Result<Box<dyn Element>, Error> {
+        match self.element.take() {
+            Some(elem) => Ok(elem),
+            None => Err(Error::NoSinkElement),
+        }
     }
 
     pub fn send_quit(&self) -> Result<(), Error> {
@@ -100,6 +107,21 @@ impl SinkPipe {
 
     pub fn drop_data_sender(&mut self) {
         self.datagram_sender.take();
+    }
+
+    pub fn try_recv_msg(&self) -> Result<Option<Message>, Error> {
+        match &self.msg_receiver {
+            Some(receiver) => {
+                match receiver.try_recv() {
+                    Ok(msg) => Ok(Some(msg)),
+                    Err(e) if e.is_empty() => Ok(None),
+                    Err(_e) => return Err(Error::ReceiveFromSinkFailed),
+                }
+            }
+            None => {
+                Err(Error::NoSinkMessageReceiver)
+            }
+        }
     }
 }
 

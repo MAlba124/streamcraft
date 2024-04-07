@@ -14,7 +14,7 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    debug, element_def,
+    element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
     error,
     pipeline::{error::Error, Datagram, Parent, SinkPipe},
@@ -51,20 +51,6 @@ impl FileSrc {
     }
 
     fn run_loop(&mut self) -> bool {
-        // TODO: move this somewhere else
-        if let Some(receiver) = &self.sink.msg_receiver {
-            loop {
-                match receiver.try_recv() {
-                    Ok(_) => debug!("Received emssage from sink"),
-                    Err(e) if e.is_empty() => break,
-                    Err(e) => {
-                        error!("Failed to receive msg from sink: {e}");
-                        return false;
-                    }
-                }
-            }
-        }
-
         true
     }
 
@@ -72,10 +58,7 @@ impl FileSrc {
         let (datagram_sender, datagram_receiver) = bounded(0);
         let (msg_sender, my_msg_receiver) = unbounded();
         let parent = Parent::new(msg_sender);
-        let mut sink_element = match self.sink.element.take() {
-            Some(elm) => elm,
-            None => return Err(Error::NoSinkElement),
-        };
+        let mut sink_element = self.sink.take_element()?;
         sink_element.set_parent(parent);
         let datagram_receiver_clone = datagram_receiver.clone();
 
@@ -123,6 +106,11 @@ impl Element for FileSrc {
                     _ => return Err(Error::ReceivedInvalidDatagramFromParent),
                 },
                 _ => return Err(Error::ReceivedInvalidDatagramFromParent),
+            }
+
+            match self.sink.try_recv_msg()? {
+                Some(_msg) => {}
+                None => {}
             }
         }
 
