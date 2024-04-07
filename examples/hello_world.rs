@@ -9,11 +9,12 @@ use streamcraft::{
 
 fn main() {
     let stdoutlog = StdoutLog::new();
-
     let mut texttest = TextTestSrc::new();
-    texttest.link_sink_element(stdoutlog);
+    texttest.link_sink_element(stdoutlog).unwrap();
+    texttest.set_text_to_send("Hello, World!\n".to_string());
 
     let mut pipeline = Pipeline::new(texttest);
+    pipeline.init().unwrap();
 
-    pipeline.run().expect("Error occurred running pipeline");
+    pipeline.iter().unwrap();
 }
