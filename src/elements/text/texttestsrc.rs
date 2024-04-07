@@ -22,9 +22,31 @@ use crate::{
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
 
+/// Text src that sends a [`Data::Text`] packet to the src.
+///
+/// # Example
+/// ```
+///use streamcraft::{
+///    elements::text::{stdoutlog::StdoutLog, texttestsrc::TextTestSrc},
+///    pipeline::Pipeline,
+///};
+///
+///let stdoutlog = StdoutLog::new();
+///let mut texttest = TextTestSrc::new();
+///texttest.link_sink_element(stdoutlog).unwrap();
+///texttest.set_text_to_send("Texttestsrc example".to_string());
+///
+///let mut pipeline = Pipeline::new(texttest);
+///pipeline.init().unwrap();
+///
+///for _ in 0..3 {
+///    pipeline.iter().unwrap(); // This will print "Texttestsrc example" to stdout
+///}
+/// ```
 pub struct TextTestSrc {
     sink: SinkPipe,
     parent: Parent,
+    text_to_send: String,
 }
 
 impl TextTestSrc {
@@ -32,9 +54,11 @@ impl TextTestSrc {
         Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
+            text_to_send: String::from("Test\n"),
         }
     }
 
+    /// Link the sink element.
     pub fn link_sink_element(&mut self, sink: impl Element + 'static) -> Result<(), Error> {
         if sink.get_sink_type() != ElementType::TextSink {
             return Err(Error::InvalidSinkType);
@@ -50,9 +74,14 @@ impl TextTestSrc {
         Err(Error::InvalidSinkType)
     }
 
+    /// Set the text to send to sink
+    pub fn set_text_to_send(&mut self, text: String) {
+        self.text_to_send = text;
+    }
+
     fn run_loop(&mut self) -> bool {
         if let Some(sender) = &self.sink.datagram_sender {
-            if let Err(e) = sender.send(Datagram::Data(Data::Text(String::from("Test\n")))) {
+            if let Err(e) = sender.send(Datagram::Data(Data::Text(self.text_to_send.clone()))) {
                 error!("{e}");
                 return false;
             }
