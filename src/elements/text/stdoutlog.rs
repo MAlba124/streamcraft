@@ -14,9 +14,9 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    debug, element_def,
+    element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
-    pipeline::{Data, Datagram, Parent},
+    pipeline::{error::Error, Data, Datagram, Message, Parent},
 };
 
 use crossbeam_channel::Receiver;
@@ -45,24 +45,8 @@ impl StdoutLog {
         }
     }
 
-    fn run_loop(&self, data_receiver: &Receiver<Datagram>) -> bool {
-        match data_receiver.recv() {
-            Ok(datagram) => match datagram {
-                Datagram::Message(msg) => match msg {
-                    crate::pipeline::Message::Quit => return false,
-                    _ => unreachable!(), // TODO: Handle invalid messages better
-                },
-                Datagram::Data(data) => {
-                    if let Data::Text(s) = data {
-                        print!("{s}");
-                    }
-                }
-            },
-            Err(e) => {
-                debug!("Failed to receive data from src: {e}");
-                return false;
-            }
-        }
+    fn run_loop(&self, text: String) -> bool {
+        print!("{text}");
 
         true
     }
@@ -83,8 +67,24 @@ impl Element for StdoutLog {
     fn run(
         &mut self,
         parent_datagram_receiver: Receiver<Datagram>,
-    ) -> Result<(), crate::pipeline::error::Error> {
-        while self.run_loop(&parent_datagram_receiver) {}
+    ) -> Result<(), Error> {
+        loop {
+            match parent_datagram_receiver.recv().map_err(|_| Error::FailedToRecvFromParent)? {
+                Datagram::Message(msg) => match msg {
+                    Message::Quit => break,
+                    _ => return Err(Error::ReceivedInvalidDatagramFromParent),
+                },
+                Datagram::Data(data) => match data {
+                    Data::Text(text) => {
+                        if !self.run_loop(text) {
+                            break;
+                        }
+                    }
+                    _ => return Err(Error::ReceivedInvalidDatagramFromParent),
+                },
+            }
+        }
+
         Ok(())
     }
 
@@ -92,7 +92,7 @@ impl Element for StdoutLog {
         self.parent = parent;
     }
 
-    fn cleanup(&mut self) -> Result<(), crate::pipeline::error::Error> {
+    fn cleanup(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
