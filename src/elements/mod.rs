@@ -21,5 +21,3 @@ pub mod io;
 pub mod text;
 #[cfg(feature = "elements-misc")]
 pub mod misc;
-
-// TODO: Make test element where callbacks are used to check expected values
