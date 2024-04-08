@@ -17,13 +17,13 @@ use crossbeam_channel::Receiver;
 
 use crate::pipeline::{self, Datagram, Parent};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum CommonFormat {
     Text,
     Bytes,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum Sink {
     One(CommonFormat),
     None,
@@ -35,7 +35,7 @@ impl Sink {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum Srcs {
     One(CommonFormat),
     None,
@@ -54,12 +54,13 @@ pub fn sink_is_compatible_with_src(sink: Sink, src: Srcs) -> bool {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ElementArchitecture {
     pub sink: Sink,
     pub srcs: Srcs,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum ElementType {
     TextSink,
     TextSrc,
