@@ -13,13 +13,5 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
-#[cfg(feature = "elements-conversion")]
-pub mod conversion;
-#[cfg(feature = "elements-io")]
-pub mod io;
-#[cfg(feature = "elements-text")]
-pub mod text;
-#[cfg(feature = "elements-misc")]
-pub mod misc;
-
-// TODO: Make test element where callbacks are used to check expected values
+#[cfg(feature = "element-testsink")]
+pub mod testsink;

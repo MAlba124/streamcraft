@@ -182,3 +182,36 @@ element_def! {
     TextTestSrc,
     "texttestsrc"
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{elements::misc::testsink, pipeline::Pipeline};
+
+    use super::*;
+
+    #[test]
+    fn test_basic() {
+        let test_text_data = "Test";
+        let testsink = testsink::TestSink::new(
+            ElementType::TextSink,
+            CommonFormat::Text,
+            |_, _| {
+                true
+            },
+            |_, data| {
+                match data {
+                    Data::Text(text) => assert_eq!(text, String::from("Test")),
+                    _ => {}
+                }
+                true
+            }
+        );
+        let mut textsrc = TextTestSrc::new();
+        textsrc.set_text_to_send(String::from(test_text_data));
+        textsrc.link_sink_element(testsink).unwrap();
+
+        let mut pipeline = Pipeline::new(textsrc);
+        pipeline.init().unwrap();
+        pipeline.iter().unwrap();
+    }
+}

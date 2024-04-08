@@ -15,14 +15,21 @@ crossbeam-channel = "0.5.12"
 
 [features]
 default = ["elements-all"]
+# TEXT
 elements-text = []
 element-stdoutlog = ["elements-text"]
 element-texttestsrc = ["elements-text"]
 all-elements-text = ["element-stdoutlog", "element-texttestsrc"]
+# IO
 elements-io = []
 element-filesrc = ["elements-io"]
 all-elements-io = ["element-filesrc"]
+# CONVERSION
 elements-conversion = []
 element-bytes2text = ["elements-conversion"]
 all-elements-conversion = ["element-bytes2text"]
-elements-all = ["all-elements-text", "all-elements-io", "all-elements-conversion"]
+# MISC
+elements-misc = []
+element-testsink = ["elements-misc"]
+all-elements-misc = ["element-testsink"]
+elements-all = ["all-elements-text", "all-elements-io", "all-elements-conversion", "all-elements-misc"]
