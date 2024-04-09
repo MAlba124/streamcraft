@@ -94,6 +94,7 @@ impl TextTestSrc {
     }
 
     fn run_loop(&mut self) -> bool {
+        // TODO: use send_datagram() and return error
         if let Some(sender) = &self.sink.datagram_sender {
             if let Err(e) = sender.send(Datagram::Data(Data::Text(self.text_to_send.clone()))) {
                 error!("{e}");
@@ -115,7 +116,7 @@ impl TextTestSrc {
         self.sink.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
-                Err(e) => debug!("Error occurred running sink element: {e}"),
+                Err(e) => error!("Error occurred running sink element: {e}"),
             }
         }));
         self.sink.msg_receiver = Some(my_msg_receiver);
@@ -195,16 +196,14 @@ mod tests {
         let testsink = testsink::TestSink::new(
             ElementType::TextSink,
             CommonFormat::Text,
-            |_, _| {
-                true
-            },
+            |_, _| true,
             |_, data| {
                 match data {
                     Data::Text(text) => assert_eq!(text, String::from("Test")),
                     _ => {}
                 }
                 true
-            }
+            },
         );
         let mut textsrc = TextTestSrc::new();
         textsrc.set_text_to_send(String::from(test_text_data));

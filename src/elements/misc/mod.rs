@@ -15,3 +15,5 @@
 
 #[cfg(feature = "element-testsink")]
 pub mod testsink;
+#[cfg(feature = "element-testsrc")]
+pub mod testsrc;

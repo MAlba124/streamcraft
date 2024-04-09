@@ -31,5 +31,6 @@ all-elements-conversion = ["element-bytes2text"]
 # MISC
 elements-misc = []
 element-testsink = ["elements-misc"]
-all-elements-misc = ["element-testsink"]
+element-testsrc = ["elements-misc"]
+all-elements-misc = ["element-testsink", "element-testsrc"]
 elements-all = ["all-elements-text", "all-elements-io", "all-elements-conversion", "all-elements-misc"]

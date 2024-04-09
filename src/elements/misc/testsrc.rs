@@ -13,57 +13,67 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
-// TODO: Write tests for this!!!!
-
 use crate::{
-    element_def,
-    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
-    error,
-    pipeline::{error::Error, Data, Datagram, Message, Parent, SinkPipe},
+    element_def, element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs}, error, pipeline::{error::Error, Datagram, Message, Parent, SinkPipe}
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
 
 ///```text
-///            +---------------------------+
-///            |______                _____|
-/// Bytes ---->| sink |  Bytes2Text  | src |----> Text
-///            |^^^^^^                ^^^^^|
-///            +---------------------------+
+/// +-----------------+
+/// |            _____|
+/// |  TestSrc  | src |----> ????
+/// |            ^^^^^|
+/// +-----------------+
 ///```
-pub struct Bytes2Text {
+pub struct TestSrc {
     sink: SinkPipe,
     parent: Parent,
+    sink_element_type: ElementType,
+    sink_format: CommonFormat,
+    index: usize,
+    datagrams: Vec<Datagram>,
 }
 
-impl Default for Bytes2Text {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Bytes2Text {
-    pub fn new() -> Self {
+impl TestSrc {
+    pub fn new(
+        sink_element_type: ElementType,
+        sink_format: CommonFormat,
+        datagrams: Vec<Datagram>,
+    ) -> Self {
         Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
+            sink_element_type,
+            sink_format,
+            datagrams: datagrams,
+            index: 0,
         }
     }
 
     /// Link the sink element.
     pub fn link_sink_element(&mut self, sink: impl Element + 'static) -> Result<(), Error> {
-        if sink.get_sink_type() != ElementType::TextSink {
+        if sink.get_sink_type() != self.sink_element_type {
             return Err(Error::InvalidSinkType);
         }
 
         if let Sink::One(format) = sink.get_architecture().sink {
-            if format == CommonFormat::Text {
+            if format == self.sink_format {
                 self.sink.set_element(sink);
                 return Ok(());
             }
         }
 
         Err(Error::InvalidSinkType)
+    }
+
+    fn run_loop(&mut self, datagram: Datagram) -> bool {
+        if let Err(e) = self.sink.send_datagram(datagram) {
+            error!("{e}");
+            return false;
+        }
+
+        true
     }
 
     fn init(&mut self) -> Result<(), Error> {
@@ -77,7 +87,7 @@ impl Bytes2Text {
         self.sink.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
-                Err(e) => error!("{e}"),
+                Err(e) => error!("Error occurred running sink element: {e}"),
             }
         }));
         self.sink.msg_receiver = Some(my_msg_receiver);
@@ -85,34 +95,18 @@ impl Bytes2Text {
 
         Ok(())
     }
-
-    fn run_loop(&mut self, buf: Vec<u8>) -> bool {
-        let text = match String::from_utf8(buf) {
-            Ok(t) => Data::Text(t),
-            Err(e) => {
-                error!("String conversion failed: {e}");
-                return false;
-            }
-        };
-
-        if let Err(e) = self.sink.send_datagram(Datagram::Data(text)) {
-            error!("{}", e);
-            return false;
-        }
-
-        true
-    }
 }
 
-impl Element for Bytes2Text {
+impl Element for TestSrc {
     fn get_sink_type(&self) -> ElementType {
-        ElementType::BytesSink
+        // TODO: change to some custom shit
+        ElementType::TextSrc
     }
 
     fn get_architecture(&self) -> ElementArchitecture {
         ElementArchitecture {
-            sink: Sink::One(CommonFormat::Bytes),
-            srcs: Srcs::One(CommonFormat::Text),
+            sink: Sink::None,
+            srcs: Srcs::One(self.sink_format.clone()),
         }
     }
 
@@ -125,20 +119,20 @@ impl Element for Bytes2Text {
                 .map_err(|_| Error::FailedToRecvFromParent)?
             {
                 Datagram::Message(msg) => match msg {
+                    Message::Iter => {
+                        if self.index >= self.datagrams.len() {
+                            break;
+                        }
+                        if !self.run_loop(self.datagrams[self.index].clone()) {
+                            break;
+                        }
+                        self.index += 1;
+                        self.parent.send_iter_fin()?;
+                    }
                     Message::Quit => break,
                     _ => return Err(Error::ReceivedInvalidDatagramFromParent),
                 },
-                Datagram::Data(data) => match data {
-                    Data::Bytes(bytes) => {
-                        if !self.run_loop(bytes) {
-                            break;
-                        }
-                    }
-                    _ => {
-                        error!("Received invalid data type");
-                        break;
-                    }
-                },
+                _ => return Err(Error::ReceivedInvalidDatagramFromParent),
             }
 
             while let Some(_msg) = self.sink.try_recv_msg()? {
@@ -162,16 +156,46 @@ impl Element for Bytes2Text {
 }
 
 element_def! {
-    Bytes2Text,
-    "bytes2text"
+    TestSrc,
+    "testsrc"
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        elements::misc::testsink::TestSink,
+        pipeline::{self, Data, Pipeline},
+    };
+
     use super::*;
 
     #[test]
     fn test_basic() {
-        // TODO
+        let testsink = TestSink::new(
+            ElementType::TextSink,
+            CommonFormat::Text,
+            |_, _| true,
+            |n, data| {
+                match n {
+                    1 => assert_eq!(data, Data::Text(String::from("Hello"))),
+                    2 => assert_eq!(data, Data::Text(String::from("World"))),
+                    _ => unreachable!(),
+                }
+                true
+            },
+        );
+        let datagrams = vec![
+            Datagram::Data(Data::Text(String::from("Hello"))),
+            Datagram::Data(Data::Text(String::from("Hello"))),
+        ];
+        let mut testsrc = TestSrc::new(ElementType::TextSink, CommonFormat::Text, datagrams);
+        testsrc.link_sink_element(testsink).unwrap();
+
+        let mut pipeline = Pipeline::new(testsrc);
+        pipeline.init().unwrap();
+
+        for _ in 0..2 {
+            pipeline.iter().unwrap();
+        }
     }
 }

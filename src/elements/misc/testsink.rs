@@ -69,12 +69,12 @@ impl Element for TestSink {
         }
     }
 
-    fn run(
-        &mut self,
-        parent_datagram_receiver: Receiver<Datagram>,
-    ) -> Result<(), Error> {
+    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
         loop {
-            match parent_datagram_receiver.recv().map_err(|_| Error::FailedToRecvFromParent)? {
+            match parent_datagram_receiver
+                .recv()
+                .map_err(|_| Error::FailedToRecvFromParent)?
+            {
                 Datagram::Message(msg) => {
                     if !(self.on_message)(self.message_count, msg) {
                         break;

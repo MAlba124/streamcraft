@@ -15,7 +15,7 @@
 
 use std::thread::JoinHandle;
 
-use crate::{define_log_info, element_traits::Element, error};
+use crate::{debug, define_log_info, element_traits::Element, error};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
@@ -23,13 +23,14 @@ pub mod error;
 
 use error::Error;
 
+#[derive(PartialEq, Debug, Clone)]
 pub enum Data {
     Text(String),
     Bytes(Vec<u8>),
     None,
 }
 
-#[derive(Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Message {
     Iter,
     IterFin,
@@ -37,6 +38,7 @@ pub enum Message {
     Finished,
 }
 
+#[derive(PartialEq, Debug, Clone)]
 pub enum Datagram {
     Message(Message),
     Data(Data),
@@ -155,7 +157,7 @@ impl Pipeline {
         self.head.thread_handle = Some(std::thread::spawn(move || {
             match sink_element.run(datagram_receiver_clone) {
                 Ok(_) => {}
-                Err(e) => println!("PIPELINE: Error occurred running sink element: {e}"),
+                Err(e) => error!("PIPELINE: Error occurred running sink element: {e}"),
             }
         }));
         self.head.msg_receiver = Some(my_msg_receiver);
@@ -183,7 +185,10 @@ impl Pipeline {
                 .map_err(|_| Error::ReceiveFromSinkFailed)?
             {
                 Message::IterFin => Ok(()),
-                Message::Finished => Err(Error::NoSinkElement),
+                Message::Finished => {
+                    debug!("Finished");
+                    Ok(())
+                }
                 _ => Err(Error::ReceivedInvalidDatagramFromSink),
             }
         } else {

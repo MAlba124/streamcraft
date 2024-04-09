@@ -64,12 +64,12 @@ impl Element for StdoutLog {
         }
     }
 
-    fn run(
-        &mut self,
-        parent_datagram_receiver: Receiver<Datagram>,
-    ) -> Result<(), Error> {
+    fn run(&mut self, parent_datagram_receiver: Receiver<Datagram>) -> Result<(), Error> {
         loop {
-            match parent_datagram_receiver.recv().map_err(|_| Error::FailedToRecvFromParent)? {
+            match parent_datagram_receiver
+                .recv()
+                .map_err(|_| Error::FailedToRecvFromParent)?
+            {
                 Datagram::Message(msg) => match msg {
                     Message::Quit => break,
                     _ => return Err(Error::ReceivedInvalidDatagramFromParent),

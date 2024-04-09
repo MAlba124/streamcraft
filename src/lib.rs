@@ -41,7 +41,6 @@
 //!pipeline.iter().unwrap();
 //!```
 
-
 pub mod element_traits;
 pub mod elements;
 pub mod log;

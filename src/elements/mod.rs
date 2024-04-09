@@ -17,7 +17,7 @@
 pub mod conversion;
 #[cfg(feature = "elements-io")]
 pub mod io;
-#[cfg(feature = "elements-text")]
-pub mod text;
 #[cfg(feature = "elements-misc")]
 pub mod misc;
+#[cfg(feature = "elements-text")]
+pub mod text;
