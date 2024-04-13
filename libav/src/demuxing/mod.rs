@@ -67,6 +67,9 @@ pub struct Demuxer {
     inner: *mut bindings::AVFormatContext,
 }
 
+unsafe impl Send for Demuxer {}
+unsafe impl Sync for Demuxer {}
+
 impl Demuxer {
     pub fn new(rl: ResourceLocation) -> Result<Self, Error> {
         let mut inner = std::ptr::null_mut();
