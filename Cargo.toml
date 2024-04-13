@@ -12,6 +12,7 @@ name = "streamcraft"
 
 [dependencies]
 crossbeam-channel = "0.5.12"
+libav = { path = "./libav" }
 
 [features]
 default = ["elements-all"]

@@ -31,6 +31,7 @@ pub enum Error {
     NoParentMessageSender,
     InvalidSinkType,
     FailedToSendDatagramToSink,
+    AVError(libav::error::Error),
 }
 
 impl std::error::Error for Error {}
@@ -41,22 +42,25 @@ impl std::fmt::Display for Error {
             f,
             "{}",
             match self {
-                Self::NoThreadHandle => "No thread handle",
-                Self::FailedToJoinThread => "Failed to join thread",
-                Self::NoSinkMessageSender => "No sink message sender",
-                Self::NoSinkMessageReceiver => "No sink message receiver",
-                Self::MessageSinkFailed => "Message sink failed",
-                Self::NoSinkElement => "No sink element",
-                Self::PipelineNotReady => "Pipeline is not ready",
-                Self::NoSinkDatagramSender => "No sink datagram sender",
-                Self::FailedToRecvFromParent => "Failed to recv from parent",
-                Self::ReceivedInvalidDatagramFromParent => "Received invalid datagram from parent",
-                Self::ReceivedInvalidDatagramFromSink => "Received invalid datagram from sink",
-                Self::ReceiveFromSinkFailed => "Receive from sink failed",
-                Self::MessageParentFailed => "Message parent failed",
-                Self::NoParentMessageSender => "No parent message sender",
-                Self::InvalidSinkType => "Invalid sink type",
-                Self::FailedToSendDatagramToSink => "Failed to send datagram to sink",
+                Self::NoThreadHandle => "No thread handle".to_string(),
+                Self::FailedToJoinThread => "Failed to join thread".to_string(),
+                Self::NoSinkMessageSender => "No sink message sender".to_string(),
+                Self::NoSinkMessageReceiver => "No sink message receiver".to_string(),
+                Self::MessageSinkFailed => "Message sink failed".to_string(),
+                Self::NoSinkElement => "No sink element".to_string(),
+                Self::PipelineNotReady => "Pipeline is not ready".to_string(),
+                Self::NoSinkDatagramSender => "No sink datagram sender".to_string(),
+                Self::FailedToRecvFromParent => "Failed to recv from parent".to_string(),
+                Self::ReceivedInvalidDatagramFromParent =>
+                    "Received invalid datagram from parent".to_string(),
+                Self::ReceivedInvalidDatagramFromSink =>
+                    "Received invalid datagram from sink".to_string(),
+                Self::ReceiveFromSinkFailed => "Receive from sink failed".to_string(),
+                Self::MessageParentFailed => "Message parent failed".to_string(),
+                Self::NoParentMessageSender => "No parent message sender".to_string(),
+                Self::InvalidSinkType => "Invalid sink type".to_string(),
+                Self::FailedToSendDatagramToSink => "Failed to send datagram to sink".to_string(),
+                Self::AVError(e) => format!("AVError: {e}"),
             }
         )
     }

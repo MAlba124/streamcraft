@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::thread::JoinHandle;
+use std::{default, thread::JoinHandle};
 
 use crate::{debug, define_log_info, element_traits::Element, error};
 
@@ -23,10 +23,14 @@ pub mod error;
 
 use error::Error;
 
+// TODO: Only include when `av` feature is enabled
+use libav::demuxing::Packet;
+
 #[derive(PartialEq, Debug, Clone)]
 pub enum Data {
     Text(String),
     Bytes(Vec<u8>),
+    AVPacket(Packet), // TODO: Only include when `av` feature is enabled
     None,
 }
 
@@ -78,6 +82,7 @@ pub struct SinkPipe {
     pub thread_handle: Option<JoinHandle<()>>,
     pub datagram_sender: Option<Sender<Datagram>>,
     pub msg_receiver: Option<Receiver<Message>>,
+    is_operational: bool,
 }
 
 impl SinkPipe {
@@ -87,7 +92,10 @@ impl SinkPipe {
 
     pub fn take_element(&mut self) -> Result<Box<dyn Element>, Error> {
         match self.element.take() {
-            Some(elem) => Ok(elem),
+            Some(elem) => {
+                self.is_operational = true;
+                Ok(elem)
+            }
             None => Err(Error::NoSinkElement),
         }
     }
@@ -132,6 +140,10 @@ impl SinkPipe {
         }
 
         Ok(())
+    }
+
+    pub fn is_operational(&self) -> bool {
+        self.is_operational
     }
 }
 

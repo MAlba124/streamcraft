@@ -24,6 +24,8 @@ pub enum Error {
     FailedToCreateDecoder,
     FailedToCopyCodecParamsToDecoder,
     FailedToOpenCodec,
+    FailedToAllocFrame,
+    FailedToAllocPacket,
 }
 
 impl std::error::Error for Error {}
@@ -41,6 +43,8 @@ impl Display for Error {
                 Self::FailedToCreateDecoder => "Failed to create decoder",
                 Self::FailedToCopyCodecParamsToDecoder => "Failed to copy codec params to decoder",
                 Self::FailedToOpenCodec => "Failed to open codec",
+                Self::FailedToAllocFrame => "Failed to alloc frame",
+                Self::FailedToAllocPacket => "Failed to alloc packet",
             }
         )
     }

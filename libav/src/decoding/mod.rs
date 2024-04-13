@@ -13,7 +13,33 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::{bindings, error::Error};
+use crate::{bindings, demuxing::Packet, error::Error};
+
+pub struct Frame {
+    pub inner: *mut bindings::AVFrame,
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        unsafe {
+            bindings::av_frame_free(&mut self.inner);
+        }
+    }
+}
+
+impl Frame {
+    pub fn new() -> Result<Self, Error> {
+        unsafe {
+            let inner = bindings::av_frame_alloc();
+
+            if inner.is_null() {
+                return Err(Error::FailedToAllocFrame);
+            }
+
+            Ok(Self { inner })
+        }
+    }
+}
 
 pub struct Decoder {
     stream_index: i32,
@@ -30,7 +56,7 @@ impl Drop for Decoder {
 
 impl Decoder {
     pub fn new(
-        (stream_index, codec_id, params): (i32, bindings::AVCodecID, bindings::AVCodecParameters),
+        (stream_index, codec_id, params): (i32, crate::demuxing::CodecID, crate::demuxing::CodecParams),
     ) -> Result<Self, Error> {
         let decoder = unsafe { bindings::avcodec_find_decoder(codec_id) };
 
@@ -44,7 +70,7 @@ impl Decoder {
             return Err(Error::FailedToCreateDecoder);
         }
 
-        if unsafe { bindings::avcodec_parameters_to_context(decoder_ctx, &params) } < 0 {
+        if unsafe { bindings::avcodec_parameters_to_context(decoder_ctx, &params.inner) } < 0 {
             return Err(Error::FailedToCopyCodecParamsToDecoder);
         }
 
@@ -56,5 +82,29 @@ impl Decoder {
             stream_index,
             ctx: decoder_ctx,
         })
+    }
+
+    pub fn decode_packet(&self, packet: Packet) -> Result<(), Error> {
+        let mut ret = unsafe { bindings::avcodec_send_packet(self.ctx, packet.inner) };
+        if ret < 0 {
+            panic!("Error submitting a packet for decoding");
+        }
+
+        while ret >= 0 {
+            let frame = Frame::new()?;
+
+            ret = unsafe { bindings::avcodec_receive_frame(self.ctx, frame.inner) };
+            if ret < 0 {
+                if ret == bindings::sc_libav_averror_eof || ret == bindings::sc_libav_averror_eagain {
+                    return Ok(());
+                }
+
+                panic!("Error during encoding");
+            }
+
+            break;
+        }
+
+        Ok(())
     }
 }

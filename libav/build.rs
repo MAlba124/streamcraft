@@ -19,6 +19,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rustc-link-lib=avformat");
     println!("cargo:rustc-link-lib=avcodec");
+    println!("cargo:rustc-link-lib=avutil");
 
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
@@ -45,11 +46,18 @@ fn main() {
         .allowlist_function("avcodec_free_context")
         .allowlist_function("avcodec_parameters_to_context")
         .allowlist_function("avcodec_open2")
+        .allowlist_function("avcodec_send_packet")
+        .allowlist_function("avcodec_receive_frame")
+        .allowlist_function("av_frame_alloc")
+        .allowlist_function("av_frame_free")
         .allowlist_type("AVInputFormat")
         .allowlist_type("AVFormatContext")
         .allowlist_type("AVPacket")
         .allowlist_type("AVCodec")
         .allowlist_type("AVMediaType")
+        .allowlist_type("AVFrame")
+        .allowlist_var("sc_libav_averror_eof")
+        .allowlist_var("sc_libav_averror_eagain")
         // Finish the builder and generate the bindings.
         .generate()
         // Unwrap the Result and panic on failure.

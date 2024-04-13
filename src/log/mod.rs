@@ -15,6 +15,14 @@ macro_rules! error {
 }
 
 #[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        print!("INFO: {}: ", self::log_info::NAME);
+        println!($($arg)*);
+    }};
+}
+
+#[macro_export]
 macro_rules! define_log_info {
     ($name:literal) => {
         mod log_info {

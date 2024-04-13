@@ -37,21 +37,30 @@ impl std::string::ToString for ResourceLocation {
     }
 }
 
+// HACK: wtf is this
+#[derive(PartialEq, Debug, Clone)]
 pub struct Packet {
     pub inner: *mut bindings::AVPacket,
 }
 
-impl Default for Packet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+unsafe impl Send for Packet {}
+unsafe impl Sync for Packet {}
 
 impl Packet {
-    pub fn new() -> Self {
-        Self {
-            inner: unsafe { bindings::av_packet_alloc() },
+    pub fn new() -> Result<Self, Error> {
+        unsafe {
+            let inner = bindings::av_packet_alloc();
+
+            if inner.is_null() {
+                return Err(Error::FailedToAllocPacket)
+            }
+
+            Ok(Self { inner })
         }
+    }
+
+    pub fn stream_index(&self) -> i32 {
+        unsafe { (*self.inner).stream_index }
     }
 }
 
@@ -61,6 +70,12 @@ impl Drop for Packet {
             bindings::av_packet_unref(self.inner);
         }
     }
+}
+
+pub type CodecID = bindings::AVCodecID;
+
+pub struct CodecParams {
+    pub inner: bindings::AVCodecParameters,
 }
 
 pub struct Demuxer {
@@ -94,10 +109,11 @@ impl Demuxer {
         Ok(Self { inner })
     }
 
+    // TODO: Return struct
     fn find_stream(
         &self,
         type_: bindings::AVMediaType,
-    ) -> Result<(i32, bindings::AVCodecID, bindings::AVCodecParameters), Error> {
+    ) -> Result<(i32, CodecID, CodecParams), Error> {
         unsafe {
             let ret =
                 bindings::av_find_best_stream(self.inner, type_, -1, -1, std::ptr::null_mut(), 0);
@@ -110,31 +126,31 @@ impl Demuxer {
             let params = (*(*(*self.inner).streams.wrapping_add(stream_index as usize))).codecpar;
             let codec_id = (*params).codec_id;
 
-            Ok((stream_index, codec_id, *params))
+            Ok((stream_index, codec_id, CodecParams {inner: *params}))
         }
     }
 
     pub fn get_video_stream(
         &self,
-    ) -> Result<(i32, bindings::AVCodecID, bindings::AVCodecParameters), Error> {
+    ) -> Result<(i32, CodecID, CodecParams), Error> {
         self.find_stream(bindings::AVMediaType_AVMEDIA_TYPE_VIDEO)
     }
 
     pub fn get_audio_stream(
         &self,
-    ) -> Result<(i32, bindings::AVCodecID, bindings::AVCodecParameters), Error> {
+    ) -> Result<(i32, CodecID, CodecParams), Error> {
         self.find_stream(bindings::AVMediaType_AVMEDIA_TYPE_AUDIO)
     }
 
-    pub fn read_frame(&self) -> Result<(), Error> {
+    pub fn read_frame(&self) -> Result<Packet, Error> {
         unsafe {
-            let packet = Packet::new();
+            let packet = Packet::new()?;
 
             if bindings::av_read_frame(self.inner, packet.inner) < 0 {
                 return Err(Error::FailedToReadFrame);
             }
 
-            Ok(())
+            Ok(packet)
         }
     }
 }
