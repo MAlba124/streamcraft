@@ -15,6 +15,7 @@
 
 use crate::{bindings, demuxing::Packet, error::Error};
 
+// TODO: Move somewhre else
 pub struct Frame {
     pub inner: *mut bindings::AVFrame,
 }
@@ -39,12 +40,19 @@ impl Frame {
             Ok(Self { inner })
         }
     }
+
+    pub fn get_pts(&self) -> i64 {
+        unsafe { (*self.inner).pts }
+    }
 }
 
 pub struct Decoder {
     stream_index: i32,
     ctx: *mut bindings::AVCodecContext,
 }
+
+unsafe impl Send for Decoder {}
+unsafe impl Sync for Decoder {}
 
 impl Drop for Decoder {
     fn drop(&mut self) {
@@ -84,27 +92,27 @@ impl Decoder {
         })
     }
 
-    pub fn decode_packet(&self, packet: Packet) -> Result<(), Error> {
-        let mut ret = unsafe { bindings::avcodec_send_packet(self.ctx, packet.inner) };
-        if ret < 0 {
-            panic!("Error submitting a packet for decoding");
+    pub fn decode_packet(&self, packet: Packet) -> Result<Vec<Frame>, Error> {
+        if unsafe { bindings::avcodec_send_packet(self.ctx, packet.inner) } < 0 {
+            return Err(Error::FailedToSendPacketToDecoder);
         }
 
-        while ret >= 0 {
+        let mut frames = Vec::new();
+        loop {
             let frame = Frame::new()?;
 
-            ret = unsafe { bindings::avcodec_receive_frame(self.ctx, frame.inner) };
+            let ret = unsafe { bindings::avcodec_receive_frame(self.ctx, frame.inner) };
             if ret < 0 {
                 if ret == bindings::sc_libav_averror_eof || ret == bindings::sc_libav_averror_eagain {
-                    return Ok(());
+                    break;
                 }
 
-                panic!("Error during encoding");
+                return Err(Error::FailedToReceiveDecodedFrame);
             }
 
-            break;
+            frames.push(frame);
         }
 
-        Ok(())
+        Ok(frames)
     }
 }

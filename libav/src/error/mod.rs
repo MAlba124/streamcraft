@@ -26,6 +26,8 @@ pub enum Error {
     FailedToOpenCodec,
     FailedToAllocFrame,
     FailedToAllocPacket,
+    FailedToSendPacketToDecoder,
+    FailedToReceiveDecodedFrame,
 }
 
 impl std::error::Error for Error {}
@@ -45,6 +47,8 @@ impl Display for Error {
                 Self::FailedToOpenCodec => "Failed to open codec",
                 Self::FailedToAllocFrame => "Failed to alloc frame",
                 Self::FailedToAllocPacket => "Failed to alloc packet",
+                Self::FailedToSendPacketToDecoder => "Failed to send packet to decoder",
+                Self::FailedToReceiveDecodedFrame => "Failed to receive decoded frame",
             }
         )
     }

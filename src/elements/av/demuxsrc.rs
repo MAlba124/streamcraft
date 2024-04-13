@@ -113,8 +113,22 @@ impl DemuxSrc {
                 let stream_index = packet.stream_index();
                 if stream_index == self.audio_stream_index {
                     info!("Got audio packet");
+                    if let Err(e) = self
+                        .audio_sink
+                        .send_datagram(Datagram::Data(Data::AVPacket(packet)))
+                    {
+                        error!("{e}");
+                        return false;
+                    }
                 } else if stream_index == self.video_stream_index {
-                    info!("Got video packet")
+                    info!("Got video packet");
+                    if let Err(e) = self
+                        .video_sink
+                        .send_datagram(Datagram::Data(Data::AVPacket(packet)))
+                    {
+                        error!("{e}");
+                        return false;
+                    }
                 }
             }
             Err(e) => {
@@ -128,38 +142,42 @@ impl DemuxSrc {
 
     fn init(&mut self) -> Result<(), Error> {
         // Video
-        let (datagram_sender, datagram_receiver) = bounded(0);
-        let (msg_sender, my_msg_receiver) = unbounded();
-        let parent = Parent::new(msg_sender);
-        let mut sink_element = self.video_sink.take_element()?;
-        sink_element.set_parent(parent);
-        let datagram_receiver_clone = datagram_receiver.clone();
+        {
+            let (datagram_sender, datagram_receiver) = bounded(0);
+            let (msg_sender, my_msg_receiver) = unbounded();
+            let parent = Parent::new(msg_sender);
+            let mut sink_element = self.video_sink.take_element()?;
+            sink_element.set_parent(parent);
+            let datagram_receiver_clone = datagram_receiver.clone();
 
-        self.video_sink.thread_handle = Some(std::thread::spawn(move || {
-            match sink_element.run(datagram_receiver_clone) {
-                Ok(_) => {}
-                Err(e) => error!("Error occurred running sink element: {e}"),
-            }
-        }));
-        self.video_sink.msg_receiver = Some(my_msg_receiver);
-        self.video_sink.datagram_sender = Some(datagram_sender);
+            self.video_sink.thread_handle = Some(std::thread::spawn(move || {
+                match sink_element.run(datagram_receiver_clone) {
+                    Ok(_) => {}
+                    Err(e) => error!("Error occurred running sink element: {e}"),
+                }
+            }));
+            self.video_sink.msg_receiver = Some(my_msg_receiver);
+            self.video_sink.datagram_sender = Some(datagram_sender);
+        }
 
         // Audio
-        let (datagram_sender, datagram_receiver) = bounded(0);
-        let (msg_sender, my_msg_receiver) = unbounded();
-        let parent = Parent::new(msg_sender);
-        let mut sink_element = self.audio_sink.take_element()?;
-        sink_element.set_parent(parent);
-        let datagram_receiver_clone = datagram_receiver.clone();
+        {
+            let (datagram_sender, datagram_receiver) = bounded(0);
+            let (msg_sender, my_msg_receiver) = unbounded();
+            let parent = Parent::new(msg_sender);
+            let mut sink_element = self.audio_sink.take_element()?;
+            sink_element.set_parent(parent);
+            let datagram_receiver_clone = datagram_receiver.clone();
 
-        self.audio_sink.thread_handle = Some(std::thread::spawn(move || {
-            match sink_element.run(datagram_receiver_clone) {
-                Ok(_) => {}
-                Err(e) => error!("Error occurred running sink element: {e}"),
-            }
-        }));
-        self.audio_sink.msg_receiver = Some(my_msg_receiver);
-        self.audio_sink.datagram_sender = Some(datagram_sender);
+            self.audio_sink.thread_handle = Some(std::thread::spawn(move || {
+                match sink_element.run(datagram_receiver_clone) {
+                    Ok(_) => {}
+                    Err(e) => error!("Error occurred running sink element: {e}"),
+                }
+            }));
+            self.audio_sink.msg_receiver = Some(my_msg_receiver);
+            self.audio_sink.datagram_sender = Some(datagram_sender);
+        }
 
         Ok(())
     }

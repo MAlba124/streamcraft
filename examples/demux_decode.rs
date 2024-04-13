@@ -18,14 +18,21 @@ fn main() {
     )))
     .unwrap();
 
-    let vdecoder = VideoDecoder::new();
-    let adecoder = AudioDecoder::new();
+    let vdecoder = VideoDecoder::new(demuxer.get_video_stream().unwrap()).unwrap();
+    let adecoder = AudioDecoder::new(demuxer.get_audio_stream().unwrap()).unwrap();
 
-    demuxer.link_video_sink_element(0, vdecoder);
-    demuxer.link_audio_sink_element(1, adecoder);
+    demuxer
+        .link_video_sink_element(vdecoder.get_stream_index(), vdecoder)
+        .unwrap();
+    demuxer
+        .link_audio_sink_element(adecoder.get_stream_index(), adecoder)
+        .unwrap();
 
     let mut pipeline = Pipeline::new(demuxer);
     pipeline.init().unwrap();
 
-    while pipeline.iter().is_ok() {}
+    for _ in 0..15 {
+        pipeline.iter().unwrap();
+    }
+    // while pipeline.iter().is_ok() {}
 }

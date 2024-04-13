@@ -13,6 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
+use crossbeam_channel::SendError;
+
+use super::Datagram;
+
 #[derive(Debug)]
 pub enum Error {
     NoThreadHandle,
@@ -32,6 +36,7 @@ pub enum Error {
     InvalidSinkType,
     FailedToSendDatagramToSink,
     AVError(libav::error::Error),
+    SendError(SendError<Datagram>),
 }
 
 impl std::error::Error for Error {}
@@ -61,6 +66,7 @@ impl std::fmt::Display for Error {
                 Self::InvalidSinkType => "Invalid sink type".to_string(),
                 Self::FailedToSendDatagramToSink => "Failed to send datagram to sink".to_string(),
                 Self::AVError(e) => format!("AVError: {e}"),
+                Self::SendError(e) => format!("SendError: {e}"),
             }
         )
     }

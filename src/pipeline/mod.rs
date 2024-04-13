@@ -135,7 +135,7 @@ impl SinkPipe {
         match &self.datagram_sender {
             Some(datagram_sender) => datagram_sender
                 .send(datagram)
-                .map_err(|_| Error::FailedToSendDatagramToSink)?,
+                .map_err(|e| Error::SendError(e))?,
             None => return Err(Error::NoSinkDatagramSender),
         }
 

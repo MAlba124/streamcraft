@@ -15,6 +15,6 @@
 
 pub use libav::demuxing::ResourceLocation;
 
+pub mod audiodecoder;
 pub mod demuxsrc;
 pub mod videodecoder;
-pub mod audiodecoder;

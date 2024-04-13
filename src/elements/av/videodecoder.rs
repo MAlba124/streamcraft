@@ -16,11 +16,15 @@
 use crate::{
     element_def,
     element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
-    error,
+    error, info,
     pipeline::{error::Error, Data, Datagram, Message, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
+use libav::{
+    decoding::Decoder,
+    demuxing::{CodecID, CodecParams, Packet},
+};
 
 ///```text
 ///               +-----------------------------+
@@ -32,20 +36,23 @@ use crossbeam_channel::{bounded, unbounded, Receiver};
 pub struct VideoDecoder {
     sink: SinkPipe,
     parent: Parent,
-}
-
-impl Default for VideoDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
+    stream_index: i32,
+    decoder: Decoder,
 }
 
 impl VideoDecoder {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(
+        (stream_index, codec_id, params): (i32, CodecID, CodecParams),
+    ) -> Result<Self, Error> {
+        let decoder =
+            Decoder::new((stream_index, codec_id, params)).map_err(|e| Error::AVError(e))?;
+
+        Ok(Self {
             sink: SinkPipe::default(),
             parent: Parent::default(),
-        }
+            stream_index,
+            decoder,
+        })
     }
 
     /// Link the sink element.
@@ -62,6 +69,10 @@ impl VideoDecoder {
         }
 
         Err(Error::InvalidSinkType)
+    }
+
+    pub fn get_stream_index(&self) -> i32 {
+        self.stream_index
     }
 
     fn init(&mut self) -> Result<(), Error> {
@@ -84,7 +95,19 @@ impl VideoDecoder {
         Ok(())
     }
 
-    fn run_loop(&mut self, buf: Vec<u8>) -> bool {
+    fn run_loop(&mut self, packet: Packet) -> bool {
+        match self.decoder.decode_packet(packet) {
+            Ok(frames) => {
+                for frame in frames {
+                    info!("Received frame. PTS: {}", frame.get_pts());
+                }
+            }
+            Err(e) => {
+                error!("{e}");
+                return false;
+            }
+        }
+
         true
     }
 }
@@ -114,8 +137,8 @@ impl Element for VideoDecoder {
                     _ => return Err(Error::ReceivedInvalidDatagramFromParent),
                 },
                 Datagram::Data(data) => match data {
-                    Data::Bytes(bytes) => {
-                        if !self.run_loop(bytes) {
+                    Data::AVPacket(packet) => {
+                        if !self.run_loop(packet) {
                             break;
                         }
                     }
@@ -126,9 +149,9 @@ impl Element for VideoDecoder {
                 },
             }
 
-            while let Some(_msg) = self.sink.try_recv_msg()? {
-                // TODO: Handle messages
-            }
+            // while let Some(_msg) = self.sink.try_recv_msg()? {
+            //     // TODO: Handle messages
+            // }
         }
 
         self.parent.send_finished()
