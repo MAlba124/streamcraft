@@ -34,5 +34,4 @@ fn main() {
     for _ in 0..15 {
         pipeline.iter().unwrap();
     }
-    // while pipeline.iter().is_ok() {}
 }

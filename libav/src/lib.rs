@@ -20,3 +20,4 @@ pub mod decoding;
 pub mod demuxing;
 pub mod error;
 pub mod muxing;
+pub mod encoding;

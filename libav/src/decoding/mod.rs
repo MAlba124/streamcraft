@@ -93,6 +93,8 @@ impl Decoder {
     }
 
     pub fn decode_packet(&self, packet: Packet) -> Result<Vec<Frame>, Error> {
+        assert_ne!(packet.stream_index(), self.stream_index);
+
         if unsafe { bindings::avcodec_send_packet(self.ctx, packet.inner) } < 0 {
             return Err(Error::FailedToSendPacketToDecoder);
         }

@@ -59,6 +59,7 @@ impl Packet {
         }
     }
 
+    #[inline(always)]
     pub fn stream_index(&self) -> i32 {
         unsafe { (*self.inner).stream_index }
     }
