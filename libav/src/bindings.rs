@@ -13,13 +13,9 @@
 // You should have received a copy of the GNU General Public License
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
-#[cfg(feature = "elements-conversion")]
-pub mod conversion;
-#[cfg(feature = "elements-io")]
-pub mod io;
-#[cfg(feature = "elements-misc")]
-pub mod misc;
-#[cfg(feature = "elements-text")]
-pub mod text;
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(unused)]
 
-pub mod av;
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

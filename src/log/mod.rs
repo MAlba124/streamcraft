@@ -1,7 +1,7 @@
 #[macro_export]
 macro_rules! debug {
     ($($arg:tt)*) => {{
-        print!("DEBUG: {}: ", self::log_info::NAME);
+        print!("\x1b[36mDEBUG\x1b[0m: {}: ", self::log_info::NAME);
         println!($($arg)*);
     }};
 }
@@ -9,7 +9,15 @@ macro_rules! debug {
 #[macro_export]
 macro_rules! error {
     ($($arg:tt)*) => {{
-        print!("ERROR: {}: ", self::log_info::NAME);
+        print!("\x1b[31mERROR\x1b[0m: {}: ", self::log_info::NAME);
+        println!($($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        print!("\x1b[32mINFO\x1b[0m: {}: ", self::log_info::NAME);
         println!($($arg)*);
     }};
 }

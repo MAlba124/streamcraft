@@ -21,6 +21,7 @@ use crate::pipeline::{self, Datagram, Parent};
 pub enum CommonFormat {
     Text,
     Bytes,
+    AVPacket, // TODO: Only include when `av` feature is enabled
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -38,6 +39,7 @@ impl Sink {
 #[derive(PartialEq, Clone, Debug)]
 pub enum Srcs {
     One(CommonFormat),
+    Two((CommonFormat, CommonFormat)),
     None,
 }
 
@@ -66,6 +68,9 @@ pub enum ElementType {
     TextSrc,
     BytesSrc,
     BytesSink,
+    AVPacketSrc,       // TODO: Only include when `av` feature is enabled
+    AVPacketVideoSink, // TODO: Only include when `av` feature is enabled
+    AVPacketAudioSink, // TODO: Only include when `av` feature is enabled
 }
 
 pub trait Element: Sync + Send {

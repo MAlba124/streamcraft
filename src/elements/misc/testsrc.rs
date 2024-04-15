@@ -14,7 +14,10 @@
 // along with StreamCraft.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    element_def, element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs}, error, pipeline::{error::Error, Datagram, Message, Parent, SinkPipe}
+    element_def,
+    element_traits::{CommonFormat, Element, ElementArchitecture, ElementType, Sink, Srcs},
+    error,
+    pipeline::{error::Error, Datagram, Message, Parent, SinkPipe},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver};
