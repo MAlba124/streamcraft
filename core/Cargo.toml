@@ -1,0 +1,17 @@
+[package]
+name = "streamcraft-core"
+description = "Dependency-free core: buffers, formats, topology, scheduler, clock, events, bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "streamcraft_core"
+
+# No dependencies. Ever. (streamcraft.md: Crate layout)
+[dependencies]
+
+[features]
+# Serve the introspection protocol (streamcraft.md: scraft-scope). Zero cost unattached.
+introspect = []

@@ -1,37 +1,18 @@
-[package]
-name = "streamcraft"
-description = "General purpose data/multimedia pipeline framework"
-version = "0.0.1"
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "elements",
+    "audio",
+    "video",
+    "scope",
+]
+
+[workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/MAlba124/streamcraft"
-readme = "README.md"
 
-[lib]
-name = "streamcraft"
-
-[dependencies]
-crossbeam-channel = "0.5.12"
-libav = { path = "./libav" }
-
-[features]
-default = ["elements-all"]
-# TEXT
-elements-text = []
-element-stdoutlog = ["elements-text"]
-element-texttestsrc = ["elements-text"]
-all-elements-text = ["element-stdoutlog", "element-texttestsrc"]
-# IO
-elements-io = []
-element-filesrc = ["elements-io"]
-all-elements-io = ["element-filesrc"]
-# CONVERSION
-elements-conversion = []
-element-bytes2text = ["elements-conversion"]
-all-elements-conversion = ["element-bytes2text"]
-# MISC
-elements-misc = []
-element-testsink = ["elements-misc"]
-element-testsrc = ["elements-misc"]
-all-elements-misc = ["element-testsink", "element-testsrc"]
-elements-all = ["all-elements-text", "all-elements-io", "all-elements-conversion", "all-elements-misc"]
+[profile.bench]
+debug = true

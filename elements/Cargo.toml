@@ -1,0 +1,15 @@
+[package]
+name = "streamcraft-elements"
+description = "Built-in pure-Rust elements (filesrc, filesink, queue, tee, testsrc, sinks)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+
+[features]
+default = []
+# Per-element / per-reactor feature flags land here (spec: Crate layout).
+io-uring = []   # Linux io_uring reactor + sources/sinks (spec: IO)

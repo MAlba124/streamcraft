@@ -1,0 +1,19 @@
+[package]
+name = "streamcraft-scope"
+description = "Slint inspector GUI + MCP server over the core introspection protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "streamcraft_scope"
+
+[[bin]]
+name = "scraft-scope"
+path = "src/main.rs"
+
+[dependencies]
+streamcraft-core = { path = "../core", features = ["introspect"] }
+# TODO: Slint (GUI) and an MCP server implementation are added when work begins.
+# Both are optional to the framework — apps that don't attach scope pay nothing.

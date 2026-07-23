@@ -1,0 +1,10 @@
+[package]
+name = "streamcraft-audio"
+description = "POD audio format descriptions and typed views over the opaque buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+streamcraft-core = { path = "../core" }
