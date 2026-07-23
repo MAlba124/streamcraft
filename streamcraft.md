@@ -1020,6 +1020,16 @@ impl Pipeline {
 - **Deterministic replay**: record source output, replay it through the pipeline in
   `step()` mode — turns "glitches after 3 hours" into a reproducible unit test.
 
+### Logging cont'd
+
+<experimental>
+Should the `Ctx` take care of logging? Logging should be super light weight. Should logging be
+similar to other buffers where we can have sinks (e.g. logsink) that accepts logs and the framework
+provides insanely light weight logging facilities? E.g. a filelogsink could use the same IO things
+as other elements? Food for thought. This section is still WIP so please fill in or push back on
+this.
+</experimental>
+
 ### Introspection protocol and scraft-scope (the inspector)
 
 Everything the debuggability sections describe — dumps, counters, latency reports,
