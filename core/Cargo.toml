@@ -12,6 +12,16 @@ name = "streamcraft_core"
 # No dependencies. Ever. (streamcraft.md: Crate layout)
 [dependencies]
 
+# Dev-only, and only under `--cfg loom`: model-checks the lock-free ring core
+# (try_push/try_pop) across all interleavings. Real builds stay dependency-free.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [features]
 # Serve the introspection protocol (streamcraft.md: scraft-scope). Zero cost unattached.
 introspect = []
+
+# `--cfg loom` is a custom cfg (set via RUSTFLAGS for the loom model tests in
+# ring.rs), not a Cargo feature — declare it so normal builds don't warn about it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

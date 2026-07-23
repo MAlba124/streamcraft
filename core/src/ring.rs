@@ -16,15 +16,78 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+
+// The lock-free core is model-checked with loom under `--cfg loom`: that build
+// swaps std's atomics/cell/sync primitives for loom's instrumented versions so
+// `loom::model` can explore every interleaving of try_push/try_pop. Real builds
+// (`cfg(not(loom))`) use std and carry no dependency. Only the primitives that
+// participate in the memory-ordering surface are swapped; the shared-slot access
+// is abstracted behind `slot_write`/`slot_read` because loom's `UnsafeCell` has a
+// closure-based API (`with`/`with_mut`) unlike std's `get() -> *mut T`.
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(loom)]
+use loom::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
+#[cfg(loom)]
+use loom::sync::{Arc, Condvar, Mutex};
+
+#[cfg(not(loom))]
+use std::cell::UnsafeCell;
+#[cfg(not(loom))]
 use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(loom))]
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Force producer and consumer indices onto separate cache lines (no false sharing).
 #[repr(align(64))]
 struct CachePadded<T>(T);
+
+/// Write `val` into a ring slot. Behind a helper because std's `UnsafeCell` exposes
+/// a raw `get() -> *mut T` while loom's needs a `with_mut(|p| ..)` closure.
+///
+/// # Safety
+/// Caller must hold exclusive access to `slot` (SPSC: the sole producer writing a
+/// free slot) and the slot must not currently hold an initialized value that would
+/// be leaked.
+#[cfg(not(loom))]
+unsafe fn slot_write<T>(slot: &UnsafeCell<MaybeUninit<T>>, val: T) {
+    (*slot.get()).write(val);
+}
+#[cfg(loom)]
+unsafe fn slot_write<T>(slot: &UnsafeCell<MaybeUninit<T>>, val: T) {
+    slot.with_mut(|p| (*p).write(val));
+}
+
+/// Read a value out of a ring slot, taking ownership. Mirror of [`slot_write`].
+///
+/// # Safety
+/// Caller must hold exclusive access to `slot` (SPSC: the sole consumer reading a
+/// published slot) and the slot must currently hold an initialized value; the value
+/// is moved out, so the caller must not read it again.
+#[cfg(not(loom))]
+unsafe fn slot_read<T>(slot: &UnsafeCell<MaybeUninit<T>>) -> T {
+    (*slot.get()).assume_init_read()
+}
+#[cfg(loom)]
+unsafe fn slot_read<T>(slot: &UnsafeCell<MaybeUninit<T>>) -> T {
+    slot.with(|p| (*p).assume_init_read())
+}
+
+/// Drop the initialized value in a ring slot in place (drain on `Inner::drop`).
+///
+/// # Safety
+/// Caller must hold exclusive access and the slot must currently hold an
+/// initialized value that has not been consumed.
+#[cfg(not(loom))]
+unsafe fn slot_drop<T>(slot: &UnsafeCell<MaybeUninit<T>>) {
+    (*slot.get()).assume_init_drop();
+}
+#[cfg(loom)]
+unsafe fn slot_drop<T>(slot: &UnsafeCell<MaybeUninit<T>>) {
+    slot.with_mut(|p| (*p).assume_init_drop());
+}
 
 struct Inner<T> {
     buf: Box<[UnsafeCell<MaybeUninit<T>>]>,
@@ -69,8 +132,10 @@ impl<T> Inner<T> {
 }
 
 impl<T> Drop for Inner<T> {
+    // Real build: sole owner at drop, so drop any undelivered elements in
+    // [head, tail). `get_mut()` gives the final indices without atomics.
+    #[cfg(not(loom))]
     fn drop(&mut self) {
-        // Sole owner at drop: drop any undelivered elements in [head, tail).
         let head = *self.head.0.get_mut();
         let tail = *self.tail.0.get_mut();
         let mut h = head;
@@ -78,11 +143,17 @@ impl<T> Drop for Inner<T> {
             let idx = h & self.mask;
             // SAFETY: slots in [head, tail) are initialized and not yet consumed.
             unsafe {
-                (*self.buf[idx].get()).assume_init_drop();
+                slot_drop(&self.buf[idx]);
             }
             h = h.wrapping_add(1);
         }
     }
+
+    // Loom build: `AtomicUsize::get_mut()` doesn't exist under loom, and the model
+    // only ever exercises `usize` payloads (no drop glue to run), so skip the drain.
+    // This keeps the drop out of loom's cell bookkeeping entirely.
+    #[cfg(loom)]
+    fn drop(&mut self) {}
 }
 
 /// The producing end. `Send` (movable to its group's thread) but not `Sync`.
@@ -133,7 +204,7 @@ impl<T> Producer<T> {
         let idx = tail & self.inner.mask;
         // SAFETY: this slot is free (past head); we are the only producer.
         unsafe {
-            (*self.inner.buf[idx].get()).write(val);
+            slot_write(&self.inner.buf[idx], val);
         }
         self.inner.tail.0.store(tail.wrapping_add(1), Ordering::Release);
         // Dekker handshake: order this publish against a consumer about to park, then
@@ -184,7 +255,7 @@ impl<T> Consumer<T> {
         }
         let idx = head & self.inner.mask;
         // SAFETY: this slot (before tail) is initialized; we are the only consumer.
-        let val = unsafe { (*self.inner.buf[idx].get()).assume_init_read() };
+        let val = unsafe { slot_read(&self.inner.buf[idx]) };
         self.inner.head.0.store(head.wrapping_add(1), Ordering::Release);
         // Dekker handshake mirroring try_push: wake a producer parked on "full".
         fence(Ordering::SeqCst);
@@ -332,5 +403,60 @@ mod tests {
         p.try_push(Box::new(2)).unwrap();
         drop(p);
         drop(c); // Inner::drop must drop the two boxed values exactly once
+    }
+}
+
+// Loom model-checks the lock-free core (`try_push`/`try_pop`) across *every*
+// interleaving, verifying the head/tail Acquire/Release protocol, the SeqCst
+// fence, and the `*_waiting` loads (which stay false here, so `wake()`/the mutex
+// are never entered — exactly the memory-ordering surface worth proving). The
+// blocking `push`/`pop` (Mutex + Condvar) are intentionally *not* modelled.
+//
+// Run with: `RUSTFLAGS="--cfg loom" cargo test -p streamcraft-core --lib loom`
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn spsc_fifo_no_loss_no_dup() {
+        // Op counts are deliberately tiny — loom explores interleavings
+        // exponentially, so 3 pushes over a capacity-2 ring (forcing at least one
+        // full/empty oscillation, i.e. a wrap) is already a rich state space.
+        const N: usize = 3;
+
+        loom::model(|| {
+            let (p, c) = spsc::<usize>(2);
+
+            let producer = loom::thread::spawn(move || {
+                for i in 0..N {
+                    // Retry on `Err` (ring full): the consumer will drain and make
+                    // room. Under loom every retry ordering is explored.
+                    while p.try_push(i).is_err() {
+                        loom::thread::yield_now();
+                    }
+                }
+            });
+
+            // Consumer collects everything it observes; `try_pop` returns `None`
+            // while empty (producer hasn't published yet), so spin until we've
+            // seen all N. Loom's bounded scheduler guarantees progress.
+            let mut received = Vec::with_capacity(N);
+            while received.len() < N {
+                if let Some(v) = c.try_pop() {
+                    received.push(v);
+                } else {
+                    loom::thread::yield_now();
+                }
+            }
+
+            producer.join().unwrap();
+
+            // FIFO with no loss and no duplication: the exact sequence [0, 1, .., N).
+            let expected: Vec<usize> = (0..N).collect();
+            assert_eq!(received, expected, "FIFO order preserved, nothing lost or duplicated");
+
+            // Ring is fully drained.
+            assert!(c.try_pop().is_none(), "nothing left after all items consumed");
+        });
     }
 }
