@@ -84,3 +84,21 @@ fn counters_track_throughput() {
     assert_eq!(src_c.bytes_in, 0, "a source has no input");
     assert_eq!(snk_c.bytes_out, 0, "a sink has no output");
 }
+
+#[test]
+fn dump_dot_shows_topology_and_groups() {
+    let (sink, _stats) = TestSink::new();
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(0));
+    let mid = p.add(PassThrough::new());
+    let snk = p.add(sink);
+    p.link((src, "src"), (mid, "sink")).unwrap();
+    p.link((mid, "src"), (snk, "sink")).unwrap();
+
+    let dot = p.dump_dot();
+    assert!(dot.contains("digraph streamcraft"));
+    assert!(dot.contains("testsrc") && dot.contains("passthrough") && dot.contains("testsink"));
+    assert!(dot.contains("e0 -> e1") && dot.contains("e1 -> e2"));
+    // testsrc (active) + passthrough (passive) share group 0; testsink is group 1.
+    assert!(dot.contains("cluster_0") && dot.contains("cluster_1"));
+}

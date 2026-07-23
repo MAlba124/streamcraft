@@ -304,8 +304,34 @@ impl Pipeline {
         &self.bus
     }
 
+    /// Render the topology as Graphviz `dot`, clustering elements by thread group
+    /// (spec: Debuggability — graph dump). Call before `run()` (elements are moved
+    /// into their threads during a run).
     pub fn dump_dot(&self) -> String {
-        todo!("spec: Debuggability — graph dump")
+        let mut s = String::from("digraph streamcraft {\n  rankdir=LR;\n  node [shape=box];\n");
+        for (i, e) in self.elements.iter().enumerate() {
+            let name = e.as_ref().map_or("?", |el| el.desc().name);
+            s.push_str(&format!("  e{i} [label=\"{name}\"];\n"));
+        }
+        // Group clusters — each group is one thread (spec: Scheduling).
+        if let Ok(order) = self.linear_order() {
+            if let Ok(groups) = self.compute_groups(&order) {
+                for (gi, ids) in groups.iter().enumerate() {
+                    s.push_str(&format!(
+                        "  subgraph cluster_{gi} {{\n    label=\"group {gi} (thread)\";\n    style=dashed;\n"
+                    ));
+                    for id in ids {
+                        s.push_str(&format!("    e{};\n", id.0));
+                    }
+                    s.push_str("  }\n");
+                }
+            }
+        }
+        for (src, dst) in &self.links {
+            s.push_str(&format!("  e{} -> e{};\n", src.0, dst.0));
+        }
+        s.push_str("}\n");
+        s
     }
 
     pub fn latency_report(&self) -> LatencyReport {
