@@ -16,6 +16,8 @@ use streamcraft_core::event::Event;
 use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
 use streamcraft_core::io::{FileHandle, IoResult};
+use streamcraft_core::log;
+use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
 /// A file is an untyped byte stream — offer the open `bytes` family, no fields.
@@ -76,8 +78,10 @@ impl Element for FileSrc {
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         let f = File::open(&self.path)
             .map_err(|e| Error::Resource(format!("open {}: {e}", self.path.display())))?;
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         self.file = ctx.io().register(f);
         self.started = true;
+        log!(&*ctx, Level::Debug, "open", len = len);
         Ok(())
     }
 
@@ -96,7 +100,10 @@ impl Element for FileSrc {
             self.in_flight -= 1;
             match c.result {
                 IoResult::Ok(0) => self.eof = true, // c.buf recycles on drop
-                IoResult::Ok(_) => ctx.out(PadId(0)).push(c.buf),
+                IoResult::Ok(n) => {
+                    log!(&*ctx, Level::Debug, "read", bytes = n);
+                    ctx.out(PadId(0)).push(c.buf);
+                }
                 IoResult::Cancelled => {}
                 IoResult::Err(k) => return Err(Error::Resource(format!("read: {k:?}"))),
             }
@@ -118,6 +125,7 @@ impl Element for FileSrc {
         }
 
         if self.eof && self.in_flight == 0 {
+            log!(&*ctx, Level::Info, "eos", offset = self.offset);
             Ok(Flow::Eos)
         } else {
             Ok(Flow::Ok)

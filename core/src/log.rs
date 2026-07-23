@@ -347,6 +347,14 @@ impl LogDrain {
         self.rx.pop()
     }
 
+    /// Whether this drain's [`LogSink`] has been dropped. The ring may still hold
+    /// undrained records — keep calling [`try_next`](Self::try_next) until it returns
+    /// `None` before treating the channel as finished. Used by a multi-drain poller to
+    /// know when a channel is done without blocking on it.
+    pub fn is_closed(&self) -> bool {
+        self.rx.is_closed()
+    }
+
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Relaxed)
     }
