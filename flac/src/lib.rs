@@ -38,11 +38,13 @@
 pub mod bitstream;
 mod decoder;
 mod encoder;
+mod flacdec;
 mod flacenc;
 
 pub use bitstream::{crc16, crc8, BitReader, BitWriter, ReadError};
-pub use decoder::{DecodeError, FlacDecoder, StreamInfo};
+pub use decoder::{DecodeError, DecodedFrame, FlacDecoder, StreamDecoder, StreamInfo};
 pub use encoder::{EncodeError, FlacEncoder, SampleFormat};
+pub use flacdec::FlacDec;
 pub use flacenc::FlacEnc;
 
 /// Byte offset of the STREAMINFO block body within a stream produced by

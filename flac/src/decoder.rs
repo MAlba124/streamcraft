@@ -210,6 +210,111 @@ impl FlacDecoder {
     }
 }
 
+/// One decoded FLAC frame: interleaved (channel-major) interchannel samples, sign-extended
+/// to `i64` — the same order and representation as [`FlacDecoder::samples`].
+pub struct DecodedFrame {
+    pub samples: Vec<i64>,
+}
+
+/// An **incremental** FLAC decoder: push bytes as they arrive, pull decoded frames as they
+/// complete (spec: decoders must not buffer the whole stream — latency #2). Only the
+/// undecoded tail is retained — the consumed prefix is dropped — so memory stays on the
+/// order of one frame regardless of stream length. It reuses [`FlacDecoder`]'s frame and
+/// metadata readers, so the two decoders can never diverge.
+#[derive(Default)]
+pub struct StreamDecoder {
+    buf: Vec<u8>,
+    /// Decode cursor within `buf`; bytes before it are consumed and periodically dropped.
+    pos: usize,
+    info: Option<StreamInfo>,
+}
+
+impl StreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The stream header, available once enough bytes have been pushed to parse it.
+    pub fn info(&self) -> Option<&StreamInfo> {
+        self.info.as_ref()
+    }
+
+    /// Append freshly-received bytes to the decode buffer.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Decode the next fully-buffered frame, or `Ok(None)` when more bytes are needed
+    /// (a truncated frame is not an error — it is backpressure). The `fLaC` marker and
+    /// STREAMINFO are parsed on the first call(s) with enough bytes; thereafter
+    /// [`info`](Self::info) is populated. Malformed input returns `Err`, never a panic.
+    pub fn pull(&mut self) -> Result<Option<DecodedFrame>, DecodeError> {
+        if self.info.is_none() && !self.try_header()? {
+            return Ok(None);
+        }
+        let info = self.info.expect("header parsed above");
+
+        // Attempt one frame from the cursor. `read_frame` runs off the end of a truncated
+        // slice as `UnexpectedEof`, which here means "need more" rather than corruption.
+        let outcome = {
+            let slice = &self.buf[self.pos..];
+            if slice.len() < 2 {
+                return Ok(None); // not even a frame sync yet
+            }
+            let mut r = BitReader::new(slice);
+            let mut out = Vec::new();
+            match FlacDecoder::read_frame(&mut r, slice, &info, &mut out) {
+                Ok(()) => Some(((r.bit_pos() / 8) as usize, out)),
+                Err(DecodeError::UnexpectedEof) => None,
+                Err(e) => return Err(e),
+            }
+        };
+        match outcome {
+            Some((used, samples)) => {
+                self.pos += used;
+                self.compact();
+                Ok(Some(DecodedFrame { samples }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Parse the `fLaC` marker and metadata chain once enough bytes are buffered. Returns
+    /// `Ok(false)` (need more) if the header is still truncated.
+    fn try_header(&mut self) -> Result<bool, DecodeError> {
+        let (info, used) = {
+            let slice = &self.buf[self.pos..];
+            let mut r = BitReader::new(slice);
+            let magic = match r.read_bits(32) {
+                Ok(m) => m,
+                Err(_) => return Ok(false), // marker not fully here yet
+            };
+            if magic != 0x664C_6143 {
+                return Err(DecodeError::BadMagic);
+            }
+            match FlacDecoder::read_metadata(&mut r) {
+                Ok(info) => (info, (r.bit_pos() / 8) as usize),
+                Err(DecodeError::UnexpectedEof) => return Ok(false), // metadata truncated
+                Err(e) => return Err(e),
+            }
+        };
+        self.info = Some(info);
+        self.pos += used;
+        self.compact();
+        Ok(true)
+    }
+
+    /// Drop the consumed prefix once it grows past a threshold, so the buffer stays around
+    /// one frame rather than the whole stream (the point of incremental decoding).
+    fn compact(&mut self) {
+        const DRAIN_AT: usize = 64 * 1024;
+        if self.pos >= DRAIN_AT {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
+}
+
 /// How the two channels of a stereo frame are correlated (§4.2, §9.1.3). Independent
 /// channels need no restoration; left/side, side/right, and mid/side each reconstruct
 /// left and right from the stored pair.
