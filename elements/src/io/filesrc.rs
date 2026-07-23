@@ -1,7 +1,9 @@
-//! `filesrc` — reads a file into pooled buffers (spec: Milestone applications §1).
+//! `filesrc` — reads a file into pooled buffers via the reactor
+//! (spec: Milestone applications §1; IO). Reactor-native: it registers its file,
+//! keeps up to `credits` positioned reads in flight, and emits completed buffers.
+//! Positioned reads (explicit offset) make it seek-ready.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use streamcraft_core::batch::Inputs;
@@ -12,6 +14,7 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::id::PadId;
+use streamcraft_core::io::{FileHandle, IoResult};
 use streamcraft_core::time::Timestamp;
 
 static PADS: [PadDesc; 1] = [PadDesc {
@@ -39,14 +42,24 @@ static DESC: ElementDesc = ElementDesc {
 
 pub struct FileSrc {
     path: PathBuf,
-    file: Option<File>,
+    file: FileHandle,
+    started: bool,
+    offset: u64,
+    eof: bool,
+    in_flight: u32,
+    seq: u64,
 }
 
 impl FileSrc {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
-            file: None,
+            file: FileHandle(0),
+            started: false,
+            offset: 0,
+            eof: false,
+            in_flight: 0,
+            seq: 0,
         }
     }
 }
@@ -56,25 +69,55 @@ impl Element for FileSrc {
         &DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         let f = File::open(&self.path)
             .map_err(|e| Error::Resource(format!("open {}: {e}", self.path.display())))?;
-        self.file = Some(f);
+        self.file = ctx.io().register(f);
+        self.started = true;
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
-        let file = self.file.as_mut().ok_or(Error::Todo("filesrc not started"))?;
-        let mut buf = ctx.alloc(PadId(0));
-        let n = file
-            .read(buf.memory.as_mut_full())
-            .map_err(|e| Error::Resource(format!("read {}: {e}", self.path.display())))?;
-        if n == 0 {
-            return Ok(Flow::Eos);
+        if !self.started {
+            return Err(Error::Todo("filesrc not started"));
         }
-        buf.memory.set_len(n);
-        ctx.out(PadId(0)).push(buf);
-        Ok(Flow::Ok)
+
+        // Drain completed reads: emit their buffers (or note EOF).
+        loop {
+            let completion = ctx.io().next_completion();
+            let c = match completion {
+                Some(c) => c,
+                None => break,
+            };
+            self.in_flight -= 1;
+            match c.result {
+                IoResult::Ok(0) => self.eof = true, // c.buf recycles on drop
+                IoResult::Ok(_) => ctx.out(PadId(0)).push(c.buf),
+                IoResult::Cancelled => {}
+                IoResult::Err(k) => return Err(Error::Resource(format!("read: {k:?}"))),
+            }
+        }
+
+        // Top up positioned reads up to credits and pool availability.
+        let credits = ctx.io().credits();
+        while !self.eof && self.in_flight < credits {
+            let buf = match ctx.try_alloc(PadId(0)) {
+                Some(b) => b,
+                None => break, // pool full → backpressure
+            };
+            let cap = buf.memory.capacity() as u64;
+            let user = self.seq;
+            self.seq += 1;
+            ctx.io().submit_read(self.file, self.offset, buf, user);
+            self.offset += cap;
+            self.in_flight += 1;
+        }
+
+        if self.eof && self.in_flight == 0 {
+            Ok(Flow::Eos)
+        } else {
+            Ok(Flow::Ok)
+        }
     }
 
     fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
@@ -82,6 +125,6 @@ impl Element for FileSrc {
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {
-        self.file = None;
+        self.started = false; // the reactor owns and closes the file
     }
 }

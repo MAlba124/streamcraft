@@ -1,10 +1,11 @@
 //! Batches: the unit of work is a span, not a buffer (spec: Batching). SoA layout —
 //! parallel arrays, so timestamp scans (QoS, latency, seek) touch one dense column.
 //!
-//! Milestone 1 uses an owned [`Batch`] with `Vec` columns, reused across iterations
-//! (cleared, not freed) so the metadata storage doesn't reallocate. The
-//! ring-buffer-slots-are-the-columns version (spec: Queue internals) replaces the
-//! transport later behind [`BatchRef`] / [`OutBatch`].
+//! Milestone-1 transport is an owned [`Batch`] with `Vec` columns, reused across
+//! iterations. Inputs are drained by *moving* owned buffers out ([`Inputs::pop`]),
+//! because an active sink hands buffers to the reactor and must own them until the
+//! write completes. The ring-buffer-slots-are-the-columns version (spec: Queue
+//! internals) replaces the transport later behind [`BatchRef`] / [`OutBatch`].
 
 use crate::buffer::{Buffer, BufferFlags};
 use crate::id::{FormatId, MetaId, PadId};
@@ -60,6 +61,32 @@ impl Batch {
         // buf.dts / buf.format / buf.sync are not carried per-row in milestone 1.
     }
 
+    /// Take the oldest buffer (FIFO), reconstructing it from the columns.
+    pub fn pop_front(&mut self) -> Option<Buffer> {
+        if self.memories.is_empty() {
+            return None;
+        }
+        let _ = self.metas.remove(0);
+        Some(Buffer {
+            memory: self.memories.remove(0),
+            pts: self.pts.remove(0),
+            dts: Timestamp::NONE,
+            duration: self.durations.remove(0),
+            flags: self.flags.remove(0),
+            format: self.format,
+            sync: None,
+        })
+    }
+
+    /// Move all buffers out of `other` (leaving it empty) onto the end of `self`.
+    pub fn append(&mut self, other: &mut Batch) {
+        self.memories.append(&mut other.memories);
+        self.pts.append(&mut other.pts);
+        self.durations.append(&mut other.durations);
+        self.flags.append(&mut other.flags);
+        self.metas.append(&mut other.metas);
+    }
+
     pub fn view(&self) -> BatchRef<'_> {
         BatchRef {
             format: self.format,
@@ -72,7 +99,8 @@ impl Batch {
     }
 }
 
-/// Borrowed SoA view over a batch. Cheap to copy (all fields are shared refs).
+/// Borrowed SoA view over a batch. Cheap to copy (all fields are shared refs). Used
+/// by passive elements that read input without taking ownership.
 #[derive(Clone, Copy)]
 pub struct BatchRef<'a> {
     pub format: FormatId,
@@ -92,7 +120,6 @@ impl<'a> BatchRef<'a> {
         self.memories.is_empty()
     }
 
-    /// The `i`th buffer's memory (for reading its bytes).
     pub fn memory(&self, i: usize) -> &'a Memory {
         &self.memories[i]
     }
@@ -128,35 +155,36 @@ impl<'a> OutBatch<'a> {
     }
 }
 
-/// The (possibly multiple) inputs delivered to `Element::process` (spec: Aggregation).
-#[derive(Clone, Copy)]
+/// The inputs delivered to `Element::process` (spec: Aggregation). Milestone 1 is a
+/// single input batch, drained by *moving* owned buffers out via [`pop`](Self::pop).
 pub struct Inputs<'a> {
-    entries: &'a [(PadId, BatchRef<'a>)],
+    batch: Option<&'a mut Batch>,
 }
 
 impl<'a> Inputs<'a> {
     pub fn empty() -> Inputs<'static> {
-        Inputs { entries: &[] }
+        Inputs { batch: None }
     }
 
-    pub fn new(entries: &'a [(PadId, BatchRef<'a>)]) -> Self {
-        Self { entries }
-    }
-
-    /// `Single`-policy sugar: the one input, if present.
-    pub fn single(&self) -> Option<BatchRef<'a>> {
-        self.entries.first().map(|(_, b)| *b)
-    }
-
-    pub fn get(&self, pad: PadId) -> Option<BatchRef<'a>> {
-        self.entries.iter().find(|(p, _)| *p == pad).map(|(_, b)| *b)
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub fn owned(batch: &'a mut Batch) -> Self {
+        Inputs { batch: Some(batch) }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.batch.as_ref().map_or(true, |b| b.is_empty())
+    }
+
+    pub fn len(&self) -> usize {
+        self.batch.as_ref().map_or(0, |b| b.len())
+    }
+
+    /// Take the oldest input buffer (owned).
+    pub fn pop(&mut self) -> Option<Buffer> {
+        self.batch.as_mut().and_then(|b| b.pop_front())
+    }
+
+    /// Borrow the inputs without taking ownership (for passive read-only elements).
+    pub fn view(&self) -> Option<BatchRef<'_>> {
+        self.batch.as_ref().map(|b| b.view())
     }
 }

@@ -31,13 +31,19 @@ fn copies_bytes_identically_with_flat_allocation() {
     assert_eq!(got.len(), data.len(), "output length matches");
     assert_eq!(got, data, "output bytes match input");
 
-    // Zero steady-state allocation: one pooled slot, reused for every batch.
+    // Bounded steady-state allocation: the pool is capped (default 4 slots) and
+    // recycles, so the buffer count never grows with file size.
     let report = p.last_report().expect("report");
-    assert_eq!(
-        report.pool_slot_allocations, 1,
-        "exactly one payload buffer was ever allocated (rest recycled)"
+    assert!(
+        report.pool_slot_allocations <= 4,
+        "payload buffers bounded by the pool cap, got {}",
+        report.pool_slot_allocations
     );
-    assert_eq!(report.pool_high_water, 1, "never more than one buffer live");
+    assert!(
+        report.pool_high_water <= 4,
+        "never more than the pool cap live at once, got {}",
+        report.pool_high_water
+    );
     assert!(report.buffers >= 8, "several batches flowed: {}", report.buffers);
 
     // EOS was posted to the bus.

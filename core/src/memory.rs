@@ -17,6 +17,7 @@ pub struct Pool {
 
 struct PoolInner {
     slot_size: usize,
+    max_slots: u32,
     free: Mutex<Vec<Box<[u8]>>>,
     slot_allocations: AtomicU64, // boxes ever heap-allocated (misses)
     acquires: AtomicU64,
@@ -26,10 +27,18 @@ struct PoolInner {
 }
 
 impl Pool {
+    /// An unbounded pool (grows on demand). Use [`Pool::bounded`] for backpressure.
     pub fn new(slot_size: usize) -> Self {
+        Self::bounded(slot_size, u32::MAX)
+    }
+
+    /// A pool capped at `max_slots` concurrently-outstanding buffers. Once the cap
+    /// is hit, [`Pool::try_acquire`] returns `None` — the backpressure signal.
+    pub fn bounded(slot_size: usize, max_slots: u32) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 slot_size,
+                max_slots,
                 free: Mutex::new(Vec::new()),
                 slot_allocations: AtomicU64::new(0),
                 acquires: AtomicU64::new(0),
@@ -42,6 +51,22 @@ impl Pool {
 
     pub fn slot_size(&self) -> usize {
         self.inner.slot_size
+    }
+
+    /// Free slots available before hitting the cap (`u32::MAX` for unbounded pools).
+    pub fn free_slots(&self) -> u32 {
+        let outstanding = self.inner.outstanding.load(Ordering::Relaxed);
+        (self.inner.max_slots as u64).saturating_sub(outstanding) as u32
+    }
+
+    /// Like [`acquire`](Self::acquire) but respects the cap: `None` when full.
+    pub fn try_acquire(&self) -> Option<Memory> {
+        if self.free_slots() == 0 {
+            // Even at the cap, a recycled buffer may be sitting free; but outstanding
+            // already accounts for those not yet dropped, so a zero cap means full.
+            return None;
+        }
+        Some(self.acquire())
     }
 
     /// Take a slot from the free-list, or heap-allocate one on a miss.
@@ -224,5 +249,20 @@ mod tests {
         let mut m = pool.acquire();
         m.set_len(999);
         assert_eq!(m.len(), 4);
+    }
+
+    #[test]
+    fn bounded_pool_backpressure() {
+        let pool = Pool::bounded(8, 2);
+        assert_eq!(pool.free_slots(), 2);
+        let a = pool.try_acquire().expect("slot 1");
+        let b = pool.try_acquire().expect("slot 2");
+        assert_eq!(pool.free_slots(), 0);
+        assert!(pool.try_acquire().is_none(), "cap reached → backpressure");
+        drop(a);
+        assert_eq!(pool.free_slots(), 1);
+        let _c = pool.try_acquire().expect("slot freed after drop");
+        assert!(pool.try_acquire().is_none());
+        drop(b);
     }
 }

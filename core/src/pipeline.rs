@@ -1,19 +1,23 @@
 //! The pipeline: owns topology, lifecycle, clock, latency (spec: The pipeline API).
 //! Elements arrive already constructed — `pipeline.add(FileSrc::new(path))`.
 //!
-//! Milestone 1 implements a **single-threaded linear scheduler**: a chain of
-//! elements driven inline (source → … → sink), one batch per step, until the source
-//! reports EOS. Thread groups, queues, and the reactor (spec: Scheduling) replace
-//! `run()`'s internals later; `play()` / `step()` grow from the same code.
+//! Milestone 1 implements a **single-threaded, reactor-driven linear scheduler**: a
+//! chain of elements (source → … → sink) driven inline, with IO going through the
+//! reactor (submit → execute → complete). Each round: every element processes
+//! (draining its IO completions, consuming its input, emitting output and/or new IO
+//! submissions), the reactor executes queued ops, and completions are routed back.
+//! Thread groups, real queues, and an async/io_uring reactor (spec: Scheduling, IO)
+//! replace the internals later; `play()` / `step()` grow from the same loop.
 
-use crate::batch::{Batch, Inputs};
+use crate::batch::Inputs;
 use crate::bus::{Bus, BusMessage, BusSender, State};
 use crate::counters::{CounterSnapshot, LatencyReport};
 use crate::ctx::Ctx;
 use crate::element::{Element, Flow, Template};
 use crate::error::Error;
 use crate::format::{FieldConstraint, Value};
-use crate::id::{ElementId, FormatId, GroupId, LinkId, PadId};
+use crate::id::{ElementId, FormatId, GroupId, LinkId};
+use crate::io::Reactor;
 use crate::memory::Pool;
 use crate::time::Timestamp;
 
@@ -35,6 +39,7 @@ pub struct Pipeline {
     bus_sender: BusSender,
     bus: Bus,
     slot_size: usize,
+    pool_slots: usize,
     last_report: Option<RunReport>,
 }
 
@@ -47,6 +52,7 @@ impl Pipeline {
             bus_sender: tx,
             bus: rx,
             slot_size: 128 * 1024,
+            pool_slots: 4,
             last_report: None,
         }
     }
@@ -72,11 +78,13 @@ impl Pipeline {
     // --- Running (milestone 1: finite, drives to EOS) ---
 
     /// Start the chain, drive it to EOS, and stop it. Returns after the source is
-    /// exhausted and all data has drained to the sink.
+    /// exhausted and all IO has drained through the sink.
     pub fn run(&mut self) -> Result<(), Error> {
         let order = self.linear_order()?;
         let n = order.len();
-        let pool = Pool::new(self.slot_size);
+        let total = self.elements.len();
+        let pool = Pool::bounded(self.slot_size, self.pool_slots as u32);
+        let credits = self.pool_slots as u32;
 
         let mut chain: Vec<Box<dyn Element>> = Vec::with_capacity(n);
         for id in &order {
@@ -87,10 +95,17 @@ impl Pipeline {
         }
         let mut ctxs: Vec<Ctx> = order
             .iter()
-            .map(|id| Ctx::new(pool.clone(), self.bus_sender.clone(), *id, BYTES))
+            .map(|id| Ctx::new(pool.clone(), self.bus_sender.clone(), *id, BYTES, credits))
             .collect();
 
-        let result = drive(&mut chain, &mut ctxs, n);
+        // element id -> index in the ordered chain (for routing completions).
+        let mut elem_to_idx = vec![0usize; total];
+        for (i, id) in order.iter().enumerate() {
+            elem_to_idx[id.0 as usize] = i;
+        }
+
+        let mut reactor = Reactor::new(total);
+        let result = drive(&mut chain, &mut ctxs, &order, &elem_to_idx, &mut reactor, n);
 
         // Stop in reverse order regardless of how the drive ended.
         for i in (0..n).rev() {
@@ -235,34 +250,71 @@ impl Default for Pipeline {
     }
 }
 
-/// The single-threaded linear drive loop (spec: Scheduling — minimal scheduler).
-fn drive(chain: &mut [Box<dyn Element>], ctxs: &mut [Ctx], n: usize) -> Result<(), Error> {
+/// The reactor-driven linear drive loop (spec: Scheduling — minimal scheduler).
+fn drive(
+    chain: &mut [Box<dyn Element>],
+    ctxs: &mut [Ctx],
+    order: &[ElementId],
+    elem_to_idx: &[usize],
+    reactor: &mut Reactor,
+    n: usize,
+) -> Result<(), Error> {
+    // Start each element; hand any file it registered to the reactor.
     for i in 0..n {
         chain[i].start(&mut ctxs[i])?;
+        if let Some(f) = ctxs[i].take_registration() {
+            reactor.set_file(order[i], f);
+        }
     }
 
-    // Buffers moving downstream between elements; reused (cleared) each step.
-    let mut carry = Batch::new(BYTES);
+    let mut source_eos = false;
+    let mut guard: u64 = 0;
+    const GUARD_MAX: u64 = 1 << 40;
 
     loop {
-        // Source: pull one batch.
-        let flow0 = chain[0].process(&mut ctxs[0], Inputs::empty())?;
-        carry.clear();
-        std::mem::swap(&mut carry, ctxs[0].output_mut());
-        let had_output = !carry.is_empty();
-
-        // Transforms and sink: feed each the previous element's output.
-        for i in 1..n {
-            {
-                let entries = [(PadId(0), carry.view())];
-                chain[i].process(&mut ctxs[i], Inputs::new(&entries))?;
-            }
-            carry.clear(); // recycle element i-1's buffers
-            std::mem::swap(&mut carry, ctxs[i].output_mut());
+        guard += 1;
+        if guard > GUARD_MAX {
+            return Err(Error::Todo("scheduler failed to make progress"));
         }
-        carry.clear();
 
-        if matches!(flow0, Flow::Eos) && !had_output {
+        // One pass: each element processes, then its output moves to the next input.
+        for i in 0..n {
+            let flow = if i == 0 {
+                chain[0].process(&mut ctxs[0], Inputs::empty())?
+            } else {
+                let mut input = ctxs[i].take_input();
+                let f = chain[i].process(&mut ctxs[i], Inputs::owned(&mut input))?;
+                ctxs[i].set_input(input); // any unconsumed input persists
+                f
+            };
+            if i == 0 && matches!(flow, Flow::Eos) {
+                source_eos = true;
+            }
+
+            let subs = ctxs[i].take_submissions();
+            reactor.submit(subs);
+
+            if i + 1 < n {
+                let (left, right) = ctxs.split_at_mut(i + 1);
+                right[0].input_append(left[i].output_mut());
+            } else {
+                ctxs[i].output_mut().clear(); // sink produces nothing
+            }
+        }
+
+        // Execute queued IO and route completions back to their elements.
+        let completions = reactor.run_once();
+        let did_io = !completions.is_empty();
+        for (elem, c) in completions {
+            ctxs[elem_to_idx[elem.0 as usize]].deliver_completion(c);
+        }
+
+        // Quiescent (nothing executed, no queued/in-flight work) and source done.
+        if source_eos
+            && !did_io
+            && reactor.pending_is_empty()
+            && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty())
+        {
             break;
         }
     }
