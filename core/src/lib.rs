@@ -36,5 +36,6 @@ pub mod io;
 pub mod log;
 pub mod memory;
 pub mod pipeline;
+pub mod ring;
 pub mod sched;
 pub mod time;
