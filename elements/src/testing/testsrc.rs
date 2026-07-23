@@ -9,6 +9,8 @@ use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
+use streamcraft_core::log;
+use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
 use super::pattern_byte;
@@ -59,12 +61,14 @@ impl Element for TestSrc {
         &DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        log!(&*ctx, Level::Debug, "start", total = self.total);
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
         if self.produced >= self.total {
+            log!(&*ctx, Level::Info, "eos", produced = self.produced);
             return Ok(Flow::Eos);
         }
         let mut buf = match ctx.try_alloc(PadId(0)) {

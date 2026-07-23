@@ -13,6 +13,7 @@ use crate::bus::{BusMessage, BusSender};
 use crate::format::FixedFormat;
 use crate::id::{ElementId, FormatId, PadId};
 use crate::io::{Completion, Io, Submission};
+use crate::log::{Field, Level, Log, Loggable};
 use crate::memory::{Arena, Pool};
 use crate::time::Timestamp;
 
@@ -35,6 +36,14 @@ pub struct Ctx {
     io_in: Vec<Completion>,
     io_out: Vec<Submission>,
     next_op: u64,
+    /// This element's log emitter (spec: Debuggability — Logging). `None` when logging
+    /// is disabled, which is the zero-overhead default: nothing is wired, so `log!`
+    /// gates out on a plain `false` with no channel, thread, or atomic behind it. When
+    /// enabled the pipeline installs a `Log` here whose owned `LogSink` is written only
+    /// by this `Ctx`'s single group thread. (Spec says "per-group ring"; a per-element
+    /// channel is a `Send`-clean refinement — the SPSC `Producer` is `Send` but not
+    /// `Sync`, so one sink per `Ctx` keeps `Ctx: Send` without sharing a producer.)
+    log: Option<Log>,
 }
 
 impl Ctx {
@@ -58,11 +67,20 @@ impl Ctx {
             io_in: Vec::new(),
             io_out: Vec::new(),
             next_op: 0,
+            log: None,
         }
     }
 
     pub fn element(&self) -> ElementId {
         self.element
+    }
+
+    /// Install this element's log emitter (pipeline → element, at `run()` setup, only
+    /// when logging is enabled). The `Log` is pre-stamped with this element's id, so
+    /// records it emits are already attributed. Absent this call the `Ctx` logs
+    /// nothing at zero cost.
+    pub(crate) fn set_log(&mut self, log: Log) {
+        self.log = Some(log);
     }
 
     /// The format the pipeline fixed on `pad` at link time (spec: Formats — fixed
@@ -174,5 +192,110 @@ impl Ctx {
 
     pub(crate) fn take_registration(&mut self) -> Option<File> {
         self.registration.take()
+    }
+}
+
+/// Elements log through their `Ctx` — `log!(ctx, Level::Info, "event", k = v)` — which
+/// forwards to the installed [`Log`] (spec: Debuggability). With no `Log` (logging
+/// disabled), [`enabled`](Loggable::enabled) is a plain `false`, so the [`log!`] macro
+/// short-circuits before touching the field expressions: the disabled path costs one
+/// branch on an `Option` and nothing else.
+impl Loggable for Ctx {
+    #[inline]
+    fn enabled(&self, level: Level) -> bool {
+        match &self.log {
+            Some(log) => log.enabled(level),
+            None => false,
+        }
+    }
+
+    fn emit(&self, level: Level, event: &'static str, fields: &[Field]) {
+        if let Some(log) = &self.log {
+            log.emit(level, event, fields);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::Bus;
+    use crate::log::{log_channel, FieldValue, LevelFilter, Log};
+    use std::sync::Arc;
+
+    /// A minimal `Ctx` for the logging-path tests. The pool/bus are unused here; we
+    /// only exercise `set_log` + `Loggable`.
+    fn test_ctx(element: ElementId) -> Ctx {
+        let pool = Pool::bounded(1024, 4);
+        let (bus, _rx) = Bus::channel();
+        Ctx::new(pool, bus, element, FormatId(0), 4)
+    }
+
+    #[test]
+    fn ctx_with_no_log_is_disabled_and_silent() {
+        // The zero-overhead default: no `Log` installed ⇒ every level gates out and the
+        // macro never evaluates its arguments.
+        let ctx = test_ctx(ElementId(1));
+        assert!(!ctx.enabled(Level::Error));
+        assert!(!ctx.enabled(Level::Trace));
+
+        let mut calls = 0u32;
+        let mut arg = || {
+            calls += 1;
+            7u64
+        };
+        crate::log!(&ctx, Level::Error, "suppressed", v = arg());
+        assert_eq!(calls, 0, "no Log ⇒ arguments must not be evaluated");
+    }
+
+    #[test]
+    fn log_through_ctx_reaches_the_drain_stamped_with_element() {
+        // Prove an element-style emit (`log!(ctx, ...)`) crosses the channel and is
+        // attributed to the element the pipeline stamped on the `Log`.
+        let filter = Arc::new(LevelFilter::with_level(Level::Info));
+        let (sink, drain) = log_channel(64);
+        let mut log = Log::new(sink, filter);
+        log.set_element(ElementId(5));
+
+        let mut ctx = test_ctx(ElementId(5));
+        ctx.set_log(log);
+
+        assert!(ctx.enabled(Level::Info));
+        crate::log!(&ctx, Level::Info, "hello", n = 42u64, ok = true);
+
+        let rec = drain.try_next().expect("record reached the drain");
+        assert_eq!(rec.event, "hello");
+        assert_eq!(rec.element, ElementId(5), "stamped with the element id");
+        assert_eq!(rec.level, Level::Info);
+        assert_eq!(rec.fields().len(), 2);
+        assert_eq!(rec.fields()[0].key, "n");
+        assert!(matches!(rec.fields()[0].val, FieldValue::Uint(42)));
+        assert!(matches!(rec.fields()[1].val, FieldValue::Bool(true)));
+        assert!(drain.try_next().is_none(), "exactly one record");
+    }
+
+    #[test]
+    fn ctx_gate_suppresses_levels_below_threshold() {
+        // Hermetic: the `LevelFilter` is set directly (no `STREAMCRAFT_DEBUG`), so the
+        // gate — not the environment — decides what passes.
+        let filter = Arc::new(LevelFilter::with_level(Level::Warn));
+        let (sink, drain) = log_channel(64);
+        let mut log = Log::new(sink, Arc::clone(&filter));
+        log.set_element(ElementId(3));
+
+        let mut ctx = test_ctx(ElementId(3));
+        ctx.set_log(log);
+
+        crate::log!(&ctx, Level::Debug, "below", x = 1); // below Warn ⇒ suppressed
+        crate::log!(&ctx, Level::Error, "boom", code = 500u32); // at/above ⇒ passes
+        let rec = drain.try_next().expect("error passed the gate");
+        assert_eq!(rec.event, "boom");
+        assert!(drain.try_next().is_none(), "debug was gated out");
+
+        // Raising the gate at runtime lets the finer level through immediately.
+        filter.set(Some(Level::Trace));
+        crate::log!(&ctx, Level::Debug, "now_visible", x = 2);
+        let rec = drain.try_next().expect("debug passes once the gate is raised");
+        assert_eq!(rec.event, "now_visible");
     }
 }

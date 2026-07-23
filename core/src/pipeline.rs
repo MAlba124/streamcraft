@@ -22,6 +22,7 @@ use crate::error::Error;
 use crate::format::{negotiate, FieldConstraint, FixedFormat, Value};
 use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, ValueId};
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
+use crate::log::{log_channel, Level, LevelFilter, Log, LogDrain};
 use crate::memory::Pool;
 use crate::ring::{spsc, Consumer, Producer};
 use crate::time::Timestamp;
@@ -86,6 +87,15 @@ pub struct Pipeline {
     reactor_factory: Option<ReactorFactory>,
     counters: Vec<Arc<ElementCounters>>,
     last_report: Option<RunReport>,
+    /// Programmatic log level (spec: Debuggability). `None` leaves the gate to
+    /// `STREAMCRAFT_DEBUG` alone; when neither is set, `run()` wires no logging at all
+    /// (no channels, no drain thread) — the zero-overhead default that keeps the hot
+    /// path clean when nobody is looking.
+    log_level: Option<Level>,
+    /// Capacity (in records) of each element's log ring. A full ring drops and counts
+    /// (spec: never block a streaming thread), so this trades memory for tolerance of
+    /// bursts before the low-priority drain catches up.
+    log_queue_cap: usize,
 }
 
 impl Pipeline {
@@ -109,6 +119,8 @@ impl Pipeline {
             reactor_factory: None,
             counters: Vec::new(),
             last_report: None,
+            log_level: None,
+            log_queue_cap: 1024,
         }
     }
 
@@ -123,6 +135,21 @@ impl Pipeline {
     /// while `run()` is blocking.
     pub fn stop_handle(&self) -> StopHandle {
         StopHandle(Arc::clone(&self.stop))
+    }
+
+    /// Programmatically enable logging up to `level`, formatting records to stderr on a
+    /// dedicated drain thread during [`run`](Self::run) (spec: Debuggability — the "one
+    /// line in `main`" dev path, without needing `STREAMCRAFT_DEBUG` in the
+    /// environment). `STREAMCRAFT_DEBUG`, if set, still applies on top at `run()` time
+    /// and takes the more verbose of the two globals.
+    pub fn log_to_stderr(&mut self, level: Level) {
+        self.log_level = Some(level);
+    }
+
+    /// Set (or clear, with `None`) the programmatic log level. See
+    /// [`log_to_stderr`](Self::log_to_stderr).
+    pub fn set_log_level(&mut self, level: Option<Level>) {
+        self.log_level = level;
     }
 
     // --- Topology: legal in every state (spec: Runtime configuration) ---
@@ -317,6 +344,13 @@ impl Pipeline {
         // `Ctx`). `.take()` moves each element's table into its group thread.
         let mut negotiated = self.negotiated_by_element();
 
+        // Logging (spec: Debuggability — Logging cont'd). Build the level filter once
+        // from the programmatic level and `STREAMCRAFT_DEBUG`, then, *only if some level
+        // is actually enabled*, wire one log channel per element and one low-priority
+        // drain thread. When logging is off nothing here allocates or spawns — the
+        // disabled path stays at zero cost, which is the point (performance is #1).
+        let (mut per_elem_logs, log_drain) = self.build_logging(total);
+
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
         for (gi, ids) in groups.into_iter().enumerate() {
@@ -333,6 +367,11 @@ impl Pipeline {
                 .iter()
                 .map(|id| std::mem::take(&mut negotiated[id.0 as usize]))
                 .collect();
+            // Move each element's `Log` (if any) into its group thread, keyed by id.
+            let group_logs: Vec<Option<Log>> = ids
+                .iter()
+                .map(|id| per_elem_logs[id.0 as usize].take())
+                .collect();
             let upstream = consumers[gi].take();
             let downstream = producers[gi].take();
             let pool = pool.clone();
@@ -341,8 +380,8 @@ impl Pipeline {
             let stop = Arc::clone(&stop);
             handles.push(std::thread::spawn(move || {
                 run_group(
-                    elems, ids, group_formats, upstream, downstream, factory, pool, bus, credits,
-                    group_counters, stop,
+                    elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
+                    bus, credits, group_counters, stop,
                 )
             }));
         }
@@ -365,6 +404,13 @@ impl Pipeline {
             }
         }
 
+        // Groups have joined, so every `Ctx` — and thus every `Log`/`LogSink` — is
+        // dropped, closing the log rings. Join the drain thread, which then sees all
+        // drains closed, flushes the tail, and exits. No-op when logging was disabled.
+        if let Some(drain) = log_drain {
+            let _ = drain.join();
+        }
+
         let s = pool.stats();
         self.last_report = Some(RunReport {
             pool_slot_allocations: s.slot_allocations,
@@ -385,6 +431,80 @@ impl Pipeline {
                 Err(e)
             }
         }
+    }
+
+    /// Build the per-element log emitters and the drain thread for this run (spec:
+    /// Debuggability — Logging). Returns `(logs, drain)` where `logs[i]` is the `Log`
+    /// for element `i` (if logging is enabled for it) and `drain` is the join handle of
+    /// the single low-priority thread that formats all records to stderr.
+    ///
+    /// The gate is decided once, here: the global level is `max(programmatic, env)` and
+    /// per-target `name:level` rules from `STREAMCRAFT_DEBUG` raise matching elements
+    /// above it. If nothing is enabled, this wires *nothing* — no channels, no thread —
+    /// so a run with logging off pays only this one comparison.
+    fn build_logging(&self, total: usize) -> (Vec<Option<Log>>, Option<LogDrainThread>) {
+        // Fold the programmatic level and the env global into one shared gate; the more
+        // verbose (higher rank) of the two wins.
+        let filter = LevelFilter::new();
+        if let Some(l) = self.log_level {
+            filter.set(Some(l));
+        }
+        let spec = filter.apply_env(); // moves the global gate up if env set one
+        if let Some(l) = self.log_level {
+            // `apply_env` overwrites, so re-assert the programmatic floor afterwards.
+            let env_rank = filter.level().map_or(0, Level::rank);
+            if l.rank() > env_rank {
+                filter.set(Some(l));
+            }
+        }
+        let global_rank = filter.level().map_or(0, Level::rank);
+
+        // Per-target overrides (`filesrc:debug`) matched against element names. A
+        // nice-to-have on top of the global gate; ignored targets that raise nothing.
+        let target_rank = |name: &str| -> u8 {
+            spec.targets
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, r)| *r)
+                .max()
+                .unwrap_or(0)
+        };
+        let any_target = spec.targets.iter().any(|(_, r)| *r > 0);
+
+        // Nothing enabled anywhere → wire nothing (the zero-overhead disabled path).
+        if global_rank == 0 && !any_target {
+            return ((0..total).map(|_| None).collect(), None);
+        }
+
+        let shared = Arc::new(filter);
+        let mut logs: Vec<Option<Log>> = Vec::with_capacity(total);
+        let mut drains: Vec<LogDrain> = Vec::new();
+        for i in 0..total {
+            let name = self.name_of(ElementId(i as u32));
+            let tr = target_rank(name);
+            // Elements not matched by a target log at the global level; matched ones get
+            // their own filter raised to `max(global, target)`. Both `>0` ⇒ a channel.
+            let elem_rank = global_rank.max(tr);
+            if elem_rank == 0 {
+                logs.push(None);
+                continue;
+            }
+            let elem_filter = if tr > global_rank {
+                Arc::new(LevelFilter::with_level(
+                    Level::from_rank(elem_rank).unwrap_or(Level::Error),
+                ))
+            } else {
+                Arc::clone(&shared)
+            };
+            let (sink, drain) = log_channel(self.log_queue_cap);
+            let mut log = Log::new(sink, elem_filter);
+            log.set_element(ElementId(i as u32));
+            logs.push(Some(log));
+            drains.push(drain);
+        }
+
+        let drain = LogDrainThread::spawn(drains);
+        (logs, Some(drain))
     }
 
     /// The report from the most recent [`run`](Self::run).
@@ -557,6 +677,65 @@ impl Default for Pipeline {
     }
 }
 
+/// The single low-priority drain thread for a run (spec: Debuggability — Logging: a
+/// low-priority [`LogDrain`] consumes; observation never perturbs what it observes).
+/// It owns *all* elements' drains, polls them round-robin off the hot path, formats
+/// each record to stderr, and parks briefly when every ring is momentarily empty. It
+/// exits once every drain is closed (its `LogSink` dropped with the owning `Ctx`) and
+/// emptied, so joining it after the group threads is a clean, bounded shutdown.
+struct LogDrainThread {
+    handle: JoinHandle<()>,
+}
+
+impl LogDrainThread {
+    fn spawn(drains: Vec<LogDrain>) -> Self {
+        let handle = std::thread::Builder::new()
+            .name("sc-log-drain".into())
+            .spawn(move || Self::run(drains))
+            .expect("spawn log drain");
+        Self { handle }
+    }
+
+    fn run(drains: Vec<LogDrain>) {
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        // Idle backoff: park a beat when a whole sweep found nothing, so the thread
+        // costs no CPU while streaming is quiet, yet stays responsive under load.
+        let idle_park = std::time::Duration::from_millis(2);
+        loop {
+            let mut progressed = false;
+            let mut all_done = true;
+            {
+                let mut lock = stderr.lock();
+                for d in &drains {
+                    let mut drained_this = false;
+                    while let Some(rec) = d.try_next() {
+                        let _ = crate::log::format_record(&mut lock, &rec);
+                        progressed = true;
+                        drained_this = true;
+                    }
+                    // A channel is finished only when closed *and* fully drained; the
+                    // producer may have pushed a last record just before dropping.
+                    if !d.is_closed() || drained_this {
+                        all_done = false;
+                    }
+                }
+                let _ = lock.flush();
+            }
+            if all_done {
+                break;
+            }
+            if !progressed {
+                std::thread::sleep(idle_park);
+            }
+        }
+    }
+
+    fn join(self) -> std::thread::Result<()> {
+        self.handle.join()
+    }
+}
+
 /// One thread group's run loop (spec: Scheduling — a group runs on one thread). The
 /// group is `[active_head, passive_tail...]`; the head pulls from the upstream ring
 /// (unless it is the source) and the tail runs inline; the last element's output goes
@@ -567,6 +746,7 @@ fn run_group(
     mut elements: Vec<Box<dyn Element>>,
     ids: Vec<ElementId>,
     formats: Vec<Vec<Option<FixedFormat>>>,
+    logs: Vec<Option<Log>>,
     upstream: Option<Consumer<Batch>>,
     downstream: Option<Producer<Batch>>,
     factory: ReactorFactory,
@@ -588,6 +768,15 @@ fn run_group(
     // element can read `ctx.negotiated(pad)` in `start()` as well as `process()`.
     for (ctx, per_pad) in ctxs.iter_mut().zip(formats) {
         ctx.set_negotiated(per_pad);
+    }
+    // Install each element's log emitter (present only when logging is enabled), so
+    // `log!(ctx, ...)` works from `start()` onward. Each `Log` owns its own `LogSink`,
+    // written solely by this group's thread — no producer is shared, so `Ctx` stays
+    // `Send`.
+    for (ctx, log) in ctxs.iter_mut().zip(logs) {
+        if let Some(log) = log {
+            ctx.set_log(log);
+        }
     }
 
     // Start each element; hand any file it registered to this group's reactor.
@@ -703,6 +892,9 @@ fn run_group(
         let quiescent = reactor.is_idle()
             && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty());
         if head_done && quiescent {
+            // Stamped on the group's head element (spec: Debuggability). Gated out at
+            // zero cost unless Trace is enabled, so it never touches the hot path.
+            crate::log!(&ctxs[0], Level::Trace, "group_done", is_source = is_source);
             break Ok(());
         }
 
