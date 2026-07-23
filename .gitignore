@@ -1,2 +1,12 @@
 /target
 .claude/
+
+# Profiling artifacts
+heaptrack.*
+perf.data*
+*.zst
+
+# Editor lock/autosave files
+\#*\#
+.\#*
+*~
