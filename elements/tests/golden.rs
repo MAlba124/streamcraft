@@ -116,3 +116,26 @@ fn link_validates_pads() {
     // Correct: src's Src pad → sink's Sink pad.
     assert!(p.link((src, "src"), (snk, "sink")).is_ok());
 }
+
+#[test]
+fn stop_handle_cancels_a_running_pipeline() {
+    // An effectively-infinite source; a stopper thread cancels it shortly after run
+    // starts. run() must return (not hang), having transported some but not all.
+    let (sink, stats) = TestSink::new();
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(u64::MAX));
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).unwrap();
+
+    let handle = p.stop_handle();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        handle.stop();
+    });
+    p.run().expect("run returns after stop");
+    stopper.join().unwrap();
+
+    let n = stats.bytes();
+    assert!(n > 0, "transported some bytes before the stop");
+    assert!(n < u64::MAX, "did not run to completion");
+}

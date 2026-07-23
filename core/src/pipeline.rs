@@ -9,6 +9,7 @@
 //! all-active chain (e.g. `filesrc ! filesink`) this yields one thread per element
 //! with a ring between them.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -37,9 +38,28 @@ pub struct RunReport {
     pub buffers: u64,
 }
 
+/// A cloneable handle that stops a running pipeline from another thread (e.g. a
+/// Ctrl-C handler). Cooperative: group threads check it between operations and then
+/// drain and exit, which closes the ring queues and cascades the stop downstream
+/// (spec: milestone 2 — cancellation; hard-interrupting a blocked reactor/clock wait
+/// is a follow-up).
+#[derive(Clone)]
+pub struct StopHandle(Arc<AtomicBool>);
+
+impl StopHandle {
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 pub struct Pipeline {
     elements: Vec<Option<Box<dyn Element>>>,
     links: Vec<(ElementId, ElementId)>,
+    stop: Arc<AtomicBool>,
     bus_sender: BusSender,
     bus: Bus,
     slot_size: usize,
@@ -57,6 +77,7 @@ impl Pipeline {
         Self {
             elements: Vec::new(),
             links: Vec::new(),
+            stop: Arc::new(AtomicBool::new(false)),
             bus_sender: tx,
             bus: rx,
             slot_size: 128 * 1024,
@@ -76,6 +97,12 @@ impl Pipeline {
     /// [`SyncReactor`] (spec: IO — the reactor is the portability boundary).
     pub fn set_reactor_factory(&mut self, factory: ReactorFactory) {
         self.reactor_factory = Some(factory);
+    }
+
+    /// A handle to stop this pipeline from another thread (or a signal handler)
+    /// while `run()` is blocking.
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle(Arc::clone(&self.stop))
     }
 
     // --- Topology: legal in every state (spec: Runtime configuration) ---
@@ -124,6 +151,7 @@ impl Pipeline {
     /// Start the chain, drive it to EOS, and stop it. Spawns one thread per group,
     /// joins them all, and returns the first error (if any).
     pub fn run(&mut self) -> Result<(), Error> {
+        self.stop.store(false, Ordering::Release);
         let order = self.linear_order()?;
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
@@ -148,6 +176,7 @@ impl Pipeline {
         let counters: Vec<Arc<ElementCounters>> =
             (0..total).map(|_| Arc::new(ElementCounters::default())).collect();
         self.counters = counters.clone();
+        let stop = Arc::clone(&self.stop);
 
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
@@ -166,8 +195,12 @@ impl Pipeline {
             let pool = pool.clone();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
+            let stop = Arc::clone(&stop);
             handles.push(std::thread::spawn(move || {
-                run_group(elems, ids, upstream, downstream, factory, pool, bus, credits, group_counters)
+                run_group(
+                    elems, ids, upstream, downstream, factory, pool, bus, credits, group_counters,
+                    stop,
+                )
             }));
         }
 
@@ -391,6 +424,7 @@ fn run_group(
     bus: BusSender,
     credits: u32,
     counters: Vec<Arc<ElementCounters>>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_none();
@@ -413,6 +447,11 @@ fn run_group(
     let mut upstream_closed = false;
 
     let result: Result<(), Error> = loop {
+        // Cooperative cancellation: break, then stop + drop downstream, which closes
+        // the ring and cascades the stop to the next group.
+        if stop.load(Ordering::Acquire) {
+            break Ok(());
+        }
         let mut progressed = false;
 
         // A. Feed the head from upstream (non-source groups only).
