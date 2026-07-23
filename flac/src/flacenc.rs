@@ -21,6 +21,7 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
+use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -30,18 +31,23 @@ use crate::encoder::{FlacEncoder, SampleFormat};
 /// common libFLAC default and within the streamable subset for <=48 kHz (§7).
 const BLOCK_SIZE: u32 = 4096;
 
+/// Raw `bytes` on both pads for now: interleaved PCM in, FLAC bytes out, matching the
+/// `filesrc`/`filesink` peers in the milestone-3 chain. Typed offers (`audio/raw` in,
+/// `audio/x-flac` out) arrive with the negotiation-aware `wavparse` upstream.
+static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+
 static PADS: [PadDesc; 2] = [
     PadDesc {
         name: "sink",
         direction: Direction::Sink,
-        offers: &[],
+        offers: &OFFERS,
         dynamic: false,
         validate: None,
     },
     PadDesc {
         name: "src",
         direction: Direction::Src,
-        offers: &[],
+        offers: &OFFERS,
         dynamic: false,
         validate: None,
     },
