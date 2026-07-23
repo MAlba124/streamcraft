@@ -102,3 +102,17 @@ fn dump_dot_shows_topology_and_groups() {
     // testsrc (active) + passthrough (passive) share group 0; testsink is group 1.
     assert!(dot.contains("cluster_0") && dot.contains("cluster_1"));
 }
+
+#[test]
+fn link_validates_pads() {
+    let (sink, _stats) = TestSink::new();
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(0));
+    let snk = p.add(sink);
+    // Unknown pad name on the source.
+    assert!(p.link((src, "nope"), (snk, "sink")).is_err());
+    // testsink has no "src" pad (it's a sink) → the sink side must be a Sink pad.
+    assert!(p.link((src, "src"), (snk, "src")).is_err());
+    // Correct: src's Src pad → sink's Sink pad.
+    assert!(p.link((src, "src"), (snk, "sink")).is_ok());
+}

@@ -16,7 +16,7 @@ use crate::batch::{Batch, Inputs};
 use crate::bus::{Bus, BusMessage, BusSender, State};
 use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
 use crate::ctx::Ctx;
-use crate::element::{Element, Flow, SchedHint, Template};
+use crate::element::{Direction, Element, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::format::{FieldConstraint, Value};
 use crate::id::{ElementId, FormatId, GroupId, LinkId};
@@ -90,10 +90,33 @@ impl Pipeline {
     /// Link a src pad to a sink pad. Milestone: linear chains, single pads; pad names
     /// are recorded but not yet validated or negotiated (spec: Formats).
     pub fn link(&mut self, src: (ElementId, &str), sink: (ElementId, &str)) -> Result<LinkId, Error> {
-        let _ = (src.1, sink.1);
+        self.check_pad(src.0, src.1, Direction::Src)?;
+        self.check_pad(sink.0, sink.1, Direction::Sink)?;
         let id = LinkId(self.links.len() as u32);
         self.links.push((src.0, sink.0));
         Ok(id)
+    }
+
+    /// Verify a named pad exists on an element with the expected direction.
+    /// (Format negotiation over the pads' offers is wired here once elements declare
+    /// them — for now offers are empty, so this checks pad name + direction.)
+    fn check_pad(&self, el: ElementId, pad: &str, dir: Direction) -> Result<(), Error> {
+        let e = self
+            .elements
+            .get(el.0 as usize)
+            .and_then(|o| o.as_ref())
+            .ok_or(Error::Todo("link: unknown element"))?;
+        match e.desc().pads.iter().find(|p| p.name == pad) {
+            Some(p) if p.direction == dir => Ok(()),
+            Some(_) => Err(Error::Resource(format!(
+                "link: pad '{pad}' on '{}' has the wrong direction",
+                e.desc().name
+            ))),
+            None => Err(Error::Resource(format!(
+                "link: element '{}' has no pad '{pad}'",
+                e.desc().name
+            ))),
+        }
     }
 
     // --- Running (finite: drives to EOS across all group threads) ---
