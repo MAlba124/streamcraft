@@ -1,0 +1,63 @@
+//! Golden pipeline tests using the seedable `TestSrc` and checksumming `TestSink`
+//! (spec: Testing). No files, no sockets — this exercises the scheduler's non-IO
+//! path and verifies the data arrives with no loss, duplication, or reordering.
+
+use streamcraft_core::pipeline::Pipeline;
+use streamcraft_elements::flow::PassThrough;
+use streamcraft_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
+
+/// The digest `TestSink` should compute for the first `n` pattern bytes.
+fn expected_hash(n: u64) -> u64 {
+    let mut h = FNV_OFFSET;
+    for i in 0..n {
+        h = fold(h, pattern_byte(i));
+    }
+    h
+}
+
+#[test]
+fn testsrc_to_testsink_transports_exactly() {
+    let n = 1_000_003u64; // not a multiple of the buffer size
+    let (sink, stats) = TestSink::new();
+
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(n));
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).expect("link");
+    p.run().expect("run");
+
+    assert!(stats.is_done(), "sink saw EOS");
+    assert_eq!(stats.bytes(), n, "every byte arrived exactly once");
+    assert_eq!(stats.hash(), expected_hash(n), "content intact and in order");
+}
+
+#[test]
+fn testsrc_passthrough_testsink_matches() {
+    // A passive passthrough inlines into testsrc's group; the digest is unchanged.
+    let n = 500_009u64;
+    let (sink, stats) = TestSink::new();
+
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(n));
+    let mid = p.add(PassThrough::new());
+    let snk = p.add(sink);
+    p.link((src, "src"), (mid, "sink")).expect("link 1");
+    p.link((mid, "src"), (snk, "sink")).expect("link 2");
+    p.run().expect("run");
+
+    assert_eq!(stats.bytes(), n);
+    assert_eq!(stats.hash(), expected_hash(n));
+}
+
+#[test]
+fn empty_stream() {
+    let (sink, stats) = TestSink::new();
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(0));
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).expect("link");
+    p.run().expect("run");
+    assert!(stats.is_done());
+    assert_eq!(stats.bytes(), 0);
+    assert_eq!(stats.hash(), FNV_OFFSET, "no bytes → offset basis unchanged");
+}
