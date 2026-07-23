@@ -5,6 +5,7 @@ members = [
     "elements",
     "http",
     "flac",
+    "ogg",
     "audio",
     "video",
     "scope",

@@ -1,0 +1,17 @@
+[package]
+name = "sc-ogg"
+description = "Hand-written, dependency-free Ogg (RFC 3533) container plugin for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_ogg"
+
+[dependencies]
+# Hand-written container — the whole point is zero container/codec dependencies.
+# Only the framework's core vocabulary (buffers, batches, the element contract) is
+# pulled in, and only if/when elements are added; the reader/writer library is
+# core-independent.
+streamcraft-core = { path = "../core" }
