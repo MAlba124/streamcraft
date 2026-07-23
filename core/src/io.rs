@@ -1,16 +1,20 @@
 //! The reactor submit/complete contract (spec: IO: built for the io_uring era).
 //!
-//! Elements never touch a reactor directly. Inside `process()` they use the
-//! [`Io`] handle from `ctx.io()` to **register** files, **submit** read/write ops,
-//! and **drain completions** — the completion-shaped API the whole design hangs off.
+//! Elements never touch a reactor directly. Inside `process()` they use the [`Io`]
+//! handle from `ctx.io()` to **register** files, **submit** read/write ops, and
+//! **drain completions** — the completion-shaped API the whole design hangs off.
 //!
-//! This module ships a **synchronous, positioned-IO** [`Reactor`] backend: ops carry
-//! an explicit offset (`read_at`/`write_at`), so they are order-independent and
-//! seek-ready, and are executed by the scheduler between element passes. It is
-//! dependency-free and has no concurrency. A truly-async backend (a thread pool,
-//! then io_uring with registered buffers and one `io_uring_enter` per wakeup)
-//! replaces the executor behind this identical interface — element code is unchanged.
+//! [`Reactor`] is the backend contract. Core ships [`SyncReactor`] — a
+//! dependency-free, synchronous, positioned-IO backend (`read_at`/`write_at`),
+//! executed by the scheduler between element passes. A truly-async backend
+//! (io_uring on Linux, in `streamcraft-elements` behind a feature) implements the
+//! same trait and is injected via `Pipeline::set_reactor` — element code is
+//! unchanged. Positioned IO (explicit offsets) keeps ops order-independent and
+//! makes sources seek-ready.
 
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
 
 use crate::buffer::Buffer;
@@ -27,7 +31,7 @@ pub struct OpId(pub u64);
 pub struct FileHandle(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum OpKind {
+pub enum OpKind {
     Read,
     Write,
 }
@@ -39,7 +43,7 @@ pub enum IoResult {
     Ok(usize),
     /// The op was cancelled before it ran.
     Cancelled,
-    Err(std::io::ErrorKind),
+    Err(ErrorKind),
 }
 
 /// A finished op handed back to the submitting element (spec: IO). The buffer rides
@@ -51,15 +55,16 @@ pub struct Completion {
     pub buf: Buffer,
 }
 
-/// A submitted-but-not-yet-executed op. Internal to the reactor plumbing.
-pub(crate) struct Submission {
-    op: OpId,
-    element: ElementId,
-    kind: OpKind,
-    file: FileHandle,
-    offset: u64,
-    buf: Buffer,
-    user: u64,
+/// A submitted op, forwarded from an element's outbox to the reactor. Public so
+/// out-of-core reactor backends (e.g. io_uring) can consume it.
+pub struct Submission {
+    pub op: OpId,
+    pub element: ElementId,
+    pub kind: OpKind,
+    pub file: FileHandle,
+    pub offset: u64,
+    pub buf: Buffer,
+    pub user: u64,
 }
 
 /// The element-facing IO handle, borrowed from `Ctx` for the duration of a call.
@@ -67,7 +72,7 @@ pub(crate) struct Submission {
 /// the scheduler; completions are drained from its inbox.
 pub struct Io<'c> {
     element: ElementId,
-    registration: &'c mut Option<std::fs::File>,
+    registration: &'c mut Option<File>,
     inbox: &'c mut Vec<Completion>,
     outbox: &'c mut Vec<Submission>,
     next_op: &'c mut u64,
@@ -77,7 +82,7 @@ pub struct Io<'c> {
 impl<'c> Io<'c> {
     pub(crate) fn new(
         element: ElementId,
-        registration: &'c mut Option<std::fs::File>,
+        registration: &'c mut Option<File>,
         inbox: &'c mut Vec<Completion>,
         outbox: &'c mut Vec<Submission>,
         next_op: &'c mut u64,
@@ -93,7 +98,7 @@ impl<'c> Io<'c> {
     }
 
     /// Register a file with the reactor (at `start`), returning its handle.
-    pub fn register(&mut self, file: std::fs::File) -> FileHandle {
+    pub fn register(&mut self, file: File) -> FileHandle {
         *self.registration = Some(file);
         FileHandle(self.element.0)
     }
@@ -144,51 +149,75 @@ impl<'c> Io<'c> {
     }
 }
 
-/// The synchronous positioned-IO reactor, owned by the scheduler. Files are
+/// A reactor backend: executes submitted IO ops and returns their completions
+/// (spec: IO — the reactor is the portability boundary). The scheduler owns one.
+pub trait Reactor {
+    /// Register an element's file (called at `start`).
+    fn set_file(&mut self, element: ElementId, file: File);
+    /// Enqueue submitted ops.
+    fn submit(&mut self, subs: Vec<Submission>);
+    /// Cancel a pending op by id (flush/seek/shutdown path).
+    fn cancel(&mut self, op: OpId);
+    /// Whether the reactor is fully idle: nothing queued *and* nothing in flight.
+    /// (An async backend may have submitted ops the kernel hasn't completed yet.)
+    fn is_idle(&self) -> bool;
+    /// Make progress: execute/reap ops, returning completions tagged with the
+    /// owning element.
+    fn run_once(&mut self) -> Vec<(ElementId, Completion)>;
+}
+
+/// The default synchronous positioned-IO reactor (dependency-free). Files are
 /// registered per element; submissions execute in FIFO order on [`run_once`].
-pub struct Reactor {
-    files: Vec<Option<std::fs::File>>,
+pub struct SyncReactor {
+    files: HashMap<u32, File>,
     pending: Vec<Submission>,
     cancelled: Vec<OpId>,
 }
 
-impl Reactor {
-    pub fn new(n_elements: usize) -> Self {
+impl SyncReactor {
+    pub fn new() -> Self {
         Self {
-            files: (0..n_elements).map(|_| None).collect(),
+            files: HashMap::new(),
             pending: Vec::new(),
             cancelled: Vec::new(),
         }
     }
+}
 
-    pub fn set_file(&mut self, element: ElementId, file: std::fs::File) {
-        self.files[element.0 as usize] = Some(file);
+impl Default for SyncReactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Reactor for SyncReactor {
+    fn set_file(&mut self, element: ElementId, file: File) {
+        self.files.insert(element.0, file);
     }
 
-    pub(crate) fn submit(&mut self, subs: Vec<Submission>) {
+    fn submit(&mut self, subs: Vec<Submission>) {
         self.pending.extend(subs);
     }
 
-    /// Cancel a pending op by id (flush/seek/shutdown path).
-    pub fn cancel(&mut self, op: OpId) {
+    fn cancel(&mut self, op: OpId) {
         self.cancelled.push(op);
     }
 
-    pub fn pending_is_empty(&self) -> bool {
+    fn is_idle(&self) -> bool {
+        // The synchronous backend completes everything within run_once, so it is
+        // idle exactly when nothing is queued.
         self.pending.is_empty()
     }
 
-    /// Execute all pending ops, returning their completions tagged with the owning
-    /// element. Positioned IO, so completion order does not affect correctness.
-    pub fn run_once(&mut self) -> Vec<(ElementId, Completion)> {
+    fn run_once(&mut self) -> Vec<(ElementId, Completion)> {
         let subs = std::mem::take(&mut self.pending);
         let mut out = Vec::with_capacity(subs.len());
         for mut s in subs {
             let result = if self.cancelled.contains(&s.op) {
                 IoResult::Cancelled
             } else {
-                match self.files[s.file.0 as usize].as_ref() {
-                    None => IoResult::Err(std::io::ErrorKind::NotFound),
+                match self.files.get(&s.file.0) {
+                    None => IoResult::Err(ErrorKind::NotFound),
                     Some(f) => match s.kind {
                         OpKind::Read => match f.read_at(s.buf.memory.as_mut_full(), s.offset) {
                             Ok(n) => {

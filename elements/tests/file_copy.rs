@@ -56,6 +56,30 @@ fn copies_bytes_identically_with_flat_allocation() {
     let _ = std::fs::remove_file(&outp);
 }
 
+#[cfg(feature = "io-uring")]
+#[test]
+fn copies_bytes_identically_on_io_uring() {
+    use streamcraft_elements::io::IoUringReactor;
+
+    let inp = temp_path("uring_in");
+    let outp = temp_path("uring_out");
+    let data: Vec<u8> = (0..1_000_003u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&inp, &data).expect("write input");
+
+    let mut p = Pipeline::new();
+    p.set_reactor(Box::new(IoUringReactor::new().expect("io_uring setup")));
+    let src = p.add(FileSrc::new(&inp));
+    let sink = p.add(FileSink::new(&outp));
+    p.link((src, "src"), (sink, "sink")).expect("link");
+    p.run().expect("run");
+
+    let got = std::fs::read(&outp).expect("read output");
+    assert_eq!(got, data, "io_uring copy is byte-identical");
+
+    let _ = std::fs::remove_file(&inp);
+    let _ = std::fs::remove_file(&outp);
+}
+
 #[test]
 fn copies_empty_file() {
     let inp = temp_path("empty_in");

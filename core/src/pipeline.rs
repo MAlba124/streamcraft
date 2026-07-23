@@ -17,7 +17,7 @@ use crate::element::{Element, Flow, Template};
 use crate::error::Error;
 use crate::format::{FieldConstraint, Value};
 use crate::id::{ElementId, FormatId, GroupId, LinkId};
-use crate::io::Reactor;
+use crate::io::{Reactor, SyncReactor};
 use crate::memory::Pool;
 use crate::time::Timestamp;
 
@@ -40,6 +40,7 @@ pub struct Pipeline {
     bus: Bus,
     slot_size: usize,
     pool_slots: usize,
+    reactor: Option<Box<dyn Reactor>>,
     last_report: Option<RunReport>,
 }
 
@@ -53,8 +54,16 @@ impl Pipeline {
             bus: rx,
             slot_size: 128 * 1024,
             pool_slots: 4,
+            reactor: None,
             last_report: None,
         }
+    }
+
+    /// Install a custom IO reactor backend (e.g. io_uring). Defaults to the
+    /// dependency-free [`SyncReactor`] when unset (spec: IO — the reactor is the
+    /// portability boundary).
+    pub fn set_reactor(&mut self, reactor: Box<dyn Reactor>) {
+        self.reactor = Some(reactor);
     }
 
     // --- Topology: legal in every state (spec: Runtime configuration) ---
@@ -104,8 +113,11 @@ impl Pipeline {
             elem_to_idx[id.0 as usize] = i;
         }
 
-        let mut reactor = Reactor::new(total);
-        let result = drive(&mut chain, &mut ctxs, &order, &elem_to_idx, &mut reactor, n);
+        let mut reactor: Box<dyn Reactor> = self
+            .reactor
+            .take()
+            .unwrap_or_else(|| Box::new(SyncReactor::new()));
+        let result = drive(&mut chain, &mut ctxs, &order, &elem_to_idx, reactor.as_mut(), n);
 
         // Stop in reverse order regardless of how the drive ended.
         for i in (0..n).rev() {
@@ -256,7 +268,7 @@ fn drive(
     ctxs: &mut [Ctx],
     order: &[ElementId],
     elem_to_idx: &[usize],
-    reactor: &mut Reactor,
+    reactor: &mut dyn Reactor,
     n: usize,
 ) -> Result<(), Error> {
     // Start each element; hand any file it registered to the reactor.
@@ -312,7 +324,7 @@ fn drive(
         // Quiescent (nothing executed, no queued/in-flight work) and source done.
         if source_eos
             && !did_io
-            && reactor.pending_is_empty()
+            && reactor.is_idle()
             && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty())
         {
             break;

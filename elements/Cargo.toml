@@ -8,8 +8,11 @@ repository.workspace = true
 
 [dependencies]
 streamcraft-core = { path = "../core" }
+# Only for the io_uring reactor backend (Linux); the syscall ABI, nothing heavier.
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-# Per-element / per-reactor feature flags land here (spec: Crate layout).
-io-uring = []   # Linux io_uring reactor + sources/sinks (spec: IO)
+# A hand-rolled io_uring reactor (spec: IO). Off by default; the dependency-free
+# SyncReactor in core is the portable fallback.
+io-uring = ["dep:libc"]

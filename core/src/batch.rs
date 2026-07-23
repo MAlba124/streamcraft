@@ -8,7 +8,7 @@
 //! internals) replaces the transport later behind [`BatchRef`] / [`OutBatch`].
 
 use crate::buffer::{Buffer, BufferFlags};
-use crate::id::{FormatId, MetaId, PadId};
+use crate::id::{FormatId, MetaId};
 use crate::memory::Memory;
 use crate::time::Timestamp;
 

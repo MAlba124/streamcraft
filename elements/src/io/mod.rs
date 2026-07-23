@@ -1,11 +1,17 @@
 //! IO elements.
 //!
-//! Milestone 1 uses blocking `std::fs` IO inline on the driving thread. The
-//! io_uring / epoll reactor (spec: IO) later replaces the blocking calls behind
-//! these same elements — the element code above the submission layer is unchanged.
+//! Elements are reactor-native: they submit reads/writes through `ctx.io()` and
+//! drain completions in `process()` (spec: IO). The scheduler runs them against a
+//! [`streamcraft_core::io::Reactor`] — the dependency-free `SyncReactor` by default,
+//! or the hand-rolled [`IoUringReactor`] (Linux, `io-uring` feature) injected via
+//! `Pipeline::set_reactor`.
 
 mod filesink;
 mod filesrc;
+#[cfg(feature = "io-uring")]
+mod uring;
 
 pub use filesink::FileSink;
 pub use filesrc::FileSrc;
+#[cfg(feature = "io-uring")]
+pub use uring::IoUringReactor;
