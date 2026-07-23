@@ -10,6 +10,7 @@ use std::fs::File;
 use crate::batch::{Batch, OutBatch};
 use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
+use crate::format::FixedFormat;
 use crate::id::{ElementId, FormatId, PadId};
 use crate::io::{Completion, Io, Submission};
 use crate::memory::{Arena, Pool};
@@ -22,6 +23,12 @@ pub struct Ctx {
     bus: BusSender,
     element: ElementId,
     out_format: FormatId,
+    /// The format negotiated on each of this element's pads, indexed by local pad
+    /// index (`PadId.0` == index into `desc().pads`). `None` for an unlinked pad.
+    /// Filled once, at link time, by the pipeline — read cheaply in `start()` /
+    /// `process()` via [`negotiated`](Self::negotiated) (spec: Formats — elements read
+    /// their fixed format from `Ctx`; never negotiated per-buffer).
+    negotiated: Vec<Option<FixedFormat>>,
     credits: u32,
     // IO mailbox (spec: IO — submit/complete via ctx.io()).
     registration: Option<File>,
@@ -45,6 +52,7 @@ impl Ctx {
             bus,
             element,
             out_format,
+            negotiated: Vec::new(),
             credits,
             registration: None,
             io_in: Vec::new(),
@@ -55,6 +63,21 @@ impl Ctx {
 
     pub fn element(&self) -> ElementId {
         self.element
+    }
+
+    /// The format the pipeline fixed on `pad` at link time (spec: Formats — fixed
+    /// formats live on edges; elements read theirs here). `None` if the pad is not
+    /// linked (or the solve set no fixed fields on a bare `ANY` edge — the family is
+    /// still available via the returned format). A cheap borrow: the solve ran once at
+    /// link time, so this is never a per-buffer cost.
+    pub fn negotiated(&self, pad: PadId) -> Option<&FixedFormat> {
+        self.negotiated.get(pad.0 as usize).and_then(|f| f.as_ref())
+    }
+
+    /// Install the per-pad negotiated formats (pipeline → element, at link/`run`
+    /// setup). Indexed by local pad index.
+    pub(crate) fn set_negotiated(&mut self, formats: Vec<Option<FixedFormat>>) {
+        self.negotiated = formats;
     }
 
     /// Allocate from this element's pool (unbounded).

@@ -19,8 +19,8 @@ use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
 use crate::ctx::Ctx;
 use crate::element::{Direction, Element, Flow, SchedHint, Template};
 use crate::error::Error;
-use crate::format::{FieldConstraint, Value};
-use crate::id::{ElementId, FormatId, GroupId, LinkId};
+use crate::format::{negotiate, FieldConstraint, FixedFormat, Value};
+use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, ValueId};
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::memory::Pool;
 use crate::ring::{spsc, Consumer, Producer};
@@ -28,6 +28,17 @@ use crate::time::Timestamp;
 
 /// Milestone raw-bytes format id. Real negotiation (spec: Formats) assigns these.
 const BYTES: FormatId = FormatId(0);
+
+/// A negotiated edge: the two pads it joins (by element + local pad index) and the
+/// [`FixedFormat`] the solver fixed on it at [`link`](Pipeline::link) time (spec:
+/// Formats — fixed formats live on edges).
+struct Edge {
+    src: ElementId,
+    src_pad: usize,
+    sink: ElementId,
+    sink_pad: usize,
+    format: FixedFormat,
+}
 
 /// A summary of a finished [`Pipeline::run`], for tests and profiling.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,7 +69,13 @@ impl StopHandle {
 
 pub struct Pipeline {
     elements: Vec<Option<Box<dyn Element>>>,
-    links: Vec<(ElementId, ElementId)>,
+    edges: Vec<Edge>,
+    // The three interning domains (spec: Formats — one interner per domain). Offers
+    // declared as `&'static str` on pads are lowered through these at link time, so
+    // ids are consistent across the whole graph and the solver only ever sees `u32`s.
+    formats: Interner,
+    fields: Interner,
+    values: Interner,
     stop: Arc<AtomicBool>,
     bus_sender: BusSender,
     bus: Bus,
@@ -76,7 +93,10 @@ impl Pipeline {
         let (tx, rx) = Bus::channel();
         Self {
             elements: Vec::new(),
-            links: Vec::new(),
+            edges: Vec::new(),
+            formats: Interner::new(),
+            fields: Interner::new(),
+            values: Interner::new(),
             stop: Arc::new(AtomicBool::new(false)),
             bus_sender: tx,
             bus: rx,
@@ -114,27 +134,65 @@ impl Pipeline {
         id
     }
 
-    /// Link a src pad to a sink pad. Milestone: linear chains, single pads; pad names
-    /// are recorded but not yet validated or negotiated (spec: Formats).
+    /// Link a src pad to a sink pad, negotiating their formats (spec: Formats — the
+    /// pipeline solves the link as a constraint pass at link time). Both pads' static
+    /// offers are lowered (interned) through this pipeline's interners and intersected;
+    /// the resulting [`FixedFormat`] is stored on the edge and later handed to both
+    /// elements via [`Ctx::negotiated`](crate::ctx::Ctx::negotiated). A pad name/
+    /// direction mismatch, or an empty format intersection, is a loud error here —
+    /// never a mid-stream failure.
     pub fn link(&mut self, src: (ElementId, &str), sink: (ElementId, &str)) -> Result<LinkId, Error> {
-        self.check_pad(src.0, src.1, Direction::Src)?;
-        self.check_pad(sink.0, sink.1, Direction::Sink)?;
-        let id = LinkId(self.links.len() as u32);
-        self.links.push((src.0, sink.0));
+        let src_pad = self.check_pad(src.0, src.1, Direction::Src)?;
+        let sink_pad = self.check_pad(sink.0, sink.1, Direction::Sink)?;
+
+        // Lower both pads' string-keyed offers to id-based offers (interning family/
+        // field/value names once, here), then intersect. Descriptors are `'static`, so
+        // these borrows are fine to hold across the two lowering passes.
+        let src_desc = &self.elements[src.0 .0 as usize].as_ref().unwrap().desc().pads[src_pad];
+        let src_offers: Vec<_> = src_desc
+            .offers
+            .iter()
+            .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
+            .collect();
+        let sink_desc = &self.elements[sink.0 .0 as usize].as_ref().unwrap().desc().pads[sink_pad];
+        let sink_offers: Vec<_> = sink_desc
+            .offers
+            .iter()
+            .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
+            .collect();
+
+        let format = negotiate(&src_offers, &sink_offers).ok_or_else(|| {
+            let (sn, sp) = (self.name_of(src.0), src.1);
+            let (dn, dp) = (self.name_of(sink.0), sink.1);
+            Error::Resource(format!(
+                "link: no common format between {sn}.{sp} and {dn}.{dp} \
+                 (offers {:?} vs {:?}) — negotiation failed",
+                self.families(&src_offers),
+                self.families(&sink_offers),
+            ))
+        })?;
+
+        let id = LinkId(self.edges.len() as u32);
+        self.edges.push(Edge {
+            src: src.0,
+            src_pad,
+            sink: sink.0,
+            sink_pad,
+            format,
+        });
         Ok(id)
     }
 
-    /// Verify a named pad exists on an element with the expected direction.
-    /// (Format negotiation over the pads' offers is wired here once elements declare
-    /// them — for now offers are empty, so this checks pad name + direction.)
-    fn check_pad(&self, el: ElementId, pad: &str, dir: Direction) -> Result<(), Error> {
+    /// Verify a named pad exists on an element with the expected direction, returning
+    /// its index in the element's `desc().pads` (which is the pad's local `PadId`).
+    fn check_pad(&self, el: ElementId, pad: &str, dir: Direction) -> Result<usize, Error> {
         let e = self
             .elements
             .get(el.0 as usize)
             .and_then(|o| o.as_ref())
             .ok_or(Error::Todo("link: unknown element"))?;
-        match e.desc().pads.iter().find(|p| p.name == pad) {
-            Some(p) if p.direction == dir => Ok(()),
+        match e.desc().pads.iter().position(|p| p.name == pad) {
+            Some(i) if e.desc().pads[i].direction == dir => Ok(i),
             Some(_) => Err(Error::Resource(format!(
                 "link: pad '{pad}' on '{}' has the wrong direction",
                 e.desc().name
@@ -144,6 +202,82 @@ impl Pipeline {
                 e.desc().name
             ))),
         }
+    }
+
+    /// An element's descriptor name, for link diagnostics.
+    fn name_of(&self, el: ElementId) -> &'static str {
+        self.elements
+            .get(el.0 as usize)
+            .and_then(|o| o.as_ref())
+            .map_or("?", |e| e.desc().name)
+    }
+
+    /// The family names of a set of lowered offers, resolved back to strings for a
+    /// negotiation-failure message.
+    fn families(&self, offers: &[crate::format::FormatOffer]) -> Vec<&str> {
+        offers
+            .iter()
+            .map(|o| self.formats.resolve(o.family.0).unwrap_or("?"))
+            .collect()
+    }
+
+    /// The format negotiated on this pipeline's edges, resolved into
+    /// per-element/per-pad tables (indexed by `ElementId`, then local pad index) to
+    /// hand each element's `Ctx`. An element sees the fixed format on every one of its
+    /// linked pads. Built once at `run()` from the already-solved edges — no solving
+    /// happens here.
+    fn negotiated_by_element(&self) -> Vec<Vec<Option<FixedFormat>>> {
+        let mut per: Vec<Vec<Option<FixedFormat>>> = self
+            .elements
+            .iter()
+            .map(|e| {
+                let n = e.as_ref().map_or(0, |el| el.desc().pads.len());
+                vec![None; n]
+            })
+            .collect();
+        for edge in &self.edges {
+            if let Some(slot) = per
+                .get_mut(edge.src.0 as usize)
+                .and_then(|v| v.get_mut(edge.src_pad))
+            {
+                *slot = Some(edge.format.clone());
+            }
+            if let Some(slot) = per
+                .get_mut(edge.sink.0 as usize)
+                .and_then(|v| v.get_mut(edge.sink_pad))
+            {
+                *slot = Some(edge.format.clone());
+            }
+        }
+        per
+    }
+
+    /// The [`FixedFormat`] fixed on a link (spec: Formats — fixed formats live on
+    /// edges). Available after a successful [`link`](Self::link), for tests and dumps.
+    pub fn negotiated(&self, link: LinkId) -> Option<&FixedFormat> {
+        self.edges.get(link.0 as usize).map(|e| &e.format)
+    }
+
+    /// Resolve an interned format-family id back to its name (for dumps / tests).
+    pub fn family_name(&self, id: FormatId) -> Option<&str> {
+        self.formats.resolve(id.0)
+    }
+
+    /// Resolve an interned field id back to its name (for dumps / tests).
+    pub fn field_name(&self, id: FieldId) -> Option<&str> {
+        self.fields.resolve(id.0)
+    }
+
+    /// The id a field name interned to, if this pipeline has seen it (i.e. some linked
+    /// pad declared it). Lets a test look a negotiated field up by name.
+    pub fn field_id(&self, name: &str) -> Option<FieldId> {
+        self.fields.get(name).map(FieldId)
+    }
+
+    /// The id a categorical value name interned to, if seen. For tests asserting on a
+    /// negotiated categorical value (pixel format, sample format).
+    pub fn value_id(&self, name: &str) -> Option<ValueId> {
+        self.values.get(name).map(ValueId)
     }
 
     // --- Running (finite: drives to EOS across all group threads) ---
@@ -178,6 +312,11 @@ impl Pipeline {
         self.counters = counters.clone();
         let stop = Arc::clone(&self.stop);
 
+        // Formats fixed at link time, resolved per element so each group can install
+        // them on its elements' `Ctx`s (spec: elements read their fixed format from
+        // `Ctx`). `.take()` moves each element's table into its group thread.
+        let mut negotiated = self.negotiated_by_element();
+
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
         for (gi, ids) in groups.into_iter().enumerate() {
@@ -190,6 +329,10 @@ impl Pipeline {
             }
             let group_counters: Vec<Arc<ElementCounters>> =
                 ids.iter().map(|id| Arc::clone(&counters[id.0 as usize])).collect();
+            let group_formats: Vec<Vec<Option<FixedFormat>>> = ids
+                .iter()
+                .map(|id| std::mem::take(&mut negotiated[id.0 as usize]))
+                .collect();
             let upstream = consumers[gi].take();
             let downstream = producers[gi].take();
             let pool = pool.clone();
@@ -198,8 +341,8 @@ impl Pipeline {
             let stop = Arc::clone(&stop);
             handles.push(std::thread::spawn(move || {
                 run_group(
-                    elems, ids, upstream, downstream, factory, pool, bus, credits, group_counters,
-                    stop,
+                    elems, ids, group_formats, upstream, downstream, factory, pool, bus, credits,
+                    group_counters, stop,
                 )
             }));
         }
@@ -257,9 +400,9 @@ impl Pipeline {
         }
         let mut indeg = vec![0usize; n];
         let mut next: Vec<Option<ElementId>> = vec![None; n];
-        for (s, d) in &self.links {
-            indeg[d.0 as usize] += 1;
-            next[s.0 as usize] = Some(*d);
+        for e in &self.edges {
+            indeg[e.sink.0 as usize] += 1;
+            next[e.src.0 as usize] = Some(e.sink);
         }
         let mut start = None;
         for (i, &deg) in indeg.iter().enumerate() {
@@ -383,8 +526,14 @@ impl Pipeline {
                 }
             }
         }
-        for (src, dst) in &self.links {
-            s.push_str(&format!("  e{} -> e{};\n", src.0, dst.0));
+        for e in &self.edges {
+            // Label the edge with the negotiated family (spec: Debuggability — the
+            // dump shows, per edge, what was chosen).
+            let fam = self.formats.resolve(e.format.family.0).unwrap_or("?");
+            s.push_str(&format!(
+                "  e{} -> e{} [label=\"{fam}\"];\n",
+                e.src.0, e.sink.0
+            ));
         }
         s.push_str("}\n");
         s
@@ -417,6 +566,7 @@ impl Default for Pipeline {
 fn run_group(
     mut elements: Vec<Box<dyn Element>>,
     ids: Vec<ElementId>,
+    formats: Vec<Vec<Option<FixedFormat>>>,
     upstream: Option<Consumer<Batch>>,
     downstream: Option<Producer<Batch>>,
     factory: ReactorFactory,
@@ -434,6 +584,11 @@ fn run_group(
         .iter()
         .map(|id| Ctx::new(pool.clone(), bus.clone(), *id, BYTES, credits))
         .collect();
+    // Install each element's link-time-negotiated formats before `start()`, so an
+    // element can read `ctx.negotiated(pad)` in `start()` as well as `process()`.
+    for (ctx, per_pad) in ctxs.iter_mut().zip(formats) {
+        ctx.set_negotiated(per_pad);
+    }
 
     // Start each element; hand any file it registered to this group's reactor.
     for i in 0..m {

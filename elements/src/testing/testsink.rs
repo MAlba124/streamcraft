@@ -11,14 +11,18 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
+use streamcraft_core::format::OfferDesc;
 use streamcraft_core::time::Timestamp;
 
 use super::{fold, FNV_OFFSET};
 
+/// Consumes a raw-byte stream; matches any peer that also speaks `bytes`.
+static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+
 static PADS: [PadDesc; 1] = [PadDesc {
     name: "sink",
     direction: Direction::Sink,
-    offers: &[],
+    offers: &OFFERS,
     dynamic: false,
     validate: None,
 }];

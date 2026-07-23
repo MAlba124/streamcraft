@@ -2,7 +2,7 @@
 //! negotiation). Open vocabulary (interned ids), closed value/constraint set —
 //! intersection is a page of integer code, no backtracking search.
 
-use crate::id::{FieldId, FormatId, ValueId};
+use crate::id::{FieldId, FormatId, Interner, ValueId};
 
 /// The entire value universe. No strings, no heap — memcmp-comparable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -97,6 +97,128 @@ pub struct FormatOffer {
     pub fields: &'static [FieldConstraint],
 }
 
+// --- Static, string-keyed descriptor layer -------------------------------------
+//
+// The id-based [`FormatOffer`] above is what the solver consumes, but interned ids
+// are a *pipeline-scoped* fact (one interner per graph). Element descriptors are
+// `'static` and shared, so they cannot bake ids in. Instead a pad declares its
+// offers with `&'static str` families/fields/values — a `const`-constructible
+// mirror of the offer types — and the pipeline lowers them to id-based offers at
+// **link time** (spec: Formats — "interning happens once, in the pipeline").
+//
+// The mirror is 1:1 with `Value`/`Constraint`/`FieldConstraint`/`FormatOffer`, the
+// only difference being that every interned handle (`FormatId`, `FieldId`,
+// `ValueId`) is a string here. Lowering is a pure interning walk — no solving.
+
+/// String form of [`Value`]: categorical ids are names, resolved at link time.
+#[derive(Clone, Copy, Debug)]
+pub enum ValueDesc {
+    Int(i64),
+    Rat(i32, i32),
+    /// A categorical value (pixel format, codec profile) named for interning.
+    Id(&'static str),
+}
+
+/// String form of [`Constraint`] — the same closed algebra over [`ValueDesc`].
+#[derive(Clone, Copy, Debug)]
+pub enum ConstraintDesc {
+    Any,
+    Eq(ValueDesc),
+    Range { min: ValueDesc, max: ValueDesc, step: ValueDesc },
+    Set(&'static [ValueDesc]),
+}
+
+/// String form of [`FieldConstraint`]: the field is named, not yet interned.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldDesc {
+    pub field: &'static str,
+    pub allowed: ConstraintDesc,
+    pub preferred: Option<ValueDesc>,
+}
+
+/// String form of [`FormatOffer`] — what a [`PadDesc`](crate::element::PadDesc)
+/// declares. `const`-constructible: families/fields/values are `&'static str`, and
+/// the field table is a `&'static [FieldDesc]`.
+#[derive(Clone, Copy, Debug)]
+pub struct OfferDesc {
+    pub family: &'static str,
+    pub fields: &'static [FieldDesc],
+}
+
+impl OfferDesc {
+    /// Convenience for a pure passthrough / byte pad: match `family` with no fields
+    /// constrained, so it intersects with any other offer in the same family.
+    pub const fn any(family: &'static str) -> Self {
+        OfferDesc { family, fields: &[] }
+    }
+}
+
+impl ValueDesc {
+    /// Intern any named categorical value into a concrete [`Value`].
+    fn lower(&self, values: &mut Interner) -> Value {
+        match *self {
+            ValueDesc::Int(n) => Value::Int(n),
+            ValueDesc::Rat(n, d) => Value::Rat(n, d),
+            ValueDesc::Id(s) => Value::Id(ValueId(values.intern(s))),
+        }
+    }
+}
+
+impl ConstraintDesc {
+    fn lower(&self, values: &mut Interner) -> Constraint {
+        match *self {
+            ConstraintDesc::Any => Constraint::Any,
+            ConstraintDesc::Eq(v) => Constraint::Eq(v.lower(values)),
+            ConstraintDesc::Range { min, max, step } => Constraint::Range {
+                min: min.lower(values),
+                max: max.lower(values),
+                step: step.lower(values),
+            },
+            ConstraintDesc::Set(vs) => {
+                // `Constraint::Set` borrows `&'static [Value]`; the interned values
+                // are pipeline-lived, so we leak the lowered slice. Offers are lowered
+                // once per link (spec: solve is a link-time cost, never per-buffer), so
+                // this is bounded by the graph's edge count, not the stream.
+                let lowered: Vec<Value> = vs.iter().map(|v| v.lower(values)).collect();
+                Constraint::Set(Box::leak(lowered.into_boxed_slice()))
+            }
+        }
+    }
+}
+
+impl FieldDesc {
+    fn lower(&self, fields: &mut Interner, values: &mut Interner) -> FieldConstraint {
+        FieldConstraint {
+            field: FieldId(fields.intern(self.field)),
+            allowed: self.allowed.lower(values),
+            preferred: self.preferred.map(|v| v.lower(values)),
+        }
+    }
+}
+
+impl OfferDesc {
+    /// Lower this static, string-keyed offer to the id-based [`FormatOffer`] the
+    /// solver consumes, interning the family, every field name, and every categorical
+    /// value through the pipeline's interners. Called once per pad at link time.
+    ///
+    /// The result borrows `&'static [FieldConstraint]`: the field table is leaked, as
+    /// its interned ids are pipeline-lived and the number of offers is bounded by the
+    /// graph, not the stream.
+    pub fn lower(
+        &self,
+        formats: &mut Interner,
+        fields: &mut Interner,
+        values: &mut Interner,
+    ) -> FormatOffer {
+        let lowered: Vec<FieldConstraint> =
+            self.fields.iter().map(|f| f.lower(fields, values)).collect();
+        FormatOffer {
+            family: FormatId(formats.intern(self.family)),
+            fields: Box::leak(lowered.into_boxed_slice()),
+        }
+    }
+}
+
 /// The solve's per-edge output: flat POD, memcmp-comparable, cheap to copy into
 /// batch/edge metadata. Up to 16 fixed fields inline (spill-to-blob is TODO).
 #[derive(Clone)]
@@ -147,6 +269,13 @@ impl FixedFormat {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The fixed `(field, value)` pairs, in insertion order. For the graph dump (spec:
+    /// Debuggability — the dump shows, per edge, what was chosen) and for tests that
+    /// assert on the negotiated result.
+    pub fn fields(&self) -> &[(FieldId, Value)] {
+        &self.fields[..self.len as usize]
     }
 }
 
@@ -237,6 +366,25 @@ pub fn intersect(a: &FormatOffer, b: &FormatOffer) -> Option<FixedFormat> {
     }
 
     Some(out)
+}
+
+/// Negotiate a link between two pads that each advertise a *list* of alternative
+/// offers. Tries `src` offers against `sink` offers in declaration order and returns
+/// the [`FixedFormat`] of the first pair that intersects, or `None` if no pair is
+/// compatible (a loud `Ready`-time failure). Declaration order is the preference
+/// order — a pad lists its favourite offer first.
+///
+/// A pad with no offers matches nothing; give byte/passthrough pads a single
+/// [`OfferDesc::any`] offer so they negotiate against any peer in that family.
+pub fn negotiate(src: &[FormatOffer], sink: &[FormatOffer]) -> Option<FixedFormat> {
+    for a in src {
+        for b in sink {
+            if let Some(fixed) = intersect(a, b) {
+                return Some(fixed);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -421,5 +569,154 @@ mod tests {
         assert_eq!(f.get(FieldId(w)), Some(vi(1920)));
         assert_eq!(f.get(FieldId(h)), Some(vi(1080)));
         assert_eq!(f.get(FieldId(fmt)), Some(Value::Id(ValueId(2))));
+    }
+
+    // --- negotiate over lists of alternatives ---
+
+    #[test]
+    fn negotiate_picks_first_compatible_pair() {
+        // src prefers family 1, sink prefers family 2; the only common family is 2, so
+        // that's what negotiation must land on regardless of declaration order.
+        let src = vec![offer(1, vec![]), offer(2, vec![fc(10, Constraint::Eq(vi(48000)), None)])];
+        let sink = vec![offer(2, vec![fc(10, Constraint::Eq(vi(48000)), None)]), offer(3, vec![])];
+        let f = negotiate(&src, &sink).unwrap();
+        assert_eq!(f.family, FormatId(2));
+        assert_eq!(f.get(FieldId(10)), Some(vi(48000)));
+    }
+
+    #[test]
+    fn negotiate_prefers_earlier_offer() {
+        // Both families intersect; the first src offer that finds any sink match wins.
+        let src = vec![offer(1, vec![]), offer(2, vec![])];
+        let sink = vec![offer(2, vec![]), offer(1, vec![])];
+        assert_eq!(negotiate(&src, &sink).unwrap().family, FormatId(1));
+    }
+
+    #[test]
+    fn negotiate_none_when_disjoint() {
+        let src = vec![offer(1, vec![]), offer(2, vec![])];
+        let sink = vec![offer(3, vec![]), offer(4, vec![])];
+        assert!(negotiate(&src, &sink).is_none());
+    }
+
+    #[test]
+    fn negotiate_empty_offer_list_matches_nothing() {
+        assert!(negotiate(&[], &[offer(1, vec![])]).is_none());
+        assert!(negotiate(&[offer(1, vec![])], &[]).is_none());
+    }
+
+    // --- the string-keyed descriptor layer + lowering ---
+
+    #[test]
+    fn lower_interns_family_field_and_value() {
+        let mut fmts = Interner::new();
+        let mut flds = Interner::new();
+        let mut vals = Interner::new();
+
+        static FIELDS: [FieldDesc; 2] = [
+            FieldDesc { field: "rate", allowed: ConstraintDesc::Eq(ValueDesc::Int(48000)), preferred: None },
+            FieldDesc {
+                field: "layout",
+                allowed: ConstraintDesc::Eq(ValueDesc::Id("interleaved")),
+                preferred: None,
+            },
+        ];
+        let desc = OfferDesc { family: "audio/raw", fields: &FIELDS };
+        let lowered = desc.lower(&mut fmts, &mut flds, &mut vals);
+
+        // Family and fields interned to dense ids; the categorical value too.
+        assert_eq!(lowered.family, FormatId(fmts.get("audio/raw").unwrap()));
+        assert_eq!(lowered.fields.len(), 2);
+        assert_eq!(lowered.fields[0].field, FieldId(flds.get("rate").unwrap()));
+        assert!(matches!(lowered.fields[0].allowed, Constraint::Eq(Value::Int(48000))));
+        let layout_id = vals.get("interleaved").unwrap();
+        assert!(matches!(
+            lowered.fields[1].allowed,
+            Constraint::Eq(Value::Id(ValueId(id))) if id == layout_id
+        ));
+    }
+
+    #[test]
+    fn lower_is_consistent_across_offers() {
+        // The same names lowered twice (as two pads would) intern to the same ids, so
+        // the solver sees them as equal — the whole point of link-time interning.
+        let (mut fmts, mut flds, mut vals) = (Interner::new(), Interner::new(), Interner::new());
+        static F: [FieldDesc; 1] =
+            [FieldDesc { field: "rate", allowed: ConstraintDesc::Any, preferred: None }];
+        let a = OfferDesc { family: "audio/raw", fields: &F }.lower(&mut fmts, &mut flds, &mut vals);
+        let b = OfferDesc { family: "audio/raw", fields: &F }.lower(&mut fmts, &mut flds, &mut vals);
+        assert_eq!(a.family, b.family);
+        assert_eq!(a.fields[0].field, b.fields[0].field);
+    }
+
+    #[test]
+    fn lower_set_interns_every_value() {
+        let (mut fmts, mut flds, mut vals) = (Interner::new(), Interner::new(), Interner::new());
+        static FMTS: [ValueDesc; 3] =
+            [ValueDesc::Id("s16"), ValueDesc::Id("s24"), ValueDesc::Id("f32")];
+        static F: [FieldDesc; 1] =
+            [FieldDesc { field: "sample", allowed: ConstraintDesc::Set(&FMTS), preferred: None }];
+        let lowered =
+            OfferDesc { family: "audio/raw", fields: &F }.lower(&mut fmts, &mut flds, &mut vals);
+        let Constraint::Set(vs) = lowered.fields[0].allowed else {
+            panic!("expected a Set");
+        };
+        assert_eq!(vs.len(), 3);
+        // All three names are now interned and the lowered set carries their ids.
+        for name in ["s16", "s24", "f32"] {
+            let id = vals.get(name).expect("value interned");
+            assert!(vs.contains(&Value::Id(ValueId(id))));
+        }
+    }
+
+    /// A tiny audio negotiation solved end-to-end through the descriptor layer: two
+    /// pads' string-keyed offers, lowered through shared interners, then negotiated.
+    #[test]
+    fn descriptor_to_negotiated_audio() {
+        let (mut fmts, mut flds, mut vals) = (Interner::new(), Interner::new(), Interner::new());
+        // src: 44.1k or 48k, prefers 48k; sink: fixed 48k. Expect 48000.
+        static SRC_RATES: [ValueDesc; 2] = [ValueDesc::Int(44100), ValueDesc::Int(48000)];
+        static SRC_F: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Set(&SRC_RATES),
+            preferred: Some(ValueDesc::Int(48000)),
+        }];
+        static SINK_F: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Eq(ValueDesc::Int(48000)),
+            preferred: None,
+        }];
+        let src = [OfferDesc { family: "audio/raw", fields: &SRC_F }
+            .lower(&mut fmts, &mut flds, &mut vals)];
+        let sink = [OfferDesc { family: "audio/raw", fields: &SINK_F }
+            .lower(&mut fmts, &mut flds, &mut vals)];
+
+        let f = negotiate(&src, &sink).expect("compatible");
+        assert_eq!(f.family, FormatId(fmts.get("audio/raw").unwrap()));
+        assert_eq!(f.get(FieldId(flds.get("rate").unwrap())), Some(vi(48000)));
+    }
+
+    /// Table-driven fuzz-style regression: (src family, sink family) pairs → expected
+    /// negotiability, so a future change to `negotiate`/`intersect` that silently
+    /// widens or narrows matching trips a case here.
+    #[test]
+    fn negotiate_table() {
+        // Each row: src offer families, sink offer families, expected Some family.
+        let cases: &[(&[u32], &[u32], Option<u32>)] = &[
+            (&[1], &[1], Some(1)),
+            (&[1], &[2], None),
+            (&[1, 2], &[2, 1], Some(1)),  // first src that matches anything wins
+            (&[3, 1], &[1, 3], Some(3)),  // ...even if the shared family is listed later on sink
+            (&[1, 2, 3], &[3], Some(3)),
+            (&[], &[1], None),
+            (&[1], &[], None),
+            (&[5, 6], &[7, 8], None),
+        ];
+        for (i, (sa, sb, want)) in cases.iter().enumerate() {
+            let src: Vec<_> = sa.iter().map(|&f| offer(f, vec![])).collect();
+            let sink: Vec<_> = sb.iter().map(|&f| offer(f, vec![])).collect();
+            let got = negotiate(&src, &sink).map(|f| f.family.0);
+            assert_eq!(got, *want, "case {i}: src={sa:?} sink={sb:?}");
+        }
     }
 }

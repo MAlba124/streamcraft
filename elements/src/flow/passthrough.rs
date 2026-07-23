@@ -11,21 +11,26 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
+use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
+
+/// Forwards bytes unchanged, so both pads offer the same open `bytes` family — the
+/// passthrough negotiates against whatever its neighbours agree on.
+static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
 static PADS: [PadDesc; 2] = [
     PadDesc {
         name: "sink",
         direction: Direction::Sink,
-        offers: &[],
+        offers: &OFFERS,
         dynamic: false,
         validate: None,
     },
     PadDesc {
         name: "src",
         direction: Direction::Src,
-        offers: &[],
+        offers: &OFFERS,
         dynamic: false,
         validate: None,
     },

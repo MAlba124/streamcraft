@@ -36,6 +36,7 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
+use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -52,10 +53,14 @@ const MAX_CHUNK_LINE_BYTES: usize = 16 * 1024;
 /// How much we pull from the socket per fill when the decoder needs more input.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// Emits the downloaded body as a raw-byte stream (framing is HTTP's concern, not the
+/// pipeline's) — offer the open `bytes` family, no fields.
+static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+
 static PADS: [PadDesc; 1] = [PadDesc {
     name: "src",
     direction: Direction::Src,
-    offers: &[],
+    offers: &OFFERS,
     dynamic: false,
     validate: None,
 }];

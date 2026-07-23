@@ -5,7 +5,7 @@ use crate::batch::Inputs;
 use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::event::Event;
-use crate::format::{Constraint, FixedFormat, FormatOffer};
+use crate::format::{Constraint, FixedFormat, OfferDesc};
 use crate::time::Timestamp;
 
 pub trait Element: Send {
@@ -65,7 +65,12 @@ pub struct LatencyDesc {
 pub struct PadDesc {
     pub name: &'static str,
     pub direction: Direction,
-    pub offers: &'static [FormatOffer],
+    /// The formats this pad supports, as a static, string-keyed list of alternatives
+    /// (spec: Formats — open vocabulary). Interned to id-based
+    /// [`FormatOffer`](crate::format::FormatOffer)s and solved at *link time*, never
+    /// per-buffer. Declaration order is preference order. Empty = matches nothing;
+    /// byte/passthrough pads should offer [`OfferDesc::any`].
+    pub offers: &'static [OfferDesc],
     pub dynamic: bool,
     /// Fixation escape hatch for coupled constraints (spec: Formats).
     pub validate: Option<fn(&FixedFormat) -> bool>,

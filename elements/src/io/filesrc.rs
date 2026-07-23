@@ -13,14 +13,18 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
+use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
 use streamcraft_core::io::{FileHandle, IoResult};
 use streamcraft_core::time::Timestamp;
 
+/// A file is an untyped byte stream — offer the open `bytes` family, no fields.
+static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+
 static PADS: [PadDesc; 1] = [PadDesc {
     name: "src",
     direction: Direction::Src,
-    offers: &[],
+    offers: &OFFERS,
     dynamic: false,
     validate: None,
 }];
