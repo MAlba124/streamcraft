@@ -4,4 +4,5 @@
 //! The reference elements are kept exemplary — element authors copy the nearest one
 //! (spec: Writing elements), so the nearest one must be perfect.
 
+pub mod flow;
 pub mod io;
