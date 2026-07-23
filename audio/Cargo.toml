@@ -8,3 +8,8 @@ repository.workspace = true
 
 [dependencies]
 streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+# For the wavparse integration test and the wav -> flac milestone example.
+streamcraft-elements = { path = "../elements" }
+sc-flac = { path = "../flac" }
