@@ -61,3 +61,26 @@ fn empty_stream() {
     assert_eq!(stats.bytes(), 0);
     assert_eq!(stats.hash(), FNV_OFFSET, "no bytes → offset basis unchanged");
 }
+
+#[test]
+fn counters_track_throughput() {
+    let n = 300_007u64;
+    let (sink, _stats) = TestSink::new();
+    let mut p = Pipeline::new();
+    let src = p.add(TestSrc::new(n));
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).expect("link");
+    p.run().expect("run");
+
+    let src_c = p.counters(src);
+    let snk_c = p.counters(snk);
+    assert_eq!(src_c.bytes_out, n, "source produced exactly n bytes");
+    assert_eq!(snk_c.bytes_in, n, "sink consumed exactly n bytes");
+    assert!(src_c.buffers_out >= 1);
+    assert_eq!(
+        snk_c.buffers_in, src_c.buffers_out,
+        "sink received the same buffer count the source produced"
+    );
+    assert_eq!(src_c.bytes_in, 0, "a source has no input");
+    assert_eq!(snk_c.bytes_out, 0, "a sink has no output");
+}

@@ -42,6 +42,11 @@ impl Batch {
         self.memories.is_empty()
     }
 
+    /// Total used bytes across all buffers in the batch (for counters).
+    pub fn total_bytes(&self) -> u64 {
+        self.memories.iter().map(|m| m.len() as u64).sum()
+    }
+
     /// Clear all columns, retaining capacity (drops the `Memory`s → recycled).
     pub fn clear(&mut self) {
         self.memories.clear();

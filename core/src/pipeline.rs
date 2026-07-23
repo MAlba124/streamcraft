@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Inputs};
 use crate::bus::{Bus, BusMessage, BusSender, State};
-use crate::counters::{CounterSnapshot, LatencyReport};
+use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
 use crate::ctx::Ctx;
 use crate::element::{Element, Flow, SchedHint, Template};
 use crate::error::Error;
@@ -47,6 +47,7 @@ pub struct Pipeline {
     queue_cap: usize,
     credits: u32,
     reactor_factory: Option<ReactorFactory>,
+    counters: Vec<Arc<ElementCounters>>,
     last_report: Option<RunReport>,
 }
 
@@ -65,6 +66,7 @@ impl Pipeline {
             queue_cap: 4,
             credits: 4,
             reactor_factory: None,
+            counters: Vec::new(),
             last_report: None,
         }
     }
@@ -102,6 +104,7 @@ impl Pipeline {
         let order = self.linear_order()?;
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
+        let total = self.elements.len();
         let pool = Pool::bounded(self.slot_size, self.pool_slots as u32);
         let credits = self.credits;
         let factory: ReactorFactory = self
@@ -118,6 +121,11 @@ impl Pipeline {
             consumers[i + 1] = Some(c);
         }
 
+        // Per-element counters, shared with the app via `counters()` after run.
+        let counters: Vec<Arc<ElementCounters>> =
+            (0..total).map(|_| Arc::new(ElementCounters::default())).collect();
+        self.counters = counters.clone();
+
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
         for (gi, ids) in groups.into_iter().enumerate() {
@@ -128,13 +136,15 @@ impl Pipeline {
                     .ok_or(Error::Todo("element already consumed by a previous run"))?;
                 elems.push(el);
             }
+            let group_counters: Vec<Arc<ElementCounters>> =
+                ids.iter().map(|id| Arc::clone(&counters[id.0 as usize])).collect();
             let upstream = consumers[gi].take();
             let downstream = producers[gi].take();
             let pool = pool.clone();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             handles.push(std::thread::spawn(move || {
-                run_group(elems, ids, upstream, downstream, factory, pool, bus, credits)
+                run_group(elems, ids, upstream, downstream, factory, pool, bus, credits, group_counters)
             }));
         }
 
@@ -302,8 +312,11 @@ impl Pipeline {
         todo!("spec: Latency")
     }
 
-    pub fn counters(&self, _el: ElementId) -> CounterSnapshot {
-        todo!("spec: Debuggability — per-element counters")
+    pub fn counters(&self, el: ElementId) -> CounterSnapshot {
+        self.counters
+            .get(el.0 as usize)
+            .map(|c| c.snapshot())
+            .unwrap_or_default()
     }
 }
 
@@ -328,6 +341,7 @@ fn run_group(
     pool: Pool,
     bus: BusSender,
     credits: u32,
+    counters: Vec<Arc<ElementCounters>>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_none();
@@ -361,6 +375,7 @@ fn run_group(
                 // Nothing to do but wait for input — block (no busy spin).
                 match up.pop() {
                     Some(mut batch) => {
+                        counters[0].record_in(batch.len() as u64, batch.total_bytes());
                         ctxs[0].input_append(&mut batch);
                         progressed = true;
                     }
@@ -368,6 +383,7 @@ fn run_group(
                 }
             } else {
                 while let Some(mut batch) = up.try_pop() {
+                    counters[0].record_in(batch.len() as u64, batch.total_bytes());
                     ctxs[0].input_append(&mut batch);
                     progressed = true;
                 }
@@ -399,8 +415,14 @@ fn run_group(
                     break;
                 }
             }
+            let (nbuf, nbytes) = {
+                let out = ctxs[i].output_mut();
+                (out.len() as u64, out.total_bytes())
+            };
+            counters[i].record_out(nbuf, nbytes);
             reactor.submit(ctxs[i].take_submissions());
             if i + 1 < m {
+                counters[i + 1].record_in(nbuf, nbytes);
                 let (left, right) = ctxs.split_at_mut(i + 1);
                 right[0].input_append(left[i].output_mut());
             }
