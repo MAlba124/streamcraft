@@ -10,12 +10,24 @@ use std::fs::File;
 use crate::batch::{Batch, OutBatch};
 use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
-use crate::format::FixedFormat;
+use crate::format::{FixedFormat, ValueDesc};
 use crate::id::{ElementId, FormatId, PadId};
 use crate::io::{Completion, Io, Submission};
 use crate::log::{Field, Level, Log, Loggable};
 use crate::memory::{Arena, Pool};
 use crate::time::Timestamp;
+
+/// A runtime format announcement queued by an element via [`Ctx::announce_format`]. The
+/// scheduler drains it after `process()`, interns it against the (frozen) pipeline tables
+/// into a [`FixedFormat`], and rides it downstream as an
+/// [`Event::FormatChange`](crate::event::Event::FormatChange) so the peer re-fixates its
+/// edge (spec: Formats — dynamic caps).
+pub(crate) struct Announcement {
+    #[allow(dead_code)] // which src pad announced — used once multi-src pads land
+    pub(crate) pad: PadId,
+    pub(crate) family: &'static str,
+    pub(crate) fields: Vec<(&'static str, ValueDesc)>,
+}
 
 pub struct Ctx {
     pool: Pool,
@@ -44,6 +56,10 @@ pub struct Ctx {
     /// channel is a `Send`-clean refinement — the SPSC `Producer` is `Send` but not
     /// `Sync`, so one sink per `Ctx` keeps `Ctx: Send` without sharing a producer.)
     log: Option<Log>,
+    /// A pending runtime format announcement (spec: Formats — dynamic caps). Set by
+    /// [`announce_format`](Self::announce_format), drained by the scheduler after
+    /// `process()`. `None` on the hot path for the overwhelming majority of elements.
+    announced: Option<Announcement>,
 }
 
 impl Ctx {
@@ -68,6 +84,7 @@ impl Ctx {
             io_out: Vec::new(),
             next_op: 0,
             log: None,
+            announced: None,
         }
     }
 
@@ -96,6 +113,43 @@ impl Ctx {
     /// setup). Indexed by local pad index.
     pub(crate) fn set_negotiated(&mut self, formats: Vec<Option<FixedFormat>>) {
         self.negotiated = formats;
+    }
+
+    /// Announce a runtime output format on `pad` (spec: Formats — dynamic caps). For an
+    /// element whose output format is data-dependent — a decoder learning rate/channels
+    /// from a header, a demuxer discovering a stream. `family` and the field names must be
+    /// ones this pad already offered (they resolve against the link-time interned tables);
+    /// the values are runtime. The scheduler turns this into a `FormatChange` that rides
+    /// downstream, and the peer reads the concrete format via
+    /// [`negotiated`](Self::negotiated). Cheap and rare — announce on change, not per
+    /// buffer.
+    pub fn announce_format(
+        &mut self,
+        pad: PadId,
+        family: &'static str,
+        fields: &[(&'static str, ValueDesc)],
+    ) {
+        self.announced = Some(Announcement {
+            pad,
+            family,
+            fields: fields.to_vec(),
+        });
+    }
+
+    /// Drain a pending announcement (scheduler hook, after `process()`).
+    pub(crate) fn take_announcement(&mut self) -> Option<Announcement> {
+        self.announced.take()
+    }
+
+    /// Update the negotiated format on a single pad at runtime, when a `FormatChange`
+    /// crosses the edge (pipeline → element). Grows the table if needed (spec: Formats —
+    /// dynamic caps).
+    pub(crate) fn set_negotiated_one(&mut self, pad: PadId, format: FixedFormat) {
+        let i = pad.0 as usize;
+        if self.negotiated.len() <= i {
+            self.negotiated.resize(i + 1, None);
+        }
+        self.negotiated[i] = Some(format);
     }
 
     /// Allocate from this element's pool (unbounded).

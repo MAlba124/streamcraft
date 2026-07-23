@@ -19,8 +19,9 @@ use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
 use crate::ctx::Ctx;
 use crate::element::{Direction, Element, Flow, SchedHint, Template};
 use crate::error::Error;
-use crate::format::{negotiate, FieldConstraint, FixedFormat, Value};
-use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, ValueId};
+use crate::event::Event;
+use crate::format::{negotiate, FieldConstraint, FixedFormat, Value, ValueDesc};
+use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, PadId, ValueId};
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::log::{log_channel, Level, LevelFilter, Log, LogDrain};
 use crate::memory::Pool;
@@ -39,6 +40,39 @@ struct Edge {
     sink: ElementId,
     sink_pad: usize,
     format: FixedFormat,
+}
+
+/// A read-only snapshot of the pipeline's interning tables, shared with each group thread
+/// so an element can resolve the `&'static` names it announces at runtime into a
+/// [`FixedFormat`] (spec: Formats — dynamic caps). Built once at `run()`, after linking has
+/// frozen the tables; never mutated on a streaming thread.
+struct Interners {
+    formats: Interner,
+    fields: Interner,
+    values: Interner,
+}
+
+impl Interners {
+    /// Resolve a string-keyed announcement into a [`FixedFormat`]. `None` if the family or
+    /// any field/categorical name was never interned (the element announced something it
+    /// never offered), so a bogus format is never fixed.
+    fn build_fixed(
+        &self,
+        family: &str,
+        fields: &[(&'static str, ValueDesc)],
+    ) -> Option<FixedFormat> {
+        let mut fixed = FixedFormat::new(FormatId(self.formats.get(family)?));
+        for (name, vd) in fields {
+            let field = FieldId(self.fields.get(name)?);
+            let value = match vd {
+                ValueDesc::Int(n) => Value::Int(*n),
+                ValueDesc::Rat(n, d) => Value::Rat(*n, *d),
+                ValueDesc::Id(s) => Value::Id(ValueId(self.values.get(s)?)),
+            };
+            fixed.set(field, value);
+        }
+        Some(fixed)
+    }
 }
 
 /// A summary of a finished [`Pipeline::run`], for tests and profiling.
@@ -344,6 +378,15 @@ impl Pipeline {
         // `Ctx`). `.take()` moves each element's table into its group thread.
         let mut negotiated = self.negotiated_by_element();
 
+        // A read-only snapshot of the (now frozen) interners, shared into every group so an
+        // element can resolve the names it announces at runtime (spec: Formats — dynamic
+        // caps). Cloning is a one-time, off-hot-path cost.
+        let interners = Arc::new(Interners {
+            formats: self.formats.clone(),
+            fields: self.fields.clone(),
+            values: self.values.clone(),
+        });
+
         // Logging (spec: Debuggability — Logging cont'd). Build the level filter once
         // from the programmatic level and `STREAMCRAFT_DEBUG`, then, *only if some level
         // is actually enabled*, wire one log channel per element and one low-priority
@@ -378,10 +421,11 @@ impl Pipeline {
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
+            let interners = Arc::clone(&interners);
             handles.push(std::thread::spawn(move || {
                 run_group(
                     elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
-                    bus, credits, group_counters, stop,
+                    bus, credits, group_counters, stop, interners,
                 )
             }));
         }
@@ -736,6 +780,28 @@ impl LogDrainThread {
     }
 }
 
+/// Deliver a batch's in-band events to the group's head element (spec: Events travel with
+/// buffers). A `FormatChange` first updates the head's negotiated format on its sink pad —
+/// so the element sees the new format via `ctx.negotiated()` inside `event()` and its next
+/// `process()` — then the event is handed to `event()` (spec: Formats — dynamic caps).
+/// Runs once per received batch, off the per-buffer path.
+fn deliver_events(
+    elem: &mut dyn Element,
+    ctx: &mut Ctx,
+    sink_pad: Option<PadId>,
+    events: Vec<Event>,
+) -> Result<(), Error> {
+    for ev in events {
+        if let Event::FormatChange(f) = &ev {
+            if let Some(pad) = sink_pad {
+                ctx.set_negotiated_one(pad, f.clone());
+            }
+        }
+        elem.event(ctx, &ev)?;
+    }
+    Ok(())
+}
+
 /// One thread group's run loop (spec: Scheduling — a group runs on one thread). The
 /// group is `[active_head, passive_tail...]`; the head pulls from the upstream ring
 /// (unless it is the source) and the tail runs inline; the last element's output goes
@@ -755,9 +821,22 @@ fn run_group(
     credits: u32,
     counters: Vec<Arc<ElementCounters>>,
     stop: Arc<AtomicBool>,
+    interners: Arc<Interners>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_none();
+    // The head element's sink pad (the one the upstream ring feeds), so a FormatChange's
+    // re-fixation lands on the right pad (spec: Formats — dynamic caps).
+    let head_sink_pad: Option<PadId> = if is_source {
+        None
+    } else {
+        elements[0]
+            .desc()
+            .pads
+            .iter()
+            .position(|p| p.direction == Direction::Sink)
+            .map(|i| PadId(i as u32))
+    };
     let mut reactor: Box<dyn Reactor> =
         factory().map_err(|e| Error::Resource(format!("reactor init: {e}")))?;
     let mut ctxs: Vec<Ctx> = ids
@@ -790,7 +869,7 @@ fn run_group(
     let mut source_eos = false;
     let mut upstream_closed = false;
 
-    let result: Result<(), Error> = loop {
+    let result: Result<(), Error> = 'group: loop {
         // Cooperative cancellation: break, then stop + drop downstream, which closes
         // the ring and cascades the stop to the next group.
         if stop.load(Ordering::Acquire) {
@@ -808,7 +887,13 @@ fn run_group(
                 match up.pop() {
                     Some(mut batch) => {
                         counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                        let events = batch.take_events();
                         ctxs[0].input_append(&mut batch);
+                        if let Err(e) =
+                            deliver_events(&mut *elements[0], &mut ctxs[0], head_sink_pad, events)
+                        {
+                            break 'group Err(e);
+                        }
                         progressed = true;
                     }
                     None => upstream_closed = true,
@@ -816,7 +901,13 @@ fn run_group(
             } else {
                 while let Some(mut batch) = up.try_pop() {
                     counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    let events = batch.take_events();
                     ctxs[0].input_append(&mut batch);
+                    if let Err(e) =
+                        deliver_events(&mut *elements[0], &mut ctxs[0], head_sink_pad, events)
+                    {
+                        break 'group Err(e);
+                    }
                     progressed = true;
                 }
                 if closed {
@@ -847,6 +938,13 @@ fn run_group(
                     break;
                 }
             }
+            // Dynamic caps: if the element announced a runtime output format, attach a
+            // FormatChange to its output batch so the peer re-fixates (spec: Formats).
+            if let Some(ann) = ctxs[i].take_announcement() {
+                if let Some(f) = interners.build_fixed(ann.family, &ann.fields) {
+                    ctxs[i].output_mut().push_event(Event::FormatChange(f));
+                }
+            }
             let (nbuf, nbytes) = {
                 let out = ctxs[i].output_mut();
                 (out.len() as u64, out.total_bytes())
@@ -866,10 +964,10 @@ fn run_group(
         // C. Push the last element's output downstream (blocking backpressure).
         if let Some(down) = &downstream {
             let out = std::mem::replace(ctxs[m - 1].output_mut(), Batch::new(BYTES));
-            if !out.is_empty() {
+            if !out.is_inert() {
                 progressed = true;
                 if down.push(out).is_err() {
-                    break Ok(()); // downstream gone
+                    break 'group Ok(()); // downstream gone
                 }
             }
         } else {

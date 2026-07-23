@@ -33,6 +33,11 @@ pub struct GroupId(pub u32);
 ///
 /// Interning is idempotent: the same string always maps to the same id, and ids are
 /// dense (`0..len`), so they double as indices into side tables.
+///
+/// `Clone` is used at `run()` to hand each group thread a read-only snapshot of the
+/// (by then frozen) interners, so an element can resolve the names it announces at
+/// runtime without touching the pipeline's live tables (spec: Formats — dynamic caps).
+#[derive(Clone)]
 pub struct Interner {
     map: HashMap<Box<str>, u32>,
     names: Vec<Box<str>>,

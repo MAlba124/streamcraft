@@ -8,6 +8,7 @@
 //! internals) replaces the transport later behind [`BatchRef`] / [`OutBatch`].
 
 use crate::buffer::{Buffer, BufferFlags};
+use crate::event::Event;
 use crate::id::{FormatId, MetaId};
 use crate::memory::Memory;
 use crate::time::Timestamp;
@@ -20,6 +21,11 @@ pub struct Batch {
     pub durations: Vec<Timestamp>,
     pub flags: Vec<BufferFlags>,
     pub metas: Vec<Option<MetaRef>>,
+    /// In-band events riding with this span, delivered to the downstream element's
+    /// `event()` at the batch boundary *before* its buffers (spec: Events travel with
+    /// buffers through the same queues). A `FormatChange` here is how a decoder announces
+    /// a runtime format to its peer (spec: Formats — dynamic caps). Usually empty.
+    pub events: Vec<Event>,
 }
 
 impl Batch {
@@ -31,6 +37,7 @@ impl Batch {
             durations: Vec::new(),
             flags: Vec::new(),
             metas: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -54,6 +61,7 @@ impl Batch {
         self.durations.clear();
         self.flags.clear();
         self.metas.clear();
+        self.events.clear();
     }
 
     /// Append one buffer, decomposing it into the SoA columns.
@@ -83,13 +91,31 @@ impl Batch {
         })
     }
 
-    /// Move all buffers out of `other` (leaving it empty) onto the end of `self`.
+    /// Move all buffers out of `other` (leaving it empty) onto the end of `self`,
+    /// carrying its in-band events too so they stay ordered with the data.
     pub fn append(&mut self, other: &mut Batch) {
         self.memories.append(&mut other.memories);
         self.pts.append(&mut other.pts);
         self.durations.append(&mut other.durations);
         self.flags.append(&mut other.flags);
         self.metas.append(&mut other.metas);
+        self.events.append(&mut other.events);
+    }
+
+    /// Attach an in-band event to this span (spec: Events travel with buffers).
+    pub fn push_event(&mut self, event: Event) {
+        self.events.push(event);
+    }
+
+    /// Take the in-band events off this batch, leaving it data-only.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Whether this batch carries no buffers *and* no events (so pushing it downstream
+    /// would be a no-op).
+    pub fn is_inert(&self) -> bool {
+        self.memories.is_empty() && self.events.is_empty()
     }
 
     pub fn view(&self) -> BatchRef<'_> {
