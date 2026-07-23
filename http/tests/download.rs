@@ -8,9 +8,9 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+use sc_http::HttpSrc;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_elements::io::FileSink;
-use streamcraft_elements::net::HttpSrc;
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

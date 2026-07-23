@@ -1247,12 +1247,15 @@ integration test and benchmark the day it works.
    Forces: buffer/pool, batches, the scheduler's minimal loop, EOS, bus.
    Pass: byte-identical output; zero allocations in steady state (pool counters
    prove it); throughput within ~2× of `cp`.
-2. **Download a video file** — `httpsrc url=… ! filesink`.
-   Forces: the reactor (io_uring source + sink sharing one ring), submission
-   credits/backpressure, cancellation (Ctrl-C mid-download must cancel cleanly),
-   error reporting on the bus (DNS failure, 404, reset).
-   Forces nothing clock-related — deliberately: network before clocks.
-   Pass: saturates a fast local link with near-zero CPU; clean abort at any moment.
+2. **Download a video file** — `httpsrc url=… ! filesink`.  Forces: the reactor (io_uring source +
+   sink sharing one ring), submission credits/backpressure, cancellation (Ctrl-C mid-download must
+   cancel cleanly), error reporting on the bus (DNS failure, 404, reset).  Forces nothing
+   clock-related — deliberately: network before clocks.  Pass: saturates a fast local link with
+   near-zero CPU; clean abort at any moment.  The HTTP source should be completely custom and
+   dependency free and all the parser and stuff should be really fast and tailored to SC's
+   architecture. Since this is the first spec SC implements make sure to download the RFCs
+   used. Start with HTTP 1.1? This should be a separate plugin since we'll eventually add TLS which
+   we need a library for... sadly :(
 3. **Convert wav to flac** — `filesrc ! wavparse ! flacenc ! filesink`.
    Forces: format negotiation (solver picks sample format/rate across the chain),
    the `-audio` helper crate, non-live throughput mode (no clock waits, maximal
@@ -1267,10 +1270,11 @@ integration test and benchmark the day it works.
    report, underrun handling.
    Pass: hours of playback with zero underruns and no drift; pause/resume is
    glitch-free; `latency_report()` matches measured output delay.
-5. **Play a video file (no audio)** — `filesrc ! mkvdemux ! vp9dec ! videosink`
+   Also make a pipewiresink.
+5. **Play a video file (no audio)** — `filesrc ! mkvdemux ! vp8dec ! videosink`
    (raw-video bring-up first: `filesrc ! rawvideoparse ! videosink`, which needs no
    decoder and isolates the sink/clock path).
-   Forces: the first hand-written video decoder (`sc-vp9`) producing frames straight
+   Forces: the first hand-written video decoder (`sc-vp8`) producing frames straight
    into pool memory, dynamic pads from the demuxer, video sink rendering on clock
    deadlines, QoS (late-frame dropping visible as bus observations).
    Pass: smooth playback at native rate; artificial CPU starvation degrades via

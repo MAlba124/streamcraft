@@ -1,0 +1,18 @@
+[package]
+name = "sc-http"
+description = "Hand-written, dependency-free HTTP/1.1 source plugin for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_http"
+
+[dependencies]
+# std-only networking — no HTTP/networking crate. Kept a separate plugin so the
+# eventual TLS dependency (for https) never leaks into the framework crates.
+streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
