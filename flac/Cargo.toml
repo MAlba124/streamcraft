@@ -1,0 +1,20 @@
+[package]
+name = "sc-flac"
+description = "Hand-written, dependency-free FLAC (RFC 9639) codec plugin for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_flac"
+
+[dependencies]
+# Hand-written codec — the whole point is zero codec/DSP dependencies. Only the
+# framework's core vocabulary (buffers, batches, the element contract) is pulled in.
+streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+# Only for the end-to-end element test (filesrc ! flacenc ! filesink); the library
+# itself depends on core alone.
+streamcraft-elements = { path = "../elements" }

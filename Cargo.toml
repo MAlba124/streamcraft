@@ -4,6 +4,7 @@ members = [
     "core",
     "elements",
     "http",
+    "flac",
     "audio",
     "video",
     "scope",
