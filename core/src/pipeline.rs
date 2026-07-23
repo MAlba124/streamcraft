@@ -868,6 +868,7 @@ fn run_group(
 
     let mut source_eos = false;
     let mut upstream_closed = false;
+    let mut eos_delivered = false;
 
     let result: Result<(), Error> = 'group: loop {
         // Cooperative cancellation: break, then stop + drop downstream, which closes
@@ -990,6 +991,19 @@ fn run_group(
         let quiescent = reactor.is_idle()
             && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty());
         if head_done && quiescent {
+            if !eos_delivered {
+                // Deliver EOS to every element so a sink can drain its device buffer and a
+                // muxer can flush its final packet (spec: Events — EOS reaches elements'
+                // `event()`). Then loop once more so any output the flush produced is
+                // pushed downstream before dropping `downstream` closes the ring.
+                eos_delivered = true;
+                for i in 0..m {
+                    if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Eos) {
+                        break 'group Err(e);
+                    }
+                }
+                continue;
+            }
             // Stamped on the group's head element (spec: Debuggability). Gated out at
             // zero cost unless Trace is enabled, so it never touches the hot path.
             crate::log!(&ctxs[0], Level::Trace, "group_done", is_source = is_source);
