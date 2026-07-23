@@ -1022,12 +1022,84 @@ impl Pipeline {
 
 ### Logging cont'd
 
+Logging is the third face of the observability plane (with **counters** and the **bus**),
+and it obeys the same rule they do: *observation never perturbs what it observes.* That
+single constraint settles most of the design.
+
+**Logs are not graph buffers.** The tempting dogfood — logs flowing to a `logsink`
+element — is rejected: emitting from inside `process()` cannot produce into a pad, cross a
+ring, and obey backpressure without coupling diagnostics to scheduling, adding allocation,
+and risking reentrancy on the hot path. Performance is #1; the emit path must be near-free
+and non-blocking. What the "logsink" instinct gets right is *reuse of IO* — honored below
+at the drain, not the source.
+
+**Emission goes through `Ctx`.** It already carries the element's interned `ElementId`, the
+group clock, and the group's log ring, and it is the one object handed to every element
+method — so it is the natural, allocation-free home. Elements never touch a global logger,
+consistent with "exactly one thread ever calls you."
+
+```rust
+// Free when the level is off: the macro tests a relaxed atomic before it
+// evaluates a single argument, and can be compiled out entirely per category.
+log!(ctx, Debug, EV_HEADER_PARSED, len = n, codec = FOURCC_FLAC);
+
+// What actually gets written is a fixed-size POD record, never a string:
+#[repr(C)]
+pub struct LogRecord {
+    ts: Timestamp,       // one cheap monotonic clock read at emit
+    element: ElementId,  // interned; filtering is integer compare, not regex
+    event: EventId,      // interns a &'static str into the static event catalog
+    level: Level,
+    fields: [Field; 4],  // typed POD: ints, interned-str ids, fourccs, …
+}
+```
+
+**Text lives in a static event catalog, formatted at the consumer.** `EventId` indexes a
+`&'static` table (the same trick as `PropDesc`) holding the human message template and field
+schema; humanization happens in the sink, never on the streaming thread. This is what makes
+filtering exact and cheap — the "structured truth instead of log soup" the inspector
+promises — and makes messages greppable, versioned, and translatable as data. Arbitrary
+runtime strings on a hot path are a smell; prefer an event id plus typed fields.
+
+**Transport is a per-group SPSC ring, drained out-of-band, drop-don't-block.** The streaming
+thread writes one POD record into its group's ring (the same ring primitive used
+everywhere); a low-priority drain consumes it. Ring full → drop and bump a `logs_dropped`
+counter — blocking a streaming thread to log would violate the latency guarantee, so we
+never do. Per-group order is preserved by the ring; the drain merges groups by `ts` for a
+global view. No global lock, no shared buffer on the hot path.
+
+**The drain reuses the Reactor and the introspection protocol — this is where "same IO as
+elements" is honored.** Drained records are just another frame type on the introspection
+channel scraft-scope already consumes (its Events-and-logs panel and the MCP `tail_logs`
+tool). A file drain writes through the same io_uring/sync `Reactor` elements use — but it is
+a framework-owned drain task, *not* a graph node. Reuse the IO machinery, not the graph.
+
+**Levels and targets** match the Debuggability bullet above: per-element runtime-adjustable
+levels behind a relaxed atomic, `STREAMCRAFT_DEBUG=element:level` env syntax, plus
+compile-time category gating to drop whole classes from the binary. A default **stderr
+drain** (one line in `main`) formats records for humans in dev; production swaps in the
+file/socket/null drain — same records, different sink. An optional `tracing`/perfetto bridge
+lives in a **non-core helper crate**, so core keeps its zero-dependency vow.
+
+**Framework internals log too.** Code without a `Ctx` (the scheduler, a reactor) obtains a
+lightweight `Log` handle for the current group directly, so pipeline plumbing shares the same
+records and transport.
+
+**Bus vs. logs — the one boundary to hold.** Logs, counters, and the bus share vocabulary
+(interned ids) and transport (the introspection protocol) but differ in *drop semantics*,
+and conflating them is the mistake to avoid: **counters** are aggregates; the **bus** carries
+semantics the application acts on (EOS, errors, state changes) and therefore **must not
+drop**; **logs** are high-rate diagnostics and **may drop**. The "logs like a sink" instinct
+blurs exactly this line — hence a separate, droppable log ring rather than a bus message or a
+graph buffer.
+
 <experimental>
-Should the `Ctx` take care of logging? Logging should be super light weight. Should logging be
-similar to other buffers where we can have sinks (e.g. logsink) that accepts logs and the framework
-provides insanely light weight logging facilities? E.g. a filelogsink could use the same IO things
-as other elements? Food for thought. This section is still WIP so please fill in or push back on
-this.
+Open sub-decision: cold events (an error, a URL) occasionally need a variable-length payload
+the fixed `LogRecord` can't hold. Two candidates — a small bounded inline string field on the
+record (simple, but wastes space on the common path) versus a side scratch-arena the record
+references by `(offset, len)` that the drain resolves before the arena recycles (zero
+hot-path waste, more moving parts). Leaning toward the side-arena, since keeping hot records
+small and cache-dense matters more than a little drain-side bookkeeping — but this is unsettled.
 </experimental>
 
 ### Introspection protocol and scraft-scope (the inspector)
