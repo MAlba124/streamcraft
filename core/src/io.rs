@@ -149,8 +149,15 @@ impl<'c> Io<'c> {
     }
 }
 
+/// Builds a reactor. Each thread group creates its own on its own thread, so the
+/// factory is `Send + Sync` but the reactors it produces need not be `Send`
+/// (io_uring holds thread-bound rings/pointers). Spec: IO — the reactor is the
+/// portability boundary, one per thread group.
+pub type ReactorFactory =
+    std::sync::Arc<dyn Fn() -> std::io::Result<Box<dyn Reactor>> + Send + Sync>;
+
 /// A reactor backend: executes submitted IO ops and returns their completions
-/// (spec: IO — the reactor is the portability boundary). The scheduler owns one.
+/// (spec: IO — the reactor is the portability boundary). Each thread group owns one.
 pub trait Reactor {
     /// Register an element's file (called at `start`).
     fn set_file(&mut self, element: ElementId, file: File);

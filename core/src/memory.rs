@@ -59,14 +59,30 @@ impl Pool {
         (self.inner.max_slots as u64).saturating_sub(outstanding) as u32
     }
 
-    /// Like [`acquire`](Self::acquire) but respects the cap: `None` when full.
+    /// Like [`acquire`](Self::acquire) but respects the cap: `None` when full. The
+    /// cap check and the `outstanding` bump happen under the free-list lock, so
+    /// concurrent acquirers can never collectively exceed `max_slots`.
     pub fn try_acquire(&self) -> Option<Memory> {
-        if self.free_slots() == 0 {
-            // Even at the cap, a recycled buffer may be sitting free; but outstanding
-            // already accounts for those not yet dropped, so a zero cap means full.
-            return None;
-        }
-        Some(self.acquire())
+        let mut free = self.inner.free.lock().unwrap();
+        let buf = match free.pop() {
+            Some(b) => b,
+            None => {
+                if self.inner.outstanding.load(Ordering::Relaxed) >= self.inner.max_slots as u64 {
+                    return None;
+                }
+                self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
+                vec![0u8; self.inner.slot_size].into_boxed_slice()
+            }
+        };
+        self.inner.acquires.fetch_add(1, Ordering::Relaxed);
+        let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.high_water.fetch_max(now, Ordering::Relaxed);
+        drop(free);
+        Some(Memory {
+            buf: Some(buf),
+            len: 0,
+            pool: Arc::clone(&self.inner),
+        })
     }
 
     /// Take a slot from the free-list, or heap-allocate one on a miss.
@@ -110,9 +126,13 @@ impl Clone for Pool {
 impl PoolInner {
     fn recycle(&self, buf: Box<[u8]>) {
         self.recycles.fetch_add(1, Ordering::Relaxed);
+        let keep = buf.len() == self.slot_size;
+        // Decrement outstanding under the free-list lock so it stays consistent with
+        // try_acquire's cap check.
+        let mut free = self.free.lock().unwrap();
         self.outstanding.fetch_sub(1, Ordering::Relaxed);
-        if buf.len() == self.slot_size {
-            self.free.lock().unwrap().push(buf);
+        if keep {
+            free.push(buf);
         }
     }
 }

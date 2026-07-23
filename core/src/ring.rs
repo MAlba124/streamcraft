@@ -194,6 +194,12 @@ impl<T> Consumer<T> {
         Some(val)
     }
 
+    /// Whether the producer has been dropped (the ring may still hold undrained
+    /// items — keep calling [`try_pop`](Self::try_pop) until it returns `None`).
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
     /// Blocking pop. Blocks while empty; `None` once the producer is gone *and* the
     /// ring has drained.
     pub fn pop(&self) -> Option<T> {

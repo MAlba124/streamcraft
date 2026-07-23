@@ -35,12 +35,12 @@ fn copies_bytes_identically_with_flat_allocation() {
     // recycles, so the buffer count never grows with file size.
     let report = p.last_report().expect("report");
     assert!(
-        report.pool_slot_allocations <= 4,
+        report.pool_slot_allocations <= 64,
         "payload buffers bounded by the pool cap, got {}",
         report.pool_slot_allocations
     );
     assert!(
-        report.pool_high_water <= 4,
+        report.pool_high_water <= 64,
         "never more than the pool cap live at once, got {}",
         report.pool_high_water
     );
@@ -67,7 +67,9 @@ fn copies_bytes_identically_on_io_uring() {
     std::fs::write(&inp, &data).expect("write input");
 
     let mut p = Pipeline::new();
-    p.set_reactor(Box::new(IoUringReactor::new().expect("io_uring setup")));
+    p.set_reactor_factory(std::sync::Arc::new(|| {
+        Ok(Box::new(IoUringReactor::new()?) as Box<dyn streamcraft_core::io::Reactor>)
+    }));
     let src = p.add(FileSrc::new(&inp));
     let sink = p.add(FileSink::new(&outp));
     p.link((src, "src"), (sink, "sink")).expect("link");

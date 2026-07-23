@@ -1,27 +1,31 @@
 //! The pipeline: owns topology, lifecycle, clock, latency (spec: The pipeline API).
 //! Elements arrive already constructed — `pipeline.add(FileSrc::new(path))`.
 //!
-//! Milestone 1 implements a **single-threaded, reactor-driven linear scheduler**: a
-//! chain of elements (source → … → sink) driven inline, with IO going through the
-//! reactor (submit → execute → complete). Each round: every element processes
-//! (draining its IO completions, consuming its input, emitting output and/or new IO
-//! submissions), the reactor executes queued ops, and completions are routed back.
-//! Thread groups, real queues, and an async/io_uring reactor (spec: Scheduling, IO)
-//! replace the internals later; `play()` / `step()` grow from the same loop.
+//! Milestone 1 → thread-group scheduler (spec: Scheduling and threading): the linear
+//! chain is split into **groups** at active-element boundaries; each group runs on
+//! its own thread (an active head element followed by any inline passive elements),
+//! with a lock-free SPSC ring queue at each boundary and its own reactor. Passive
+//! chains run inline as function calls; real queues exist only between groups. For an
+//! all-active chain (e.g. `filesrc ! filesink`) this yields one thread per element
+//! with a ring between them.
 
-use crate::batch::Inputs;
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use crate::batch::{Batch, Inputs};
 use crate::bus::{Bus, BusMessage, BusSender, State};
 use crate::counters::{CounterSnapshot, LatencyReport};
 use crate::ctx::Ctx;
-use crate::element::{Element, Flow, Template};
+use crate::element::{Element, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::format::{FieldConstraint, Value};
 use crate::id::{ElementId, FormatId, GroupId, LinkId};
-use crate::io::{Reactor, SyncReactor};
+use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::memory::Pool;
+use crate::ring::{spsc, Consumer, Producer};
 use crate::time::Timestamp;
 
-/// Milestone-1 raw-bytes format id. Real negotiation (spec: Formats) assigns these.
+/// Milestone raw-bytes format id. Real negotiation (spec: Formats) assigns these.
 const BYTES: FormatId = FormatId(0);
 
 /// A summary of a finished [`Pipeline::run`], for tests and profiling.
@@ -40,7 +44,9 @@ pub struct Pipeline {
     bus: Bus,
     slot_size: usize,
     pool_slots: usize,
-    reactor: Option<Box<dyn Reactor>>,
+    queue_cap: usize,
+    credits: u32,
+    reactor_factory: Option<ReactorFactory>,
     last_report: Option<RunReport>,
 }
 
@@ -53,17 +59,21 @@ impl Pipeline {
             bus_sender: tx,
             bus: rx,
             slot_size: 128 * 1024,
-            pool_slots: 4,
-            reactor: None,
+            // Sized so the ring (queue_cap batches) is the binding backpressure, not
+            // the pool — the source blocks on a full ring, never spins on the pool.
+            pool_slots: 64,
+            queue_cap: 4,
+            credits: 4,
+            reactor_factory: None,
             last_report: None,
         }
     }
 
-    /// Install a custom IO reactor backend (e.g. io_uring). Defaults to the
-    /// dependency-free [`SyncReactor`] when unset (spec: IO — the reactor is the
-    /// portability boundary).
-    pub fn set_reactor(&mut self, reactor: Box<dyn Reactor>) {
-        self.reactor = Some(reactor);
+    /// Install a per-thread-group reactor factory (e.g. io_uring). Each group thread
+    /// calls it to build its own reactor. Defaults to the dependency-free
+    /// [`SyncReactor`] (spec: IO — the reactor is the portability boundary).
+    pub fn set_reactor_factory(&mut self, factory: ReactorFactory) {
+        self.reactor_factory = Some(factory);
     }
 
     // --- Topology: legal in every state (spec: Runtime configuration) ---
@@ -75,8 +85,8 @@ impl Pipeline {
         id
     }
 
-    /// Link a src pad to a sink pad. Milestone 1: linear chains, single pads; pad
-    /// names are recorded but not yet validated or negotiated (spec: Formats).
+    /// Link a src pad to a sink pad. Milestone: linear chains, single pads; pad names
+    /// are recorded but not yet validated or negotiated (spec: Formats).
     pub fn link(&mut self, src: (ElementId, &str), sink: (ElementId, &str)) -> Result<LinkId, Error> {
         let _ = (src.1, sink.1);
         let id = LinkId(self.links.len() as u32);
@@ -84,44 +94,66 @@ impl Pipeline {
         Ok(id)
     }
 
-    // --- Running (milestone 1: finite, drives to EOS) ---
+    // --- Running (finite: drives to EOS across all group threads) ---
 
-    /// Start the chain, drive it to EOS, and stop it. Returns after the source is
-    /// exhausted and all IO has drained through the sink.
+    /// Start the chain, drive it to EOS, and stop it. Spawns one thread per group,
+    /// joins them all, and returns the first error (if any).
     pub fn run(&mut self) -> Result<(), Error> {
         let order = self.linear_order()?;
-        let n = order.len();
-        let total = self.elements.len();
+        let groups = self.compute_groups(&order)?;
+        let ng = groups.len();
         let pool = Pool::bounded(self.slot_size, self.pool_slots as u32);
-        let credits = self.pool_slots as u32;
+        let credits = self.credits;
+        let factory: ReactorFactory = self
+            .reactor_factory
+            .clone()
+            .unwrap_or_else(|| Arc::new(|| Ok(Box::new(SyncReactor::new()) as Box<dyn Reactor>)));
 
-        let mut chain: Vec<Box<dyn Element>> = Vec::with_capacity(n);
-        for id in &order {
-            let el = self.elements[id.0 as usize]
-                .take()
-                .ok_or(Error::Todo("element already consumed by a previous run"))?;
-            chain.push(el);
-        }
-        let mut ctxs: Vec<Ctx> = order
-            .iter()
-            .map(|id| Ctx::new(pool.clone(), self.bus_sender.clone(), *id, BYTES, credits))
-            .collect();
-
-        // element id -> index in the ordered chain (for routing completions).
-        let mut elem_to_idx = vec![0usize; total];
-        for (i, id) in order.iter().enumerate() {
-            elem_to_idx[id.0 as usize] = i;
+        // Rings between consecutive groups: ring i connects group i → group i+1.
+        let mut producers: Vec<Option<Producer<Batch>>> = (0..ng).map(|_| None).collect();
+        let mut consumers: Vec<Option<Consumer<Batch>>> = (0..ng).map(|_| None).collect();
+        for i in 0..ng.saturating_sub(1) {
+            let (p, c) = spsc::<Batch>(self.queue_cap);
+            producers[i] = Some(p);
+            consumers[i + 1] = Some(c);
         }
 
-        let mut reactor: Box<dyn Reactor> = self
-            .reactor
-            .take()
-            .unwrap_or_else(|| Box::new(SyncReactor::new()));
-        let result = drive(&mut chain, &mut ctxs, &order, &elem_to_idx, reactor.as_mut(), n);
+        // Spawn a thread per group.
+        let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
+        for (gi, ids) in groups.into_iter().enumerate() {
+            let mut elems: Vec<Box<dyn Element>> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let el = self.elements[id.0 as usize]
+                    .take()
+                    .ok_or(Error::Todo("element already consumed by a previous run"))?;
+                elems.push(el);
+            }
+            let upstream = consumers[gi].take();
+            let downstream = producers[gi].take();
+            let pool = pool.clone();
+            let bus = self.bus_sender.clone();
+            let factory = Arc::clone(&factory);
+            handles.push(std::thread::spawn(move || {
+                run_group(elems, ids, upstream, downstream, factory, pool, bus, credits)
+            }));
+        }
 
-        // Stop in reverse order regardless of how the drive ended.
-        for i in (0..n).rev() {
-            chain[i].stop(&mut ctxs[i]);
+        // Join all groups; keep the first error.
+        let mut first_err = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(Error::Todo("group thread panicked"));
+                    }
+                }
+            }
         }
 
         let s = pool.stats();
@@ -131,12 +163,12 @@ impl Pipeline {
             buffers: s.acquires,
         });
 
-        match result {
-            Ok(()) => {
+        match first_err {
+            None => {
                 self.bus_sender.send(BusMessage::Eos);
                 Ok(())
             }
-            Err(e) => {
+            Some(e) => {
                 self.bus_sender.send(BusMessage::Error {
                     element: ElementId(u32::MAX),
                     error: e.clone(),
@@ -151,7 +183,7 @@ impl Pipeline {
         self.last_report
     }
 
-    /// Order the elements into a single source→sink chain (milestone 1 topology).
+    /// Order the elements into a single source→sink chain (milestone topology).
     fn linear_order(&self) -> Result<Vec<ElementId>, Error> {
         let n = self.elements.len();
         if n == 0 {
@@ -188,6 +220,25 @@ impl Pipeline {
             return Err(Error::Todo("disconnected graph (not a single chain)"));
         }
         Ok(order)
+    }
+
+    /// Split the ordered chain into thread groups: a new group begins at each active
+    /// element; passive elements inline into the current group (spec: Scheduling).
+    fn compute_groups(&self, order: &[ElementId]) -> Result<Vec<Vec<ElementId>>, Error> {
+        let mut groups: Vec<Vec<ElementId>> = Vec::new();
+        for &id in order {
+            let sched = self.elements[id.0 as usize]
+                .as_ref()
+                .ok_or(Error::Todo("element already consumed"))?
+                .desc()
+                .sched;
+            if groups.is_empty() || matches!(sched, SchedHint::Active) {
+                groups.push(vec![id]);
+            } else {
+                groups.last_mut().unwrap().push(id);
+            }
+        }
+        Ok(groups)
     }
 
     // --- State and clock: pause is a clock op, not a state (TODO: later steps) ---
@@ -262,74 +313,147 @@ impl Default for Pipeline {
     }
 }
 
-/// The reactor-driven linear drive loop (spec: Scheduling — minimal scheduler).
-fn drive(
-    chain: &mut [Box<dyn Element>],
-    ctxs: &mut [Ctx],
-    order: &[ElementId],
-    elem_to_idx: &[usize],
-    reactor: &mut dyn Reactor,
-    n: usize,
+/// One thread group's run loop (spec: Scheduling — a group runs on one thread). The
+/// group is `[active_head, passive_tail...]`; the head pulls from the upstream ring
+/// (unless it is the source) and the tail runs inline; the last element's output goes
+/// to the downstream ring. Backpressure is the blocking ring push; the group parks on
+/// the upstream ring when idle. Its reactor serves the group's IO.
+#[allow(clippy::too_many_arguments)]
+fn run_group(
+    mut elements: Vec<Box<dyn Element>>,
+    ids: Vec<ElementId>,
+    upstream: Option<Consumer<Batch>>,
+    downstream: Option<Producer<Batch>>,
+    factory: ReactorFactory,
+    pool: Pool,
+    bus: BusSender,
+    credits: u32,
 ) -> Result<(), Error> {
-    // Start each element; hand any file it registered to the reactor.
-    for i in 0..n {
-        chain[i].start(&mut ctxs[i])?;
+    let m = elements.len();
+    let is_source = upstream.is_none();
+    let mut reactor: Box<dyn Reactor> =
+        factory().map_err(|e| Error::Resource(format!("reactor init: {e}")))?;
+    let mut ctxs: Vec<Ctx> = ids
+        .iter()
+        .map(|id| Ctx::new(pool.clone(), bus.clone(), *id, BYTES, credits))
+        .collect();
+
+    // Start each element; hand any file it registered to this group's reactor.
+    for i in 0..m {
+        elements[i].start(&mut ctxs[i])?;
         if let Some(f) = ctxs[i].take_registration() {
-            reactor.set_file(order[i], f);
+            reactor.set_file(ids[i], f);
         }
     }
 
     let mut source_eos = false;
-    let mut guard: u64 = 0;
-    const GUARD_MAX: u64 = 1 << 40;
+    let mut upstream_closed = false;
 
-    loop {
-        guard += 1;
-        if guard > GUARD_MAX {
-            return Err(Error::Todo("scheduler failed to make progress"));
+    let result: Result<(), Error> = loop {
+        let mut progressed = false;
+
+        // A. Feed the head from upstream (non-source groups only).
+        if let Some(up) = &upstream {
+            let closed = up.is_closed();
+            let head_idle =
+                ctxs[0].input_is_empty() && ctxs[0].inbox_empty() && reactor.is_idle();
+            if !closed && head_idle {
+                // Nothing to do but wait for input — block (no busy spin).
+                match up.pop() {
+                    Some(mut batch) => {
+                        ctxs[0].input_append(&mut batch);
+                        progressed = true;
+                    }
+                    None => upstream_closed = true,
+                }
+            } else {
+                while let Some(mut batch) = up.try_pop() {
+                    ctxs[0].input_append(&mut batch);
+                    progressed = true;
+                }
+                if closed {
+                    upstream_closed = true;
+                }
+            }
         }
 
-        // One pass: each element processes, then its output moves to the next input.
-        for i in 0..n {
-            let flow = if i == 0 {
-                chain[0].process(&mut ctxs[0], Inputs::empty())?
+        // B. Run the group's elements inline (head active, passive tail).
+        let mut fatal = None;
+        for i in 0..m {
+            let flow = if i == 0 && is_source {
+                elements[0].process(&mut ctxs[0], Inputs::empty())
             } else {
                 let mut input = ctxs[i].take_input();
-                let f = chain[i].process(&mut ctxs[i], Inputs::owned(&mut input))?;
-                ctxs[i].set_input(input); // any unconsumed input persists
+                let f = elements[i].process(&mut ctxs[i], Inputs::owned(&mut input));
+                ctxs[i].set_input(input);
                 f
             };
-            if i == 0 && matches!(flow, Flow::Eos) {
-                source_eos = true;
+            match flow {
+                Ok(fl) => {
+                    if i == 0 && is_source && matches!(fl, Flow::Eos) {
+                        source_eos = true;
+                    }
+                }
+                Err(e) => {
+                    fatal = Some(e);
+                    break;
+                }
             }
-
-            let subs = ctxs[i].take_submissions();
-            reactor.submit(subs);
-
-            if i + 1 < n {
+            reactor.submit(ctxs[i].take_submissions());
+            if i + 1 < m {
                 let (left, right) = ctxs.split_at_mut(i + 1);
                 right[0].input_append(left[i].output_mut());
-            } else {
-                ctxs[i].output_mut().clear(); // sink produces nothing
+            }
+        }
+        if let Some(e) = fatal {
+            break Err(e);
+        }
+
+        // C. Push the last element's output downstream (blocking backpressure).
+        if let Some(down) = &downstream {
+            let out = std::mem::replace(ctxs[m - 1].output_mut(), Batch::new(BYTES));
+            if !out.is_empty() {
+                progressed = true;
+                if down.push(out).is_err() {
+                    break Ok(()); // downstream gone
+                }
+            }
+        } else {
+            ctxs[m - 1].output_mut().clear();
+        }
+
+        // D. Drive this group's reactor and route completions back to their elements.
+        let completions = reactor.run_once();
+        if !completions.is_empty() {
+            progressed = true;
+        }
+        for (elem, c) in completions {
+            if let Some(idx) = ids.iter().position(|e| *e == elem) {
+                ctxs[idx].deliver_completion(c);
             }
         }
 
-        // Execute queued IO and route completions back to their elements.
-        let completions = reactor.run_once();
-        let did_io = !completions.is_empty();
-        for (elem, c) in completions {
-            ctxs[elem_to_idx[elem.0 as usize]].deliver_completion(c);
+        // E. Termination: the head is finished and nothing is buffered or in flight.
+        let head_done = if is_source { source_eos } else { upstream_closed };
+        let quiescent = reactor.is_idle()
+            && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty());
+        if head_done && quiescent {
+            break Ok(());
         }
 
-        // Quiescent (nothing executed, no queued/in-flight work) and source done.
-        if source_eos
-            && !did_io
-            && reactor.is_idle()
-            && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty())
-        {
-            break;
+        // Safety net against a pathological busy-spin (the pool is sized so the ring
+        // is the real backpressure, so this should be rare): yield if a whole pass
+        // made no progress.
+        if !progressed {
+            std::thread::yield_now();
         }
+    };
+
+    // Stop elements (reverse). Dropping `downstream` here closes the ring, signalling
+    // EOS to the next group.
+    for i in (0..m).rev() {
+        elements[i].stop(&mut ctxs[i]);
     }
-
-    Ok(())
+    drop(downstream);
+    result
 }
