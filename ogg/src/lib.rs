@@ -37,25 +37,34 @@
 //!   skip forward to the next `OggS` (§6). Truncated tails are held (streaming) or
 //!   reported as leftover ([`OggReader::finish`]).
 //!
+//! ## streamcraft elements
+//! - [`OggDemux`] / [`OggMux`] — **single logical bitstream** container elements wrapping
+//!   the reader/writer above ([`element`]). `OggDemux` turns an Ogg byte stream into one
+//!   codec packet per output buffer (first bos serial only); `OggMux` wraps one input
+//!   buffer per packet into an Ogg byte stream, terminating it with an eos page. Both are
+//!   passive byte→byte transforms with static `bytes` pads, matching today's pad model.
+//!
 //! ## Not yet
-//! - **streamcraft elements** (`OggMux` / `OggDemux`): deferred. A demuxer needs one
-//!   dynamic src pad *per discovered logical stream* and a muxer one dynamic sink pad
-//!   per input stream; the milestone-1 [`Element`](streamcraft_core::element::Element)
-//!   pad model is static (`PadDesc { dynamic: false, .. }`) and the scheduler has no
-//!   per-stream pad add/remove yet. Following how `sc-flac` shipped the codec core
-//!   before element polish, the tested reader/writer **library** is the deliverable;
-//!   elements land once the core grows dynamic pads. The library is
-//!   framework-independent (depends on `streamcraft-core` only nominally) and drops
-//!   straight into an element wrapper when that exists.
+//! - **Multi-stream elements**: the demuxer emits only the *first* logical bitstream and
+//!   the muxer accepts only *one* input stream. The general case wants one dynamic src pad
+//!   *per discovered logical stream* (demux) and one dynamic sink pad per input (mux); the
+//!   milestone-1 [`Element`](streamcraft_core::element::Element) pad model is static
+//!   (`PadDesc { dynamic: false, .. }`) and the scheduler has no per-stream pad add/remove
+//!   yet. Following how `sc-flac` shipped the codec core before element polish, the
+//!   single-stream elements ship now; the multi-stream ones land once the core grows
+//!   dynamic pads. The reader/writer library already demuxes/muxes every serial, so the
+//!   dynamic-pad wrapper is the only missing piece.
 
 #![deny(unsafe_code)]
 
 pub mod crc;
+pub mod element;
 pub mod page;
 pub mod reader;
 pub mod writer;
 
 pub use crc::{crc32, Crc32};
+pub use element::{OggDemux, OggMux, DEFAULT_SERIAL};
 pub use page::{
     flags as header_flags, page_crc, write_page, PageError, PageHeader, CAPTURE_PATTERN,
     GRANULE_NONE, HEADER_FIXED_LEN, MAX_PAGE_SIZE, MAX_SEGMENTS, STREAM_STRUCTURE_VERSION,
