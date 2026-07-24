@@ -17,6 +17,8 @@ members = [
     "scope",
     "pipewire",
     "opus",
+    "mp3",
+    "mp4",
     "wayland",
     "launch",
 ]
