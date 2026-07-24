@@ -34,7 +34,21 @@ pub(crate) struct Announcement {
 pub struct Ctx {
     pool: Pool,
     input: Batch,
-    out: Batch,
+    /// Per-src-pad output batches, indexed by local pad index (`PadId.0`). An element
+    /// with one src pad uses a single slot; a branching element (a demuxer) writes each
+    /// src pad's buffers to its own slot and the scheduler routes each to that pad's
+    /// downstream ring (spec: dynamic pads / branching). Grown on demand, so a
+    /// runtime-added pad is writable immediately.
+    outs: Vec<Batch>,
+    /// The src pad whose batch [`output_mut`](Self::output_mut) returns — the element's
+    /// first src pad (a sink has none, so the slot is a harmless always-empty scratch).
+    /// Set by [`configure_pads`](Self::configure_pads) at run setup.
+    primary_out: usize,
+    /// `Some(idx)` when the element has exactly one src pad: then `ctx.out(pad)` routes
+    /// there regardless of the `pad` argument, preserving the pre-branching contract (one
+    /// output, pad ignored). `None` for a branching element (≥2 src pads), where `out`
+    /// routes strictly by pad, and for a sink (no src pad).
+    single_src: Option<usize>,
     bus: BusSender,
     element: ElementId,
     out_format: FormatId,
@@ -85,7 +99,9 @@ impl Ctx {
     ) -> Self {
         Self {
             input: Batch::new(out_format),
-            out: Batch::new(out_format),
+            outs: Vec::new(),
+            primary_out: 0,
+            single_src: None,
             pool,
             bus,
             element,
@@ -226,9 +242,11 @@ impl Ctx {
         }
     }
 
-    /// SoA writer into this element's output batch.
-    pub fn out(&mut self, _pad: PadId) -> OutBatch<'_> {
-        OutBatch::new(&mut self.out)
+    /// SoA writer into the output batch for `pad` (spec: Elements and pads — an element
+    /// writes each src pad independently). Grows the per-pad table on demand, so a
+    /// runtime-added pad is writable immediately.
+    pub fn out(&mut self, pad: PadId) -> OutBatch<'_> {
+        OutBatch::new(self.out_batch(pad))
     }
 
     /// The reactor submit/complete handle (spec: IO).
@@ -281,8 +299,61 @@ impl Ctx {
 
     // --- Scheduler hooks (crate-internal) ---
 
+    /// Raw per-pad output slot, indexed strictly by `pad` and grown on demand. The
+    /// scheduler's explicit per-pad routing uses this; the public [`out`](Self::out) goes
+    /// through [`out_batch`](Self::out_batch), which adds the single-src-pad leniency.
+    fn out_slot(&mut self, pad: PadId) -> &mut Batch {
+        let i = pad.0 as usize;
+        if self.outs.len() <= i {
+            self.outs.resize_with(i + 1, || Batch::new(self.out_format));
+        }
+        &mut self.outs[i]
+    }
+
+    /// The batch a public `out(pad)` writes to. For a single-src-pad element every write
+    /// lands on that one pad regardless of the `pad` argument (the pre-branching contract
+    /// — pad ignored); a branching element routes strictly by `pad`.
+    fn out_batch(&mut self, pad: PadId) -> &mut Batch {
+        let pad = match self.single_src {
+            Some(idx) => PadId(idx as u32),
+            None => pad,
+        };
+        self.out_slot(pad)
+    }
+
+    /// Size the per-pad output table to this element's pad count and record its src pads
+    /// (spec: dynamic pads / branching). `primary_out` is the first src pad (used by
+    /// [`output_mut`](Self::output_mut)); `single_src` is set when there is exactly one,
+    /// so `out()` keeps the pre-branching "pad ignored" contract. Called once at run
+    /// setup, before `start()`. A sink (no src pad) gets `primary_out = 0`, a scratch.
+    pub(crate) fn configure_pads(&mut self, npads: usize, src_pads: &[usize]) {
+        self.outs = (0..npads).map(|_| Batch::new(self.out_format)).collect();
+        self.primary_out = src_pads.first().copied().unwrap_or(0);
+        self.single_src = if src_pads.len() == 1 { Some(src_pads[0]) } else { None };
+    }
+
+    /// The element's primary output batch (its first src pad). Used by the scheduler for
+    /// the single-downstream push and intra-group hand-off.
     pub(crate) fn output_mut(&mut self) -> &mut Batch {
-        &mut self.out
+        self.out_slot(PadId(self.primary_out as u32))
+    }
+
+    /// The output batch for a specific src pad (the scheduler's per-pad routing).
+    pub(crate) fn output_on(&mut self, pad: PadId) -> &mut Batch {
+        self.out_slot(pad)
+    }
+
+    /// Take (replace with empty) the output batch for a src pad, to route it downstream.
+    pub(crate) fn take_output(&mut self, pad: PadId) -> Batch {
+        let fmt = self.out_format;
+        std::mem::replace(self.out_slot(pad), Batch::new(fmt))
+    }
+
+    /// Total buffers and used bytes across all src pads (for counters).
+    pub(crate) fn total_output(&self) -> (u64, u64) {
+        self.outs
+            .iter()
+            .fold((0u64, 0u64), |(n, b), o| (n + o.len() as u64, b + o.total_bytes()))
     }
 
     pub(crate) fn take_input(&mut self) -> Batch {

@@ -866,6 +866,19 @@ fn run_group(
         .iter()
         .map(|id| Ctx::new(pool.clone(), bus.clone(), *id, BYTES, credits))
         .collect();
+    // Size each Ctx's per-pad output table and record its primary (first) src pad, so
+    // `ctx.out(pad)` routes per pad and the scheduler can pull each src pad's output for
+    // its downstream ring (spec: dynamic pads / branching).
+    for (ctx, elem) in ctxs.iter_mut().zip(elements.iter()) {
+        let pads = elem.desc().pads;
+        let src_pads: Vec<usize> = pads
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.direction == Direction::Src)
+            .map(|(i, _)| i)
+            .collect();
+        ctx.configure_pads(pads.len(), &src_pads);
+    }
     // Install each element's link-time-negotiated formats before `start()`, so an
     // element can read `ctx.negotiated(pad)` in `start()` as well as `process()`.
     for (ctx, per_pad) in ctxs.iter_mut().zip(formats) {
