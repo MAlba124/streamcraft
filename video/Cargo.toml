@@ -8,3 +8,6 @@ repository.workspace = true
 
 [dependencies]
 streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
