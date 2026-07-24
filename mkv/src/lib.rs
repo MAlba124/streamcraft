@@ -66,12 +66,13 @@
 //!   pad. Multi-track wants one dynamic sink pad per input plus fan-in on the core side (a
 //!   documented follow-up, mirroring `sc-ogg`'s single-stream `OggMux`). The **demux** side
 //!   is already multi-track (one dynamic src pad per discovered track).
-//! - **Video *mux* element**: the writer muxes a `V_VP8` (etc.) track today
-//!   ([`TrackConfig::video`]), but [`MkvMux`] is FLAC-oriented. A `V_VP8` mux element is a
-//!   naming-only wrapper over the same writer — deferred with the multi-track element above.
-//! - **Codec-init via caps**: audio params + `CodecPrivate` are constructor arguments for
-//!   now. Carrying codec-init-data through a negotiated `FixedFormat` config blob is the
-//!   clean future path (see [`element`] docs).
+//! - **Remux of av1 / h264 / h265**: [`MkvMux::from_caps`] muxes announced `flac` (CodecPrivate
+//!   absorbed from the in-band head), `vp8` and `vp9` tracks today; `av1` needs an `av1C`
+//!   CodecPrivate and the NAL codecs need Annex B → length-prefixed reframing + a config
+//!   record — both loud errors at the announcement until built (see [`element`] docs).
+//! - **Frame-preserving demux emission**: a frame larger than the demuxer's pool slot is
+//!   emitted split, which a downstream muxer would write as several blocks; remuxing such
+//!   streams needs `Pipeline::set_element_pool` sizing today.
 //! - **Seeking metadata**: no Cues/SeekHead — a streaming muxer does not need them, and
 //!   `finalize` stays seek-free; the demuxer walks Clusters linearly. A later two-pass /
 //!   index-driven mode can add them.
@@ -98,18 +99,17 @@ use streamcraft_core::registry::Registry;
 /// Register this crate's elements for name-based lookup (spec: Plugins — `--list` and
 /// descriptor introspection). Typed `use` + constructor stays the primary path.
 ///
-/// **Neither element is constructible by name yet.** Both descriptors carry `make_default:
-/// None`, so [`Registry::parse`](streamcraft_core::registry::Registry::parse) cannot build
-/// them — by design: `MkvMux` needs the track config (CodecID/CodecPrivate/audio params) and
-/// `MkvDemux` needs the stream **header bytes** at construction (see [`MkvDemux::new`]), and
-/// neither has a sensible zero-arg default while codec-init negotiation and autoplug are still
-/// being built. Registration exposes the `mkvmux`/`mkvdemux` descriptors for `--list`/help and
-/// descriptor queries until autoplug lands and can supply those inputs.
+/// **`mkvmux` is constructible by name** (its `make_default` is the caps-driven
+/// [`MkvMux::from_caps`], configured by the upstream announcement — the remux path).
+/// `mkvdemux` still carries `make_default: None`: it needs the stream **header bytes** at
+/// construction (see [`MkvDemux::new`]), which a zero-arg default cannot supply until
+/// preroll-time header capture / autoplug lands; registration exposes its descriptor for
+/// `--list`/help and descriptor queries meanwhile.
 ///
-/// The `&'static ElementDesc`s are taken from throwaway instances (a bare `MkvDemux` over an
-/// empty header, a FLAC `MkvMux`) — only `desc()` is called, so the instances are dropped.
+/// The `&'static ElementDesc`s are taken from throwaway instances — only `desc()` is
+/// called, so the instances are dropped.
 pub fn register(registry: &mut Registry) {
-    registry.register(MkvMux::flac(Vec::new(), 0.0, 0, 0).desc());
+    registry.register(MkvMux::from_caps().desc());
     registry.register(MkvDemux::new(Vec::new()).desc());
 }
 
@@ -117,14 +117,18 @@ pub fn register(registry: &mut Registry) {
 mod tests {
     use super::*;
 
-    /// `register` exposes both elements under their descriptor names; neither is
-    /// name-constructible (both carry `make_default: None`).
+    /// `register` exposes both elements under their descriptor names. `mkvmux` is
+    /// name-constructible (the caps-driven [`MkvMux::from_caps`] default — the remux
+    /// path); `mkvdemux` is not (it needs the stream header bytes at construction).
     #[test]
     fn register_exposes_both_elements() {
         let mut reg = Registry::new();
         register(&mut reg);
         assert_eq!(reg.names(), vec!["mkvdemux", "mkvmux"], "both descriptors registered");
-        assert!(reg.get("mkvmux").unwrap().make_default.is_none(), "mkvmux not name-constructible");
+        assert!(
+            reg.get("mkvmux").unwrap().make_default.is_some(),
+            "mkvmux is name-constructible (caps-driven default)"
+        );
         assert!(reg.get("mkvdemux").unwrap().make_default.is_none(), "mkvdemux not name-constructible");
     }
 }

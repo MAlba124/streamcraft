@@ -7,30 +7,41 @@
 //! **passive transform**: encoded frames in, MKV bytes out, inlining into the upstream
 //! group like `sc-ogg`'s `OggMux`.
 //!
-//! Both pads carry raw [`bytes`](streamcraft_core::format::OfferDesc::any): encoded codec
-//! frames on the sink side, a Matroska byte stream on the src side — matching `OggMux` so
-//! an MKV muxer links to a codec/de-framer element at link time without a typed vocabulary.
+//! The **sink pad offers every family it can mux** (plus a `bytes` fallback for the
+//! constructed path) with the field/value names those announcements carry — a consumer
+//! that *reads* announced fields must declare them, since a pad's offers are what interns
+//! the names the upstream's announcement resolves against (spec: Formats — dynamic caps;
+//! a wildcard pad would admit everything but intern nothing). The src pad stays raw
+//! [`bytes`](streamcraft_core::format::OfferDesc::any) — a Matroska byte stream.
 //!
-//! ## Codec-init data (out-of-band, for now)
-//! The `CodecPrivate` (FLAC `fLaC` + STREAMINFO) and the audio params are supplied at
-//! **construction** ([`MkvMux::flac`]), because format negotiation of codec-init blobs is
-//! still being built. The clean future path is to carry the init data through the
-//! **negotiated caps** — a `FixedFormat` config blob the upstream codec/parse element
-//! announces (spec: Formats — dynamic caps; the same mechanism `flacdec` uses to announce
-//! rate/channels). The element would then read `ctx.negotiated(sink)` in `start()` and
-//! build the header from it, needing no constructor arguments. Until that lands, the
-//! constructor arguments are the pragmatic bridge (exactly how `sc-flac`'s encoder took
-//! audio params before negotiation existed).
+//! ## Track config: negotiated (remux) or constructed
+//! Two ways to know the track:
+//! - **[`MkvMux::from_caps`]** (the registry default): configured by the upstream runtime
+//!   announcement (spec: dynamic caps) — `vp8`/`vp9` → a `V_VP8`/`V_VP9` video track with
+//!   the announced `width`/`height`; `flac` → an `A_FLAC` track whose `CodecPrivate` *is*
+//!   the native head (`fLaC` + metadata blocks, RFC 9559 A_FLAC mapping) absorbed from the
+//!   leading in-band bytes — exactly what `MkvDemux`/`flacenc` emit first — with the audio
+//!   params parsed out of STREAMINFO (RFC 9639 §8.2). This is what makes
+//!   `mkvdemux ! mkvmux` a working remux. Families we cannot yet mux conformantly are a
+//!   loud error at the announcement: `av1` (needs an `av1C` CodecPrivate extracted from
+//!   the Sequence Header OBU) and `h264/h265` (arrive as Annex B, but Matroska wants
+//!   length-prefixed NALs + a config record) — both documented follow-ups.
+//! - **[`MkvMux::flac`] / [`MkvMux::with_track`]**: explicit construction, for producers
+//!   that announce nothing (a bare byte pipeline).
 //!
 //! ## The header, and one frame per input buffer
-//! `start()` (re)creates the writer; the **header is emitted lazily on the first frame**
-//! (so a stream with no frames produces no partial file, and the writer's track config is
-//! fixed before any block). Each input buffer is one encoded frame → one `SimpleBlock`
-//! (spec `§simpleblock`); its bytes are pushed downstream chunked to the pool slot, exactly
-//! like `OggMux`. Timestamps come from the buffer PTS (falling back to a synthesised cadence
-//! when absent — a container needs *a* timeline, and a byte pipeline carries no PTS yet).
-//! Every FLAC frame is independently decodable, so every block is flagged a keyframe unless
-//! the buffer clears [`BufferFlags::KEYFRAME`].
+//! The **header is emitted lazily on the first frame** (so a stream with no frames
+//! produces no partial file, and the track config is fixed before any block). Each input
+//! buffer is one encoded frame → one `SimpleBlock` (spec `§simpleblock`); its bytes are
+//! pushed downstream chunked to the pool slot, exactly like `OggMux`. **A frame larger
+//! than the upstream's pool slot arrives split and would mux as several blocks** — for
+//! remuxing, size the demuxer's pool to the largest frame
+//! (`Pipeline::set_element_pool`); a frame-preserving emission mode is the documented
+//! follow-up. Timestamps come from the buffer PTS (falling back to a synthesised cadence
+//! when absent). A block is a keyframe unless the buffer is tagged
+//! [`BufferFlags::DELTA`] — untagged means "unknown", and every FLAC frame is
+//! independently decodable, so keyframe is the right default; a demuxed video track
+//! arrives explicitly tagged either way.
 //!
 //! ## EOS / finalize (spec: Events — Eos)
 //! The Segment and final Cluster are unknown-size streamed masters closed implicitly at end
@@ -48,7 +59,7 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::{OfferDesc, ValueDesc};
+use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -65,16 +76,43 @@ const TRACK: u64 = 1;
 // (matches `OggMux`).
 const SRC: PadId = PadId(1);
 
-/// Raw `bytes` on both pads: encoded frames on the sink side, an MKV byte stream on the
-/// src side. Matches `OggMux`/`flacenc` byte pads so an MKV element links to a codec
-/// element at link time without a typed vocabulary (the container is codec-agnostic).
+/// Raw `bytes`: the src side is a Matroska byte stream; also the demux sink side.
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+/// The mux sink declares every family it can build a track from **and every field/value
+/// name its announcements carry** — declaring them is what interns the names, so the
+/// upstream's `build_fixed` can resolve its announcement in a pipeline where no decoder
+/// ever mentioned them (spec: Formats — a `FixedFormat` resolves against the link-time
+/// vocabulary; a wildcard pad would admit everything but intern nothing). A family a
+/// demuxer announces that is *not* here (av1, the NAL codecs) still installs tolerantly
+/// and reaches `event()`, where it is a loud unsupported-remux error.
+static MUX_SAMPLE_VALUES: [ValueDesc; 5] = [
+    ValueDesc::Id("u8"),
+    ValueDesc::Id("s16"),
+    ValueDesc::Id("s24"),
+    ValueDesc::Id("s32"),
+    ValueDesc::Id("f32"),
+];
+static MUX_AUDIO_FIELDS: [FieldDesc; 3] = [
+    FieldDesc { field: "rate", allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: "channels", allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: "sample", allowed: ConstraintDesc::Set(&MUX_SAMPLE_VALUES), preferred: None },
+];
+static MUX_VIDEO_FIELDS: [FieldDesc; 2] = [
+    FieldDesc { field: "width", allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: "height", allowed: ConstraintDesc::Any, preferred: None },
+];
+static MUX_SINK_OFFERS: [OfferDesc; 4] = [
+    OfferDesc { family: "flac", fields: &MUX_AUDIO_FIELDS },
+    OfferDesc { family: "vp8", fields: &MUX_VIDEO_FIELDS },
+    OfferDesc { family: "vp9", fields: &MUX_VIDEO_FIELDS },
+    OfferDesc::any("bytes"),
+];
 
 static MUX_PADS: [PadDesc; 2] = [
     PadDesc {
         name: "sink",
         direction: Direction::Sink,
-        offers: &OFFERS,
+        offers: &MUX_SINK_OFFERS,
         // A single static sink pad: this element muxes one track. One dynamic sink pad per
         // input track is the multi-track follow-up (the writer already supports N tracks).
         dynamic: false,
@@ -102,22 +140,45 @@ static MUX_DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // The parse/launch default is the caps-driven muxer: `... ! mkvmux ! filesink` learns
+    // its track from the upstream announcement (spec: dynamic caps; the remux path).
+    make_default: Some(|| Box::new(MkvMux::from_caps())),
 };
+
+/// How this muxer learns its [`TrackConfig`] (see the module docs).
+enum Setup {
+    /// Constructor-supplied ([`MkvMux::flac`]/[`MkvMux::with_track`]): `track` is present
+    /// from birth and the writer is built at `start()`.
+    Fixed,
+    /// [`MkvMux::from_caps`]: waiting for the upstream `FormatChange`. Data before any
+    /// announcement is a loud error — a caps-driven muxer cannot guess its codec.
+    AwaitCaps,
+    /// A `flac` family was announced: absorbing the leading in-band native head (`fLaC` +
+    /// metadata blocks) into the `CodecPrivate` before the writer can be built. Holds the
+    /// bytes absorbed so far.
+    FlacHead(Vec<u8>),
+}
 
 /// Muxes a single track into Matroska: one encoded frame **per input buffer** on the sink
 /// pad, an MKV byte stream on the src pad. The header is emitted before the first frame;
 /// each frame becomes a `SimpleBlock` in a Cluster (spec `§simpleblock`).
 ///
-/// The track's `CodecID`, `CodecPrivate` and audio params are given at construction (see
-/// the module docs on codec-init data). Handling several input tracks into one MKV needs
-/// one dynamic sink pad per input plus fan-in — a documented follow-up.
+/// The track's `CodecID`/`CodecPrivate`/params come from the upstream announcement
+/// ([`from_caps`](Self::from_caps) — the remux path) or from construction (see the module
+/// docs). Handling several input tracks into one MKV needs one dynamic sink pad per input
+/// plus fan-in — a documented follow-up.
 pub struct MkvMux {
-    /// The track config the writer is built from. Cloned into a fresh writer at `start()`.
-    track: TrackConfig,
-    /// The writer. Present between `start` and finalize; `None` before start and after the
-    /// stream is finished (so a second finalize is a no-op).
+    /// The track config the writer is built from. `Some` from birth in `Fixed` setup;
+    /// filled by the announcement/head in caps-driven setup.
+    track: Option<TrackConfig>,
+    /// How `track` is (or will be) obtained.
+    setup: Setup,
+    /// The writer. Present once the track is known (from `start()` in `Fixed` setup,
+    /// from the announcement/head otherwise) until finalize.
     writer: Option<MatroskaWriter>,
+    /// The stream has been finalized: late buffers are dropped, never remuxed into a
+    /// reopened stream.
+    done: bool,
     /// Whether the header has been written (lazily, before the first frame).
     header_done: bool,
     /// Synthesised frame timeline: nanoseconds of the next frame when a buffer carries no
@@ -148,8 +209,10 @@ impl MkvMux {
         track.track_number = TRACK;
         let frame_dur_ns = Self::frame_duration_ns(&track);
         Self {
-            track,
+            track: Some(track),
+            setup: Setup::Fixed,
             writer: None,
+            done: false,
             header_done: false,
             next_ts_ns: 0,
             frame_dur_ns,
@@ -157,9 +220,84 @@ impl MkvMux {
         }
     }
 
-    /// This element's track config (for tests / introspection).
-    pub fn track(&self) -> &TrackConfig {
-        &self.track
+    /// A caps-driven MKV muxer (the registry default; the **remux** path): the track is
+    /// built from the upstream runtime announcement — see the module docs for the
+    /// supported families and the loud-error ones. `mkvdemux ! mkvmux` is the canonical
+    /// use.
+    pub fn from_caps() -> Self {
+        Self {
+            track: None,
+            setup: Setup::AwaitCaps,
+            writer: None,
+            done: false,
+            header_done: false,
+            next_ts_ns: 0,
+            frame_dur_ns: 0,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// This element's track config, once known (for tests / introspection). `None` for a
+    /// caps-driven muxer that has not seen its announcement yet.
+    pub fn track(&self) -> Option<&TrackConfig> {
+        self.track.as_ref()
+    }
+
+    /// Install `track` and build the writer — the moment a caps-driven muxer becomes
+    /// equivalent to a constructed one.
+    fn configure(&mut self, mut track: TrackConfig) {
+        track.track_number = TRACK;
+        self.frame_dur_ns = Self::frame_duration_ns(&track);
+        self.writer = Some(MatroskaWriter::new(vec![track.clone()]));
+        self.track = Some(track);
+        self.setup = Setup::Fixed;
+    }
+
+    /// The total length of a complete native FLAC head — `fLaC` magic + every metadata
+    /// block (RFC 9639 §8: a 4-octet block header of last-flag(1)+type(7) then a 24-bit
+    /// big-endian length, repeated until the last-flag) — or `None` while `b` is still a
+    /// proper prefix of one. A wrong magic is a hard error: the announced `flac` stream
+    /// does not start with a FLAC head.
+    fn flac_head_len(b: &[u8]) -> Result<Option<usize>, Error> {
+        if b.len() >= 4 && &b[..4] != b"fLaC" {
+            return Err(Error::Todo("mkvmux: announced flac stream does not start with fLaC"));
+        }
+        if b.len() < 4 {
+            return Ok(None);
+        }
+        let mut off = 4;
+        loop {
+            if b.len() < off + 4 {
+                return Ok(None);
+            }
+            let last = b[off] & 0x80 != 0;
+            let len = u32::from_be_bytes([0, b[off + 1], b[off + 2], b[off + 3]]) as usize;
+            off += 4 + len;
+            if last {
+                // The head is complete once all of the last block's payload is present.
+                return Ok(if b.len() >= off { Some(off) } else { None });
+            }
+        }
+    }
+
+    /// The audio params out of a native FLAC head's STREAMINFO (RFC 9639 §8.2: the first
+    /// metadata block, type 0, 34 octets — sample rate is the 20 bits at bit offset 80,
+    /// then 3 bits channels−1, then 5 bits bits-per-sample−1).
+    fn flac_streaminfo_params(head: &[u8]) -> Result<(f64, u32, u32), Error> {
+        // head[..4] == "fLaC"; the STREAMINFO body starts after its 4-octet block header.
+        let si = head
+            .get(8..8 + 34)
+            .ok_or(Error::Todo("mkvmux: flac head too short for STREAMINFO"))?;
+        if head[4] & 0x7f != 0 {
+            return Err(Error::Todo("mkvmux: first flac metadata block is not STREAMINFO"));
+        }
+        let rate = ((si[10] as u32) << 12) | ((si[11] as u32) << 4) | ((si[12] as u32) >> 4);
+        let channels = (((si[12] >> 1) & 0x7) as u32) + 1;
+        let bits = ((((si[12] & 1) as u32) << 4) | ((si[13] as u32) >> 4)) + 1;
+        if rate == 0 {
+            return Err(Error::Todo("mkvmux: STREAMINFO sample rate is zero"));
+        }
+        Ok((rate as f64, channels, bits))
     }
 
     /// Nanoseconds between synthesised frame timestamps when buffers carry no PTS: one FLAC
@@ -198,6 +336,7 @@ impl MkvMux {
     /// writer is taken on first call, so later calls (the `event` path then `stop`, or vice
     /// versa) do nothing. Any bytes finalize produces are pushed downstream.
     fn finish_stream(&mut self, ctx: &mut Ctx) {
+        self.done = true;
         if let Some(mut writer) = self.writer.take() {
             let mut out = std::mem::take(&mut self.scratch);
             writer.finalize(&mut out);
@@ -213,7 +352,12 @@ impl Element for MkvMux {
     }
 
     fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
-        self.writer = Some(MatroskaWriter::new(vec![self.track.clone()]));
+        // Fixed setup builds its writer here; caps-driven setup builds it when the
+        // announcement (and, for flac, the in-band head) arrives.
+        if let (Setup::Fixed, Some(track)) = (&self.setup, &self.track) {
+            self.writer = Some(MatroskaWriter::new(vec![track.clone()]));
+        }
+        self.done = false;
         self.header_done = false;
         self.next_ts_ns = 0;
         self.scratch.clear();
@@ -224,14 +368,46 @@ impl Element for MkvMux {
         while let Some(buf) = inputs.pop() {
             // Stop early if the stream is already finalized: a late buffer after EOS is
             // dropped rather than reopening a closed stream (matches `OggMux`).
-            if self.writer.is_none() {
+            if self.done {
                 break;
+            }
+            // A caps-driven muxer that has not yet built its writer is either absorbing
+            // the flac in-band head or has been fed data before any announcement.
+            if self.writer.is_none() {
+                match &mut self.setup {
+                    Setup::FlacHead(head) => {
+                        head.extend_from_slice(buf.memory.data());
+                        match Self::flac_head_len(head)? {
+                            None => continue, // head still incomplete — keep absorbing
+                            Some(len) => {
+                                if len != head.len() {
+                                    // The head must end on a buffer boundary — `MkvDemux`
+                                    // and `flacenc` both emit it as its own emission; bytes
+                                    // beyond it here would be frames we cannot re-split.
+                                    return Err(Error::Todo(
+                                        "mkvmux: flac head not on a buffer boundary",
+                                    ));
+                                }
+                                let head = std::mem::take(head);
+                                let (rate, channels, bits) = Self::flac_streaminfo_params(&head)?;
+                                self.configure(TrackConfig::flac(TRACK, head, rate, channels, bits));
+                                continue; // the head is CodecPrivate, never a block
+                            }
+                        }
+                    }
+                    Setup::AwaitCaps => {
+                        return Err(Error::Todo(
+                            "mkvmux: data before any format announcement — a caps-driven \
+                             muxer cannot guess its codec (use MkvMux::with_track for bare \
+                             byte streams)",
+                        ));
+                    }
+                    Setup::Fixed => break, // unreachable: Fixed builds the writer at start
+                }
             }
 
             // Timestamp: prefer the buffer PTS; otherwise the synthesised cadence. Computed
-            // before borrowing the writer (it mutates `self.next_ts_ns`). A frame is a
-            // keyframe unless the buffer explicitly clears the flag — every FLAC frame is
-            // independently decodable, so keyframe is the correct default.
+            // before borrowing the writer (it mutates `self.next_ts_ns`).
             let ts_ns = match buf.pts.nanos() {
                 None => {
                     let t = self.next_ts_ns;
@@ -245,8 +421,10 @@ impl Element for MkvMux {
                     t
                 }
             };
-            // Empty flags means "not tagged" → default to keyframe (FLAC frames all are).
-            let keyframe = buf.flags.is_empty() || buf.flags.contains(BufferFlags::KEYFRAME);
+            // A block is a keyframe unless explicitly tagged DELTA (spec: Buffer flags —
+            // untagged means "unknown", and all-independent-frame codecs like FLAC are the
+            // untagged norm; a demuxed video track arrives tagged either way).
+            let keyframe = !buf.flags.contains(BufferFlags::DELTA);
 
             let mut out = std::mem::take(&mut self.scratch);
             let writer = self.writer.as_mut().expect("writer present");
@@ -271,10 +449,62 @@ impl Element for MkvMux {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // Primary finalize path: the pipeline delivers EOS in-band and pushes whatever this
-        // produces before closing the ring.
-        if matches!(event, Event::Eos) {
-            self.finish_stream(ctx);
+        match event {
+            // Primary finalize path: the pipeline delivers EOS in-band and pushes whatever
+            // this produces before closing the ring.
+            Event::Eos => self.finish_stream(ctx),
+            // The caps-driven track config (spec: dynamic caps; the remux path). Only the
+            // first announcement configures; a mid-stream change cannot be honoured — a
+            // Matroska track is fixed once the header is written — so it is a loud error
+            // rather than a silently corrupt file.
+            Event::FormatChange(f) => match &self.setup {
+                Setup::AwaitCaps => {
+                    let family = ctx.family_name(f.family).unwrap_or("?").to_owned();
+                    match family.as_str() {
+                        // The CodecPrivate is the in-band native head; absorb it first.
+                        "flac" => self.setup = Setup::FlacHead(Vec::new()),
+                        "vp8" | "vp9" => {
+                            let dim = |name: &str| {
+                                ctx.field_id(name)
+                                    .and_then(|id| f.get(id))
+                                    .and_then(|v| match v {
+                                        Value::Int(n) if n > 0 => Some(n as u32),
+                                        _ => None,
+                                    })
+                            };
+                            let (Some(w), Some(h)) = (dim("width"), dim("height")) else {
+                                return Err(Error::Todo(
+                                    "mkvmux: video announcement without width/height",
+                                ));
+                            };
+                            let id = if family == "vp8" { "V_VP8" } else { "V_VP9" };
+                            self.configure(TrackConfig::video(TRACK, id, Vec::new(), w, h));
+                        }
+                        // Families we cannot mux *conformantly* yet — loud, with the reason
+                        // (see the module docs): av1 needs an av1C CodecPrivate; H.264/H.265
+                        // arrive as Annex B but Matroska wants length-prefixed + a config
+                        // record.
+                        other => {
+                            return Err(Error::Resource(format!(
+                                "mkvmux: cannot remux family '{other}' yet (av1 needs an \
+                                 av1C CodecPrivate; h264/h265 need Annex B → length-prefixed \
+                                 reframing + a config record — documented follow-ups)"
+                            )));
+                        }
+                    }
+                }
+                Setup::Fixed | Setup::FlacHead(_) => {
+                    if self.header_done {
+                        return Err(Error::Todo(
+                            "mkvmux: mid-stream format change cannot be muxed (track is \
+                             fixed once the header is written)",
+                        ));
+                    }
+                    // Not yet writing: a repeated/refined announcement before data is
+                    // harmless (e.g. a re-validation pass re-delivering the same format).
+                }
+            },
+            _ => {}
         }
         Ok(())
     }
@@ -411,6 +641,7 @@ pub struct MkvDemux {
 struct Carry {
     pad: PadId,
     pts_ns: Option<u64>,
+    flags: BufferFlags,
     bytes: Vec<u8>,
     off: usize,
 }
@@ -475,8 +706,16 @@ impl MkvDemux {
     /// Push `bytes[off..]` on `pad` via **pooled** slots (`try_alloc`), chunked to the slot
     /// size, returning the new offset — `< bytes.len()` means the pool ran dry and the caller
     /// must carry the remainder and stop consuming input (spec: the backpressure rule). PTS
-    /// is stamped on each buffer.
-    fn emit_bounded(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8], mut off: usize) -> usize {
+    /// and `flags` (the frame's keyframe/delta tag, on every chunk of the frame) are stamped
+    /// on each buffer.
+    fn emit_bounded(
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        bytes: &[u8],
+        mut off: usize,
+    ) -> usize {
         while off < bytes.len() {
             let Some(mut buf) = ctx.try_alloc(pad) else { return off };
             let cap = buf.memory.capacity();
@@ -487,6 +726,7 @@ impl MkvDemux {
             if let Some(t) = pts_ns {
                 buf.pts = Timestamp::from_nanos(t);
             }
+            buf.flags = flags;
             ctx.out(pad).push(buf);
             off += n;
         }
@@ -496,7 +736,14 @@ impl MkvDemux {
     /// Emit `bytes[off..]` as one **exact-size** buffer (`alloc_exact` — a right-sized heap
     /// allocation when the pool is dry, never a slot-sized over-allocation). Only for the
     /// bounded EOS/stop flush, where yielding for a slot is no longer possible.
-    fn emit_exact(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8], off: usize) {
+    fn emit_exact(
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        bytes: &[u8],
+        off: usize,
+    ) {
         let rest = &bytes[off..];
         if rest.is_empty() {
             return;
@@ -507,22 +754,30 @@ impl MkvDemux {
         if let Some(t) = pts_ns {
             buf.pts = Timestamp::from_nanos(t);
         }
+        buf.flags = flags;
         ctx.out(pad).push(buf);
     }
 
     /// Queue a blob for emission and try to emit it now; on pool exhaustion the remainder
     /// parks in `pending` (drained first on the next pass).
-    fn emit_or_park(&mut self, ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: Vec<u8>) {
-        let off = Self::emit_bounded(ctx, pad, pts_ns, &bytes, 0);
+    fn emit_or_park(
+        &mut self,
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        bytes: Vec<u8>,
+    ) {
+        let off = Self::emit_bounded(ctx, pad, pts_ns, flags, &bytes, 0);
         if off < bytes.len() {
-            self.pending.push_back(Carry { pad, pts_ns, bytes, off });
+            self.pending.push_back(Carry { pad, pts_ns, flags, bytes, off });
         }
     }
 
     /// Resume parked emissions. `true` when everything pending has drained.
     fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
         while let Some(mut c) = self.pending.pop_front() {
-            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, &c.bytes, c.off);
+            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
             if c.off < c.bytes.len() {
                 self.pending.push_front(c);
                 return false;
@@ -573,16 +828,21 @@ impl MkvDemux {
                 // The head carries the stream start; stamp it with the first frame's pts. Take
                 // it (leaving empty) — it is emitted exactly once, before the first frame.
                 let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
-                self.emit_or_park(ctx, pad, Some(frame.pts_ns), head);
+                self.emit_or_park(ctx, pad, Some(frame.pts_ns), BufferFlags::empty(), head);
             }
             let pad = self.pad_tracks[idx].pad;
+            // The container's keyframe bit rides the buffer (spec: Buffer flags) so a
+            // remuxing consumer preserves seekability; `DELTA` is explicit — an untagged
+            // buffer would read as "unknown", which a muxer defaults to keyframe.
+            let flags = if frame.keyframe { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
             // Emit from the (usually borrowed) reframed bytes; only a parked remainder
             // pays the copy into an owned carry.
-            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), &out_bytes, 0);
+            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), flags, &out_bytes, 0);
             if off < out_bytes.len() {
                 self.pending.push_back(Carry {
                     pad,
                     pts_ns: Some(frame.pts_ns),
+                    flags,
                     bytes: out_bytes.into_owned(),
                     off,
                 });
@@ -600,7 +860,7 @@ impl MkvDemux {
     /// input while it could emit, so at most one input batch's worth of samples sits here.
     fn flush_exact(&mut self, ctx: &mut Ctx) {
         while let Some(c) = self.pending.pop_front() {
-            Self::emit_exact(ctx, c.pad, c.pts_ns, &c.bytes, c.off);
+            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
         }
         // Reuse drain()'s routing/announce logic by swapping the emitter is overkill for
         // the tail; inline the same walk with exact emission.
@@ -617,10 +877,11 @@ impl MkvDemux {
                 let (pad, family) = (self.pad_tracks[idx].pad, self.pad_tracks[idx].family);
                 Self::announce(ctx, pad, family, &self.pad_tracks[idx].track);
                 let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
-                Self::emit_exact(ctx, pad, Some(frame.pts_ns), &head, 0);
+                Self::emit_exact(ctx, pad, Some(frame.pts_ns), BufferFlags::empty(), &head, 0);
             }
             let pad = self.pad_tracks[idx].pad;
-            Self::emit_exact(ctx, pad, Some(frame.pts_ns), &out_bytes, 0);
+            let flags = if frame.keyframe { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
+            Self::emit_exact(ctx, pad, Some(frame.pts_ns), flags, &out_bytes, 0);
         }
     }
 
