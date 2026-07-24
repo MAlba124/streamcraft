@@ -29,20 +29,16 @@
 //! pad admits any announced format). `elements/tests/queue.rs` proves that crossing and
 //! re-validation with this element's `event()` a pure no-op.
 //!
-//! FOLLOW-UP (main session): the *onward* hop — the queue re-emitting that FormatChange
-//! to its own downstream — is not yet expressible from an element. The scheduler consumes
-//! an element's inbound events rather than auto-riding them to that element's output, and
-//! the only element→downstream format primitive, [`Ctx::announce_format`], needs
-//! `&'static str` field names a generic forwarder cannot recover from a resolved
-//! `FixedFormat` (`Ctx` exposes no `field_name`, no `FixedFormat`-based re-announce, and
-//! no event-forward). Forwarding a FormatChange verbatim across an Active element needs a
-//! core primitive (scheduler tail-event forwarding or a `Ctx` event-forward), owned by
-//! the same session that owns the per-queue-capacity plumbing below.
+//! The *onward* hop — the queue re-emitting that FormatChange to its own downstream — is
+//! the one thing its `event()` does: the scheduler consumes inbound events rather than
+//! auto-riding them across, so a pure transport re-announces the resolved format via
+//! [`Ctx::forward_format`] and the change hops onward at the next batch boundary (spec:
+//! Formats — dynamic caps travel end to end).
 //!
-//! **Props: none in v1.** A per-queue capacity / leaky-policy knob needs scheduler
-//! plumbing (ring sizing is chosen when the group's rings are built) owned by the main
-//! session; that is a follow-up, noted here so an element author does not reach for a
-//! prop that the transport cannot yet honour.
+//! **Props: none in v1.** Depth comes from the scheduler:
+//! `Pipeline::set_queue_capacity(queue_el, batches)` sizes this element's inbound ring
+//! (ring sizing is chosen when the group's rings are built); a leaky-policy knob follows
+//! the core leaky-ring work.
 
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
@@ -126,11 +122,14 @@ impl Element for Queue {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
-        // Events ride the batches; the scheduler delivers them here and rides them to the
-        // downstream ring itself (spec: Events travel with buffers through the same
-        // queues). A pure transport neither consumes nor rewrites them — see the module
-        // docs and `elements/tests/queue.rs::dynamic_caps_announce_crosses_the_queue`.
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // A FormatChange terminates here (the scheduler re-fixates our sink pad and
+        // consumes the event), so a pure transport must re-announce it onward — verbatim,
+        // already resolved — for its own downstream to re-fixate too (spec: Formats —
+        // dynamic caps travel end to end). Everything else needs no action.
+        if let Event::FormatChange(f) = event {
+            ctx.forward_format(PadId(1), f.clone());
+        }
         Ok(())
     }
 

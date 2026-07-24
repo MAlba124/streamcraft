@@ -194,20 +194,14 @@ fn dynamic_caps_announce_reaches_the_queue_and_revalidates() {
     // FormatChange rides the source's output batch into the queue's input ring, where the
     // scheduler re-validates it against the queue's *sink* pad — a wildcard, which admits
     // any announced format (spec: Formats — a wildcard pad admits any announced format).
-    // That re-validation not failing is the property under test: without the wildcard the
-    // queue would reject the audio/raw announcement it never offered, and the run would
-    // error. A queue that could not adopt the peer's family could not sit in this graph.
+    // That re-validation not failing is the first property under test: without the
+    // wildcard the queue would reject the audio/raw announcement it never offered, and
+    // the run would error.
     //
-    // NOTE (follow-up, main session): the *onward* hop — the queue re-emitting the
-    // FormatChange to its own downstream so `raterecordsink.event()` fires — is not yet
-    // possible from an element. The scheduler consumes an element's inbound events (it
-    // does not auto-ride them to that element's output), and the only element→downstream
-    // format primitive, `Ctx::announce_format`, needs `&'static str` field names that a
-    // generic forwarder cannot recover from a resolved `FixedFormat` (Ctx exposes no
-    // `field_name`, and no `FixedFormat`-based re-announce / event-forward). Forwarding a
-    // FormatChange verbatim across an Active element therefore needs a core primitive
-    // (scheduler tail-event forwarding, or a Ctx event-forward), owned by the same
-    // session that owns the per-queue-capacity plumbing. See `elements/src/flow/queue.rs`.
+    // The second is the *onward* hop: the queue's `event()` re-announces the resolved
+    // format via `Ctx::forward_format`, so the FormatChange crosses the queue's own
+    // downstream ring too and `raterecordsink.event()` observes the runtime rate (spec:
+    // Formats — dynamic caps travel end to end, through pure transports).
     let seen_rate = Arc::new(AtomicI64::new(0));
     let seen_change = Arc::new(AtomicU64::new(0));
 
@@ -224,10 +218,15 @@ fn dynamic_caps_announce_reaches_the_queue_and_revalidates() {
     // (An incompatible announcement fails the run — see dynamic_caps.rs; here it doesn't,
     // because a wildcard admits everything.)
     p.run().expect("a runtime announcement re-validates against the wildcard queue");
-    // The sink handles are kept for the onward-hop assertion that the follow-up will
-    // enable; today they read their initial values, and we deliberately do not assert on
-    // them so this test tracks real behaviour rather than an unimplemented one.
-    let _ = (seen_rate, seen_change);
+    assert!(
+        seen_change.load(Ordering::Relaxed) >= 1,
+        "the FormatChange hopped onward across the queue to the sink"
+    );
+    assert_eq!(
+        seen_rate.load(Ordering::Relaxed),
+        48000,
+        "the sink observed the runtime-announced rate through the queue"
+    );
 }
 
 // --- 3. A queue turns an illegal passive fan-out into a legal topology -----------------

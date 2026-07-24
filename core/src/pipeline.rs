@@ -1657,7 +1657,15 @@ fn run_group(
             // Dynamic caps: if the element announced a runtime output format, attach a
             // FormatChange to its output batch so the peer re-fixates (spec: Formats).
             if let Some(ann) = ctxs[i].take_announcement() {
-                if let Some(f) = vocabulary.build_fixed(ann.family, &ann.fields) {
+                let fixed = match ann.payload {
+                    crate::ctx::AnnouncePayload::Named { family, fields } => {
+                        vocabulary.build_fixed(family, &fields)
+                    }
+                    // Already resolved — the forwarding path (a queue re-emitting a
+                    // FormatChange it received; spec: Formats — dynamic caps).
+                    crate::ctx::AnnouncePayload::Fixed(f) => Some(f),
+                };
+                if let Some(f) = fixed {
                     // Ride the FormatChange on the announced src pad's batch so it travels
                     // to that pad's downstream (correct when the element branches).
                     ctxs[i].output_on(ann.pad).push_event(Event::FormatChange(f));

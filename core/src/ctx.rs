@@ -31,8 +31,19 @@ pub(crate) struct Announcement {
     /// Which src pad announced — the scheduler rides the `FormatChange` on that pad's
     /// output batch, so it travels to that pad's downstream (branching-correct).
     pub(crate) pad: PadId,
-    pub(crate) family: &'static str,
-    pub(crate) fields: Vec<(&'static str, ValueDesc)>,
+    pub(crate) payload: AnnouncePayload,
+}
+
+/// What an announcement carries: names to resolve through the vocabulary (the
+/// decoder/demuxer path, [`Ctx::announce_format`]), or a format that is already
+/// resolved (the forwarding path, [`Ctx::forward_format`] — a queue re-emitting a
+/// `FormatChange` it received has no static names to offer).
+pub(crate) enum AnnouncePayload {
+    Named {
+        family: &'static str,
+        fields: Vec<(&'static str, ValueDesc)>,
+    },
+    Fixed(FixedFormat),
 }
 
 /// A pad an element instantiated at runtime via [`Ctx::add_pad`] during preroll (spec:
@@ -245,9 +256,25 @@ impl Ctx {
     ) {
         self.announced = Some(Announcement {
             pad,
-            family,
-            fields: fields.to_vec(),
+            payload: AnnouncePayload::Named { family, fields: fields.to_vec() },
         });
+    }
+
+    /// Re-announce an **already-resolved** format downstream on `pad` (spec: Formats
+    /// — dynamic caps). The forwarding primitive for pure transports (a queue, a
+    /// tee): on `Event::FormatChange(f)`, call `forward_format(src, f.clone())` so
+    /// the change hops onward across this element — [`announce_format`]
+    /// (Self::announce_format) cannot express this, since a generic forwarder has no
+    /// static names for fields it never knew. Same single-slot, batch-boundary
+    /// semantics as an announcement.
+    pub fn forward_format(&mut self, pad: PadId, format: FixedFormat) {
+        // Single-src leniency, as in `out(pad)`: the scheduler's drain routes the
+        // ride-along event strictly by this pad index.
+        let pad = match self.single_src {
+            Some(idx) => PadId(idx as u32),
+            None => pad,
+        };
+        self.announced = Some(Announcement { pad, payload: AnnouncePayload::Fixed(format) });
     }
 
     /// Drain a pending announcement (scheduler hook, after `process()`).

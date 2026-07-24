@@ -401,7 +401,13 @@ impl Harness {
     /// harness just records the resolved format.
     fn drain_announcement(&mut self) {
         if let Some(ann) = self.ctx.take_announcement() {
-            if let Some(f) = self.vocabulary.build_fixed(ann.family, &ann.fields) {
+            let fixed = match ann.payload {
+                crate::ctx::AnnouncePayload::Named { family, fields } => {
+                    self.vocabulary.build_fixed(family, &fields)
+                }
+                crate::ctx::AnnouncePayload::Fixed(f) => Some(f),
+            };
+            if let Some(f) = fixed {
                 self.announced = Some(f);
             }
         }
