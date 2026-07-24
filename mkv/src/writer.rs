@@ -147,6 +147,13 @@ struct OpenCluster {
     /// `Timestamp` child, and the origin the SimpleBlock relative timestamps are measured
     /// from.
     base_tick: i64,
+    /// The Cluster's body (Timestamp child + SimpleBlocks), staged here until the Cluster
+    /// closes so its **real size** can be written. Unknown-size (`0xFF`) Clusters are
+    /// RFC 8794 §6.2-legal and libav accepts them, but real players do not — mpv's own
+    /// demuxer rejects every block inside one ("Corrupt file detected") — so the writer
+    /// buffers one Cluster (≈ one GOP) and emits it sized, like every mainstream muxer.
+    /// The *Segment* stays unknown-size (universally accepted; nothing to back-patch).
+    buf: Vec<u8>,
 }
 
 /// Multi-track Matroska muxer. Configure with tracks, [`write_header`], then
@@ -363,22 +370,35 @@ impl MatroskaWriter {
             self.open_cluster(out, tick);
         }
 
-        // Safe: a Cluster is open now (just opened, or already was).
-        let base = self.cluster.as_ref().expect("cluster open").base_tick;
-        let rel = (tick - base) as i16; // within the checked window
-        Self::write_simple_block(out, track, rel, bytes, keyframe);
+        // Safe: a Cluster is open now (just opened, or already was). Blocks stage into the
+        // Cluster's buffer; `out` receives the whole sized Cluster when it closes.
+        let cluster = self.cluster.as_mut().expect("cluster open");
+        let rel = (tick - cluster.base_tick) as i16; // within the checked window
+        Self::write_simple_block(&mut cluster.buf, track, rel, bytes, keyframe);
         Ok(())
     }
 
-    /// Open a new Cluster at `base_tick` (spec `§ID-tree` Cluster, `§sizing`): the Cluster
-    /// ID, the unknown-size marker, then its `Timestamp` child. The previous Cluster (if
-    /// any) is thereby implicitly closed.
+    /// Open a new Cluster at `base_tick` (spec `§ID-tree` Cluster, `§sizing`), first
+    /// emitting the previous Cluster (if any) into `out` with its now-known size. The new
+    /// Cluster's body starts with its `Timestamp` child and stages in memory until it
+    /// closes (see [`OpenCluster::buf`] — players reject unknown-size Clusters).
     fn open_cluster(&mut self, out: &mut Vec<u8>, base_tick: i64) {
-        ebml::write_id(out, id::CLUSTER);
-        ebml::write_unknown_size(out);
+        // Reuse the closed cluster's allocation for the new one's staging buffer.
+        let mut buf = self.close_cluster(out);
         // Cluster base timestamp, in ticks (non-negative for a forward stream).
-        ebml::write_uint(out, id::TIMESTAMP, base_tick.max(0) as u64);
-        self.cluster = Some(OpenCluster { base_tick });
+        ebml::write_uint(&mut buf, id::TIMESTAMP, base_tick.max(0) as u64);
+        self.cluster = Some(OpenCluster { base_tick, buf });
+    }
+
+    /// Emit the staged Cluster (if any) into `out` — ID, its **real** body size, body —
+    /// returning the drained staging buffer for reuse (empty if no Cluster was open).
+    fn close_cluster(&mut self, out: &mut Vec<u8>) -> Vec<u8> {
+        let Some(mut c) = self.cluster.take() else { return Vec::new() };
+        ebml::write_id(out, id::CLUSTER);
+        ebml::write_size(out, c.buf.len() as u64);
+        out.extend_from_slice(&c.buf);
+        c.buf.clear();
+        c.buf
     }
 
     /// Serialise one `SimpleBlock` element (spec `§simpleblock`): the `A3` ID, the data
@@ -403,13 +423,12 @@ impl MatroskaWriter {
         out.extend_from_slice(frame);
     }
 
-    /// Finish the stream (spec `§sizing`). The `Segment` and the final `Cluster` are
-    /// unknown-size masters closed implicitly at end of stream, so there is nothing to
-    /// back-patch or seek — this only marks the writer done (any buffered bytes were
-    /// already appended by [`write_frame`]). Present for symmetry with a two-pass writer
-    /// and to allow future trailing elements (Cues) without changing the call site.
-    pub fn finalize(&mut self, _out: &mut Vec<u8>) {
-        self.cluster = None;
+    /// Finish the stream (spec `§sizing`): emit the final staged Cluster with its real
+    /// size. The `Segment` stays an unknown-size master closed implicitly at end of
+    /// stream — nothing is back-patched in bytes already emitted, so the writer remains
+    /// single-pass and seek-free.
+    pub fn finalize(&mut self, out: &mut Vec<u8>) {
+        let _ = self.close_cluster(out);
     }
 }
 
@@ -504,20 +523,21 @@ mod tests {
     }
 
     /// Successive small timestamps stay in one Cluster; a keyframe on the anchor track
-    /// opens a new one.
+    /// opens a new one. Clusters land in `out` when they *close* (staged so their real
+    /// size is written — players reject unknown-size Clusters), so counts are observed
+    /// at close boundaries and after finalize.
     #[test]
     fn anchor_keyframe_opens_new_cluster() {
         let mut w = MatroskaWriter::new(vec![flac_track(1)]);
         let mut out = Vec::new();
         w.write_header(&mut out).unwrap();
-        let before = count_clusters(&out);
-        w.write_frame(&mut out, 1, 0, &[1], true).unwrap(); // opens cluster #1
+        w.write_frame(&mut out, 1, 0, &[1], true).unwrap(); // opens cluster #1 (staged)
         w.write_frame(&mut out, 1, 1_000_000, &[2], false).unwrap(); // same cluster (1 tick)
-        let mid = count_clusters(&out);
+        assert_eq!(count_clusters(&out), 0, "open cluster is staged, not yet emitted");
         w.write_frame(&mut out, 1, 2_000_000, &[3], true).unwrap(); // keyframe → new cluster
-        let after = count_clusters(&out);
-        assert_eq!(mid - before, 1, "first frame opened exactly one cluster");
-        assert_eq!(after - mid, 1, "anchor keyframe opened a second cluster");
+        assert_eq!(count_clusters(&out), 1, "anchor keyframe closed+emitted cluster #1");
+        w.finalize(&mut out);
+        assert_eq!(count_clusters(&out), 2, "finalize emitted the last cluster");
     }
 
     /// A timestamp beyond the signed-16-bit window forces a new Cluster even without a
@@ -528,10 +548,12 @@ mod tests {
         let mut out = Vec::new();
         w.write_header(&mut out).unwrap();
         w.write_frame(&mut out, 1, 0, &[1], true).unwrap(); // cluster base tick 0
-        let mid = count_clusters(&out);
-        // 40_000 ms ticks > 32767 → must open a new cluster (non-keyframe).
+        // 40_000 ms ticks > 32767 → must open a new cluster (non-keyframe), closing and
+        // emitting the first.
         w.write_frame(&mut out, 1, 40_000 * 1_000_000, &[2], false).unwrap();
-        assert_eq!(count_clusters(&out) - mid, 1, "ts overflow opened a new cluster");
+        assert_eq!(count_clusters(&out), 1, "ts overflow closed+emitted the first cluster");
+        w.finalize(&mut out);
+        assert_eq!(count_clusters(&out), 2, "finalize emitted the overflow cluster");
     }
 
     /// Count Cluster IDs in a byte stream (a coarse structural probe for the tests above).
