@@ -3,10 +3,15 @@
 //! buffers arrive on the sink pad, encoded FLAC bytes leave on the src pad. It inlines
 //! into the upstream active element's group like [`passthrough`], so it never blocks.
 //!
-//! Audio parameters are constructor arguments ([`FlacEnc::new`]) because format
-//! negotiation is being built in parallel and this element must not depend on it — the
-//! `wavparse` upstream will eventually hand these over, but for now the caller wires
-//! them (spec target: S16 mono/stereo at 44100/48000).
+//! Audio parameters come from, in increasing precedence: the [`FlacEnc::new`]
+//! constructor, parse-path props, and the **negotiated/announced input format**
+//! (spec: Formats — dynamic caps, the consumer side). The sink pad offers
+//! `audio/raw` (preferred — so a decoder like `flacdec` links directly and its
+//! runtime `FormatChange` announcement sets rate/channels/sample) plus a legacy
+//! `bytes` bridge (raw interleaved PCM from `filesrc`, or `wavparse`, whose
+//! announcement rides the bridge and is learned the same way). A format change
+//! after the STREAMINFO header has been emitted is a loud error — FLAC cannot
+//! change stream parameters mid-file.
 //!
 //! It writes a **streaming**, forward-only FLAC stream (see
 //! [`FlacEncoder::new_streaming`]): the STREAMINFO header is emitted once, up front,
@@ -21,7 +26,9 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::{Constraint, OfferDesc, Value};
+use streamcraft_core::format::{
+    Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc,
+};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -31,23 +38,48 @@ use crate::encoder::{FlacEncoder, SampleFormat};
 /// common libFLAC default and within the streamable subset for <=48 kHz (§7).
 const BLOCK_SIZE: u32 = 4096;
 
-/// Raw `bytes` on both pads for now: interleaved PCM in, FLAC bytes out, matching the
-/// `filesrc`/`filesink` peers in the milestone-3 chain. Typed offers (`audio/raw` in,
-/// `audio/x-flac` out) arrive with the negotiation-aware `wavparse` upstream.
-static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+// `audio/raw` names, matching `flacdec`'s announce vocabulary (interned by string,
+// so the ids line up graph-wide).
+const FAMILY: &str = "audio/raw";
+const F_RATE: &str = "rate";
+const F_CHANNELS: &str = "channels";
+const F_SAMPLE: &str = "sample";
+
+static SAMPLE_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("s8"),
+    ValueDesc::Id("s16"),
+    ValueDesc::Id("s24"),
+    ValueDesc::Id("s32"),
+];
+
+static SINK_FIELDS: [FieldDesc; 3] = [
+    FieldDesc { field: F_RATE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_CHANNELS, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_SAMPLE, allowed: ConstraintDesc::Set(&SAMPLE_VALUES), preferred: None },
+];
+
+/// Sink: typed `audio/raw` first (a decoder links directly and its announcement sets
+/// the parameters), then the legacy `bytes` bridge (raw PCM from `filesrc`, or
+/// `wavparse` announcing over the bridge). Declaration order is preference order.
+static SINK_OFFERS: [OfferDesc; 2] = [
+    OfferDesc { family: FAMILY, fields: &SINK_FIELDS },
+    OfferDesc::any("bytes"),
+];
+/// Src: encoded FLAC bytes, matching `filesink`/`oggmux`/`flacdec` peers.
+static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
 static PADS: [PadDesc; 2] = [
     PadDesc {
         name: "sink",
         direction: Direction::Sink,
-        offers: &OFFERS,
+        offers: &SINK_OFFERS,
         dynamic: false,
         validate: None,
     },
     PadDesc {
         name: "src",
         direction: Direction::Src,
-        offers: &OFFERS,
+        offers: &SRC_OFFERS,
         dynamic: false,
         validate: None,
     },
@@ -126,6 +158,55 @@ impl FlacEnc {
         }
     }
 
+    /// Adopt rate/channels/sample from the sink pad's installed `audio/raw` format —
+    /// the link-time fixation in `start()`, or a runtime `FormatChange` announcement
+    /// (spec: Formats — dynamic caps, the consumer side; the `AudioConvert` pattern).
+    /// Fields absent from the format keep their current values, so a partially
+    /// specified link-time fixation is refined by the upstream's announcement (which
+    /// always arrives before its data). Returns whether anything changed.
+    fn learn_from_caps(&mut self, ctx: &Ctx) -> bool {
+        let Some(f) = ctx.negotiated(PadId(0)) else { return false };
+        if ctx.family_name(f.family) != Some(FAMILY) {
+            return false; // the bytes bridge fixes no audio parameters
+        }
+        let mut changed = false;
+        if let Some(Value::Int(r)) = ctx.field_id(F_RATE).and_then(|id| f.get(id)) {
+            if r > 0 && r as u32 != self.sample_rate {
+                self.sample_rate = r as u32;
+                changed = true;
+            }
+        }
+        if let Some(Value::Int(c)) = ctx.field_id(F_CHANNELS).and_then(|id| f.get(id)) {
+            if c > 0 && c as u32 != self.channels {
+                self.channels = c as u32;
+                changed = true;
+            }
+        }
+        if let Some(Value::Id(id)) = ctx.field_id(F_SAMPLE).and_then(|id| f.get(id)) {
+            if let Some(sf) = ctx.value_name(id).and_then(sample_format_from_name) {
+                if sf != self.format {
+                    self.format = sf;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.frame_stride = self.channels as usize * self.format.bytes_per_sample();
+        }
+        changed
+    }
+
+    /// (Re)build the encoder from the current parameters. Any carried partial sample
+    /// belongs to the old layout, so it is dropped with the old encoder.
+    fn rebuild_encoder(&mut self) -> Result<(), Error> {
+        let (encoder, _header) =
+            FlacEncoder::new_streaming(self.sample_rate, self.channels, self.format, BLOCK_SIZE)
+                .map_err(|e| Error::Resource(format!("flacenc: {e:?}")))?;
+        self.encoder = Some(encoder);
+        self.carry.clear();
+        Ok(())
+    }
+
     /// Push `bytes` as an output buffer on the src pad, chunked to the pool slot size
     /// so no single copy exceeds a buffer. Zero-length input pushes nothing.
     fn emit(ctx: &mut Ctx, bytes: &[u8]) -> Result<(), Error> {
@@ -168,33 +249,38 @@ impl Element for FlacEnc {
             }
         }
         self.frame_stride = self.channels as usize * self.format.bytes_per_sample();
+        // The negotiated input format (if the edge is typed `audio/raw`) outranks
+        // props and constructor; a runtime announcement refines it again before any
+        // data flows (see `event`).
+        self.learn_from_caps(ctx);
 
-        // Build the encoder and stash the header to emit on the first `process` (we
-        // can only push output when we hold an `out` batch mid-`process`).
-        let (encoder, _header) =
-            FlacEncoder::new_streaming(self.sample_rate, self.channels, self.format, BLOCK_SIZE)
-                .map_err(|e| Error::Resource(format!("flacenc: {e:?}")))?;
-        self.encoder = Some(encoder);
+        // Build the encoder; the STREAMINFO header is emitted on the first `process`
+        // (output can only be pushed while holding an `out` batch mid-`process`), so
+        // a pre-data `FormatChange` can still rebuild with the right parameters.
+        self.rebuild_encoder()?;
         self.header_sent = false;
-        self.carry.clear();
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
-        // Emit the STREAMINFO header exactly once, before any frames.
-        if !self.header_sent {
-            let (_enc, header) = FlacEncoder::new_streaming(
-                self.sample_rate,
-                self.channels,
-                self.format,
-                BLOCK_SIZE,
-            )
-            .map_err(|e| Error::Resource(format!("flacenc: {e:?}")))?;
-            Self::emit(ctx, &header)?;
-            self.header_sent = true;
-        }
-
         while let Some(buf) = inputs.pop() {
+            // Emit the STREAMINFO header exactly once, right before the first
+            // encoded bytes — *lazily*, so an upstream's format announcement (which
+            // always precedes its data) can still set the parameters. Emitting it
+            // eagerly on the first `process` call would race a decoder upstream
+            // that needs a pass of lookahead before it announces.
+            if !self.header_sent {
+                let (_enc, header) = FlacEncoder::new_streaming(
+                    self.sample_rate,
+                    self.channels,
+                    self.format,
+                    BLOCK_SIZE,
+                )
+                .map_err(|e| Error::Resource(format!("flacenc: {e:?}")))?;
+                Self::emit(ctx, &header)?;
+                self.header_sent = true;
+            }
+
             // Prepend any carried partial sample, then encode whole interchannel
             // samples and carry the remainder to the next buffer.
             let data = buf.memory.data();
@@ -235,7 +321,24 @@ impl Element for FlacEnc {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // The upstream's runtime format announcement (a decoder's header, wavparse's
+        // fmt chunk) arrives here before its data (spec: dynamic caps). Before the
+        // header went out, adopting it is free — rebuild the encoder. After, FLAC
+        // cannot change stream parameters mid-file: fail loudly, never mislabel.
+        if matches!(event, Event::FormatChange(_)) && self.learn_from_caps(ctx) {
+            if self.header_sent {
+                return Err(Error::Element {
+                    element: ctx.element(),
+                    message: format!(
+                        "flacenc: input format changed mid-stream (now {} Hz, {} ch, {:?}) \
+                         after STREAMINFO was written — unsupported",
+                        self.sample_rate, self.channels, self.format
+                    ),
+                });
+            }
+            self.rebuild_encoder()?;
+        }
         Ok(())
     }
 
