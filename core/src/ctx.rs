@@ -14,6 +14,7 @@ use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
 use crate::clock::{Clock, WaitOutcome};
 use crate::element::Direction;
+use crate::event::Event;
 use crate::format::{FixedFormat, OfferDesc, Value, ValueDesc, Vocabulary};
 use crate::id::{ElementId, FieldId, FormatId, PadId, ValueId};
 use crate::io::{Completion, Io, Submission};
@@ -31,6 +32,10 @@ pub(crate) struct Announcement {
     /// Which src pad announced — the scheduler rides the `FormatChange` on that pad's
     /// output batch, so it travels to that pad's downstream (branching-correct).
     pub(crate) pad: PadId,
+    /// The output-batch row the announcement precedes — captured at the moment of the
+    /// announce call, so a mid-`process()` announcement splits the batch exactly
+    /// there (spec: Events ordered relative to buffers).
+    pub(crate) at: u32,
     pub(crate) payload: AnnouncePayload,
 }
 
@@ -282,8 +287,11 @@ impl Ctx {
         family: &'static str,
         fields: &[(&'static str, ValueDesc)],
     ) {
+        let pad = self.resolve_src_pad(pad);
+        let at = self.out_slot(pad).len() as u32;
         self.announced.push(Announcement {
             pad,
+            at,
             payload: AnnouncePayload::Named { family, fields: fields.to_vec() },
         });
     }
@@ -296,13 +304,18 @@ impl Ctx {
     /// static names for fields it never knew. Same queued, batch-boundary semantics as
     /// an announcement.
     pub fn forward_format(&mut self, pad: PadId, format: FixedFormat) {
-        // Single-src leniency, as in `out(pad)`: the scheduler's drain routes the
-        // ride-along event strictly by this pad index.
-        let pad = match self.single_src {
+        let pad = self.resolve_src_pad(pad);
+        let at = self.out_slot(pad).len() as u32;
+        self.announced.push(Announcement { pad, at, payload: AnnouncePayload::Fixed(format) });
+    }
+
+    /// Single-src leniency, as in `out(pad)`: the scheduler's drain routes strictly
+    /// by pad index, so the announcement records the resolved pad.
+    fn resolve_src_pad(&self, pad: PadId) -> PadId {
+        match self.single_src {
             Some(idx) => PadId(idx as u32),
             None => pad,
-        };
-        self.announced.push(Announcement { pad, payload: AnnouncePayload::Fixed(format) });
+        }
     }
 
     /// Drain the pending announcements, in announce order (scheduler hook, after
@@ -747,6 +760,24 @@ impl Ctx {
         self.input.is_empty()
     }
 
+    /// The next in-band event due at the primary input's drain cursor (scheduler
+    /// hook — delivered before running the element; spec: Events ordered relative
+    /// to buffers, exact mid-batch positions).
+    pub(crate) fn due_input_event(&mut self) -> Option<Event> {
+        self.input.due_event()
+    }
+
+    /// Any event pending on a fan-in pad's input (delivered before the batch — see
+    /// `Batch::next_event_any` for why fan-in is pre-positioned).
+    pub(crate) fn any_input_event_on(&mut self, pad: PadId) -> Option<Event> {
+        self.ins.get_mut(pad.0 as usize)?.next_event_any()
+    }
+
+    /// Whether undelivered in-band events remain on the primary input.
+    pub(crate) fn input_has_events(&self) -> bool {
+        self.input.has_events()
+    }
+
     /// Buffers waiting on the primary sink pad — the scheduler's inline-backpressure
     /// gauge (see `run_group`: an element is not run while its co-grouped successor
     /// still holds a backlog).
@@ -757,7 +788,9 @@ impl Ctx {
     /// True if no pad has pending input — the primary sink pad *and* every fan-in pad.
     /// The scheduler's quiescence check (works for single- and multi-input elements).
     pub(crate) fn inputs_empty(&self) -> bool {
-        self.input.is_empty() && self.ins.iter().all(|b| b.is_empty())
+        self.input.is_empty()
+            && !self.input.has_events()
+            && self.ins.iter().all(|b| b.is_empty() && !b.has_events())
     }
 
     /// Append an upstream batch to a specific sink pad's input (scheduler hook, fan-in).

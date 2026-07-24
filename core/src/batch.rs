@@ -30,11 +30,14 @@ pub struct Batch {
     /// no per-buffer column shifting (spec: Batching — queued hop budget). The columns
     /// compact (reset) when the last row is popped.
     head: usize,
-    /// In-band events riding with this span, delivered to the downstream element's
-    /// `event()` at the batch boundary *before* its buffers (spec: Events travel with
-    /// buffers through the same queues). A `FormatChange` here is how a decoder announces
-    /// a runtime format to its peer (spec: Formats — dynamic caps). Usually empty.
-    events: Vec<Event>,
+    /// In-band events riding with this span, **positioned**: `(row, event)` means the
+    /// event precedes row `row` (spec: Events travel with buffers, *ordered relative to
+    /// them* — a mid-batch `FormatChange` applies exactly from its position, not to the
+    /// whole batch). The drain cursor treats an undelivered event as a barrier:
+    /// [`pop_front`](Self::pop_front) refuses to hand out row `row` until the scheduler
+    /// has taken the event via [`due_event`](Self::due_event). Sorted by position
+    /// (pushes stamp the current end, which is monotone). Usually empty.
+    events: Vec<(u32, Event)>,
     /// The seek generation this span was produced under (spec: flush/seek). The scheduler
     /// stamps it on each batch crossing a ring and drops any batch whose generation is
     /// older than the current one on the consuming side — so a seek can discard the data
@@ -84,14 +87,20 @@ impl Batch {
         self.pushed_at = None;
     }
 
-    /// Clear the data columns (not the events), resetting the drain cursor.
+    /// Clear the data columns (not the events), resetting the drain cursor. Remaining
+    /// event positions rebase by the drained rows (an end-of-batch event becomes due
+    /// at 0 once every row is gone).
     fn reset_columns(&mut self) {
+        let drained = self.head as u32;
         self.memories.clear();
         self.pts.clear();
         self.durations.clear();
         self.flags.clear();
         self.metas.clear();
         self.head = 0;
+        for (pos, _) in &mut self.events {
+            *pos = pos.saturating_sub(drained);
+        }
     }
 
     /// Append one buffer, decomposing it into the SoA columns.
@@ -106,9 +115,17 @@ impl Batch {
 
     /// Take the oldest buffer (FIFO), reconstructing it from the columns. O(1): the
     /// drain cursor advances and the row's `Memory` is moved out; nothing shifts.
+    /// An undelivered in-band event at the cursor is a **barrier**: `None` until the
+    /// scheduler delivers it ([`due_event`](Self::due_event)) — this is what makes a
+    /// mid-batch `FormatChange` land between exactly the right two buffers.
     pub fn pop_front(&mut self) -> Option<Buffer> {
         if self.head == self.memories.len() {
             return None;
+        }
+        if let Some(&(pos, _)) = self.events.first() {
+            if pos as usize <= self.head {
+                return None; // event due before this row — barrier until delivered
+            }
         }
         let i = self.head;
         self.head += 1;
@@ -128,26 +145,67 @@ impl Batch {
     }
 
     /// Move all (undrained) buffers out of `other` (leaving it empty) onto the end of
-    /// `self`, carrying its in-band events too so they stay ordered with the data.
+    /// `self`, carrying its in-band events too — re-positioned so they stay between
+    /// exactly the same buffers they arrived between.
     pub fn append(&mut self, other: &mut Batch) {
         let h = other.head;
+        let base = self.memories.len() as u32;
         self.memories.extend(other.memories.drain(h..));
         self.pts.extend_from_slice(&other.pts[h..]);
         self.durations.extend_from_slice(&other.durations[h..]);
         self.flags.extend_from_slice(&other.flags[h..]);
         self.metas.extend_from_slice(&other.metas[h..]);
-        self.events.append(&mut other.events);
+        for (pos, ev) in other.events.drain(..) {
+            // An event whose position was already at/behind other's cursor is due at
+            // the seam; later ones keep their offset into the appended span.
+            self.events.push((base + (pos.saturating_sub(h as u32)), ev));
+        }
         other.reset_columns();
     }
 
-    /// Attach an in-band event to this span (spec: Events travel with buffers).
+    /// Attach an in-band event to this span at the **current end** (spec: Events
+    /// travel with buffers): it precedes whatever is pushed next — so an element that
+    /// announces mid-`process()` splits the batch exactly there.
     pub fn push_event(&mut self, event: Event) {
-        self.events.push(event);
+        self.events.push((self.memories.len() as u32, event));
     }
 
-    /// Take the in-band events off this batch, leaving it data-only.
-    pub fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
+    /// Attach an in-band event at an explicit row position (scheduler use — e.g. an
+    /// announcement whose position was captured when the element made it).
+    pub(crate) fn push_event_at(&mut self, pos: u32, event: Event) {
+        // Keep the position order invariant (positions are monotone by construction
+        // on every normal path; a stray out-of-order insert would break the barrier).
+        let at = self.events.partition_point(|&(p, _)| p <= pos);
+        self.events.insert(at, (pos, event));
+    }
+
+    /// The next in-band event **due at the drain cursor** (its position has been
+    /// reached), removed. The scheduler calls this before running the element, until
+    /// it returns `None` — delivering each event after the element consumed exactly
+    /// the buffers that preceded it.
+    pub fn due_event(&mut self) -> Option<Event> {
+        match self.events.first() {
+            Some(&(pos, _)) if pos as usize <= self.head => Some(self.events.remove(0).1),
+            _ => None,
+        }
+    }
+
+    /// Whether any in-band events (delivered or not-yet-due) remain on this span.
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    /// Pop the first event **regardless of position** — the fan-in path: an
+    /// aggregator takes whole per-pad batches out of the scheduler's reach
+    /// (`take_input_on`), so its events are delivered before the batch (the
+    /// pre-positioning semantics), not at exact rows. Single-input elements get the
+    /// positioned [`due_event`](Self::due_event) instead.
+    pub(crate) fn next_event_any(&mut self) -> Option<Event> {
+        if self.events.is_empty() {
+            None
+        } else {
+            Some(self.events.remove(0).1)
+        }
     }
 
     /// Whether this batch carries no buffers *and* no events (so pushing it downstream
@@ -341,13 +399,29 @@ mod tests {
         b.push(buf(&pool, 2, 1));
         b.push(buf(&pool, 3, 1));
         let _ = b.pop_front(); // 1 is gone
-        b.push_event(Event::Eos);
+        b.push_event(Event::Eos); // positioned at b's end (after row 3)
         a.append(&mut b);
-        assert!(b.is_empty() && b.take_events().is_empty(), "source emptied");
+        assert!(b.is_empty() && !b.has_events(), "source emptied");
         assert_eq!(a.len(), 2, "only undrained rows moved");
-        assert_eq!(a.take_events().len(), 1, "events ride along");
+        assert!(a.has_events(), "events ride along");
+        // The event was positioned after b's last row: both rows pop before it is due.
         assert_eq!(a.pop_front().unwrap().memory.data()[0], 2);
+        assert!(a.due_event().is_none(), "not due until its position is reached");
         assert_eq!(a.pop_front().unwrap().memory.data()[0], 3);
+        assert!(matches!(a.due_event(), Some(Event::Eos)), "due after its preceding rows");
+    }
+
+    #[test]
+    fn mid_batch_event_is_a_barrier_until_delivered() {
+        let pool = Pool::bounded(64, 8);
+        let mut b = Batch::new(FormatId(0));
+        b.push(buf(&pool, 1, 1));
+        b.push_event(Event::Eos); // precedes row 1 (the next push)
+        b.push(buf(&pool, 2, 1));
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 1, "row before the event flows");
+        assert!(b.pop_front().is_none(), "barrier: row 2 held until the event is delivered");
+        assert!(matches!(b.due_event(), Some(Event::Eos)), "event due exactly here");
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 2, "row after the event flows");
     }
 
     #[test]

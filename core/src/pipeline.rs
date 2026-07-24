@@ -1788,17 +1788,11 @@ fn run_group(
                     if let Some(t) = batch.pushed_at.take() {
                         counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
                     }
-                    let events = batch.take_events();
                     ctxs[0].append_input_on(*pad, &mut batch);
                     // Return the drained shell for the producer's take_output to reuse
                     // (columns keep their capacity; drop is the harmless fallback).
                     batch.clear();
                     let _ = shell_tx.try_push(batch);
-                    if let Err(e) =
-                        deliver_events(&mut *elements[0], &mut ctxs[0], Some(*pad), events, &vocabulary)
-                    {
-                        break 'group Err(e);
-                    }
                     progressed = true;
                 }
                 if cons.is_closed() {
@@ -1812,8 +1806,10 @@ fn run_group(
             }
         } else if let Some((_pad, up, shell_tx)) = upstream.first() {
             let closed = up.is_closed();
-            let head_idle =
-                ctxs[0].input_is_empty() && ctxs[0].inbox_empty() && reactor.is_idle();
+            let head_idle = ctxs[0].input_is_empty()
+                && !ctxs[0].input_has_events()
+                && ctxs[0].inbox_empty()
+                && reactor.is_idle();
             if !closed && head_idle {
                 // Nothing to do but wait for input — block (no busy spin).
                 match up.pop() {
@@ -1822,19 +1818,9 @@ fn run_group(
                         if let Some(t) = batch.pushed_at.take() {
                             counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
                         }
-                        let events = batch.take_events();
                         ctxs[0].input_append(&mut batch);
                         batch.clear();
                         let _ = shell_tx.try_push(batch);
-                        if let Err(e) = deliver_events(
-                            &mut *elements[0],
-                            &mut ctxs[0],
-                            head_sink_pad,
-                            events,
-                            &vocabulary,
-                        ) {
-                            break 'group Err(e);
-                        }
                         progressed = true;
                     }
                     Some(_) => {} // stale pre-seek data: drop (buffers recycle)
@@ -1855,19 +1841,9 @@ fn run_group(
                     if let Some(t) = batch.pushed_at.take() {
                         counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
                     }
-                    let events = batch.take_events();
                     ctxs[0].input_append(&mut batch);
                     batch.clear();
                     let _ = shell_tx.try_push(batch);
-                    if let Err(e) = deliver_events(
-                        &mut *elements[0],
-                        &mut ctxs[0],
-                        head_sink_pad,
-                        events,
-                        &vocabulary,
-                    ) {
-                        break 'group Err(e);
-                    }
                     progressed = true;
                 }
                 if closed && up.is_empty() {
@@ -1915,31 +1891,48 @@ fn run_group(
             // flag is on — the untraced hot path pays one relaxed load per call.
             let trace_t0 =
                 if tracing.load(Ordering::Relaxed) { Some(std::time::Instant::now()) } else { None };
+            // Deliver due in-band events at this element's drain cursor (spec: Events
+            // ordered relative to buffers — a mid-batch FormatChange lands between
+            // exactly the buffers it arrived between; the batch barrier held the
+            // element at the boundary until now). Fan-in pads are pre-positioned:
+            // their whole batches leave the scheduler via `take_input_on`, so their
+            // events deliver before the batch instead.
+            if i == 0 && fan_in {
+                for (pad, _, _) in &upstream {
+                    while let Some(ev) = ctxs[0].any_input_event_on(*pad) {
+                        if let Err(e) = deliver_events(
+                            &mut *elements[0], &mut ctxs[0], Some(*pad), vec![ev], &vocabulary,
+                        ) {
+                            fatal = Some(e);
+                            break;
+                        }
+                        progressed = true;
+                    }
+                    if fatal.is_some() {
+                        break;
+                    }
+                }
+            } else if !(i == 0 && is_source) {
+                let pad = if i == 0 { head_sink_pad } else { member_sink_pads[i] };
+                while let Some(ev) = ctxs[i].due_input_event() {
+                    if let Err(e) =
+                        deliver_events(&mut *elements[i], &mut ctxs[i], pad, vec![ev], &vocabulary)
+                    {
+                        fatal = Some(e);
+                        break;
+                    }
+                    progressed = true;
+                }
+            }
+            if fatal.is_some() {
+                break;
+            }
             let flow = if i == 0 && (is_source || fan_in) {
                 // A source has no input; a fan-in head reads its pads via
                 // `ctx.take_input_on(pad)`, so both get an empty `Inputs` here.
                 elements[0].process(&mut ctxs[0], Inputs::empty())
             } else {
                 let mut input = ctxs[i].take_input();
-                // In-band events from a co-grouped upstream ride the inline-appended
-                // batch (a ring-fed head's events were already delivered at feed
-                // time and never reach here). Deliver them now, before the buffers
-                // they precede — this is what lets a passive consumer see a passive
-                // producer's FormatChange (spec: Formats — dynamic caps).
-                let events = input.take_events();
-                if !events.is_empty() {
-                    if let Err(e) = deliver_events(
-                        &mut *elements[i],
-                        &mut ctxs[i],
-                        member_sink_pads[i],
-                        events,
-                        &vocabulary,
-                    ) {
-                        ctxs[i].set_input(input);
-                        fatal = Some(e);
-                        break;
-                    }
-                }
                 let f = elements[i].process(&mut ctxs[i], Inputs::owned(&mut input));
                 ctxs[i].set_input(input);
                 f
@@ -1973,10 +1966,11 @@ fn run_group(
                     crate::ctx::AnnouncePayload::Fixed(f) => Some(f),
                 };
                 if let Some(f) = fixed {
-                    // Ride the FormatChange on the announced src pad's batch so it travels
-                    // to that pad's downstream (correct when the element branches — a
-                    // multi-track demuxer announces several pads in one pass).
-                    ctxs[i].output_on(ann.pad).push_event(Event::FormatChange(f));
+                    // Ride the FormatChange on the announced src pad's batch, at the row
+                    // the announcement was made (correct when the element branches, and
+                    // when it announces mid-`process()` — the event splits the batch
+                    // exactly there; spec: Events ordered relative to buffers).
+                    ctxs[i].output_on(ann.pad).push_event_at(ann.at, Event::FormatChange(f));
                 }
             }
             let (nbuf, nbytes) = ctxs[i].total_output();
