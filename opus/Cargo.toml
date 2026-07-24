@@ -1,0 +1,17 @@
+[package]
+name = "sc-opus"
+description = "Opus (RFC 6716) codec plugin for streamcraft backed by the pure-Rust oxideav-opus (adoption pending evaluation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_opus"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+oxideav-opus = { version = "0.0.13", default-features = false }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }

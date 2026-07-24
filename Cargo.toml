@@ -16,6 +16,7 @@ members = [
     "vp9",
     "scope",
     "pipewire",
+    "opus",
     "wayland",
     "launch",
 ]
