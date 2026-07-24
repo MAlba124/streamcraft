@@ -342,6 +342,10 @@ pub struct Pipeline {
     /// `ElementId`; `None` uses `queue_cap`. See
     /// [`set_queue_capacity`](Self::set_queue_capacity).
     queue_overrides: Vec<Option<usize>>,
+    /// Per-element inbound-ring leaky policy (spec: Queues — leaky modes for live
+    /// sources), indexed by `ElementId`; `None`/`Block` blocks (the default
+    /// backpressure). See [`set_queue_leaky`](Self::set_queue_leaky).
+    leaky_overrides: Vec<Option<crate::ring::Leaky>>,
     /// Pads instantiated at runtime, per element (spec: dynamic pads). Indexed by
     /// `ElementId`; grown to match `elements` in [`add`](Self::add) and populated by
     /// [`preroll`](Self::preroll). Empty for a static pipeline.
@@ -389,6 +393,7 @@ impl Pipeline {
             dyn_pads: Vec::new(),
             pool_overrides: Vec::new(),
             queue_overrides: Vec::new(),
+            leaky_overrides: Vec::new(),
         }
     }
 
@@ -495,6 +500,7 @@ impl Pipeline {
         self.dyn_pads.push(Vec::new());
         self.pool_overrides.push(None);
         self.queue_overrides.push(None);
+        self.leaky_overrides.push(None);
         id
     }
 
@@ -521,6 +527,19 @@ impl Pipeline {
     pub fn set_queue_capacity(&mut self, el: ElementId, batches: usize) {
         if let Some(o) = self.queue_overrides.get_mut(el.0 as usize) {
             *o = Some(batches.max(1));
+        }
+    }
+
+    /// Make the ring feeding **into** `el` leaky (spec: Queues — leaky modes): with
+    /// [`Leaky::DropNewest`](crate::ring::Leaky) a full ring drops the incoming batch
+    /// instead of blocking the producer — the live-source policy (a camera must not
+    /// stall on a slow consumer; the freshest-frame-wins variant, DropOldest, is
+    /// deliberately unavailable — see the ring docs). Dropped batches are counted in
+    /// the *producing* element's `drops` counter. The default is blocking
+    /// backpressure, which is what file pipelines want.
+    pub fn set_queue_leaky(&mut self, el: ElementId, leaky: crate::ring::Leaky) {
+        if let Some(o) = self.leaky_overrides.get_mut(el.0 as usize) {
+            *o = Some(leaky);
         }
     }
 
@@ -855,7 +874,13 @@ impl Pipeline {
                 .copied()
                 .flatten()
                 .unwrap_or(self.queue_cap);
-            let (p, c) = spsc::<Batch>(cap);
+            let leaky = self
+                .leaky_overrides
+                .get(edge.sink.0 as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(crate::ring::Leaky::Block);
+            let (p, c) = crate::ring::spsc_leaky::<Batch>(cap, leaky);
             // The shell return ring (spec: Batching — zero-alloc transport): the
             // consumer sends drained batch shells back so the producer's
             // `take_output` reuses their column capacity instead of allocating.
@@ -2005,8 +2030,16 @@ fn run_group(
                     out.pushed_at = Some(std::time::Instant::now());
                 }
                 progressed = true;
+                // On a leaky ring a full push drops the batch inside the ring (never
+                // blocks — the live-source policy); surface it in the producer's
+                // drops counter (spec: Queues — leaky modes; drops are observable).
+                let nbuf = out.len() as u64;
+                let dropped_before = down.dropped();
                 if down.push(out).is_err() {
                     break 'group Ok(()); // this downstream is gone
+                }
+                if down.dropped() > dropped_before {
+                    counters[m - 1].record_drops(nbuf);
                 }
                 // Queue-fill high-water on the producing element (spec: Taps —
                 // backpressure shows as the ring sitting at capacity).
