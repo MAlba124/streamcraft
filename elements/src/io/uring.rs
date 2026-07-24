@@ -11,7 +11,8 @@
 //! it is necessarily `unsafe`. The ring head/tail indices are shared with the kernel
 //! and accessed as atomics with acquire/release ordering.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Error as IoError;
 use std::os::unix::io::AsRawFd;
@@ -19,7 +20,10 @@ use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use streamcraft_core::id::ElementId;
-use streamcraft_core::io::{Completion, IoResult, OpId, OpKind, Reactor, Submission};
+use streamcraft_core::io::{
+    fadvise, Completion, IoResult, OpId, OpKind, Reactor, StreamHygiene, Submission,
+    POSIX_FADV_SEQUENTIAL,
+};
 
 // --- ABI constants ---
 
@@ -179,7 +183,66 @@ struct InflightOp {
     op: OpId,
     user: u64,
     kind: OpKind,
+    /// File + offset ride along so the completion can feed that file's
+    /// [`StreamHygiene`] watermark.
+    file: u32,
+    offset: u64,
     buf: streamcraft_core::buffer::Buffer,
+}
+
+/// Contiguous-completion watermark: uring completes ops in any order, but cache
+/// hygiene (`POSIX_FADV_DONTNEED` behind the position) is only safe below the
+/// point where *every* prior byte's op has completed — dropping under an
+/// in-flight write would discard the not-yet-dirty page for nothing, and
+/// advising on a max-end mark could jump over holes. Completed ranges pool in a
+/// min-heap and the watermark advances over whatever became contiguous.
+#[derive(Default)]
+struct Watermark {
+    /// Everything below this has completed. Initialized to the first submitted
+    /// offset (a stream need not start at 0 — a seek target).
+    contig: Option<u64>,
+    /// Completed `(start, end)` ranges above (and possibly at) `contig`.
+    done: BinaryHeap<Reverse<(u64, u64)>>,
+}
+
+impl Watermark {
+    /// Note the first submitted offset (fixes the origin).
+    fn origin(&mut self, offset: u64) {
+        if self.contig.is_none() {
+            self.contig = Some(offset);
+        }
+    }
+
+    /// Merge a completed range; returns the newly-contiguous `(from, to)` span
+    /// if the watermark advanced.
+    fn complete(&mut self, start: u64, end: u64) -> Option<(u64, u64)> {
+        let mut contig = self.contig?;
+        let from = contig;
+        self.done.push(Reverse((start, end)));
+        while let Some(&Reverse((s, e))) = self.done.peek() {
+            if s > contig {
+                break;
+            }
+            self.done.pop();
+            contig = contig.max(e);
+        }
+        self.contig = Some(contig);
+        (contig > from).then_some((from, contig))
+    }
+}
+
+/// A registered file plus its streaming-hygiene state (see [`StreamHygiene`] —
+/// same policy as `SyncReactor`, adapted to out-of-order completion).
+struct UringFile {
+    file: File,
+    hygiene: StreamHygiene,
+    /// Submission-order high-water marks: monotonicity must be judged on the
+    /// *submitted* pattern (completion order is arbitrary here), so one backward
+    /// submitted offset disables that side's hygiene for good.
+    read_submit_end: u64,
+    write_submit_end: u64,
+    read_wm: Watermark,
+    write_wm: Watermark,
 }
 
 pub struct IoUringReactor {
@@ -203,8 +266,11 @@ pub struct IoUringReactor {
     cqes: *const IoUringCqe,
     cq_head: u32, // local mirror of the head we consume
 
-    files: HashMap<u32, File>,
+    files: HashMap<u32, UringFile>,
     pending: Vec<Submission>,
+    /// Drain scratch for `submit_pending`: `pending` swaps in here so both vecs
+    /// keep their capacity across passes (ZERO-COPY.md stage 4.2).
+    scratch: Vec<Submission>,
     in_flight: HashMap<u64, InflightOp>,
 }
 
@@ -256,23 +322,46 @@ impl IoUringReactor {
                 cq_head,
                 files: HashMap::new(),
                 pending: Vec::new(),
+                scratch: Vec::new(),
                 in_flight: HashMap::new(),
             })
         }
     }
 
-    /// Fill SQEs for all pending ops, park their buffers, and submit. Returns any
-    /// immediate errors (e.g. an op for an unregistered file).
-    fn submit_pending(&mut self) -> Vec<(ElementId, Completion)> {
-        let mut errors = Vec::new();
-        let subs = std::mem::take(&mut self.pending);
+    /// Fill SQEs for all pending ops, park their buffers, and submit. Any
+    /// immediate errors (e.g. an op for an unregistered file) push into `out`.
+    fn submit_pending(&mut self, out: &mut Vec<(ElementId, Completion)>) {
+        // Swap `pending` into the drain scratch so its capacity survives the pass.
+        debug_assert!(self.scratch.is_empty());
+        std::mem::swap(&mut self.pending, &mut self.scratch);
         let mut submitted: u32 = 0;
 
-        for mut s in subs {
-            let fd = match self.files.get(&s.file.0) {
-                Some(f) => f.as_raw_fd(),
+        for mut s in self.scratch.drain(..) {
+            let fd = match self.files.get_mut(&s.file.0) {
+                Some(rf) => {
+                    // Hygiene bookkeeping happens at *submission*, where order still
+                    // reflects the element's access pattern (completions reorder):
+                    // fix the watermark origin and check monotonicity.
+                    match s.kind {
+                        OpKind::Read => {
+                            rf.read_wm.origin(s.offset);
+                            if s.offset < rf.read_submit_end {
+                                rf.hygiene.disable_read();
+                            }
+                            rf.read_submit_end = s.offset + s.buf.memory.capacity() as u64;
+                        }
+                        OpKind::Write => {
+                            rf.write_wm.origin(s.offset);
+                            if s.offset < rf.write_submit_end {
+                                rf.hygiene.disable_write();
+                            }
+                            rf.write_submit_end = s.offset + s.buf.memory.len() as u64;
+                        }
+                    }
+                    rf.file.as_raw_fd()
+                }
                 None => {
-                    errors.push((
+                    out.push((
                         s.element,
                         Completion {
                             op: s.op,
@@ -322,7 +411,15 @@ impl IoUringReactor {
 
             self.in_flight.insert(
                 s.op.0,
-                InflightOp { element: s.element, op: s.op, user: s.user, kind: s.kind, buf: s.buf },
+                InflightOp {
+                    element: s.element,
+                    op: s.op,
+                    user: s.user,
+                    kind: s.kind,
+                    file: s.file.0,
+                    offset: s.offset,
+                    buf: s.buf,
+                },
             );
         }
 
@@ -338,13 +435,10 @@ impl IoUringReactor {
             // A spurious EINTR is fine — the next run_once retries.
             let _ = io_uring_enter(self.ring_fd, submitted, min_complete, flags);
         }
-
-        errors
     }
 
-    /// Reap all currently-available completions.
-    fn reap(&mut self) -> Vec<(ElementId, Completion)> {
-        let mut out = Vec::new();
+    /// Reap all currently-available completions into `out`.
+    fn reap(&mut self, out: &mut Vec<(ElementId, Completion)>) {
         // SAFETY: ktail is the kernel-updated CQ tail; acquire orders the CQE reads.
         let ktail = unsafe { (*self.cq_ktail).load(Ordering::Acquire) };
         while self.cq_head != ktail {
@@ -364,6 +458,25 @@ impl IoUringReactor {
                     if let OpKind::Read = op.kind {
                         op.buf.memory.set_len(n);
                     }
+                    // Feed the file's hygiene watermark: only spans that became
+                    // *contiguously* complete reach StreamHygiene, in file order,
+                    // so the DONTNEED/sync windows behave exactly as in the
+                    // ordered SyncReactor despite arbitrary CQE order.
+                    if n > 0 {
+                        if let Some(rf) = self.files.get_mut(&op.file) {
+                            let fd = rf.file.as_raw_fd();
+                            let wm = match op.kind {
+                                OpKind::Read => &mut rf.read_wm,
+                                OpKind::Write => &mut rf.write_wm,
+                            };
+                            if let Some((from, to)) = wm.complete(op.offset, op.offset + n as u64) {
+                                match op.kind {
+                                    OpKind::Read => rf.hygiene.on_read(fd, from, (to - from) as usize),
+                                    OpKind::Write => rf.hygiene.on_write(fd, from, (to - from) as usize),
+                                }
+                            }
+                        }
+                    }
                     IoResult::Ok(n)
                 };
                 out.push((op.element, Completion { op: op.op, user: op.user, result, buf: op.buf }));
@@ -373,17 +486,34 @@ impl IoUringReactor {
         unsafe {
             (*self.cq_khead).store(self.cq_head, Ordering::Release);
         }
-        out
     }
 }
 
 impl Reactor for IoUringReactor {
     fn set_file(&mut self, element: ElementId, file: File) {
-        self.files.insert(element.0, file);
+        // Registered files stream: double the readahead window up front
+        // (`man 2 posix_fadvise`; best-effort — advice).
+        let _ = fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
+        self.files.insert(
+            element.0,
+            UringFile {
+                file,
+                hygiene: StreamHygiene::new(),
+                read_submit_end: 0,
+                write_submit_end: 0,
+                read_wm: Watermark::default(),
+                write_wm: Watermark::default(),
+            },
+        );
     }
 
-    fn submit(&mut self, subs: Vec<Submission>) {
-        self.pending.extend(subs);
+    fn submit(&mut self, mut subs: Vec<Submission>) {
+        // Steady state `pending` is empty here (submit_pending drains every pass):
+        // adopt the larger allocation instead of copying into a smaller one.
+        if self.pending.is_empty() && self.pending.capacity() < subs.capacity() {
+            std::mem::swap(&mut self.pending, &mut subs);
+        }
+        self.pending.append(&mut subs);
     }
 
     fn cancel(&mut self, op: OpId) {
@@ -397,8 +527,11 @@ impl Reactor for IoUringReactor {
     }
 
     fn run_once(&mut self) -> Vec<(ElementId, Completion)> {
-        let mut out = self.submit_pending();
-        out.extend(self.reap());
+        // One vec per pass (forced fresh by the trait — the scheduler consumes it
+        // by value); submit errors and reaped completions share it.
+        let mut out = Vec::new();
+        self.submit_pending(&mut out);
+        self.reap(&mut out);
         out
     }
 }
@@ -409,5 +542,33 @@ impl Drop for IoUringReactor {
         unsafe {
             libc::close(self.ring_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Watermark;
+
+    /// Out-of-order completions only advance the watermark once contiguous —
+    /// the invariant the hygiene feed depends on.
+    #[test]
+    fn watermark_advances_only_when_contiguous() {
+        let mut wm = Watermark::default();
+        wm.origin(0);
+        assert_eq!(wm.complete(10, 20), None); // hole at [0,10)
+        assert_eq!(wm.complete(20, 30), None); // still blocked
+        assert_eq!(wm.complete(0, 10), Some((0, 30))); // hole filled: all three merge
+        assert_eq!(wm.complete(30, 40), Some((30, 40)));
+    }
+
+    /// The origin is the first submitted offset, not zero — a stream that starts
+    /// mid-file (a seek target) must not wait for bytes nobody submitted.
+    #[test]
+    fn watermark_origin_is_first_offset() {
+        let mut wm = Watermark::default();
+        assert_eq!(wm.complete(0, 10), None); // no origin yet: ignored
+        wm.origin(100);
+        wm.origin(50); // later origins are no-ops
+        assert_eq!(wm.complete(100, 150), Some((100, 150)));
     }
 }
