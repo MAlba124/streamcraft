@@ -116,6 +116,22 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > several blocks), multi-track fan-in `MkvMux`, and an `mp4 → mkv` test once
 > vp9/av1 passthrough lands end-to-end.
 
+> **Update — session 4c (2026-07-24): the movie remux goal — DONE.** A real 1.6 GB
+> H.264 movie remuxes `mp4 → mkv` at disk speed (1.44 GiB in 9.5 s, 151 MiB/s):
+> `Mp4Demux::passthrough()` keeps NAL samples length-prefixed as stored (families
+> `h264/avcc`/`h265/hvcc`, raw record as in-band head — Matroska's native shape,
+> RFC 9559 §12); `MkvMux` takes the first buffer as CodecPrivate verbatim; sample
+> sync bits ride as KEYFRAME/DELTA. `mp4/examples/remux_to_mkv.rs` + fixture test
+> vs the Mp4Reader oracle. The two-track movie flushed out **two core bugs**:
+> the single announcement *slot* (several pads announcing in one process() pass
+> lost all but the last — now a queue) and the unlinked-pad drop policy only
+> covering the group *tail* (a mid-group demuxer's unwatched audio pad exhausted
+> its pool and stalled the run at 72 KB — now every member drops+counts unrouted
+> output). Ring agent merged: cached-index SPSC fast path (~120→~90 ns/item
+> two-thread), leaky DropNewest, loom models, ring_hop bench — fenceless-as-specced
+> proven unsound (Dekker lost-wakeup), the SeqCst wake fence stays. Remaining for
+> remux: audio (multi-track fan-in MkvMux + A_AAC/esds), av1C, `Language` tags.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
