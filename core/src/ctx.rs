@@ -563,6 +563,13 @@ impl Ctx {
         self.input.is_empty()
     }
 
+    /// Buffers waiting on the primary sink pad — the scheduler's inline-backpressure
+    /// gauge (see `run_group`: an element is not run while its co-grouped successor
+    /// still holds a backlog).
+    pub(crate) fn input_len(&self) -> usize {
+        self.input.len()
+    }
+
     /// True if no pad has pending input — the primary sink pad *and* every fan-in pad.
     /// The scheduler's quiescence check (works for single- and multi-input elements).
     pub(crate) fn inputs_empty(&self) -> bool {

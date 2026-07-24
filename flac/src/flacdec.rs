@@ -53,7 +53,11 @@ static SRC_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: F_CHANNELS, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_SAMPLE, allowed: ConstraintDesc::Set(&SAMPLE_VALUES), preferred: None },
 ];
-static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }];
+// Typed `audio/raw` first; then the `bytes` bridge, so a byte sink (`filesink` — dump
+// decoded PCM to a file) still links and the announcement rides it tolerantly (spec:
+// Formats — an `audio/raw` refinement riding a `bytes` bridge to a byte sink).
+static SRC_OFFERS: [OfferDesc; 2] =
+    [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }, OfferDesc::any("bytes")];
 static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
 static PADS: [PadDesc; 2] = [

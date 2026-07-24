@@ -75,10 +75,12 @@ static SRC_DESC: ElementDesc = ElementDesc {
     make_default: None,
 };
 
-/// Emits each chunk in order (one per `process`), then EOS.
+/// Emits chunks in order — up to `burst` per `process` call, as fast as the pool
+/// allows (an IO source's shape: several completions per pass) — then EOS.
 struct PacketSrc {
     packets: Vec<Vec<u8>>,
     next: usize,
+    burst: usize,
 }
 
 impl Element for PacketSrc {
@@ -90,15 +92,17 @@ impl Element for PacketSrc {
         Ok(())
     }
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
-        if self.next >= self.packets.len() {
-            return Ok(Flow::Eos);
+        for _ in 0..self.burst {
+            if self.next >= self.packets.len() {
+                return Ok(Flow::Eos);
+            }
+            let pkt = &self.packets[self.next];
+            let Some(mut buf) = ctx.try_alloc(PadId(0)) else { return Ok(Flow::Ok) };
+            buf.memory.as_mut_full()[..pkt.len()].copy_from_slice(pkt);
+            buf.memory.set_len(pkt.len());
+            ctx.out(PadId(0)).push(buf);
+            self.next += 1;
         }
-        let pkt = &self.packets[self.next];
-        let Some(mut buf) = ctx.try_alloc(PadId(0)) else { return Ok(Flow::Ok) };
-        buf.memory.as_mut_full()[..pkt.len()].copy_from_slice(pkt);
-        buf.memory.set_len(pkt.len());
-        ctx.out(PadId(0)).push(buf);
-        self.next += 1;
         Ok(Flow::Ok)
     }
     fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
@@ -176,7 +180,7 @@ fn transcode_is_lossless_and_learns_the_announced_format() {
     let packets: Vec<Vec<u8>> = stream.chunks(1500).map(<[u8]>::to_vec).collect();
 
     let mut p = Pipeline::new();
-    let src = p.add(PacketSrc { packets, next: 0 });
+    let src = p.add(PacketSrc { packets, next: 0, burst: 1 });
     let dec = p.add(FlacDec::new());
     // Deliberately wrong constructor parameters: only the FormatChange announced by
     // flacdec (22050 Hz stereo s16, from STREAMINFO) can make the output correct.
@@ -195,4 +199,47 @@ fn transcode_is_lossless_and_learns_the_announced_format() {
     assert_eq!(out.info.channels, CHANNELS, "channels learned from the announcement");
     assert_eq!(out.info.bits_per_sample, 16, "sample format learned from the announcement");
     assert_eq!(out.samples, expected, "decode → re-encode → decode is lossless");
+}
+
+#[test]
+fn bursty_source_with_starved_pool_does_not_deadlock() {
+    // Regression: `filesrc ! flacdec ! flacenc ! filesink` livelocked — the source,
+    // inlined ahead of the latency-bounded decoder, free-ran until every pool slot
+    // sat in the decoder's unconsumed input; the decoder then couldn't allocate its
+    // own output, never consumed, and no slot ever came back. The scheduler's inline
+    // backpressure gate (an element is not run while its successor holds a backlog)
+    // must keep this flowing. Reproduced deliberately small: a 16-slot / 4 KiB pool
+    // and a source bursting 4 packets per pass, with a run-thread timeout as the
+    // deadlock detector.
+    let (pcm, expected) = gen_s16(60_000);
+    let stream = encode_stream(&pcm);
+    // Small chunks so the packet count dwarfs the pool regardless of how well the
+    // sines compress.
+    let packets: Vec<Vec<u8>> = stream.chunks(512).map(<[u8]>::to_vec).collect();
+    assert!(packets.len() > 64, "enough packets to overwhelm a 16-slot pool");
+
+    let mut p = Pipeline::new();
+    p.set_pool(4096, 16);
+    let src = p.add(PacketSrc { packets, next: 0, burst: 4 });
+    let dec = p.add(FlacDec::new());
+    let enc = p.add(FlacEnc::new(8_000, 1, SampleFormat::S32));
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let sink = p.add(ByteSink { got: Arc::clone(&got) });
+    p.link((src, "src"), (dec, "sink")).expect("src!dec");
+    p.link((dec, "src"), (enc, "sink")).expect("dec!enc");
+    p.link((enc, "src"), (sink, "sink")).expect("enc!sink");
+
+    let run = std::thread::spawn(move || p.run());
+    for _ in 0..600 {
+        if run.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(run.is_finished(), "transcode deadlocked under a starved pool");
+    run.join().expect("joined").expect("run ok");
+
+    let flac = got.lock().unwrap().clone();
+    let out = FlacDecoder::decode(&flac).expect("output decodes");
+    assert_eq!(out.samples, expected, "still lossless under pool pressure");
 }

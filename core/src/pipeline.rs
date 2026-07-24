@@ -33,6 +33,12 @@ use crate::time::Timestamp;
 /// Milestone raw-bytes format id. Real negotiation (spec: Formats) assigns these.
 const BYTES: FormatId = FormatId(0);
 
+/// How many unconsumed buffers a co-grouped element's input may hold before the
+/// scheduler stops running its upstream (inline backpressure — see `run_group`).
+/// A few batches, mirroring the boundary-ring capacity philosophy: enough to
+/// amortize, small enough that no single chain position can starve the shared pool.
+const INLINE_INPUT_CAP: usize = 8;
+
 /// A negotiated edge: the two pads it joins (by element + local pad index) and the
 /// [`FixedFormat`] the solver fixed on it at [`link`](Pipeline::link) time (spec:
 /// Formats — fixed formats live on edges).
@@ -226,6 +232,17 @@ impl Pipeline {
     /// (spec: flush/seek). See [`SeekHandle`].
     pub fn seek_handle(&self) -> SeekHandle {
         SeekHandle(Arc::clone(&self.seek))
+    }
+
+    /// Configure the shared buffer pool for the next [`run`](Self::run) (spec: Memory —
+    /// pools are sized at state changes, never per buffer). `slot_size` is each pooled
+    /// buffer's capacity in bytes (video frames need `w*h*3/2` for I420); `slots` caps
+    /// how many live at once — the allocation backstop behind the ring backpressure.
+    /// Until per-link pool negotiation lands (spec: Formats — pool negotiation is
+    /// decoupled), one pool serves the whole pipeline.
+    pub fn set_pool(&mut self, slot_size: usize, slots: u32) {
+        self.slot_size = slot_size.max(1);
+        self.pool_slots = slots.max(1) as usize;
     }
 
     /// Programmatically enable logging up to `level`, formatting records to stderr on a
@@ -1398,6 +1415,19 @@ fn run_group(
         // B. Run the group's elements inline (head active, passive tail).
         let mut fatal = None;
         for i in 0..m {
+            // Inline backpressure (spec: Scheduling — real queues exist only at group
+            // boundaries; *inside* a group the scheduler paces producers): don't run
+            // an element while its co-grouped successor still holds a backlog of
+            // unconsumed input. Without this, a fast IO source inlined with a
+            // deliberately-latency-bounded consumer (filesrc ! flacdec …) free-runs
+            // until the shared pool is exhausted by its own queued output — at which
+            // point the consumer can no longer allocate *its* output, never consumes,
+            // never frees a slot, and the group livelocks. The tail ring stays the
+            // inter-group bound; this is its inline analogue. Consumers below the
+            // gated element still run, so backlogs always drain.
+            if i + 1 < m && ctxs[i + 1].input_len() >= INLINE_INPUT_CAP {
+                continue;
+            }
             // Live property sets land here, at the batch boundary — a set issued
             // while batch N was in flight takes effect no earlier than N+1 (spec:
             // Dynamic element properties). Idle cost: one relaxed load.
