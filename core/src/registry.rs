@@ -291,6 +291,156 @@ fn is_ident(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
 }
 
+// --- Descriptor inspection (the gst-inspect surface) ---------------------------------
+//
+// Everything an element declares is already plain static data (spec: Elements and
+// pads — "everything *static* lives in a descriptor"), so inspection is pure
+// formatting: no pipeline, no interners, no instantiation.
+
+impl Registry {
+    /// A human-readable description of the element registered under `name` — pads with
+    /// their offer menus and constraints, properties with their validation constraint
+    /// and live/structural class, scheduling/aggregation/latency declarations, and
+    /// whether the parse layer can construct it. `None` for an unregistered name.
+    pub fn describe(&self, name: &str) -> Option<String> {
+        self.get(name).map(describe_desc)
+    }
+}
+
+/// Render one descriptor (see [`Registry::describe`]).
+pub fn describe_desc(desc: &ElementDesc) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "{}", desc.name);
+    let _ = writeln!(
+        s,
+        "  scheduling: {:?}   inputs: {:?}   construct: {}",
+        desc.sched,
+        desc.inputs,
+        if desc.make_default.is_some() {
+            "typed or parse (make_default)"
+        } else {
+            "typed only (no make_default)"
+        }
+    );
+    let _ = writeln!(
+        s,
+        "  latency: min {}  max {}  jitter {}  live: {}",
+        fmt_ts(desc.latency.min),
+        fmt_ts(desc.latency.max),
+        fmt_ts(desc.latency.jitter),
+        if desc.latency.is_live { "yes" } else { "no" },
+    );
+
+    let _ = writeln!(s, "  pads:");
+    for pad in desc.pads {
+        let dir = match pad.direction {
+            Direction::Sink => "sink",
+            Direction::Src => "src",
+        };
+        let dynamic = if pad.dynamic { ", dynamic" } else { "" };
+        let validate = if pad.validate.is_some() { ", validate-hook" } else { "" };
+        let _ = writeln!(s, "    {} ({dir}{dynamic}{validate})", pad.name);
+        for offer in pad.offers {
+            if offer.fields.is_empty() {
+                let _ = writeln!(s, "      {} (any)", offer.family);
+                continue;
+            }
+            let _ = writeln!(s, "      {}", offer.family);
+            for f in offer.fields {
+                let pref = match &f.preferred {
+                    Some(v) => format!("  (preferred: {})", fmt_value_desc(v)),
+                    None => String::new(),
+                };
+                let _ = writeln!(
+                    s,
+                    "        {}: {}{pref}",
+                    f.field,
+                    fmt_constraint_desc(&f.allowed)
+                );
+            }
+        }
+    }
+
+    if desc.props.is_empty() {
+        let _ = writeln!(s, "  properties: (none)");
+    } else {
+        let _ = writeln!(s, "  properties:");
+        let width = desc.props.iter().map(|p| p.name.len()).max().unwrap_or(0);
+        for p in desc.props {
+            let _ = writeln!(
+                s,
+                "    {:width$}  {}  ({})",
+                p.name,
+                fmt_constraint(&p.allowed),
+                if p.live { "live" } else { "structural" },
+            );
+        }
+    }
+    s
+}
+
+fn fmt_ts(t: crate::time::Timestamp) -> String {
+    match t.nanos() {
+        None => "unset".into(),
+        Some(0) => "0".into(),
+        Some(n) if n % 1_000_000 == 0 => format!("{}ms", n / 1_000_000),
+        Some(n) => format!("{n}ns"),
+    }
+}
+
+fn fmt_value_desc(v: &crate::format::ValueDesc) -> String {
+    use crate::format::ValueDesc as V;
+    match v {
+        V::Int(i) => i.to_string(),
+        V::Rat(n, d) => format!("{n}/{d}"),
+        V::Id(s) => (*s).to_string(),
+    }
+}
+
+fn fmt_constraint_desc(c: &crate::format::ConstraintDesc) -> String {
+    use crate::format::ConstraintDesc as C;
+    match c {
+        C::Any => "any".into(),
+        C::Eq(v) => fmt_value_desc(v),
+        C::Range { min, max, step } => format!(
+            "[{}, {}] step {}",
+            fmt_value_desc(min),
+            fmt_value_desc(max),
+            fmt_value_desc(step)
+        ),
+        C::Set(vs) => {
+            let items: Vec<String> = vs.iter().map(fmt_value_desc).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+fn fmt_value(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Rat(n, d) => format!("{n}/{d}"),
+        // Interned categorical ids are pipeline-scoped; a static prop constraint
+        // holding one can only be shown opaquely.
+        Value::Id(id) => format!("#{}", id.0),
+    }
+}
+
+fn fmt_constraint(c: &crate::format::Constraint) -> String {
+    use crate::format::Constraint as C;
+    match c {
+        C::Any => "any".into(),
+        C::Eq(v) => fmt_value(v),
+        C::Range { min, max, step } => {
+            format!("[{}, {}] step {}", fmt_value(min), fmt_value(max), fmt_value(step))
+        }
+        C::Set(vs) => {
+            let items: Vec<String> = vs.iter().map(fmt_value).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +683,96 @@ mod tests {
         assert!(matches!(parse_value("s16"), ParsedValue::Str("s16")));
         // Overflowing integer falls back to a string (parse::<i64> fails), never panics.
         assert!(matches!(parse_value("999999999999999999999999"), ParsedValue::Str(_)));
+    }
+
+    // A descriptor exercising every branch of the inspect renderer: a constrained,
+    // preference-carrying offer on a dynamic pad, and both live/structural props.
+    static RICH_VALUES: [crate::format::ValueDesc; 2] = [
+        crate::format::ValueDesc::Id("s16"),
+        crate::format::ValueDesc::Id("s32"),
+    ];
+    static RICH_FIELDS: [crate::format::FieldDesc; 3] = [
+        crate::format::FieldDesc {
+            field: "rate",
+            allowed: crate::format::ConstraintDesc::Range {
+                min: crate::format::ValueDesc::Int(8_000),
+                max: crate::format::ValueDesc::Int(192_000),
+                step: crate::format::ValueDesc::Int(1),
+            },
+            preferred: Some(crate::format::ValueDesc::Int(48_000)),
+        },
+        crate::format::FieldDesc {
+            field: "sample",
+            allowed: crate::format::ConstraintDesc::Set(&RICH_VALUES),
+            preferred: None,
+        },
+        crate::format::FieldDesc {
+            field: "fps",
+            allowed: crate::format::ConstraintDesc::Eq(crate::format::ValueDesc::Rat(30, 1)),
+            preferred: None,
+        },
+    ];
+    static RICH_OFFERS: [OfferDesc; 2] = [
+        OfferDesc { family: "audio/raw", fields: &RICH_FIELDS },
+        OfferDesc::any("bytes"),
+    ];
+    static RICH_PADS: [PadDesc; 1] = [PadDesc {
+        name: "src",
+        direction: Direction::Src,
+        offers: &RICH_OFFERS,
+        dynamic: true,
+        validate: None,
+    }];
+    static RICH_PROPS: [PropDesc; 2] = [
+        PropDesc {
+            name: "volume",
+            allowed: Constraint::Range {
+                min: Value::Int(0),
+                max: Value::Int(10),
+                step: Value::Int(1),
+            },
+            live: true,
+        },
+        PropDesc { name: "path", allowed: Constraint::Any, live: false },
+    ];
+    static RICH_DESC: ElementDesc = ElementDesc {
+        name: "rich",
+        pads: &RICH_PADS,
+        props: &RICH_PROPS,
+        sched: SchedHint::Passive,
+        inputs: InputPolicy::Single,
+        latency: LatencyDesc {
+            min: crate::time::Timestamp::ZERO,
+            max: crate::time::Timestamp::from_millis(5),
+            is_live: true,
+            jitter: crate::time::Timestamp::ZERO,
+        },
+        make_default: None,
+    };
+
+    #[test]
+    fn describe_renders_pads_offers_and_props() {
+        let mut r = Registry::new();
+        r.register(&RICH_DESC);
+        let s = r.describe("rich").expect("registered");
+        for needle in [
+            "rich",
+            "scheduling: Passive",
+            "inputs: Single",
+            "typed only (no make_default)",
+            "max 5ms",
+            "live: yes",
+            "src (src, dynamic)",
+            "audio/raw",
+            "rate: [8000, 192000] step 1  (preferred: 48000)",
+            "sample: {s16, s32}",
+            "fps: 30/1",
+            "bytes (any)",
+            "volume  [0, 10] step 1  (live)",
+            "path    any  (structural)",
+        ] {
+            assert!(s.contains(needle), "describe output missing {needle:?}:\n{s}");
+        }
+        assert!(r.describe("nope").is_none(), "unregistered name");
     }
 }
