@@ -428,9 +428,10 @@ fn edit_list_shift(trak_body: &[u8]) -> Result<i64, Mp4Error> {
 }
 
 /// Fold the `stbl` tables into a flat per-sample list (spec: §8.6.1.2/§8.6.1.3/§8.7.3/
-/// §8.7.4/§8.7.5). For each sample this computes its file offset (from `stsc` chunk mapping
-/// + `stco` chunk bases + cumulative sizes within a chunk), decode time (running `stts`
-/// sum), presentation time (`dts + ctts` offset, minus the edit shift), and sync flag.
+/// §8.7.4/§8.7.5). For each sample this computes its file offset (the `stsc` chunk mapping
+/// plus the `stco` chunk bases plus cumulative sizes within a chunk), decode time (the
+/// running `stts` sum), presentation time (`dts + ctts` offset, minus the edit shift), and
+/// the sync flag.
 #[allow(clippy::too_many_arguments)]
 fn build_samples(
     track_index: usize,

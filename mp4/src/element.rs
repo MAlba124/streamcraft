@@ -242,13 +242,9 @@ impl Mp4Demux {
         }
         // Slice the next available sample; borrow the reframed bytes, compute the pts, then
         // release the reader borrow before touching pool memory (the reader's window may be
-        // mutated by the next slice).
-        loop {
-            // Pull one sample's routing + reframed bytes + pts into owned locals so the
-            // reader borrow is released before emission (which may re-enter the reader).
-            let Some((idx, pts_ns, sync, reframed, head_to_emit, announce)) = self.take_next(ctx) else {
-                break;
-            };
+        // mutated by the next slice). `take_next` hands back owned locals so the reader borrow
+        // is dropped before emission (which may re-enter the reader).
+        while let Some((idx, pts_ns, sync, reframed, head_to_emit, announce)) = self.take_next(ctx) {
             let _ = sync; // sync flag not surfaced downstream yet (kept for a future keyframe tag)
             let pad = self.pad_tracks[idx].pad;
 
