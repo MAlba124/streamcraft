@@ -32,6 +32,12 @@ const F_RATE: &str = "rate";
 const F_CHANNELS: &str = "channels";
 const F_SAMPLE: &str = "sample";
 
+/// How many FLAC frames `process()` decodes before yielding its output batch downstream.
+/// Small on purpose: it bounds the batch so the first audio reaches the sink after ~one
+/// frame's decode rather than after a whole read's worth (spec: latency #2). A FLAC frame is
+/// ~0.1 s of audio, so a handful still leaves plenty of jitter buffer downstream.
+const FRAMES_PER_BATCH: u32 = 2;
+
 static SAMPLE_VALUES: [ValueDesc; 4] = [
     ValueDesc::Id("s8"),
     ValueDesc::Id("s16"),
@@ -188,13 +194,14 @@ impl Element for FlacDec {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        // Flush any carry from a prior backpressured call before decoding more.
+        if !self.emit_pending(ctx, true)? {
+            // Pool full: yield without consuming more input, so the sink drains first.
+            // Leaving input buffered keeps the group non-quiescent (backpressure).
+            return Ok(Flow::Ok);
+        }
+        let mut emitted = 0u32;
         loop {
-            // Flush any carry from a prior backpressured call before decoding more.
-            if !self.emit_pending(ctx, true)? {
-                // Pool full: yield without consuming more input, so the sink drains first.
-                // Leaving input buffered keeps the group non-quiescent (backpressure).
-                return Ok(Flow::Ok);
-            }
             // Decode the next buffered frame; if the decoder is hungry, feed it one input
             // buffer; when there is neither a frame nor more input, we are done this call.
             // Decode straight into the reused `pending` buffer — no per-frame allocation
@@ -205,6 +212,15 @@ impl Element for FlacDec {
                     self.announce_if_needed(ctx)?; // first frame → header known
                     if !self.emit_pending(ctx, true)? {
                         return Ok(Flow::Ok); // pool filled mid-frame — carry the rest, yield
+                    }
+                    // Yield the batch after a few frames rather than draining all buffered
+                    // input into one large batch: the first audio reaches the sink after ~one
+                    // frame instead of after the whole batch is decoded — much lower latency,
+                    // especially after a seek (spec: latency #2). The scheduler re-invokes us
+                    // with the remaining input still buffered, so throughput is unaffected.
+                    emitted += 1;
+                    if emitted >= FRAMES_PER_BATCH {
+                        return Ok(Flow::Ok);
                     }
                 }
                 Ok(None) => match inputs.pop() {
