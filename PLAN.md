@@ -35,6 +35,27 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > (`Batch` columns went private; `Memory::take` moves payloads out O(1)); idle
 > scheduler passes no longer do counter RMWs. Workspace **319 tests green**.
 
+> **Update — session 3b (2026-07-24, parallel agents):** merged four agent branches +
+> one main-session adoption. (1) **`video/`**: `video/raw` vocab, plane geometry +
+> `VideoFrameRef`/`Mut`, `VideoTestSrc`, `RawVideoParse`, clock-driven `VideoCkSink`
+> (chroma rounds **up**, ffmpeg convention). (2) **Stage 5 DONE**: `core/src/registry.rs`
+> (panic-free parse), `Pipeline::{add_boxed,set_str}` (string props ride `Value::Id`),
+> props+`make_default` on the common elements, `launch/` = **scraft-launch** with
+> `--dump-dot/--counters/--log/--list`. (3) **`MkvDemux`**: incremental EBML reader
+> (RFC 8794/9559 in `mkv/spec/`), per-track dynamic pads (constructor-supplied header
+> bytes for preroll discovery — mid-pipeline elements get no preroll input), all lacing
+> modes, A_FLAC→native-FLAC reconstruction feeding `FlacDec` bit-exact. (4) **`vp8/`:
+> adopted `oxideav-vp8`** (pure Rust, zero-dep w/ default-features off, no unsafe, MIT,
+> RFC-annotated — rubric + nativization debt in `vp8/src/lib.rs`): `Vp8Dec` with
+> dynamic-caps announce, per-buffer warn-drop-resync error scope, invisible-frame
+> handling. Log records now carry the element **name** (`flacdec#3`). Workspace ~350
+> tests green across 67 binaries. **In flight**: four adoption agents for
+> `oxideav-{h264,av1,vp9,h265}` into the pre-created `h264/ h265/ av1/ vp9/` stubs
+> (note: those four pull `oxideav-core`+serde_json mandatorily, unlike vp8 — flagged
+> for upstream). Open follow-ups: `decode_frame_into` upstream (kill the per-frame
+> plane copy), official `vp80-*` conformance vectors in CI, `MkvDemux` V_VP8 family
+> naming alignment with `vp8dec` ("vp8"), display video sink backend decision.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
