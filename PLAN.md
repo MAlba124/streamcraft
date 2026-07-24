@@ -172,6 +172,22 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > flight. Agent-requested core APIs worth adding: `Ctx::out_format()`,
 > `Ctx::pad_linked(pad)` (unlocks skipping unlinked-track resolution).
 
+> **Update — session 4f (overnight 2026-07-25):** the through-the-night batch.
+> **Stage-4 transport zero-alloc closed**: batch shell return rings (columns
+> circulate back upstream) + the IO agent's fadvise/sync_file_range hygiene
+> (memcapped stall GONE, dirty 1.15 GB → 8–63 MiB) + the Reactor trait's
+> caller-owned vecs — movie remux **314.9K → 87.1K allocs**, and the filesink
+> rerun stall fixed earlier (unlink-before-create). **Mid-batch event boundaries
+> DONE** (the last dynamic-caps gap): positioned events + drain-cursor barrier;
+> a mid-process() announce lands between exactly the right two buffers, across
+> rings, inline hand-offs, and the queue's forward hop (fan-in stays
+> pre-positioned — documented). **Leaky rings integrated**
+> (set_queue_leaky(el, DropNewest), drops surfaced in producer counters).
+> **Pause UX**: 'p'/'q' stdin control in `streamcraft launch` and `play_file`.
+> New Ctx APIs: pad_linked (skip unlinked tracks — wire into demuxers next),
+> out_format. **In flight**: multi-track audio remux agent (aac/esds +
+> MkvMux::multi fan-in — merge on completion).
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
