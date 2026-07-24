@@ -29,6 +29,7 @@
 //! Unbounded `ctx.alloc` in a demuxer is **banned** — it OOM'd a real movie.
 
 use streamcraft_core::batch::Inputs;
+use streamcraft_core::buffer::BufferFlags;
 use streamcraft_core::bus::BusMessage;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
@@ -56,10 +57,15 @@ const FAMILY_BYTES: &str = "bytes";
 /// `mp4demux.src_track<N> ! h264dec.sink` (etc.) negotiates (spec: RFC 6381 four-CCs;
 /// [`codec::family_for`]). All unconstrained byte families — concrete dims/rate ride the
 /// runtime announcement, not the offer.
-static DEMUX_SRC_OFFERS: [OfferDesc; 6] = [
+static DEMUX_SRC_OFFERS: [OfferDesc; 8] = [
     OfferDesc::any(FAMILY_BYTES),
     OfferDesc::any("h264/annexb"),
     OfferDesc::any("h265/annexb"),
+    // The passthrough/remux framings (see [`Mp4Demux::passthrough`]): samples stay
+    // length-prefixed as stored and the raw `avcC`/`hvcC` record leads in-band — exactly
+    // Matroska's `V_MPEG4/ISO/AVC`//`V_MPEGH/ISO/HEVC` shape (RFC 9559 §12).
+    OfferDesc::any("h264/avcc"),
+    OfferDesc::any("h265/hvcc"),
     OfferDesc::any("vp9"),
     OfferDesc::any("av1"),
     OfferDesc::any("opus"),
@@ -125,6 +131,7 @@ enum Announce {
 struct Carry {
     pad: PadId,
     pts_ns: Option<u64>,
+    flags: BufferFlags,
     bytes: Vec<u8>,
     off: usize,
 }
@@ -135,6 +142,10 @@ struct Carry {
 pub struct Mp4Demux {
     /// The file head handed in at construction — resolved in `preroll` to discover tracks.
     head: Vec<u8>,
+    /// Remux mode (see [`passthrough`](Self::passthrough)): NAL tracks keep their stored
+    /// length-prefixed framing and lead with the raw config record instead of being
+    /// reframed to Annex B for a decoder.
+    passthrough: bool,
     /// The discovered tracks wired to their src pads, filled in `preroll`.
     pad_tracks: Vec<PadTrack>,
     /// The parse engine: resolved from the head in `preroll`, slices samples during
@@ -157,10 +168,26 @@ impl Mp4Demux {
     pub fn new(head: Vec<u8>) -> Self {
         Self {
             head,
+            passthrough: false,
             pad_tracks: Vec::new(),
             reader: None, // resolved in `preroll`
             pending: std::collections::VecDeque::new(),
         }
+    }
+
+    /// A demuxer in **remux mode**: NAL tracks (`avc1`/`hvc1`) are *not* reframed to
+    /// Annex B — samples go out length-prefixed exactly as stored, led by the raw
+    /// `avcC`/`hvcC` record as the in-band codec head, under the `h264/avcc` /
+    /// `h265/hvcc` families. That is precisely the shape Matroska wants
+    /// (`V_MPEG4/ISO/AVC` CodecPrivate = the record verbatim, RFC 9559 §12), so
+    /// `mp4demux(passthrough) ! mkvmux` remuxes without touching a single sample byte.
+    /// Non-NAL tracks (vp9/av1/audio) are already passthrough and keep their families.
+    /// In-band-parameter-set files (`avc3`/`hev1`, no config record) are a loud preroll
+    /// error in this mode — they have no record to hand Matroska.
+    pub fn passthrough(head: Vec<u8>) -> Self {
+        let mut d = Self::new(head);
+        d.passthrough = true;
+        d
     }
 
     /// The tracks discovered during `preroll` (for tests / introspection). Empty before it.
@@ -176,7 +203,14 @@ impl Mp4Demux {
     /// Push `bytes[off..]` on `pad` via **pooled** slots ([`Ctx::try_alloc`]), chunked to the
     /// slot size, returning the new offset — `< bytes.len()` means the pool ran dry and the
     /// caller must carry the remainder and stop consuming input (spec: the backpressure rule).
-    fn emit_bounded(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8], mut off: usize) -> usize {
+    fn emit_bounded(
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        bytes: &[u8],
+        mut off: usize,
+    ) -> usize {
         while off < bytes.len() {
             let Some(mut buf) = ctx.try_alloc(pad) else { return off };
             let cap = buf.memory.capacity();
@@ -187,6 +221,7 @@ impl Mp4Demux {
             if let Some(t) = pts_ns {
                 buf.pts = Timestamp::from_nanos(t);
             }
+            buf.flags = flags;
             ctx.out(pad).push(buf);
             off += n;
         }
@@ -196,7 +231,14 @@ impl Mp4Demux {
     /// Emit `bytes[off..]` as one **exact-size** buffer ([`Ctx::alloc_exact`] — a right-sized
     /// heap allocation when the pool is dry, never a slot-sized over-allocation). Only for the
     /// bounded EOS/stop flush, where yielding for a slot is no longer possible.
-    fn emit_exact(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8], off: usize) {
+    fn emit_exact(
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        bytes: &[u8],
+        off: usize,
+    ) {
         let rest = &bytes[off..];
         if rest.is_empty() {
             return;
@@ -207,28 +249,60 @@ impl Mp4Demux {
         if let Some(t) = pts_ns {
             buf.pts = Timestamp::from_nanos(t);
         }
+        buf.flags = flags;
         ctx.out(pad).push(buf);
     }
 
     /// Queue a blob for emission and try to emit it now; on pool exhaustion the remainder
     /// parks in `pending` (drained first on the next pass).
-    fn emit_or_park(&mut self, ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: Vec<u8>) {
-        let off = Self::emit_bounded(ctx, pad, pts_ns, &bytes, 0);
+    fn emit_or_park(
+        &mut self,
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        bytes: Vec<u8>,
+    ) {
+        let off = Self::emit_bounded(ctx, pad, pts_ns, flags, &bytes, 0);
         if off < bytes.len() {
-            self.pending.push_back(Carry { pad, pts_ns, bytes, off });
+            self.pending.push_back(Carry { pad, pts_ns, flags, bytes, off });
         }
     }
 
     /// Resume parked emissions. `true` when everything pending has drained.
     fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
         while let Some(mut c) = self.pending.pop_front() {
-            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, &c.bytes, c.off);
+            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
             if c.off < c.bytes.len() {
                 self.pending.push_front(c);
                 return false;
             }
         }
         true
+    }
+
+    /// Per-track pad wiring — announce family, in-band codec head, and reframer — for the
+    /// current mode. Decode mode (default): Annex B head + NAL reframing, families the
+    /// decoders link on. Passthrough mode: the raw config record verbatim as the head,
+    /// samples untouched, the `h264/avcc`/`h265/hvcc` remux families (RFC 9559 §12 shape).
+    fn track_wiring(
+        track: &crate::reader::Track,
+        passthrough: bool,
+    ) -> Result<(&'static str, Vec<u8>, Reframer), &'static str> {
+        if passthrough {
+            if let k @ (b"avc1" | b"avc3" | b"hvc1" | b"hev1") = &track.entry.kind {
+                if track.entry.config_record.is_empty() {
+                    return Err(
+                        "mp4demux passthrough: no avcC/hvcC record (in-band avc3/hev1 \
+                         parameter sets) — nothing to hand Matroska as CodecPrivate",
+                    );
+                }
+                let is_hevc = matches!(k, b"hvc1" | b"hev1");
+                let family = if is_hevc { "h265/hvcc" } else { "h264/avcc" };
+                return Ok((family, track.entry.config_record.clone(), Reframer::Passthrough));
+            }
+        }
+        Ok((track.family(), track.codec_head().to_vec(), track.reframer().clone()))
     }
 
     /// Drain samples the reader has sliced, emitting each on its track's src pad — **pool
@@ -245,20 +319,23 @@ impl Mp4Demux {
         // mutated by the next slice). `take_next` hands back owned locals so the reader borrow
         // is dropped before emission (which may re-enter the reader).
         while let Some((idx, pts_ns, sync, reframed, head_to_emit, announce)) = self.take_next(ctx) {
-            let _ = sync; // sync flag not surfaced downstream yet (kept for a future keyframe tag)
             let pad = self.pad_tracks[idx].pad;
+            // The sample table's sync bit rides the buffer (spec: Buffer flags), so a
+            // remuxing consumer preserves seekability; DELTA is explicit — untagged would
+            // read as "unknown", which a muxer defaults to keyframe.
+            let flags = if sync { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
 
             // First sample on this pad: announce the format, then emit the codec head.
             if let Some((family, ann)) = announce {
                 Self::announce(ctx, pad, family, ann);
             }
             if let Some(head) = head_to_emit {
-                self.emit_or_park(ctx, pad, Some(pts_ns), head);
+                self.emit_or_park(ctx, pad, Some(pts_ns), BufferFlags::empty(), head);
             }
 
-            let off = Self::emit_bounded(ctx, pad, Some(pts_ns), &reframed, 0);
+            let off = Self::emit_bounded(ctx, pad, Some(pts_ns), flags, &reframed, 0);
             if off < reframed.len() {
-                self.pending.push_back(Carry { pad, pts_ns: Some(pts_ns), bytes: reframed, off });
+                self.pending.push_back(Carry { pad, pts_ns: Some(pts_ns), flags, bytes: reframed, off });
             }
             if !self.pending.is_empty() {
                 return false; // pool dry — carry parked, stop pulling reader samples
@@ -321,17 +398,18 @@ impl Mp4Demux {
     /// it could emit, so at most one input batch's worth of samples sits here.
     fn flush_exact(&mut self, ctx: &mut Ctx) {
         while let Some(c) = self.pending.pop_front() {
-            Self::emit_exact(ctx, c.pad, c.pts_ns, &c.bytes, c.off);
+            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
         }
-        while let Some((idx, pts_ns, _sync, reframed, head, announce)) = self.take_next(ctx) {
+        while let Some((idx, pts_ns, sync, reframed, head, announce)) = self.take_next(ctx) {
             let pad = self.pad_tracks[idx].pad;
+            let flags = if sync { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
             if let Some((family, ann)) = announce {
                 Self::announce(ctx, pad, family, ann);
             }
             if let Some(head) = head {
-                Self::emit_exact(ctx, pad, Some(pts_ns), &head, 0);
+                Self::emit_exact(ctx, pad, Some(pts_ns), BufferFlags::empty(), &head, 0);
             }
-            Self::emit_exact(ctx, pad, Some(pts_ns), &reframed, 0);
+            Self::emit_exact(ctx, pad, Some(pts_ns), flags, &reframed, 0);
         }
     }
 
@@ -371,8 +449,9 @@ impl Element for Mp4Demux {
         // is a loud preroll error.
         let reader = Mp4Reader::new(&self.head).map_err(map_resolve_err)?;
         for (i, track) in reader.tracks().iter().enumerate() {
-            let family = track.family();
-            let announce = if codec::is_video_family(family) {
+            let (family, codec_head, reframer) =
+                Self::track_wiring(track, self.passthrough).map_err(Error::Todo)?;
+            let announce = if codec::is_video_family(track.family()) {
                 Announce::Video { width: track.width, height: track.height }
             } else if family == "opus" || track.entry.sample_rate != 0 || track.entry.channels != 0 {
                 Announce::Audio { rate: track.entry.sample_rate, channels: track.entry.channels }
@@ -384,8 +463,8 @@ impl Element for Mp4Demux {
             self.pad_tracks.push(PadTrack {
                 pad,
                 family,
-                codec_head: track.codec_head().to_vec(),
-                reframer: track.reframer().clone(),
+                codec_head,
+                reframer,
                 announce,
                 started: false,
             });
@@ -407,8 +486,13 @@ impl Element for Mp4Demux {
         for pt in &mut self.pad_tracks {
             pt.started = false;
         }
-        // Re-derive the codec heads (taken/consumed on a previous run) from the resolved tracks.
-        let heads: Vec<Vec<u8>> = reader.tracks().iter().map(|t| t.codec_head().to_vec()).collect();
+        // Re-derive the codec heads (taken/consumed on a previous run) from the resolved
+        // tracks, honouring the mode (wiring errors already surfaced at preroll).
+        let heads: Vec<Vec<u8>> = reader
+            .tracks()
+            .iter()
+            .map(|t| Self::track_wiring(t, self.passthrough).map(|(_, h, _)| h).unwrap_or_default())
+            .collect();
         for (pt, head) in self.pad_tracks.iter_mut().zip(heads) {
             pt.codec_head = head;
         }

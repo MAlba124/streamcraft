@@ -101,10 +101,14 @@ static MUX_VIDEO_FIELDS: [FieldDesc; 2] = [
     FieldDesc { field: "width", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "height", allowed: ConstraintDesc::Any, preferred: None },
 ];
-static MUX_SINK_OFFERS: [OfferDesc; 4] = [
+static MUX_SINK_OFFERS: [OfferDesc; 6] = [
     OfferDesc { family: "flac", fields: &MUX_AUDIO_FIELDS },
     OfferDesc { family: "vp8", fields: &MUX_VIDEO_FIELDS },
     OfferDesc { family: "vp9", fields: &MUX_VIDEO_FIELDS },
+    // The passthrough NAL framings (`sc-mp4`'s remux mode): length-prefixed samples led
+    // by the raw config record in-band — Matroska's native shape (RFC 9559 §12).
+    OfferDesc { family: "h264/avcc", fields: &MUX_VIDEO_FIELDS },
+    OfferDesc { family: "h265/hvcc", fields: &MUX_VIDEO_FIELDS },
     OfferDesc::any("bytes"),
 ];
 
@@ -157,6 +161,11 @@ enum Setup {
     /// metadata blocks) into the `CodecPrivate` before the writer can be built. Holds the
     /// bytes absorbed so far.
     FlacHead(Vec<u8>),
+    /// A passthrough NAL family (`h264/avcc`/`h265/hvcc`) was announced: the **first
+    /// buffer** is the raw `avcC`/`hvcC` record (the demuxer emits it as one leading
+    /// buffer — it is a few hundred octets, far below any pool slot), taken verbatim as
+    /// `CodecPrivate` (RFC 9559 §12); every later buffer is one length-prefixed sample.
+    NalHead { codec_id: &'static str, width: u32, height: u32 },
 }
 
 /// Muxes a single track into Matroska: one encoded frame **per input buffer** on the sink
@@ -395,6 +404,22 @@ impl Element for MkvMux {
                             }
                         }
                     }
+                    Setup::NalHead { codec_id, width, height } => {
+                        // First buffer = the raw config record, verbatim (RFC 9559 §12:
+                        // CodecPrivate *is* the AVC/HEVCDecoderConfigurationRecord).
+                        // configurationVersion is 1 for both records — a cheap guard
+                        // against being fed sample data first.
+                        let head = buf.memory.data().to_vec();
+                        if head.first() != Some(&1) {
+                            return Err(Error::Todo(
+                                "mkvmux: leading buffer is not an avcC/hvcC record \
+                                 (configurationVersion != 1)",
+                            ));
+                        }
+                        let (codec_id, w, h) = (*codec_id, *width, *height);
+                        self.configure(TrackConfig::video(TRACK, codec_id, head, w, h));
+                        continue; // the record is CodecPrivate, never a block
+                    }
                     Setup::AwaitCaps => {
                         return Err(Error::Todo(
                             "mkvmux: data before any format announcement — a caps-driven \
@@ -460,18 +485,18 @@ impl Element for MkvMux {
             Event::FormatChange(f) => match &self.setup {
                 Setup::AwaitCaps => {
                     let family = ctx.family_name(f.family).unwrap_or("?").to_owned();
+                    let dim = |name: &str| {
+                        ctx.field_id(name)
+                            .and_then(|id| f.get(id))
+                            .and_then(|v| match v {
+                                Value::Int(n) if n > 0 => Some(n as u32),
+                                _ => None,
+                            })
+                    };
                     match family.as_str() {
                         // The CodecPrivate is the in-band native head; absorb it first.
                         "flac" => self.setup = Setup::FlacHead(Vec::new()),
                         "vp8" | "vp9" => {
-                            let dim = |name: &str| {
-                                ctx.field_id(name)
-                                    .and_then(|id| f.get(id))
-                                    .and_then(|v| match v {
-                                        Value::Int(n) if n > 0 => Some(n as u32),
-                                        _ => None,
-                                    })
-                            };
                             let (Some(w), Some(h)) = (dim("width"), dim("height")) else {
                                 return Err(Error::Todo(
                                     "mkvmux: video announcement without width/height",
@@ -480,20 +505,35 @@ impl Element for MkvMux {
                             let id = if family == "vp8" { "V_VP8" } else { "V_VP9" };
                             self.configure(TrackConfig::video(TRACK, id, Vec::new(), w, h));
                         }
+                        // Passthrough NAL remux: the CodecPrivate arrives as the first
+                        // buffer (the raw record); defer writer creation until then.
+                        "h264/avcc" | "h265/hvcc" => {
+                            let (Some(w), Some(h)) = (dim("width"), dim("height")) else {
+                                return Err(Error::Todo(
+                                    "mkvmux: video announcement without width/height",
+                                ));
+                            };
+                            let codec_id = if family == "h264/avcc" {
+                                "V_MPEG4/ISO/AVC"
+                            } else {
+                                "V_MPEGH/ISO/HEVC"
+                            };
+                            self.setup = Setup::NalHead { codec_id, width: w, height: h };
+                        }
                         // Families we cannot mux *conformantly* yet — loud, with the reason
-                        // (see the module docs): av1 needs an av1C CodecPrivate; H.264/H.265
-                        // arrive as Annex B but Matroska wants length-prefixed + a config
-                        // record.
+                        // (see the module docs): av1 needs an av1C CodecPrivate; the Annex B
+                        // decode framings lack the config record Matroska wants (remux from
+                        // MP4 with `Mp4Demux::passthrough` → `h264/avcc` instead).
                         other => {
                             return Err(Error::Resource(format!(
-                                "mkvmux: cannot remux family '{other}' yet (av1 needs an \
-                                 av1C CodecPrivate; h264/h265 need Annex B → length-prefixed \
-                                 reframing + a config record — documented follow-ups)"
+                                "mkvmux: cannot remux family '{other}' (av1 needs an av1C \
+                                 CodecPrivate — follow-up; for h264/h265 use the demuxer's \
+                                 passthrough mode, which announces h264/avcc / h265/hvcc)"
                             )));
                         }
                     }
                 }
-                Setup::Fixed | Setup::FlacHead(_) => {
+                Setup::Fixed | Setup::FlacHead(_) | Setup::NalHead { .. } => {
                     if self.header_done {
                         return Err(Error::Todo(
                             "mkvmux: mid-stream format change cannot be muxed (track is \

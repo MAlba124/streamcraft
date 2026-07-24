@@ -43,6 +43,12 @@ pub struct SampleEntry {
     /// The Annex B parameter-set head to emit before the first frame (empty for non-NAL
     /// codecs, for `avc3`/`hev1` in-band parameter sets, or a malformed config record).
     pub codec_head: Vec<u8>,
+    /// The **raw** codec-configuration record (`avcC`/`hvcC` box body, ISO/IEC 14496-15),
+    /// verbatim — what a remux hands to Matroska as `CodecPrivate` (RFC 9559 §12:
+    /// `V_MPEG4/ISO/AVC` CodecPrivate *is* the AVCDecoderConfigurationRecord). Kept even
+    /// when [`nal_head_from_config`] rejects it (a remux is byte-faithful; only the decode
+    /// path needs to parse it). Empty for non-NAL codecs and in-band-only `avc3`/`hev1`.
+    pub config_record: Vec<u8>,
     /// How each sample's payload is reframed downstream: NAL length-prefix → Annex B for
     /// `avc*`/`hvc*`/`hev*`, passthrough for everything else.
     pub reframer: Reframer,
@@ -124,6 +130,7 @@ fn parse_sample_entry(h: &BoxHeader, data: &[u8]) -> Result<SampleEntry, BoxErro
         sample_rate: 0,
         channels: 0,
         codec_head: Vec::new(),
+        config_record: Vec::new(),
         reframer: Reframer::Passthrough,
     };
     if is_video_family(family) || is_nal_entry(&kind) {
@@ -159,17 +166,22 @@ fn parse_visual_entry(payload: &[u8], entry: &mut SampleEntry) -> Result<(), Box
         // `avc3`/`hev1` carry parameter sets in-band; only `avc1`/`hvc1` guarantee an
         // out-of-band config record. Either way the samples are length-prefixed, so reframe.
         match boxes::find_child(children, boxes::fourcc(cfg_type))? {
-            Some(cfg) => match nal_head_from_config(cfg.body(children), is_hevc) {
-                Ok((head, length_size)) => {
-                    // For avc3/hev1 the head is present but redundant with the in-band sets;
-                    // emitting it is harmless (the decoder ignores duplicate parameter sets).
-                    entry.codec_head = head;
-                    entry.reframer = Reframer::Nal { length_size };
+            Some(cfg) => {
+                // Retain the record verbatim for the passthrough/remux path regardless of
+                // whether the Annex B conversion below accepts it.
+                entry.config_record = cfg.body(children).to_vec();
+                match nal_head_from_config(cfg.body(children), is_hevc) {
+                    Ok((head, length_size)) => {
+                        // For avc3/hev1 the head is present but redundant with the in-band
+                        // sets; emitting it is harmless (duplicate parameter sets are ignored).
+                        entry.codec_head = head;
+                        entry.reframer = Reframer::Nal { length_size };
+                    }
+                    // A broken config record must not kill the demuxer: reframe with the
+                    // default 4-octet length size and no head (decoder resyncs in-band).
+                    Err(_) => entry.reframer = Reframer::Nal { length_size: 4 },
                 }
-                // A broken config record must not kill the demuxer: reframe with the default
-                // 4-octet length size and no head (decoder resyncs at an in-band set).
-                Err(_) => entry.reframer = Reframer::Nal { length_size: 4 },
-            },
+            }
             // No config box (typical for avc3/hev1): length size defaults to 4 (§5.2.4.1.1
             // of 14496-15 makes lengthSizeMinusOne almost always 3), head stays empty.
             None => entry.reframer = Reframer::Nal { length_size: 4 },
