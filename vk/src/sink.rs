@@ -89,6 +89,21 @@ struct FrameFormat {
     frame_dur_ns: u64,
 }
 
+/// How converted frames reach the compositor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Present {
+    /// GPU converts, the frame is read back and presented via the shm swapchain —
+    /// one PCIe readback per frame, but **incapable of crashing a compositor**.
+    /// The default: repeated real-world compositor crashes on dma-buf imports
+    /// (buffer-backed *and* image-backed) made "safe unless asked" the only
+    /// responsible posture.
+    ShmReadback,
+    /// Zero-copy: exported dma-bufs imported via `zwp_linux_dmabuf_v1`. Opt-in via
+    /// `SC_VK_DMABUF=1` — experimental until the compositor-side crashes are
+    /// understood/fixed upstream.
+    Dmabuf,
+}
+
 /// The GPU-accelerated Wayland video sink. Construct with [`VkVideoSink::new`]; set a
 /// window title with [`with_title`](Self::with_title).
 pub struct VkVideoSink {
@@ -97,18 +112,25 @@ pub struct VkVideoSink {
     gpu: Option<Gpu>,
     renderer: Option<Renderer>,
     format: Option<FrameFormat>,
+    mode: Present,
     disabled: bool,
     close_reported: bool,
 }
 
 impl VkVideoSink {
     pub fn new() -> Self {
+        let mode = if std::env::var("SC_VK_DMABUF").is_ok_and(|v| v == "1") {
+            Present::Dmabuf
+        } else {
+            Present::ShmReadback
+        };
         Self {
             title: "streamcraft (vk)".to_string(),
             client: None,
             gpu: None,
             renderer: None,
             format: None,
+            mode,
             disabled: false,
             close_reported: false,
         }
@@ -191,19 +213,22 @@ impl VkVideoSink {
                 }
             }
         }
+        // Dmabuf mode needs compositor support up front; shm-readback needs nothing.
         let client = self.client.as_mut().expect("connected above");
-        if !client.has_dmabuf() {
-            self.disable(ctx, "compositor has no linux-dmabuf support".into());
-            return Ok(());
-        }
-        if !client.dmabuf_supports(DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR) {
-            self.disable(ctx, "compositor does not import XRGB8888+LINEAR dmabufs".into());
-            return Ok(());
+        if self.mode == Present::Dmabuf {
+            if !client.has_dmabuf() {
+                self.disable(ctx, "compositor has no linux-dmabuf support".into());
+                return Ok(());
+            }
+            if !client.dmabuf_supports(DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR) {
+                self.disable(ctx, "compositor does not import XRGB8888+LINEAR dmabufs".into());
+                return Ok(());
+            }
         }
 
-        // Vulkan (once per sink).
+        // Vulkan (once per sink). Export capability only matters for dmabuf mode.
         if self.gpu.is_none() {
-            match Gpu::new(true) {
+            match Gpu::new(self.mode == Present::Dmabuf) {
                 Ok(g) => self.gpu = Some(g),
                 Err(e) => {
                     self.disable(ctx, format!("vulkan init failed: {e}"));
@@ -213,49 +238,56 @@ impl VkVideoSink {
         }
         let gpu = self.gpu.as_ref().expect("initialised above");
 
-        // (Re)build the exported framebuffers at the new geometry.
+        // (Re)build the framebuffers at the new geometry. Shm-readback uses a single
+        // host-visible slot the sink reads back; dmabuf uses SLOTS exported images.
         if let Some(old) = self.renderer.take() {
             self.client.as_mut().expect("client").clear_dmabuf_buffers();
             old.destroy(gpu);
         }
-        let renderer = match Renderer::new(gpu, fmt.width, fmt.height, SLOTS, true) {
+        let (nslots, export) = match self.mode {
+            Present::ShmReadback => (1, false),
+            Present::Dmabuf => (SLOTS, true),
+        };
+        let renderer = match Renderer::new(gpu, fmt.width, fmt.height, nslots, export) {
             Ok(r) => r,
             Err(e) => {
                 self.disable(ctx, format!("renderer init failed: {e}"));
                 return Ok(());
             }
         };
-        let client = self.client.as_mut().expect("client");
-        for slot in 0..renderer.slot_count() {
-            let fd = renderer.slot_fd(slot).expect("export mode has fds");
-            if let Err(e) = client.import_dmabuf(
-                slot as u32,
-                fmt.width,
-                fmt.height,
-                DRM_FORMAT_XRGB8888,
-                DRM_FORMAT_MOD_LINEAR,
-                fd,
-                // The driver's subresource layout, not assumptions — a padded pitch
-                // told wrong is how importers get corrupted or worse.
-                renderer.offset(),
-                renderer.stride(),
-            ) {
-                renderer.destroy(gpu);
-                self.disable(ctx, format!("dmabuf import failed: {e:?}"));
-                return Ok(());
+        if self.mode == Present::Dmabuf {
+            let client = self.client.as_mut().expect("client");
+            for slot in 0..renderer.slot_count() {
+                let fd = renderer.slot_fd(slot).expect("export mode has fds");
+                if let Err(e) = client.import_dmabuf(
+                    slot as u32,
+                    fmt.width,
+                    fmt.height,
+                    DRM_FORMAT_XRGB8888,
+                    DRM_FORMAT_MOD_LINEAR,
+                    fd,
+                    // The driver's subresource layout, not assumptions — a padded
+                    // pitch told wrong is how importers get corrupted or worse.
+                    renderer.offset(),
+                    renderer.stride(),
+                ) {
+                    renderer.destroy(gpu);
+                    self.disable(ctx, format!("dmabuf import failed: {e:?}"));
+                    return Ok(());
+                }
             }
-        }
-        match client.take_dmabuf_import_failed() {
-            Ok(false) => {}
-            Ok(true) => {
-                renderer.destroy(gpu);
-                self.disable(ctx, "compositor rejected the exported dmabuf".into());
-                return Ok(());
-            }
-            Err(e) => {
-                renderer.destroy(gpu);
-                self.disable(ctx, format!("dmabuf import roundtrip failed: {e:?}"));
-                return Ok(());
+            match client.take_dmabuf_import_failed() {
+                Ok(false) => {}
+                Ok(true) => {
+                    renderer.destroy(gpu);
+                    self.disable(ctx, "compositor rejected the exported dmabuf".into());
+                    return Ok(());
+                }
+                Err(e) => {
+                    renderer.destroy(gpu);
+                    self.disable(ctx, format!("dmabuf import roundtrip failed: {e:?}"));
+                    return Ok(());
+                }
             }
         }
         self.renderer = Some(renderer);
@@ -291,7 +323,51 @@ impl VkVideoSink {
             return Ok(());
         };
 
-        // Acquire a compositor-released slot, convert into it on the GPU, present it.
+        if self.mode == Present::ShmReadback {
+            // GPU converts into the single host-visible slot; the frame is read back
+            // and presented over the shm swapchain — the path that cannot crash a
+            // compositor. One readback + one copy per frame; the conversion itself
+            // (the CPU path's hot loop) stays on the GPU.
+            if let Err(e) = renderer.render(gpu, data, 0) {
+                self.disable(ctx, format!("gpu render failed: {e}"));
+                return Ok(());
+            }
+            let frame = match renderer.read_back(gpu, 0) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.disable(ctx, format!("gpu readback failed: {e}"));
+                    return Ok(());
+                }
+            };
+            let (w, h) = (fmt.width, fmt.height);
+            let present = client.present(w, h, |dst, stride, w, h| {
+                // `frame` rows are tightly packed (w*4); honor the shm stride.
+                let tight = w * 4;
+                for row in 0..h {
+                    let src = &frame[row * tight..(row + 1) * tight];
+                    dst[row * stride..row * stride + tight].copy_from_slice(src);
+                }
+            });
+            match present {
+                Ok(true) => {}
+                Ok(false) => {
+                    if !self.close_reported {
+                        let element = ctx.element();
+                        ctx.post(BusMessage::Warning {
+                            element,
+                            error: Error::Resource("vkvideosink: window closed by user".into()),
+                        });
+                        self.close_reported = true;
+                    }
+                    self.disabled = true;
+                }
+                Err(e) => self.disable(ctx, format!("present failed: {e:?}")),
+            }
+            return Ok(());
+        }
+
+        // Dmabuf mode: acquire a compositor-released slot, convert into it on the
+        // GPU, present the imported wl_buffer.
         let slot = match client.acquire_dmabuf_slot() {
             Ok(Some(s)) => s,
             Ok(None) => {

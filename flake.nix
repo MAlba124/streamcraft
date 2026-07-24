@@ -64,6 +64,11 @@
           # /run/opengl-driver + /usr/share/vulkan/icd.d manifests.
           LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
 
+          # Baked into sc-vk at *build* time (`option_env!` in vk/src/gpu.rs), so a
+          # binary built in this devshell finds its loader no matter how it is later
+          # launched — LD_LIBRARY_PATH is too fragile an invocation contract.
+          SC_VULKAN_LOADER = "${pkgs.vulkan-loader}/lib/libvulkan.so.1";
+
           shellHook = ''
             echo "streamcraft devshell — $(rustc --version)"
           '';

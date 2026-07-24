@@ -16,11 +16,14 @@
 //! fence-wait, then attach/commit the imported `wl_buffer` — release-gated triple
 //! buffering, exactly like the shm swapchain.
 //!
-//! **Status: experimental for large surfaces.** An earlier revision exported raw
-//! `VkBuffer` memory with an assumed pitch; importing it at 1920×1040 crashed a
-//! real compositor (session down). The image-based exporter is the fix, verified
-//! byte-exact headlessly — but its first live large-surface presents should be run
-//! deliberately (small sizes first), not stumbled into.
+//! **Presentation modes.** After repeated real-world compositor crashes on our
+//! dma-buf imports (raw-buffer-backed *and* image-backed — the crash is in the
+//! compositor/driver import path, but we refuse to keep triggering it), the sink's
+//! **default is GPU-convert + shm present**: the shader converts on the GPU, the
+//! frame is read back once over PCIe and presented via the shm swapchain, which
+//! cannot crash a compositor. The zero-copy dma-buf path (exported LINEAR
+//! `VkImage`s, driver-reported offset/pitch) is **opt-in via `SC_VK_DMABUF=1`** and
+//! stays experimental until the compositor-side crash is diagnosed upstream.
 //!
 //! v1 limitations (documented follow-ups in `REFERENCES.md`): LINEAR modifier only;
 //! output at the video's own dimensions (no scaling — the citable scaler ladder,

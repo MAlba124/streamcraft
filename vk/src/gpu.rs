@@ -72,32 +72,48 @@ impl Gpu {
     /// implementation, which is what keeps the conversion-parity tests runnable on
     /// headless CI.
     pub fn new(require_export: bool) -> Result<Gpu, String> {
-        // SAFETY: `Entry::load` dlopens libvulkan.so.1 (the loader) and resolves core
-        // entry points; no Vulkan objects exist yet. Failure (no loader) is an Err.
-        // Outside the nix devshell the loader is often not on the default search
-        // path, so fall back to the conventional locations before giving up with a
-        // message that names the fix.
-        let entry = unsafe { ash::Entry::load() }.or_else(|first| {
+        // SAFETY (all `Entry::load*` below): dlopens the Vulkan loader and resolves
+        // core entry points; no Vulkan objects exist yet. Failure is an Err.
+        //
+        // Resolution order — invocation environment must not decide whether the GPU
+        // works (LD_LIBRARY_PATH-only lookup silently broke every bare-binary run):
+        //  1. `SC_VULKAN_LOADER` at runtime (explicit override),
+        //  2. the loader path baked in at build time (the nix devshell exports
+        //     `SC_VULKAN_LOADER`, captured here via `option_env!` — a binary built in
+        //     the devshell always finds the loader it was built against),
+        //  3. the default search path,
+        //  4. conventional system locations.
+        let baked: Option<&'static str> = option_env!("SC_VULKAN_LOADER");
+        let mut entry: Option<ash::Entry> = None;
+        if let Ok(p) = std::env::var("SC_VULKAN_LOADER") {
+            entry = unsafe { ash::Entry::load_from(&p) }.ok();
+        }
+        if entry.is_none() {
+            if let Some(p) = baked {
+                entry = unsafe { ash::Entry::load_from(p) }.ok();
+            }
+        }
+        if entry.is_none() {
+            entry = unsafe { ash::Entry::load() }.ok();
+        }
+        if entry.is_none() {
             for path in [
                 "/run/opengl-driver/lib/libvulkan.so.1", // NixOS system profile
                 "/usr/lib/libvulkan.so.1",               // FHS distros
                 "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", // Debian-family
             ] {
-                // SAFETY: same contract as `Entry::load`, explicit path.
                 if let Ok(e) = unsafe { ash::Entry::load_from(path) } {
-                    return Ok(e);
+                    entry = Some(e);
+                    break;
                 }
             }
-            Err(first)
-        });
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(format!(
-                    "vulkan loader not found ({e}) — run via `nix develop` (the devshell \
-                     puts libvulkan on the search path), or install a system Vulkan loader"
-                ))
-            }
+        }
+        let Some(entry) = entry else {
+            return Err(format!(
+                "vulkan loader not found (baked path: {}) — rebuild inside `nix develop`, \
+                 or point SC_VULKAN_LOADER at a libvulkan.so.1",
+                baked.unwrap_or("none"),
+            ));
         };
 
         let app = vk::ApplicationInfo::default()
