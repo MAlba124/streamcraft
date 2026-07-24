@@ -841,7 +841,7 @@ fn run_group(
 
     let mut source_eos = false;
     let mut upstream_closed = false;
-    let mut eos_delivered = false;
+    let mut eos_next = 0usize;
 
     let result: Result<(), Error> = 'group: loop {
         // Cooperative cancellation: break, then stop + drop downstream, which closes
@@ -964,17 +964,16 @@ fn run_group(
         let quiescent = reactor.is_idle()
             && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty());
         if head_done && quiescent {
-            if !eos_delivered {
-                // Deliver EOS to every element so a sink can drain its device buffer and a
-                // muxer can flush its final packet (spec: Events — EOS reaches elements'
-                // `event()`). Then loop once more so any output the flush produced is
-                // pushed downstream before dropping `downstream` closes the ring.
-                eos_delivered = true;
-                for i in 0..m {
-                    if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Eos) {
-                        break 'group Err(e);
-                    }
+            if eos_next < m {
+                // Deliver EOS to one element per pass, in chain order, then loop so its
+                // flushed output propagates to and is processed by the next element before
+                // that element gets EOS (spec: Events — EOS reaches elements in order). A
+                // sink drains its device buffer; a muxer flushes its final page, which the
+                // downstream depacketiser then sees as input before its own EOS.
+                if let Err(e) = elements[eos_next].event(&mut ctxs[eos_next], &Event::Eos) {
+                    break 'group Err(e);
                 }
+                eos_next += 1;
                 continue;
             }
             // Stamped on the group's head element (spec: Debuggability). Gated out at

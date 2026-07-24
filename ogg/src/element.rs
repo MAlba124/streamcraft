@@ -28,22 +28,13 @@
 //!
 //! Either way the final page is emitted exactly once, with the eos flag set.
 //!
-//! Note that on today's pipeline neither path's output is routed downstream (EOS is
-//! structural — the source returns `Flow::Eos` / the ring closes; `event(Eos)` is not yet
-//! delivered and `stop()` output is dropped). So the muxer additionally flushes **each
-//! packet's page during `process`** (see [`OggMux::process`]), which is what makes the
-//! packet data survive the round-trip today; the eos *page* is the only thing that waits
-//! on the EOS path, and it carries no packet payload (it terminates the stream). The
-//! `finish`-contract test in `tests/element_roundtrip.rs` covers the eos-terminated bytes.
-//!
-//! One documented consequence of flushing per packet: since every packet's page is
-//! already out when the stream ends, [`OggWriter::finish`] finds nothing pending and emits
-//! a **nil eos page** (§6 — a valid empty terminator), which a demuxer reads back as a
-//! trailing zero-length packet (`spec/NOTES.md`, "Nil eos page on an empty/flushed
-//! stream"). This is well-formed Ogg; it is invisible to today's round-trip (the eos page
-//! is dropped, not routed) and becomes a redundant per-packet flush to remove once the
-//! core routes EOS output — at which point `finish` terminates the last real packet's page
-//! directly, with no trailing nil packet.
+//! The muxer packs several packets per page (the efficient default): `process` flushes only
+//! *full* pages, and the pending partial page is emitted by `finish_stream` on EOS, which
+//! terminates the last real packet's page with the eos flag — so there is no trailing nil
+//! packet. This relies on the pipeline delivering `Event::Eos` to `event()` in chain order
+//! and pushing the handler's output before closing the ring, which it does (spec: Events —
+//! EOS reaches elements). The `finish`-contract test in `tests/element_roundtrip.rs` covers
+//! the eos-terminated bytes.
 
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
@@ -362,24 +353,12 @@ impl Element for OggMux {
             };
             // One input buffer == one Ogg packet (its whole payload, nil packets
             // included). `write_packet` segments it and flushes any *full* pages into
-            // `scratch`; the terminating segment lands in a still-pending page. `AfterEos`
-            // cannot occur — we hold the only writer and drop it only in `finish_stream`.
+            // `scratch`, packing several packets per page; the pending partial page is
+            // flushed on EOS by `finish_stream`, which terminates the last real packet's
+            // page with the eos flag — no trailing nil packet. `AfterEos` cannot occur — we
+            // hold the only writer and drop it only in `finish_stream`.
             let _ = writer.write_packet(&mut self.scratch, buf.memory.data(), DEFAULT_GRANULE);
-            // Then flush that pending page immediately, so **every** packet leaves as a
-            // complete page during `process`, one page per packet.
-            //
-            // Why not pack many packets per page (the library default, and what a
-            // throughput-oriented muxer does)? Packing holds a partial page until it fills
-            // or the stream ends — but a held final page can only go out at end-of-stream,
-            // and this pipeline does not yet route an element's end-of-stream output
-            // downstream (EOS is structural: the source returns `Flow::Eos` / the ring
-            // closes; `event(Eos)` is not delivered and `stop()` output is dropped — see
-            // the module docs). Flushing per packet guarantees no packet is ever stranded
-            // in an unflushed page. When the core delivers `Event::Eos` to elements and
-            // pushes the handler's output (the primary path in `event`), this becomes a
-            // pure optimisation to restore — the correctness no longer depends on it.
-            writer.flush(&mut self.scratch);
-            // `buf` recycles here on drop; move the completed page(s) downstream.
+            // `buf` recycles here on drop; move any completed page(s) downstream.
             let mut out = std::mem::take(&mut self.scratch);
             Self::emit(ctx, &mut out);
             self.scratch = out;
