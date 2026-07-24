@@ -95,6 +95,14 @@ pub struct FieldConstraint {
 pub struct FormatOffer {
     pub family: FormatId,
     pub fields: &'static [FieldConstraint],
+    /// A **wildcard** offer — a family-level marker meaning "adopt the peer's family"
+    /// (spec: Formats — family-agnostic elements). It is not a new constraint kind: the
+    /// closed value/constraint algebra is untouched; this flag only widens *family*
+    /// matching in [`intersect`]. A wildcard offer carries no fields (a wildcard pad
+    /// cannot constrain fields — it does not know the peer's field vocabulary); an
+    /// `intersect` involving a wildcard-with-fields is rejected loudly. When both sides
+    /// are wildcards the result adopts the interned "any" family ([`WILDCARD`]).
+    pub wildcard: bool,
 }
 
 // --- Static, string-keyed descriptor layer -------------------------------------
@@ -145,11 +153,36 @@ pub struct OfferDesc {
     pub fields: &'static [FieldDesc],
 }
 
+/// The reserved wildcard family name (spec: Formats — the wildcard is a family-level
+/// marker). A pad whose offer names this family "adopts the peer's family" at
+/// negotiation; it must carry no fields. Distinct from [`OfferDesc::any`], which is a
+/// *concrete* family with no field constraints — `any("bytes")` still only intersects
+/// `bytes`, whereas [`OfferDesc::wildcard`] intersects *any* family. The name is chosen
+/// so an accidental collision with a real family is implausible, and so the graph dump
+/// renders it legibly.
+pub const WILDCARD: &str = "*";
+
 impl OfferDesc {
     /// Convenience for a pure passthrough / byte pad: match `family` with no fields
     /// constrained, so it intersects with any other offer in the same family.
     pub const fn any(family: &'static str) -> Self {
         OfferDesc { family, fields: &[] }
+    }
+
+    /// A **wildcard** offer: adopts the peer's family at negotiation (spec: Formats —
+    /// the blocker for family-agnostic elements like `queue`, `tee`, `funnel`). A
+    /// wildcard pad advertises this single offer; intersecting it with any concrete
+    /// offer yields that concrete side's family *and* fields, and wildcard-vs-wildcard
+    /// picks the interned "any" family. A wildcard offer declares no fields, and it is
+    /// an error to give it any — a wildcard pad cannot constrain fields it does not know
+    /// (enforced in [`intersect`], which rejects a wildcard-with-fields loudly).
+    pub const fn wildcard() -> Self {
+        OfferDesc { family: WILDCARD, fields: &[] }
+    }
+
+    /// Whether this static offer is a wildcard (its family is [`WILDCARD`]).
+    pub fn is_wildcard(&self) -> bool {
+        self.family == WILDCARD
     }
 }
 
@@ -204,6 +237,10 @@ impl OfferDesc {
     /// The result borrows `&'static [FieldConstraint]`: the field table is leaked, as
     /// its interned ids are pipeline-lived and the number of offers is bounded by the
     /// graph, not the stream.
+    ///
+    /// A [`wildcard`](Self::wildcard) offer lowers to a wildcard [`FormatOffer`] whose
+    /// interned family is [`WILDCARD`] ("any"): concrete peers adopt *their* family, and
+    /// two wildcards meeting adopt this interned "any" family (spec).
     pub fn lower(
         &self,
         formats: &mut Interner,
@@ -215,6 +252,7 @@ impl OfferDesc {
         FormatOffer {
             family: FormatId(formats.intern(self.family)),
             fields: Box::leak(lowered.into_boxed_slice()),
+            wildcard: self.is_wildcard(),
         }
     }
 }
@@ -339,32 +377,72 @@ fn fixate(a: Option<&FieldConstraint>, b: Option<&FieldConstraint>) -> Option<Op
 /// Intersect two offers on a link and fixate, or `None` when the intersection is
 /// empty (a loud `Ready`-time failure, never a runtime flow error). Fields are
 /// fixated with [`fixate`]; fields unconstrained on both sides are left unset.
+///
+/// **Wildcards** (spec: Formats — a family-level marker, not a new constraint kind):
+/// a wildcard offer "adopts the peer's family". Intersecting a wildcard with a concrete
+/// offer yields the concrete side's family *and* its fixated fields (the wildcard adds
+/// no constraints); wildcard-vs-wildcard yields the interned "any" family with no
+/// fields. A wildcard offer must carry no fields — a wildcard-with-fields is rejected
+/// loudly (`None`), because a wildcard pad cannot constrain fields it doesn't know.
 pub fn intersect(a: &FormatOffer, b: &FormatOffer) -> Option<FixedFormat> {
-    if a.family != b.family {
+    // A wildcard may never carry fields (a wildcard pad cannot constrain fields it does
+    // not know — e.g. a link-filtered wildcard). Reject loudly rather than silently
+    // dropping the constraints.
+    if (a.wildcard && !a.fields.is_empty()) || (b.wildcard && !b.fields.is_empty()) {
         return None;
     }
-    let mut out = FixedFormat::new(a.family);
 
-    for fc_a in a.fields {
-        let value = fixate(Some(fc_a), find_field(b, fc_a.field))?;
-        if let Some(v) = value {
-            if !out.set(fc_a.field, v) {
-                return None; // too many fixed fields
+    match (a.wildcard, b.wildcard) {
+        // Both wildcards: adopt the interned "any" family (they share it after lowering,
+        // so `a.family == b.family`), no fields to fixate.
+        (true, true) => Some(FixedFormat::new(a.family)),
+        // One wildcard adopts the concrete peer's family and fields — the wildcard adds
+        // no constraints, so this is just the concrete side fixated against `Any`.
+        (true, false) => fixate_solo(b),
+        (false, true) => fixate_solo(a),
+        (false, false) => {
+            if a.family != b.family {
+                return None;
             }
+            let mut out = FixedFormat::new(a.family);
+
+            for fc_a in a.fields {
+                let value = fixate(Some(fc_a), find_field(b, fc_a.field))?;
+                if let Some(v) = value {
+                    if !out.set(fc_a.field, v) {
+                        return None; // too many fixed fields
+                    }
+                }
+            }
+            // Fields present only on b.
+            for fc_b in b.fields {
+                if find_field(a, fc_b.field).is_some() {
+                    continue;
+                }
+                if let Some(v) = fixate(None, Some(fc_b))? {
+                    if !out.set(fc_b.field, v) {
+                        return None;
+                    }
+                }
+            }
+
+            Some(out)
         }
     }
-    // Fields present only on b.
-    for fc_b in b.fields {
-        if find_field(a, fc_b.field).is_some() {
-            continue;
-        }
-        if let Some(v) = fixate(None, Some(fc_b))? {
-            if !out.set(fc_b.field, v) {
+}
+
+/// Fixate a single concrete offer as if its peer were fully unconstrained (the wildcard
+/// case): adopt its family and fixate each of its fields against `Any`. Never fails
+/// except by overflowing the 16-field cap.
+fn fixate_solo(concrete: &FormatOffer) -> Option<FixedFormat> {
+    let mut out = FixedFormat::new(concrete.family);
+    for fc in concrete.fields {
+        if let Some(v) = fixate(Some(fc), None)? {
+            if !out.set(fc.field, v) {
                 return None;
             }
         }
     }
-
     Some(out)
 }
 
@@ -448,7 +526,18 @@ impl Vocabulary {
     /// field the offer constrains but the announcement leaves unset is **not** a
     /// conflict — the peer would fixate it, exactly as at link time. Read-only: resolves
     /// names against the frozen tables, interning nothing.
+    ///
+    /// **A wildcard pad admits any announced format** (spec: Formats — the wildcard
+    /// adopts the peer's family). A wildcard offer has no fields and no fixed family, so
+    /// there is nothing to conflict with: a `queue`/`tee`-style pad passes every runtime
+    /// `FormatChange` straight through re-validation, exactly as it accepts every family
+    /// at link time. (A wildcard-with-fields is a contradiction — it admits nothing, the
+    /// same loud rejection [`intersect`] gives it.)
     pub fn offer_admits(&self, offer: &OfferDesc, format: &FixedFormat) -> bool {
+        if offer.is_wildcard() {
+            // A malformed wildcard-with-fields admits nothing (see `intersect`).
+            return offer.fields.is_empty();
+        }
         match self.family_id(offer.family) {
             Some(fam) if fam == format.family => {}
             _ => return false,
@@ -467,7 +556,8 @@ impl Vocabulary {
 
     /// Whether *any* of a pad's alternative offers admits `format` (declaration order is
     /// preference, but for validation any match suffices). An empty offer list admits
-    /// nothing, mirroring [`negotiate`].
+    /// nothing, mirroring [`negotiate`]. A wildcard offer in the list admits everything
+    /// (see [`offer_admits`](Self::offer_admits)).
     pub fn offers_admit(&self, offers: &[OfferDesc], format: &FixedFormat) -> bool {
         offers.iter().any(|o| self.offer_admits(o, format))
     }
@@ -595,7 +685,27 @@ mod tests {
 
     fn offer(family: u32, fields: Vec<FieldConstraint>) -> FormatOffer {
         // Leak is fine in tests: FormatOffer.fields is 'static (element descriptors).
-        FormatOffer { family: FormatId(family), fields: Box::leak(fields.into_boxed_slice()) }
+        FormatOffer {
+            family: FormatId(family),
+            fields: Box::leak(fields.into_boxed_slice()),
+            wildcard: false,
+        }
+    }
+
+    /// A lowered wildcard offer over an interned "any" family id, no fields — what
+    /// `OfferDesc::wildcard().lower(..)` produces (both wildcards share this family id).
+    fn wildcard(any_family: u32) -> FormatOffer {
+        FormatOffer { family: FormatId(any_family), fields: &[], wildcard: true }
+    }
+
+    /// A malformed wildcard that (illegally) carries fields — used to prove the loud
+    /// rejection. Real code cannot build one: `OfferDesc::wildcard()` has empty fields.
+    fn wildcard_with_fields(any_family: u32, fields: Vec<FieldConstraint>) -> FormatOffer {
+        FormatOffer {
+            family: FormatId(any_family),
+            fields: Box::leak(fields.into_boxed_slice()),
+            wildcard: true,
+        }
     }
 
     #[test]
@@ -684,6 +794,82 @@ mod tests {
         assert_eq!(f.get(FieldId(w)), Some(vi(1920)));
         assert_eq!(f.get(FieldId(h)), Some(vi(1080)));
         assert_eq!(f.get(FieldId(fmt)), Some(Value::Id(ValueId(2))));
+    }
+
+    // --- wildcard family: adopts the peer's family (spec: family-agnostic elements) ---
+
+    #[test]
+    fn offerdesc_wildcard_is_marked_and_lowers_to_wildcard() {
+        let wc = OfferDesc::wildcard();
+        assert!(wc.is_wildcard());
+        assert!(wc.fields.is_empty(), "a wildcard offer carries no fields");
+        assert!(!OfferDesc::any("bytes").is_wildcard(), "any() is a concrete family");
+
+        let (mut fmts, mut flds, mut vals) =
+            (Interner::new(), Interner::new(), Interner::new());
+        let lowered = wc.lower(&mut fmts, &mut flds, &mut vals);
+        assert!(lowered.wildcard);
+        assert_eq!(lowered.family, FormatId(fmts.get(WILDCARD).unwrap()));
+        assert!(lowered.fields.is_empty());
+    }
+
+    #[test]
+    fn intersect_wildcard_adopts_concrete_family_and_fields_both_orders() {
+        // A concrete audio offer (family 5) with two fields, one preferred.
+        static RATES: [Value; 2] = [Value::Int(44100), Value::Int(48000)];
+        let concrete = || {
+            offer(
+                5,
+                vec![
+                    fc(10, Constraint::Set(&RATES), Some(vi(48000))),
+                    fc(11, Constraint::Eq(vi(2)), None),
+                ],
+            )
+        };
+        // wildcard × concrete and concrete × wildcard both adopt family 5 + fixated fields.
+        for (a, b) in [(wildcard(0), concrete()), (concrete(), wildcard(0))] {
+            let f = intersect(&a, &b).expect("wildcard adopts the peer");
+            assert_eq!(f.family, FormatId(5), "adopted the concrete family");
+            assert_eq!(f.get(FieldId(10)), Some(vi(48000)), "preferred fixation");
+            assert_eq!(f.get(FieldId(11)), Some(vi(2)));
+        }
+    }
+
+    #[test]
+    fn intersect_wildcard_vs_wildcard_picks_any_family() {
+        // Both lowered wildcards share the interned "any" family id (here 7).
+        let f = intersect(&wildcard(7), &wildcard(7)).expect("two wildcards intersect");
+        assert_eq!(f.family, FormatId(7), "the interned any family");
+        assert!(f.is_empty(), "no fields to fixate");
+    }
+
+    #[test]
+    fn intersect_wildcard_with_fields_is_rejected_loudly() {
+        // A wildcard pad cannot constrain fields it does not know — a wildcard-with-fields
+        // is a contradiction and must be rejected, in either position.
+        let bad = || wildcard_with_fields(0, vec![fc(10, Constraint::Eq(vi(1)), None)]);
+        assert!(intersect(&bad(), &offer(5, vec![])).is_none(), "wildcard-with-fields (a)");
+        assert!(intersect(&offer(5, vec![]), &bad()).is_none(), "wildcard-with-fields (b)");
+        assert!(intersect(&bad(), &wildcard(0)).is_none(), "even vs a clean wildcard");
+    }
+
+    #[test]
+    fn negotiate_wildcard_pad_links_against_any_family() {
+        // A wildcard src pad negotiates against a concrete sink of any family — the
+        // queue/tee use case, end-to-end through the descriptor layer.
+        let (mut fmts, mut flds, mut vals) =
+            (Interner::new(), Interner::new(), Interner::new());
+        static SINK_F: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Eq(ValueDesc::Int(48000)),
+            preferred: None,
+        }];
+        let src = [OfferDesc::wildcard().lower(&mut fmts, &mut flds, &mut vals)];
+        let sink = [OfferDesc { family: "audio/raw", fields: &SINK_F }
+            .lower(&mut fmts, &mut flds, &mut vals)];
+        let f = negotiate(&src, &sink).expect("wildcard links against audio/raw");
+        assert_eq!(f.family, FormatId(fmts.get("audio/raw").unwrap()));
+        assert_eq!(f.get(FieldId(flds.get("rate").unwrap())), Some(vi(48000)));
     }
 
     // --- negotiate over lists of alternatives ---
@@ -949,5 +1135,24 @@ mod tests {
         ];
         assert!(vocab.offers_admit(&alts, &f), "second alternative admits it");
         assert!(!vocab.offers_admit(&[], &f), "no offers admit nothing");
+    }
+
+    #[test]
+    fn wildcard_pad_admits_any_announced_format() {
+        // A wildcard pad passes every runtime FormatChange through re-validation — it
+        // adopts the peer's family, so there is nothing to conflict with. This is what
+        // lets a dynamic-caps announcement cross a `queue`/`tee`.
+        let vocab = vocab_with(&["audio/raw", "video/raw"], &["rate", "width"], &["s16"]);
+        let mut audio = FixedFormat::new(vocab.family_id("audio/raw").unwrap());
+        audio.set(vocab.field_id("rate").unwrap(), Value::Int(48000));
+        let mut video = FixedFormat::new(vocab.family_id("video/raw").unwrap());
+        video.set(vocab.field_id("width").unwrap(), Value::Int(1920));
+
+        let wc = OfferDesc::wildcard();
+        assert!(vocab.offer_admits(&wc, &audio), "wildcard admits audio");
+        assert!(vocab.offer_admits(&wc, &video), "wildcard admits video (a different family)");
+        // Even a family the vocabulary never interned is admitted (nothing resolved).
+        let alien = FixedFormat::new(FormatId(9999));
+        assert!(vocab.offer_admits(&wc, &alien), "wildcard admits an unknown family");
     }
 }
