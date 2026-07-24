@@ -137,10 +137,13 @@ pub struct Ctx {
     /// channel is a `Send`-clean refinement — the SPSC `Producer` is `Send` but not
     /// `Sync`, so one sink per `Ctx` keeps `Ctx: Send` without sharing a producer.)
     log: Option<Log>,
-    /// A pending runtime format announcement (spec: Formats — dynamic caps). Set by
+    /// Pending runtime format announcements (spec: Formats — dynamic caps). Pushed by
     /// [`announce_format`](Self::announce_format), drained by the scheduler after
-    /// `process()`. `None` on the hot path for the overwhelming majority of elements.
-    announced: Option<Announcement>,
+    /// `process()`. A queue, not a slot: a multi-track demuxer whose first samples for
+    /// *several* pads land in one `process()` pass announces once per pad, and none may
+    /// overwrite another (a single slot silently lost all but the last — found by a
+    /// two-track remux). Empty on the hot path for the overwhelming majority of elements.
+    announced: Vec<Announcement>,
     /// The pipeline's frozen interning tables (installed at run setup), so this element can
     /// resolve the names in its negotiated format — `field_id("rate")`, `value_name(id)`.
     /// `None` outside a run (spec: Formats — elements read their caps by name).
@@ -202,7 +205,7 @@ impl Ctx {
             io_out: Vec::new(),
             next_op: 0,
             log: None,
-            announced: None,
+            announced: Vec::new(),
             vocabulary: None,
             clock: None,
             base_time: Timestamp::ZERO,
@@ -254,7 +257,7 @@ impl Ctx {
         family: &'static str,
         fields: &[(&'static str, ValueDesc)],
     ) {
-        self.announced = Some(Announcement {
+        self.announced.push(Announcement {
             pad,
             payload: AnnouncePayload::Named { family, fields: fields.to_vec() },
         });
@@ -265,8 +268,8 @@ impl Ctx {
     /// tee): on `Event::FormatChange(f)`, call `forward_format(src, f.clone())` so
     /// the change hops onward across this element — [`announce_format`]
     /// (Self::announce_format) cannot express this, since a generic forwarder has no
-    /// static names for fields it never knew. Same single-slot, batch-boundary
-    /// semantics as an announcement.
+    /// static names for fields it never knew. Same queued, batch-boundary semantics as
+    /// an announcement.
     pub fn forward_format(&mut self, pad: PadId, format: FixedFormat) {
         // Single-src leniency, as in `out(pad)`: the scheduler's drain routes the
         // ride-along event strictly by this pad index.
@@ -274,12 +277,13 @@ impl Ctx {
             Some(idx) => PadId(idx as u32),
             None => pad,
         };
-        self.announced = Some(Announcement { pad, payload: AnnouncePayload::Fixed(format) });
+        self.announced.push(Announcement { pad, payload: AnnouncePayload::Fixed(format) });
     }
 
-    /// Drain a pending announcement (scheduler hook, after `process()`).
-    pub(crate) fn take_announcement(&mut self) -> Option<Announcement> {
-        self.announced.take()
+    /// Drain the pending announcements, in announce order (scheduler hook, after
+    /// `process()`).
+    pub(crate) fn take_announcements(&mut self) -> Vec<Announcement> {
+        std::mem::take(&mut self.announced)
     }
 
     /// Update the negotiated format on a single pad at runtime, when a `FormatChange`

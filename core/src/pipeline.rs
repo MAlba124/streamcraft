@@ -1656,7 +1656,7 @@ fn run_group(
             ctxs[i].reset_scratch();
             // Dynamic caps: if the element announced a runtime output format, attach a
             // FormatChange to its output batch so the peer re-fixates (spec: Formats).
-            if let Some(ann) = ctxs[i].take_announcement() {
+            for ann in ctxs[i].take_announcements() {
                 let fixed = match ann.payload {
                     crate::ctx::AnnouncePayload::Named { family, fields } => {
                         vocabulary.build_fixed(family, &fields)
@@ -1667,7 +1667,8 @@ fn run_group(
                 };
                 if let Some(f) = fixed {
                     // Ride the FormatChange on the announced src pad's batch so it travels
-                    // to that pad's downstream (correct when the element branches).
+                    // to that pad's downstream (correct when the element branches — a
+                    // multi-track demuxer announces several pads in one pass).
                     ctxs[i].output_on(ann.pad).push_event(Event::FormatChange(f));
                 }
             }
@@ -1684,6 +1685,17 @@ fn run_group(
                 }
                 let (left, right) = ctxs.split_at_mut(i + 1);
                 right[0].input_append(left[i].output_mut());
+                // The inline hand-off moves only the primary src pad. Anything left on
+                // another pad has nowhere to go — an *unlinked* pad on a non-tail member
+                // (a demuxer's unwatched track, inlined mid-group). Same policy as the
+                // tail's unrouted pads below: drop it, count it, recycle its pool slots
+                // — accumulating here exhausts the element's pool and stalls the group
+                // (spec: robustness).
+                let (unrouted, _) = left[i].total_output();
+                if unrouted > 0 {
+                    counters[i].record_drops(unrouted);
+                    left[i].clear_outputs();
+                }
             }
         }
         if let Some(e) = fatal {

@@ -305,7 +305,7 @@ impl Harness {
     }
 
     /// The element's most recent runtime format announcement, resolved through the
-    /// vocabulary exactly as the scheduler resolves it (`take_announcement` +
+    /// vocabulary exactly as the scheduler resolves it (`take_announcements` +
     /// [`Vocabulary::build_fixed`]). `None` until the element announces. Set after each
     /// driving call; a fresh announcement overwrites the last.
     pub fn announced(&self) -> Option<FixedFormat> {
@@ -400,7 +400,7 @@ impl Harness {
     /// additionally ride it downstream as a `FormatChange`; with no downstream here, the
     /// harness just records the resolved format.
     fn drain_announcement(&mut self) {
-        if let Some(ann) = self.ctx.take_announcement() {
+        for ann in self.ctx.take_announcements() {
             let fixed = match ann.payload {
                 crate::ctx::AnnouncePayload::Named { family, fields } => {
                     self.vocabulary.build_fixed(family, &fields)
@@ -408,6 +408,8 @@ impl Harness {
                 crate::ctx::AnnouncePayload::Fixed(f) => Some(f),
             };
             if let Some(f) = fixed {
+                // Later announcements win the cached slot (the single-element harness
+                // observes one pad at a time).
                 self.announced = Some(f);
             }
         }
