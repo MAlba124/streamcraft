@@ -14,6 +14,8 @@
 //! - [`log`], [`counters`] — observability (spec: Debuggability, Taps)
 //! - [`props`] — dynamic element properties (spec: Dynamic element properties)
 //! - [`registry`] — the opt-in element-by-name table + parse-launch (spec: Plugins)
+//! - [`harness`] — the threadless, mock-clocked single-element test rig (spec: Testing —
+//!   Element harness; it *is* the inline caller)
 
 // `unsafe` is permitted only in `memory` and the SPSC ring (audited, loom+miri
 // covered) once they land. `deny` (not `forbid`) so those modules can locally
@@ -33,6 +35,7 @@ pub mod element;
 pub mod error;
 pub mod event;
 pub mod format;
+pub mod harness;
 pub mod id;
 pub mod io;
 pub mod log;
