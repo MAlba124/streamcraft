@@ -20,7 +20,7 @@ use crate::ctx::Ctx;
 use crate::element::{Direction, Element, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::event::Event;
-use crate::format::{negotiate, FieldConstraint, FixedFormat, Value, ValueDesc};
+use crate::format::{negotiate, FieldConstraint, FixedFormat, Value, Vocabulary};
 use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, PadId, ValueId};
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::log::{log_channel, Level, LevelFilter, Log, LogDrain};
@@ -40,39 +40,6 @@ struct Edge {
     sink: ElementId,
     sink_pad: usize,
     format: FixedFormat,
-}
-
-/// A read-only snapshot of the pipeline's interning tables, shared with each group thread
-/// so an element can resolve the `&'static` names it announces at runtime into a
-/// [`FixedFormat`] (spec: Formats — dynamic caps). Built once at `run()`, after linking has
-/// frozen the tables; never mutated on a streaming thread.
-struct Interners {
-    formats: Interner,
-    fields: Interner,
-    values: Interner,
-}
-
-impl Interners {
-    /// Resolve a string-keyed announcement into a [`FixedFormat`]. `None` if the family or
-    /// any field/categorical name was never interned (the element announced something it
-    /// never offered), so a bogus format is never fixed.
-    fn build_fixed(
-        &self,
-        family: &str,
-        fields: &[(&'static str, ValueDesc)],
-    ) -> Option<FixedFormat> {
-        let mut fixed = FixedFormat::new(FormatId(self.formats.get(family)?));
-        for (name, vd) in fields {
-            let field = FieldId(self.fields.get(name)?);
-            let value = match vd {
-                ValueDesc::Int(n) => Value::Int(*n),
-                ValueDesc::Rat(n, d) => Value::Rat(*n, *d),
-                ValueDesc::Id(s) => Value::Id(ValueId(self.values.get(s)?)),
-            };
-            fixed.set(field, value);
-        }
-        Some(fixed)
-    }
 }
 
 /// A summary of a finished [`Pipeline::run`], for tests and profiling.
@@ -378,10 +345,11 @@ impl Pipeline {
         // `Ctx`). `.take()` moves each element's table into its group thread.
         let mut negotiated = self.negotiated_by_element();
 
-        // A read-only snapshot of the (now frozen) interners, shared into every group so an
-        // element can resolve the names it announces at runtime (spec: Formats — dynamic
-        // caps). Cloning is a one-time, off-hot-path cost.
-        let interners = Arc::new(Interners {
+        // A read-only snapshot of the (now frozen) interners, shared into every group and
+        // installed on each `Ctx`, so elements can resolve their negotiated format by name
+        // and the scheduler can build announced formats (spec: Formats — dynamic caps).
+        // Cloning is a one-time, off-hot-path cost.
+        let vocabulary = Arc::new(Vocabulary {
             formats: self.formats.clone(),
             fields: self.fields.clone(),
             values: self.values.clone(),
@@ -421,11 +389,11 @@ impl Pipeline {
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
-            let interners = Arc::clone(&interners);
+            let vocabulary = Arc::clone(&vocabulary);
             handles.push(std::thread::spawn(move || {
                 run_group(
                     elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
-                    bus, credits, group_counters, stop, interners,
+                    bus, credits, group_counters, stop, vocabulary,
                 )
             }));
         }
@@ -821,7 +789,7 @@ fn run_group(
     credits: u32,
     counters: Vec<Arc<ElementCounters>>,
     stop: Arc<AtomicBool>,
-    interners: Arc<Interners>,
+    vocabulary: Arc<Vocabulary>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_none();
@@ -856,6 +824,11 @@ fn run_group(
         if let Some(log) = log {
             ctx.set_log(log);
         }
+    }
+    // Install the frozen vocabulary so elements can resolve their negotiated format by name
+    // and the produce hook can build announced formats (spec: Formats — dynamic caps).
+    for ctx in ctxs.iter_mut() {
+        ctx.set_vocabulary(Arc::clone(&vocabulary));
     }
 
     // Start each element; hand any file it registered to this group's reactor.
@@ -942,7 +915,7 @@ fn run_group(
             // Dynamic caps: if the element announced a runtime output format, attach a
             // FormatChange to its output batch so the peer re-fixates (spec: Formats).
             if let Some(ann) = ctxs[i].take_announcement() {
-                if let Some(f) = interners.build_fixed(ann.family, &ann.fields) {
+                if let Some(f) = vocabulary.build_fixed(ann.family, &ann.fields) {
                     ctxs[i].output_mut().push_event(Event::FormatChange(f));
                 }
             }

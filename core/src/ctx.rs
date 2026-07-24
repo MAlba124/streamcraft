@@ -6,12 +6,13 @@
 //! then drains the `out` batch and the IO `outbox` (submissions) afterwards.
 
 use std::fs::File;
+use std::sync::Arc;
 
 use crate::batch::{Batch, OutBatch};
 use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
-use crate::format::{FixedFormat, ValueDesc};
-use crate::id::{ElementId, FormatId, PadId};
+use crate::format::{FixedFormat, ValueDesc, Vocabulary};
+use crate::id::{ElementId, FieldId, FormatId, PadId, ValueId};
 use crate::io::{Completion, Io, Submission};
 use crate::log::{Field, Level, Log, Loggable};
 use crate::memory::{Arena, Pool};
@@ -60,6 +61,10 @@ pub struct Ctx {
     /// [`announce_format`](Self::announce_format), drained by the scheduler after
     /// `process()`. `None` on the hot path for the overwhelming majority of elements.
     announced: Option<Announcement>,
+    /// The pipeline's frozen interning tables (installed at run setup), so this element can
+    /// resolve the names in its negotiated format — `field_id("rate")`, `value_name(id)`.
+    /// `None` outside a run (spec: Formats — elements read their caps by name).
+    vocabulary: Option<Arc<Vocabulary>>,
 }
 
 impl Ctx {
@@ -85,6 +90,7 @@ impl Ctx {
             next_op: 0,
             log: None,
             announced: None,
+            vocabulary: None,
         }
     }
 
@@ -150,6 +156,33 @@ impl Ctx {
             self.negotiated.resize(i + 1, None);
         }
         self.negotiated[i] = Some(format);
+    }
+
+    /// Install the frozen vocabulary (pipeline → element at run setup).
+    pub(crate) fn set_vocabulary(&mut self, vocabulary: Arc<Vocabulary>) {
+        self.vocabulary = Some(vocabulary);
+    }
+
+    /// Resolve a format-field name to its interned id, for reading a negotiated
+    /// [`FixedFormat`] by name (spec: Formats — an element acts on its caps). `None` before
+    /// `run()` or for a name the graph never interned.
+    pub fn field_id(&self, name: &str) -> Option<FieldId> {
+        self.vocabulary.as_ref()?.field_id(name)
+    }
+
+    /// Resolve a categorical value name (e.g. a `sample` format) to its interned id.
+    pub fn value_id(&self, name: &str) -> Option<ValueId> {
+        self.vocabulary.as_ref()?.value_id(name)
+    }
+
+    /// Resolve an interned family id back to its name.
+    pub fn family_name(&self, id: FormatId) -> Option<&str> {
+        self.vocabulary.as_ref()?.family_name(id)
+    }
+
+    /// Resolve an interned categorical value id back to its name.
+    pub fn value_name(&self, id: ValueId) -> Option<&str> {
+        self.vocabulary.as_ref()?.value_name(id)
     }
 
     /// Allocate from this element's pool (unbounded).

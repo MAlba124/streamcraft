@@ -387,6 +387,60 @@ pub fn negotiate(src: &[FormatOffer], sink: &[FormatOffer]) -> Option<FixedForma
     None
 }
 
+/// A read-only snapshot of the pipeline's interning tables (spec: Formats). Built once at
+/// `run()` after linking has frozen the tables, then shared with every group thread and
+/// installed on each `Ctx`. It lets an element resolve the names in its negotiated
+/// [`FixedFormat`] — `ctx.field_id("rate")`, `ctx.value_name(id)` — and lets the scheduler
+/// turn a string-keyed announcement into a `FixedFormat`, all without touching the live
+/// tables (spec: Formats — dynamic caps). Never mutated on a streaming thread.
+pub struct Vocabulary {
+    pub formats: Interner,
+    pub fields: Interner,
+    pub values: Interner,
+}
+
+impl Vocabulary {
+    pub fn family_id(&self, name: &str) -> Option<FormatId> {
+        self.formats.get(name).map(FormatId)
+    }
+    pub fn field_id(&self, name: &str) -> Option<FieldId> {
+        self.fields.get(name).map(FieldId)
+    }
+    pub fn value_id(&self, name: &str) -> Option<ValueId> {
+        self.values.get(name).map(ValueId)
+    }
+    pub fn family_name(&self, id: FormatId) -> Option<&str> {
+        self.formats.resolve(id.0)
+    }
+    pub fn field_name(&self, id: FieldId) -> Option<&str> {
+        self.fields.resolve(id.0)
+    }
+    pub fn value_name(&self, id: ValueId) -> Option<&str> {
+        self.values.resolve(id.0)
+    }
+
+    /// Resolve a string-keyed runtime announcement into a [`FixedFormat`] (spec: dynamic
+    /// caps). `None` if the family or any field/categorical name was never interned (the
+    /// element announced something it never offered), so a bogus format is never fixed.
+    pub fn build_fixed(
+        &self,
+        family: &str,
+        fields: &[(&'static str, ValueDesc)],
+    ) -> Option<FixedFormat> {
+        let mut fixed = FixedFormat::new(self.family_id(family)?);
+        for (name, vd) in fields {
+            let field = self.field_id(name)?;
+            let value = match vd {
+                ValueDesc::Int(n) => Value::Int(*n),
+                ValueDesc::Rat(n, d) => Value::Rat(*n, *d),
+                ValueDesc::Id(s) => Value::Id(self.value_id(s)?),
+            };
+            fixed.set(field, value);
+        }
+        Some(fixed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
