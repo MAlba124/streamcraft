@@ -197,7 +197,9 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Name-constructible (spec: Plugins): config-free; it learns the format from the
+    // WAV header.
+    make_default: Some(|| Box::new(WavParse::new())),
 };
 
 /// Parses a WAV stream and emits its interleaved PCM payload.

@@ -17,11 +17,11 @@
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
+use streamcraft_core::format::{Constraint, OfferDesc, Value};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -53,10 +53,21 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+/// The interleaved-PCM parameters, for the parse path (spec: Plugins —
+/// `parse("… ! flacenc rate=44100 channels=2 format=s16 ! …")`). Until `wavparse`
+/// propagates the format through caps, `flacenc` needs these out of band; the parse
+/// layer supplies them as props (the typed [`FlacEnc::new`] is the other path). All
+/// structural (`live: false`): the encoder is built in `start()`.
+static PROPS: [PropDesc; 3] = [
+    PropDesc { name: "rate", allowed: Constraint::Any, live: false },
+    PropDesc { name: "channels", allowed: Constraint::Any, live: false },
+    PropDesc { name: "format", allowed: Constraint::Any, live: false },
+];
+
 static DESC: ElementDesc = ElementDesc {
     name: "flacenc",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     // Passive: pure transform, inlines into the upstream group (spec: Scheduling).
     sched: SchedHint::Passive,
     inputs: InputPolicy::Single,
@@ -66,8 +77,22 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default parameters (44.1 kHz stereo S16, the spec-target case); override via
+    // the `rate`/`channels`/`format` props at parse time.
+    make_default: Some(|| Box::new(FlacEnc::new(44_100, 2, SampleFormat::S16))),
 };
+
+/// Map an `audio/raw`-style sample-format name to the encoder's [`SampleFormat`], for
+/// the parse path's `format=` property. Unknown names leave the constructor default.
+fn sample_format_from_name(s: &str) -> Option<SampleFormat> {
+    Some(match s {
+        "s8" => SampleFormat::S8,
+        "s16" => SampleFormat::S16,
+        "s24" => SampleFormat::S24,
+        "s32" => SampleFormat::S32,
+        _ => return None,
+    })
+}
 
 pub struct FlacEnc {
     sample_rate: u32,
@@ -124,7 +149,26 @@ impl Element for FlacEnc {
         &DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // Parsed props override the constructor parameters (spec: Plugins). `rate` and
+        // `channels` are ints; `format` is an interned sample-format name.
+        if let Some(Value::Int(r)) = ctx.prop("rate") {
+            if r > 0 {
+                self.sample_rate = r as u32;
+            }
+        }
+        if let Some(Value::Int(c)) = ctx.prop("channels") {
+            if c > 0 {
+                self.channels = c as u32;
+            }
+        }
+        if let Some(Value::Id(id)) = ctx.prop("format") {
+            if let Some(sf) = ctx.value_name(id).and_then(sample_format_from_name) {
+                self.format = sf;
+            }
+        }
+        self.frame_stride = self.channels as usize * self.format.bytes_per_sample();
+
         // Build the encoder and stash the header to emit on the first `process` (we
         // can only push output when we hold an `out` batch mid-`process`).
         let (encoder, _header) =

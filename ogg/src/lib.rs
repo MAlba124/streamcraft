@@ -65,6 +65,19 @@ pub mod writer;
 
 pub use crc::{crc32, Crc32};
 pub use element::{OggDemux, OggMux, DEFAULT_SERIAL};
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! oggdemux ! …")`). Typed `use` + constructor stays primary; both
+/// elements are config-free (the muxer uses [`DEFAULT_SERIAL`]; set a specific serial
+/// with [`OggMux::with_serial`] in code). Descriptors are `&'static`, taken from a
+/// throwaway default instance.
+pub fn register(registry: &mut Registry) {
+    registry.register(OggDemux::new().desc());
+    registry.register(OggMux::new().desc());
+}
 pub use page::{
     flags as header_flags, page_crc, write_page, PageError, PageHeader, CAPTURE_PATTERN,
     GRANULE_NONE, HEADER_FIXED_LEN, MAX_PAGE_SIZE, MAX_SEGMENTS, STREAM_STRUCTURE_VERSION,

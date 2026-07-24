@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
+use streamcraft_core::format::{Constraint, OfferDesc};
 use streamcraft_core::io::{FileHandle, IoResult};
 use streamcraft_core::time::Timestamp;
 
@@ -28,10 +28,20 @@ static PADS: [PadDesc; 1] = [PadDesc {
     validate: None,
 }];
 
+/// The file to write (spec: Plugins — `parse("filesink path=…")`); see [`filesrc`]'s
+/// `path` prop. Structural: the file is created in `start()`.
+///
+/// [`filesrc`]: crate::io::FileSrc
+static PROPS: [PropDesc; 1] = [PropDesc {
+    name: "path",
+    allowed: Constraint::Any,
+    live: false,
+}];
+
 static DESC: ElementDesc = ElementDesc {
     name: "filesink",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     sched: SchedHint::Active,
     inputs: InputPolicy::Single,
     latency: LatencyDesc {
@@ -40,7 +50,7 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    make_default: Some(|| Box::new(FileSink::new(""))),
 };
 
 pub struct FileSink {
@@ -69,6 +79,13 @@ impl Element for FileSink {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // A parsed `path=` overrides the constructor value (spec: Plugins — the string
+        // rides `Value::Id`, resolved by name off the value vocabulary).
+        if let Some(streamcraft_core::format::Value::Id(id)) = ctx.prop("path") {
+            if let Some(s) = ctx.value_name(id) {
+                self.path = PathBuf::from(s);
+            }
+        }
         let f = File::create(&self.path)
             .map_err(|e| Error::Resource(format!("create {}: {e}", self.path.display())))?;
         self.file = ctx.io().register(f);

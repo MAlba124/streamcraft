@@ -85,7 +85,9 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Name-constructible (spec: Plugins): the decoder is config-free — it learns its
+    // format from the FLAC stream and announces it via dynamic caps.
+    make_default: Some(|| Box::new(FlacDec::new())),
 };
 
 /// The `audio/raw` sample-format name for a FLAC bit depth.

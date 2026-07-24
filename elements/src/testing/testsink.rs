@@ -39,7 +39,9 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // The parse layer builds the sink without its stats handle (a parsed pipeline just
+    // drives to EOS); the typed `new()` is how a test reads the digest back.
+    make_default: Some(|| Box::new(TestSink::new().0)),
 };
 
 struct Shared {
