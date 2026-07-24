@@ -400,6 +400,19 @@ pub struct MkvDemux {
     reader: MatroskaReader,
     /// Reused byte buffer for chunked emission (mirrors `MkvMux::scratch`).
     scratch: Vec<u8>,
+    /// Emissions stalled on pool exhaustion (spec: the backpressure rule — the pool,
+    /// never the heap, bounds a demuxer racing a slow decoder). While non-empty the
+    /// demuxer consumes **no input**, so upstream backs up into the scheduler's gates
+    /// instead of this element ballooning. Holds at most a codec head + one frame.
+    pending: std::collections::VecDeque<Carry>,
+}
+
+/// A partially-emitted blob: `bytes[off..]` still needs pool slots on `pad`.
+struct Carry {
+    pad: PadId,
+    pts_ns: Option<u64>,
+    bytes: Vec<u8>,
+    off: usize,
 }
 
 impl MkvDemux {
@@ -414,6 +427,7 @@ impl MkvDemux {
             pad_tracks: Vec::new(),
             reader: MatroskaReader::new(),
             scratch: Vec::new(),
+            pending: std::collections::VecDeque::new(),
         }
     }
 
@@ -458,14 +472,13 @@ impl MkvDemux {
         }
     }
 
-    /// Push `bytes` on `pad`, chunked to the pool slot so no single copy exceeds a buffer, and
-    /// stamp each buffer's PTS with `pts_ns` (identical chunking to `MkvMux::emit`, plus the
-    /// timestamp a demuxer must carry). Empty `bytes` push nothing (a byte stream has no
-    /// boundary to preserve — the native FLAC head/frames are just concatenated downstream).
-    fn emit(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8]) {
-        let mut off = 0;
+    /// Push `bytes[off..]` on `pad` via **pooled** slots (`try_alloc`), chunked to the slot
+    /// size, returning the new offset — `< bytes.len()` means the pool ran dry and the caller
+    /// must carry the remainder and stop consuming input (spec: the backpressure rule). PTS
+    /// is stamped on each buffer.
+    fn emit_bounded(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8], mut off: usize) -> usize {
         while off < bytes.len() {
-            let mut buf = ctx.alloc(pad);
+            let Some(mut buf) = ctx.try_alloc(pad) else { return off };
             let cap = buf.memory.capacity();
             debug_assert!(cap > 0, "mkvdemux: zero-capacity pool slot");
             let n = cap.min(bytes.len() - off);
@@ -477,16 +490,57 @@ impl MkvDemux {
             ctx.out(pad).push(buf);
             off += n;
         }
+        off
     }
 
-    /// Drain every frame the reader has decoded so far, emitting each on its track's src pad.
-    /// On a track's first frame the native codec head is emitted first and the pad's runtime
-    /// format is announced (spec: dynamic caps). A frame for a track that was not discovered
-    /// (absent from the header the demux was constructed with) is dropped — its pad does not
-    /// exist, so there is nowhere to route it. A Block that fails to reframe (a malformed
-    /// length-prefixed NAL access unit for H.264/H.265) is **warned-and-dropped**, not fatal —
-    /// the demuxer keeps parsing (spec: untrusted input; per-buffer error scope).
-    fn drain(&mut self, ctx: &mut Ctx) {
+    /// Emit `bytes[off..]` as one **exact-size** buffer (`alloc_exact` — a right-sized heap
+    /// allocation when the pool is dry, never a slot-sized over-allocation). Only for the
+    /// bounded EOS/stop flush, where yielding for a slot is no longer possible.
+    fn emit_exact(ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: &[u8], off: usize) {
+        let rest = &bytes[off..];
+        if rest.is_empty() {
+            return;
+        }
+        let mut buf = ctx.alloc_exact(pad, rest.len());
+        buf.memory.as_mut_full()[..rest.len()].copy_from_slice(rest);
+        buf.memory.set_len(rest.len());
+        if let Some(t) = pts_ns {
+            buf.pts = Timestamp::from_nanos(t);
+        }
+        ctx.out(pad).push(buf);
+    }
+
+    /// Queue a blob for emission and try to emit it now; on pool exhaustion the remainder
+    /// parks in `pending` (drained first on the next pass).
+    fn emit_or_park(&mut self, ctx: &mut Ctx, pad: PadId, pts_ns: Option<u64>, bytes: Vec<u8>) {
+        let off = Self::emit_bounded(ctx, pad, pts_ns, &bytes, 0);
+        if off < bytes.len() {
+            self.pending.push_back(Carry { pad, pts_ns, bytes, off });
+        }
+    }
+
+    /// Resume parked emissions. `true` when everything pending has drained.
+    fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
+        while let Some(mut c) = self.pending.pop_front() {
+            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, &c.bytes, c.off);
+            if c.off < c.bytes.len() {
+                self.pending.push_front(c);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Drain frames the reader has decoded, emitting each on its track's src pad — **pool
+    /// bounded**: returns `false` when slots ran out (remainder parked in `pending`; stop
+    /// consuming input until it clears). On a track's first frame the native codec head is
+    /// emitted first and the pad's runtime format is announced (spec: dynamic caps). A frame
+    /// for an undiscovered track is dropped (no pad); a Block that fails to reframe is
+    /// warned-and-dropped, not fatal (spec: untrusted input; per-buffer error scope).
+    fn drain(&mut self, ctx: &mut Ctx) -> bool {
+        if !self.drain_pending(ctx) {
+            return false;
+        }
         while let Some(frame) = self.reader.next_frame() {
             let Some(idx) = self.pad_tracks.iter().position(|pt| pt.track_number == frame.track_number) else {
                 continue; // undiscovered track — no pad to route to
@@ -519,10 +573,54 @@ impl MkvDemux {
                 // The head carries the stream start; stamp it with the first frame's pts. Take
                 // it (leaving empty) — it is emitted exactly once, before the first frame.
                 let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
-                Self::emit(ctx, pad, Some(frame.pts_ns), &head);
+                self.emit_or_park(ctx, pad, Some(frame.pts_ns), head);
             }
             let pad = self.pad_tracks[idx].pad;
-            Self::emit(ctx, pad, Some(frame.pts_ns), &out_bytes);
+            // Emit from the (usually borrowed) reframed bytes; only a parked remainder
+            // pays the copy into an owned carry.
+            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), &out_bytes, 0);
+            if off < out_bytes.len() {
+                self.pending.push_back(Carry {
+                    pad,
+                    pts_ns: Some(frame.pts_ns),
+                    bytes: out_bytes.into_owned(),
+                    off,
+                });
+            }
+            if !self.pending.is_empty() {
+                return false; // pool dry — carry parked, stop pulling reader frames
+            }
+        }
+        true
+    }
+
+    /// The EOS/stop flush: everything parked or still queued in the reader goes out with
+    /// exact-size allocations (no slot to wait for at end of stream, and no multi-MiB slot
+    /// per small sample either). Bounded in volume: the steady-state path only consumed
+    /// input while it could emit, so at most one input batch's worth of samples sits here.
+    fn flush_exact(&mut self, ctx: &mut Ctx) {
+        while let Some(c) = self.pending.pop_front() {
+            Self::emit_exact(ctx, c.pad, c.pts_ns, &c.bytes, c.off);
+        }
+        // Reuse drain()'s routing/announce logic by swapping the emitter is overkill for
+        // the tail; inline the same walk with exact emission.
+        while let Some(frame) = self.reader.next_frame() {
+            let Some(idx) = self.pad_tracks.iter().position(|pt| pt.track_number == frame.track_number) else {
+                continue;
+            };
+            let out_bytes = match self.pad_tracks[idx].reframer.reframe_block(&frame.data) {
+                Ok(bytes) => bytes,
+                Err(_) => continue, // tail flush: drop silently rather than warn-spam
+            };
+            if !self.pad_tracks[idx].started {
+                self.pad_tracks[idx].started = true;
+                let (pad, family) = (self.pad_tracks[idx].pad, self.pad_tracks[idx].family);
+                Self::announce(ctx, pad, family, &self.pad_tracks[idx].track);
+                let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
+                Self::emit_exact(ctx, pad, Some(frame.pts_ns), &head, 0);
+            }
+            let pad = self.pad_tracks[idx].pad;
+            Self::emit_exact(ctx, pad, Some(frame.pts_ns), &out_bytes, 0);
         }
     }
 
@@ -628,10 +726,18 @@ impl Element for MkvDemux {
             pt.reframer = reframer;
         }
         self.scratch.clear();
+        self.pending.clear();
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        // Backpressure: resume any parked emission first, and consume input only while
+        // emission keeps up. Un-popped input stays buffered for the next pass, which is
+        // what makes the scheduler's gates (not this element's memory) absorb a fast
+        // source racing a slow decoder.
+        if !self.drain(ctx) {
+            return Ok(Flow::Ok);
+        }
         while let Some(buf) = inputs.pop() {
             // Feed the bytes to the structure reader; it parses whole elements and queues the
             // frames it decodes. A malformed stream errors here (never panics). `buf` recycles
@@ -639,25 +745,28 @@ impl Element for MkvDemux {
             self.reader
                 .push(buf.memory.data())
                 .map_err(|e| Error::Resource(format!("mkvdemux: parse error: {e:?}")))?;
-            self.drain(ctx);
+            if !self.drain(ctx) {
+                return Ok(Flow::Ok);
+            }
         }
         Ok(Flow::Ok)
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // On EOS, drain any frame a just-completed element produced. The Matroska streamed
-        // masters (Segment/Cluster) end implicitly, so there is no trailer to flush — a clean
-        // stream ends on an element boundary with nothing buffered.
+        // On EOS, flush everything still parked or queued — exact-size allocations, since
+        // waiting for pool slots is no longer an option. The Matroska streamed masters
+        // (Segment/Cluster) end implicitly, so there is no trailer beyond this.
         if matches!(event, Event::Eos) {
-            self.drain(ctx);
+            self.flush_exact(ctx);
         }
         Ok(())
     }
 
     fn stop(&mut self, ctx: &mut Ctx) {
-        // Belt-and-braces: drain any final frame even if `event(Eos)` was not delivered.
-        self.drain(ctx);
+        // Belt-and-braces: flush any final frame even if `event(Eos)` was not delivered.
+        self.flush_exact(ctx);
         self.reader = MatroskaReader::new();
         self.scratch = Vec::new();
+        self.pending.clear();
     }
 }
