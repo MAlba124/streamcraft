@@ -19,8 +19,10 @@ use streamcraft_video::{VideoFormat, VideoTestSrc};
 use sc_vk::VkVideoSink;
 
 fn main() {
-    let width = 640u32;
-    let height = 360u32;
+    // Optional `WIDTH HEIGHT` args — reproducing size-dependent compositor behavior.
+    let mut args = std::env::args().skip(1);
+    let width: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(640);
+    let height: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(360);
     let fps = Rational::new(30, 1);
     let seconds = 4u64;
     let count = seconds * 30;

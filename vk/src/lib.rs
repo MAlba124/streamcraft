@@ -10,9 +10,17 @@
 //!
 //! Per frame: memcpy the packed I420 planes into a host-visible storage buffer, one
 //! compute dispatch (`shaders/yuv2rgb.comp`, committed SPIR-V alongside the GLSL
-//! source) converts into a per-slot linear XRGB8888 framebuffer whose memory was
-//! allocated dma-buf-exportable, fence-wait, then attach/commit the imported
-//! `wl_buffer` — release-gated triple buffering, exactly like the shm swapchain.
+//! source) converts into a shared framebuffer SSBO, and a GPU copy lands it in a
+//! per-slot **LINEAR `VkImage`** whose dedicated dma-buf-exportable memory — with
+//! the driver's own subresource offset/pitch — is what the compositor imports;
+//! fence-wait, then attach/commit the imported `wl_buffer` — release-gated triple
+//! buffering, exactly like the shm swapchain.
+//!
+//! **Status: experimental for large surfaces.** An earlier revision exported raw
+//! `VkBuffer` memory with an assumed pitch; importing it at 1920×1040 crashed a
+//! real compositor (session down). The image-based exporter is the fix, verified
+//! byte-exact headlessly — but its first live large-surface presents should be run
+//! deliberately (small sizes first), not stumbled into.
 //!
 //! v1 limitations (documented follow-ups in `REFERENCES.md`): LINEAR modifier only;
 //! output at the video's own dimensions (no scaling — the citable scaler ladder,

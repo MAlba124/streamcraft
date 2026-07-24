@@ -148,6 +148,12 @@ pub struct H265Dec {
     /// Output-order frames released from the reorder window, awaiting a pool slot,
     /// front first — the backpressure carry.
     ready: std::collections::VecDeque<ReadyFrame>,
+    /// The most recent access unit carrying parameter sets (VPS/SPS/PPS — H.265
+    /// §7.4.2.2, nal_unit_type 32/33/34). BluRay-class MKV streams carry parameter
+    /// sets **only** in the out-of-band head the demuxer emits once, so a decoder
+    /// rebuild after an error would otherwise lose them and doom every following AU.
+    /// Re-injected after each rebuild.
+    param_cache: Vec<u8>,
     /// Consecutive access units the decoder rejected (reset by any success). Guards
     /// the give-up below.
     failures: u32,
@@ -173,9 +179,51 @@ impl H265Dec {
             reorder: Vec::new(),
             pts_queue: BinaryHeap::new(),
             ready: std::collections::VecDeque::new(),
+            param_cache: Vec::new(),
             failures: 0,
             dead: false,
         }
+    }
+
+    /// Extract only the parameter-set NALs (VPS/SPS/PPS — nal_unit_type 32/33/34,
+    /// bits 1..7 of the first byte after the start code; H.265 §7.3.1.2) from an
+    /// Annex B access unit, as a re-injectable Annex B blob. Slice NALs are excluded
+    /// on purpose: a typical stream packs parameter sets *and* the IDR slice into one
+    /// AU, and re-injecting the whole AU after a decoder rebuild would decode that
+    /// frame twice. Empty when the AU carries none. Total: malformed data yields
+    /// whatever well-formed NALs it contains, never a panic.
+    fn extract_parameter_sets(au: &[u8]) -> Vec<u8> {
+        // Collect every start-code position first (3- or 4-byte; Annex B §B.2.2).
+        let mut starts: Vec<(usize, usize)> = Vec::new(); // (code start, payload start)
+        let mut i = 0;
+        while i + 3 <= au.len() {
+            if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+                starts.push((i, i + 3));
+                i += 3;
+            } else if i + 4 <= au.len()
+                && au[i] == 0
+                && au[i + 1] == 0
+                && au[i + 2] == 0
+                && au[i + 3] == 1
+            {
+                starts.push((i, i + 4));
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        let mut out = Vec::new();
+        for (k, &(code, payload)) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).map_or(au.len(), |&(next_code, _)| next_code);
+            if payload < end {
+                let nal_type = (au[payload] >> 1) & 0x3F;
+                if (32..=34).contains(&nal_type) {
+                    let _ = code; // keep the NAL's own start code form
+                    out.extend_from_slice(&au[code..end]);
+                }
+            }
+        }
+        out
     }
 
     /// Move newly decoded pictures into the reorder window and release every frame
@@ -304,8 +352,14 @@ impl Element for H265Dec {
             if self.dead {
                 continue;
             }
-            // One buffer = one Annex B access unit. Record its pts for output-order
-            // re-attachment, then decode.
+            // One buffer = one Annex B access unit. Remember the latest parameter
+            // sets (the demuxer's out-of-band head, or in-band repeats) so a decoder
+            // rebuild below can re-inject them — parameter NALs only, never slices.
+            let params = Self::extract_parameter_sets(inbuf.memory.data());
+            if !params.is_empty() {
+                self.param_cache = params;
+            }
+            // Record its pts for output-order re-attachment, then decode.
             if let Some(ns) = inbuf.pts.nanos() {
                 self.pts_queue.push(Reverse(ns as i64));
             }
@@ -348,9 +402,14 @@ impl Element for H265Dec {
                 }
                 // Rebuild only on the first failure after a success: a fresh decoder
                 // fed the next non-IDR AU fails identically, and rebuilding the DPB
-                // per frame is an allocation storm (the movie-OOM lesson).
+                // per frame is an allocation storm (the movie-OOM lesson). The fresh
+                // decoder must re-learn the parameter sets — streams that carry them
+                // only out-of-band would otherwise fail every AU from here on.
                 if self.failures == 1 {
                     self.seq = SequenceDecoder::new();
+                    if !self.param_cache.is_empty() {
+                        let _ = self.seq.push_annexb(&self.param_cache);
+                    }
                 }
                 // The dropped AU's pts is now orphaned; the ascending re-attach still
                 // matches the surviving frames in order, so leave the heap as is.
@@ -369,6 +428,11 @@ impl Element for H265Dec {
             // flush/seek). Pending pts are dropped with the frames they belonged to.
             Event::FlushStart => {
                 self.seq = SequenceDecoder::new();
+                // Post-seek data starts mid-stream; the demuxer's out-of-band head is
+                // not re-sent, so re-inject the cached parameter sets.
+                if !self.param_cache.is_empty() {
+                    let _ = self.seq.push_annexb(&self.param_cache);
+                }
                 self.reorder.clear();
                 self.ready.clear();
                 self.pts_queue.clear();

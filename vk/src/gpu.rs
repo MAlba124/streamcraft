@@ -3,16 +3,17 @@
 //! core's `memory`/`ring`: one `#![allow(unsafe_code)]` module, invariants documented
 //! per block, nothing `unsafe` escapes the boundary.
 //!
-//! Design (see crate docs + REFERENCES.md): a **compute** pipeline, buffers only — no
-//! images, no render pass, no WSI swapchain. The I420 planes are memcpy'd into a
-//! host-visible storage buffer; one dispatch converts (integer BT.601, the shader in
-//! `shaders/yuv2rgb.comp`) into a per-slot output storage buffer holding the linear
-//! XRGB8888 framebuffer; that buffer's device memory is allocated exportable
-//! (`VK_EXT_external_memory_dma_buf`) and its fd handed to the Wayland client for
-//! `zwp_linux_dmabuf_v1` import as a LINEAR `wl_buffer`. A compositor consuming a
-//! LINEAR dmabuf only cares about (fd, offset, stride, fourcc, modifier) — which
-//! Vulkan object produced the bytes is irrelevant, so a plain storage buffer is the
-//! least-machinery correct choice for v1.
+//! Design (see crate docs + REFERENCES.md): a **compute** pipeline, no render pass,
+//! no WSI swapchain. The I420 planes are memcpy'd into a host-visible storage
+//! buffer; one dispatch converts (integer BT.601, `shaders/yuv2rgb.comp`) into a
+//! shared device-local storage buffer; a GPU copy lands each frame in a per-slot
+//! **LINEAR-tiled `VkImage`** whose dedicated memory is allocated dma-buf-exportable
+//! (`VK_EXT_external_memory_dma_buf` + core-1.1 dedicated allocation) and whose
+//! driver-reported subresource layout (offset, row pitch) is what the
+//! `zwp_linux_dmabuf_v1` import advertises. Images — not raw buffer memory — are the
+//! export shape compositor importers are actually hardened against: a first version
+//! exported `VkBuffer` memory with an assumed `width*4` pitch, which crashed a real
+//! compositor at 1080p.
 //!
 //! Synchronisation: each `render` submits one command buffer (dispatch + a
 //! memory-visibility barrier) and **waits its fence** before the frame is presented —
@@ -54,6 +55,7 @@ pub struct Gpu {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
+    phys: vk::PhysicalDevice,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     /// Both `VK_KHR_external_memory_fd` and `VK_EXT_external_memory_dma_buf` were
     /// enabled — [`Renderer`]s may allocate exportable memory.
@@ -72,9 +74,30 @@ impl Gpu {
     pub fn new(require_export: bool) -> Result<Gpu, String> {
         // SAFETY: `Entry::load` dlopens libvulkan.so.1 (the loader) and resolves core
         // entry points; no Vulkan objects exist yet. Failure (no loader) is an Err.
-        let entry = match unsafe { ash::Entry::load() } {
+        // Outside the nix devshell the loader is often not on the default search
+        // path, so fall back to the conventional locations before giving up with a
+        // message that names the fix.
+        let entry = unsafe { ash::Entry::load() }.or_else(|first| {
+            for path in [
+                "/run/opengl-driver/lib/libvulkan.so.1", // NixOS system profile
+                "/usr/lib/libvulkan.so.1",               // FHS distros
+                "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", // Debian-family
+            ] {
+                // SAFETY: same contract as `Entry::load`, explicit path.
+                if let Ok(e) = unsafe { ash::Entry::load_from(path) } {
+                    return Ok(e);
+                }
+            }
+            Err(first)
+        });
+        let entry = match entry {
             Ok(e) => e,
-            Err(e) => return err("vulkan loader", e),
+            Err(e) => {
+                return Err(format!(
+                    "vulkan loader not found ({e}) — run via `nix develop` (the devshell \
+                     puts libvulkan on the search path), or install a system Vulkan loader"
+                ))
+            }
         };
 
         let app = vk::ApplicationInfo::default()
@@ -189,6 +212,7 @@ impl Gpu {
             device,
             queue,
             queue_family,
+            phys: pd,
             memory_props,
             can_export: has_export,
             external_fd,
@@ -228,18 +252,24 @@ impl Drop for Gpu {
     }
 }
 
-/// One output slot: an exportable storage buffer holding the linear XRGB framebuffer.
+/// One output slot: a LINEAR-tiled `VkImage` whose dedicated, exportable memory is
+/// the presented dma-buf. Images (not raw buffer memory) are what compositor
+/// importers are actually exercised against — exporting `VkBuffer` memory is legal
+/// but so unusual that it crashed a real compositor at 1080p (the incident that
+/// forced this design; see the crate docs).
 struct Slot {
-    buffer: vk::Buffer,
+    image: vk::Image,
     memory: vk::DeviceMemory,
     /// Our end of the exported dma-buf. The compositor dups the fd on import, so this
     /// stays owned here and closes on drop. `None` in the non-export (test) mode.
     fd: Option<OwnedFd>,
-    set: vk::DescriptorSet,
 }
 
-/// A fixed-geometry converter: I420 in (host memcpy), XRGB8888 out (per-slot
-/// exportable buffers), one fence-synchronised compute dispatch per frame.
+/// A fixed-geometry converter: I420 in (host memcpy), XRGB8888 out. Per frame: one
+/// compute dispatch (BT.601, `shaders/yuv2rgb.comp`) into a shared device-local
+/// storage buffer, then a GPU copy into the slot's LINEAR image — whose driver-
+/// reported subresource layout (offset + row pitch) is exactly what the dma-buf
+/// import advertises. Fence-synchronised; CPU-throttled explicit sync (v1).
 pub struct Renderer {
     width: usize,
     height: usize,
@@ -251,9 +281,18 @@ pub struct Renderer {
     /// fence waits, so the GPU never reads while the CPU writes.
     input_ptr: *mut u8,
     input_size: usize,
+    /// The shared conversion target: one framebuffer-sized storage buffer the shader
+    /// writes and every slot copy reads (STORAGE | TRANSFER_SRC, device-local).
+    fb_buffer: vk::Buffer,
+    fb_memory: vk::DeviceMemory,
     slots: Vec<Slot>,
+    /// The driver's subresource layout for the slot images (identical across slots —
+    /// asserted at build): what the dma-buf importer must be told.
+    img_offset: u64,
+    row_pitch: u64,
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     shader: vk::ShaderModule,
@@ -263,9 +302,16 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Framebuffer row stride in bytes (LINEAR, tightly packed).
+    /// Framebuffer row stride in bytes — the driver's reported row pitch for the
+    /// LINEAR image (may exceed `width * 4`; the importer must use this value).
     pub fn stride(&self) -> u32 {
-        (self.width * 4) as u32
+        self.row_pitch as u32
+    }
+
+    /// Byte offset of the image data within the exported memory (usually 0, but the
+    /// importer must use the driver's value).
+    pub fn offset(&self) -> u32 {
+        self.img_offset as u32
     }
 
     /// The exported dma-buf fd for `slot` (raw; ownership stays here — the Wayland
@@ -279,9 +325,9 @@ impl Renderer {
         self.slots.len()
     }
 
-    /// Build a renderer for `width`x`height` with `nslots` output framebuffers. With
-    /// `export`, output memory is allocated dma-buf-exportable (requires
-    /// [`Gpu::can_export`]); without it, output memory is host-visible so tests can
+    /// Build a renderer for `width`x`height` with `nslots` output images. With
+    /// `export`, image memory is allocated dma-buf-exportable (requires
+    /// [`Gpu::can_export`]); without it, image memory is host-visible so tests can
     /// [`read_back`](Self::read_back).
     pub fn new(
         gpu: &Gpu,
@@ -297,6 +343,22 @@ impl Renderer {
             return Err("renderer: device cannot export dma-bufs".into());
         }
         let dev = &gpu.device;
+
+        // The output format: B8G8R8A8_UNORM's memory bytes are [B, G, R, A] LE —
+        // both wl_shm XRGB8888 and DRM 'XR24'. The LINEAR tiling must support being
+        // a transfer destination (checked, loud).
+        // SAFETY: `phys` is this instance's physical device.
+        let fmt_props = unsafe {
+            gpu.instance
+                .get_physical_device_format_properties(gpu.phys, vk::Format::B8G8R8A8_UNORM)
+        };
+        if !fmt_props
+            .linear_tiling_features
+            .contains(vk::FormatFeatureFlags::TRANSFER_DST)
+        {
+            return Err("B8G8R8A8_UNORM linear images cannot be transfer targets here".into());
+        }
+
         // Round the plane bytes up to a whole number of u32 words (the shader reads
         // the planes as a uint array).
         let input_size = i420_size(width, height).next_multiple_of(4);
@@ -356,8 +418,8 @@ impl Renderer {
             }
         };
 
-        // From here on, build into a partially-initialised struct so one Drop path
-        // cleans up whatever exists on any later failure.
+        // From here on, build into a partially-initialised struct so one cleanup path
+        // (destroy) covers whatever exists on any later failure.
         let mut r = Renderer {
             width,
             height,
@@ -366,9 +428,14 @@ impl Renderer {
             input_memory,
             input_ptr,
             input_size,
+            fb_buffer: vk::Buffer::null(),
+            fb_memory: vk::DeviceMemory::null(),
             slots: Vec::new(),
+            img_offset: 0,
+            row_pitch: 0,
             layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             shader: vk::ShaderModule::null(),
@@ -376,14 +443,42 @@ impl Renderer {
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
         };
-        r.init_rest(gpu, fb_size, nslots)?;
+        if let Err(e) = r.init_rest(gpu, fb_size, nslots) {
+            r.destroy(gpu);
+            return Err(e);
+        }
         Ok(r)
     }
 
     fn init_rest(&mut self, gpu: &Gpu, fb_size: vk::DeviceSize, nslots: usize) -> Result<(), String> {
         let dev = &gpu.device;
 
-        // --- descriptor set layout: {0: planes RO, 1: pixels} storage buffers ---
+        // --- the shared framebuffer SSBO: shader writes it, slot copies read it ---
+        let binfo = vk::BufferCreateInfo::default()
+            .size(fb_size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY (this and every raw call below): info structs and their pointees
+        // live across the call; all handles are created and destroyed on `dev`.
+        self.fb_buffer = unsafe { dev.create_buffer(&binfo, None) }
+            .map_err(|e| format!("fb buffer: {e}"))?;
+        let req = unsafe { dev.get_buffer_memory_requirements(self.fb_buffer) };
+        let mem_type = gpu
+            .find_memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or("no memory type for the fb buffer")?;
+        let ainfo = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        self.fb_memory = unsafe { dev.allocate_memory(&ainfo, None) }
+            .map_err(|e| format!("fb memory: {e}"))?;
+        unsafe { dev.bind_buffer_memory(self.fb_buffer, self.fb_memory, 0) }
+            .map_err(|e| format!("bind fb memory: {e}"))?;
+
+        // --- descriptor set: {0: planes RO, 1: fb} — one set, shared by every slot ---
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -397,38 +492,55 @@ impl Renderer {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let linfo = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        // SAFETY (this and every create below): the info structs and their pointees
-        // live across the call; handles are created and destroyed on `dev` only.
         self.layout = unsafe { dev.create_descriptor_set_layout(&linfo, None) }
             .map_err(|e| format!("descriptor layout: {e}"))?;
-
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count((nslots * 2) as u32)];
-        let pinfo = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(nslots as u32)
-            .pool_sizes(&sizes);
+            .descriptor_count(2)];
+        let pinfo = vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes);
         self.pool = unsafe { dev.create_descriptor_pool(&pinfo, None) }
             .map_err(|e| format!("descriptor pool: {e}"))?;
+        let set_layouts = [self.layout];
+        let alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.pool)
+            .set_layouts(&set_layouts);
+        self.set = unsafe { dev.allocate_descriptor_sets(&alloc) }
+            .map_err(|e| format!("descriptor set: {e}"))?[0];
+        let in_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.input_buffer)
+            .range(vk::WHOLE_SIZE)];
+        let fb_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.fb_buffer)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&in_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&fb_info),
+        ];
+        unsafe { dev.update_descriptor_sets(&writes, &[]) };
 
         // --- pipeline: push constants {width, height}, the committed SPIR-V ---
         let pc = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
             .size(8)];
-        let set_layouts = [self.layout];
         let plinfo = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&pc);
         self.pipeline_layout = unsafe { dev.create_pipeline_layout(&plinfo, None) }
             .map_err(|e| format!("pipeline layout: {e}"))?;
-
         let words = ash::util::read_spv(&mut Cursor::new(YUV2RGB_SPV))
             .map_err(|e| format!("read_spv: {e}"))?;
         let sinfo = vk::ShaderModuleCreateInfo::default().code(&words);
         self.shader = unsafe { dev.create_shader_module(&sinfo, None) }
             .map_err(|e| format!("shader module: {e}"))?;
-
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(self.shader)
@@ -441,107 +553,92 @@ impl Renderer {
         }
         .map_err(|(_, e)| format!("compute pipeline: {e}"))?[0];
 
-        // --- per-slot output buffers (+ export) and descriptor sets ---
-        for _ in 0..nslots {
-            let mut ext = vk::ExternalMemoryBufferCreateInfo::default()
+        // --- per-slot LINEAR images with dedicated, exportable memory ---
+        for i in 0..nslots {
+            let mut ext = vk::ExternalMemoryImageCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let mut binfo = vk::BufferCreateInfo::default()
-                .size(fb_size)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let mut iinfo = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: self.width as u32,
+                    height: self.height as u32,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
             if self.export {
-                binfo = binfo.push_next(&mut ext);
+                iinfo = iinfo.push_next(&mut ext);
             }
-            let buffer = unsafe { dev.create_buffer(&binfo, None) }
-                .map_err(|e| format!("output buffer: {e}"))?;
-            let req = unsafe { dev.get_buffer_memory_requirements(buffer) };
+            let image = unsafe { dev.create_image(&iinfo, None) }
+                .map_err(|e| format!("slot image: {e}"))?;
+            // Keep the image alive in the struct even if a later step fails.
+            self.slots.push(Slot { image, memory: vk::DeviceMemory::null(), fd: None });
+            let slot = self.slots.last_mut().expect("just pushed");
+
+            let req = unsafe { dev.get_image_memory_requirements(image) };
             let (required, preferred) = if self.export {
-                // The exported buffer is GPU-written, compositor-read: device-local
-                // preferred, no host access needed.
                 (vk::MemoryPropertyFlags::empty(), vk::MemoryPropertyFlags::DEVICE_LOCAL)
             } else {
-                // Test mode: host-readable for `read_back`.
                 (
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                     vk::MemoryPropertyFlags::empty(),
                 )
             };
-            let Some(mem_type) = gpu.find_memory_type(req.memory_type_bits, required, preferred)
-            else {
-                unsafe { dev.destroy_buffer(buffer, None) };
-                return Err("no matching memory type for the output buffer".into());
-            };
+            let mem_type = gpu
+                .find_memory_type(req.memory_type_bits, required, preferred)
+                .ok_or("no matching memory type for a slot image")?;
+            // Exportable images want a dedicated allocation (and some drivers require
+            // it) — VK_KHR_dedicated_allocation is core in 1.1.
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
             let mut export_info = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
             let mut ainfo = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
-                .memory_type_index(mem_type);
+                .memory_type_index(mem_type)
+                .push_next(&mut dedicated);
             if self.export {
                 ainfo = ainfo.push_next(&mut export_info);
             }
-            let memory = match unsafe { dev.allocate_memory(&ainfo, None) } {
-                Ok(m) => m,
-                Err(e) => {
-                    unsafe { dev.destroy_buffer(buffer, None) };
-                    return err("allocate output memory", e);
+            slot.memory = unsafe { dev.allocate_memory(&ainfo, None) }
+                .map_err(|e| format!("slot memory: {e}"))?;
+            unsafe { dev.bind_image_memory(image, slot.memory, 0) }
+                .map_err(|e| format!("bind slot memory: {e}"))?;
+
+            // The driver's linear layout — the truth the dma-buf importer needs.
+            let sub = vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR);
+            // SAFETY: linear-tiled image created above on this device.
+            let lay = unsafe { dev.get_image_subresource_layout(image, sub) };
+            if i == 0 {
+                self.img_offset = lay.offset;
+                self.row_pitch = lay.row_pitch;
+                if self.row_pitch < (self.width * 4) as u64 {
+                    return Err(format!(
+                        "driver reported row pitch {} < width*4 {}",
+                        self.row_pitch,
+                        self.width * 4
+                    ));
                 }
-            };
-            if let Err(e) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
-                unsafe {
-                    dev.destroy_buffer(buffer, None);
-                    dev.free_memory(memory, None);
-                }
-                return err("bind output memory", e);
+            } else if lay.offset != self.img_offset || lay.row_pitch != self.row_pitch {
+                return Err("slot images disagree on subresource layout".into());
             }
 
-            let fd = if self.export {
+            if self.export {
                 let ext_dev = gpu.external_fd.as_ref().expect("can_export checked");
                 let info = vk::MemoryGetFdInfoKHR::default()
-                    .memory(memory)
+                    .memory(slot.memory)
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-                // SAFETY: `memory` was allocated with DMA_BUF export on this device.
-                // On success the returned fd is ours to own and close.
-                match unsafe { ext_dev.get_memory_fd(&info) } {
-                    Ok(raw) => Some(unsafe { OwnedFd::from_raw_fd(raw) }),
-                    Err(e) => {
-                        unsafe {
-                            dev.destroy_buffer(buffer, None);
-                            dev.free_memory(memory, None);
-                        }
-                        return err("get_memory_fd", e);
-                    }
-                }
-            } else {
-                None
-            };
-
-            let alloc = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.pool)
-                .set_layouts(&set_layouts);
-            let set = unsafe { dev.allocate_descriptor_sets(&alloc) }
-                .map_err(|e| format!("descriptor set: {e}"))?[0];
-            let in_info = [vk::DescriptorBufferInfo::default()
-                .buffer(self.input_buffer)
-                .range(vk::WHOLE_SIZE)];
-            let out_info = [vk::DescriptorBufferInfo::default()
-                .buffer(buffer)
-                .range(vk::WHOLE_SIZE)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&in_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&out_info),
-            ];
-            // SAFETY: sets/buffers are live handles on this device; infos outlive the call.
-            unsafe { dev.update_descriptor_sets(&writes, &[]) };
-
-            self.slots.push(Slot { buffer, memory, fd, set });
+                // SAFETY: memory allocated with DMA_BUF export on this device; on
+                // success the returned fd is ours to own and close.
+                let raw = unsafe { ext_dev.get_memory_fd(&info) }
+                    .map_err(|e| format!("get_memory_fd: {e}"))?;
+                slot.fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+            }
         }
 
         // --- command pool + one reusable command buffer + fence ---
@@ -561,10 +658,11 @@ impl Renderer {
         Ok(())
     }
 
-    /// Convert one packed-I420 frame into `slot`'s framebuffer. Copies the planes to
-    /// the mapped input buffer, records dispatch + visibility barrier, submits, and
-    /// waits the fence — on return the slot's memory holds the finished frame and is
-    /// safe for the compositor (or [`read_back`](Self::read_back)) to read.
+    /// Convert one packed-I420 frame into `slot`'s image: memcpy planes, dispatch the
+    /// shader into the shared fb buffer, copy buffer→image, barrier for external
+    /// readers, submit, fence-wait. On return the slot's memory holds the finished
+    /// frame at (offset, row_pitch) and is safe for the compositor (or
+    /// [`read_back`](Self::read_back)) to read.
     pub fn render(&mut self, gpu: &Gpu, planes: &[u8], slot: usize) -> Result<(), String> {
         let need = i420_size(self.width, self.height);
         if planes.len() < need {
@@ -572,6 +670,9 @@ impl Renderer {
         }
         debug_assert!(need <= self.input_size, "mapped input covers a whole frame");
         let s = self.slots.get(slot).ok_or("bad slot")?;
+        if s.memory == vk::DeviceMemory::null() {
+            return Err("slot not fully initialised".into());
+        }
         let dev = &gpu.device;
 
         // SAFETY: `input_ptr` maps `input_size >= need` coherent bytes (invariant on
@@ -596,7 +697,7 @@ impl Renderer {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 0,
-                &[s.set],
+                &[self.set],
                 &[],
             );
             let pc = [self.width as u32, self.height as u32];
@@ -614,23 +715,80 @@ impl Renderer {
                 (self.height as u32).div_ceil(8),
                 1,
             );
-            // Make the shader writes available to any consumer (host read-back or the
-            // dma-buf importer) before the fence signals.
-            let barrier = vk::BufferMemoryBarrier::default()
+
+            // Shader writes → transfer read on the fb buffer.
+            let fb_barrier = vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::HOST_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(s.buffer)
+                .buffer(self.fb_buffer)
                 .size(vk::WHOLE_SIZE);
+            // Slot image → GENERAL for the copy (UNDEFINED discards the old frame —
+            // we overwrite every texel; linear images use GENERAL throughout).
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(s.image)
+                .subresource_range(range);
             dev.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[fb_barrier],
+                &[to_dst],
+            );
+
+            let copy = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0) // tightly packed rows in the fb buffer
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: self.width as u32,
+                    height: self.height as u32,
+                    depth: 1,
+                });
+            dev.cmd_copy_buffer_to_image(
+                self.cmd,
+                self.fb_buffer,
+                s.image,
+                vk::ImageLayout::GENERAL,
+                &[copy],
+            );
+
+            // Make the copy visible to external readers (dma-buf importer / host).
+            let to_read = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::HOST_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(s.image)
+                .subresource_range(range);
+            dev.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE | vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[],
-                &[barrier],
                 &[],
+                &[to_read],
             );
             dev.end_command_buffer(self.cmd).map_err(|e| format!("end cmd: {e}"))?;
 
@@ -645,48 +803,81 @@ impl Renderer {
         Ok(())
     }
 
-    /// Read `slot`'s framebuffer back to the host (test mode only — the slot memory
-    /// must be host-visible, i.e. the renderer was built with `export == false`).
+    /// Read `slot`'s image back to the host as **tightly packed** `width*4`-stride
+    /// rows (test mode only — the slot memory must be host-visible, i.e. the
+    /// renderer was built with `export == false`). Honors the driver's row pitch.
     pub fn read_back(&self, gpu: &Gpu, slot: usize) -> Result<Vec<u8>, String> {
         if self.export {
             return Err("read_back: renderer is in export mode (memory not host-visible)".into());
         }
         let s = self.slots.get(slot).ok_or("bad slot")?;
-        let size = self.width * self.height * 4;
+        let tight = self.width * 4;
         let dev = &gpu.device;
-        // SAFETY: non-export slots are HOST_VISIBLE|COHERENT and unmapped (only the
-        // input buffer holds a persistent map); mapped here, copied, unmapped before
-        // return — no aliasing with GPU work (render() fence-waits before returning).
+        // SAFETY: non-export slot memory is HOST_VISIBLE|COHERENT and unmapped (only
+        // the input buffer holds a persistent map); mapped here, copied row by row at
+        // the driver pitch, unmapped before return — no aliasing with GPU work
+        // (render() fence-waits before returning).
         unsafe {
             let p = dev
                 .map_memory(s.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                .map_err(|e| format!("map output: {e}"))? as *const u8;
-            let mut out = vec![0u8; size];
-            std::ptr::copy_nonoverlapping(p, out.as_mut_ptr(), size);
+                .map_err(|e| format!("map slot: {e}"))? as *const u8;
+            let base = p.add(self.img_offset as usize);
+            let mut out = vec![0u8; tight * self.height];
+            for row in 0..self.height {
+                std::ptr::copy_nonoverlapping(
+                    base.add(row * self.row_pitch as usize),
+                    out.as_mut_ptr().add(row * tight),
+                    tight,
+                );
+            }
             dev.unmap_memory(s.memory);
             Ok(out)
         }
     }
 
     /// Tear down against the creating `Gpu`. Must be called (the plain `Drop` cannot
-    /// reach the device); the sink owns both and calls this from `stop`.
+    /// reach the device); the sink owns both and calls this from `stop`. Safe on a
+    /// partially-built renderer (null handles are skipped).
     pub fn destroy(mut self, gpu: &Gpu) {
         let dev = &gpu.device;
         // SAFETY: every handle below was created on `dev` by this renderer, and the
-        // device is idled first so nothing is in flight.
+        // device is idled first so nothing is in flight. Null checks make this safe
+        // for a partially-initialised build.
         unsafe {
             let _ = dev.device_wait_idle();
-            dev.destroy_fence(self.fence, None);
-            dev.destroy_command_pool(self.cmd_pool, None);
-            dev.destroy_pipeline(self.pipeline, None);
-            dev.destroy_shader_module(self.shader, None);
-            dev.destroy_pipeline_layout(self.pipeline_layout, None);
-            dev.destroy_descriptor_pool(self.pool, None);
-            dev.destroy_descriptor_set_layout(self.layout, None);
+            if self.fence != vk::Fence::null() {
+                dev.destroy_fence(self.fence, None);
+            }
+            if self.cmd_pool != vk::CommandPool::null() {
+                dev.destroy_command_pool(self.cmd_pool, None);
+            }
+            if self.pipeline != vk::Pipeline::null() {
+                dev.destroy_pipeline(self.pipeline, None);
+            }
+            if self.shader != vk::ShaderModule::null() {
+                dev.destroy_shader_module(self.shader, None);
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                dev.destroy_pipeline_layout(self.pipeline_layout, None);
+            }
+            if self.pool != vk::DescriptorPool::null() {
+                dev.destroy_descriptor_pool(self.pool, None);
+            }
+            if self.layout != vk::DescriptorSetLayout::null() {
+                dev.destroy_descriptor_set_layout(self.layout, None);
+            }
             for s in self.slots.drain(..) {
-                dev.destroy_buffer(s.buffer, None);
-                dev.free_memory(s.memory, None);
+                dev.destroy_image(s.image, None);
+                if s.memory != vk::DeviceMemory::null() {
+                    dev.free_memory(s.memory, None);
+                }
                 // s.fd (our dup of the dma-buf) closes on drop.
+            }
+            if self.fb_buffer != vk::Buffer::null() {
+                dev.destroy_buffer(self.fb_buffer, None);
+            }
+            if self.fb_memory != vk::DeviceMemory::null() {
+                dev.free_memory(self.fb_memory, None);
             }
             dev.unmap_memory(self.input_memory);
             dev.destroy_buffer(self.input_buffer, None);

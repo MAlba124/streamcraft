@@ -235,7 +235,9 @@ impl VkVideoSink {
                 DRM_FORMAT_XRGB8888,
                 DRM_FORMAT_MOD_LINEAR,
                 fd,
-                0,
+                // The driver's subresource layout, not assumptions — a padded pitch
+                // told wrong is how importers get corrupted or worse.
+                renderer.offset(),
                 renderer.stride(),
             ) {
                 renderer.destroy(gpu);

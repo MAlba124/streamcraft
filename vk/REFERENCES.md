@@ -16,6 +16,10 @@ libplacebo, mpv, or otherwise — is consulted. Clean-room).
 - **VK_KHR_external_memory_fd**, **VK_EXT_external_memory_dma_buf** (Khronos
   extension specs) — exportable allocations (`VkExportMemoryAllocateInfo`) and
   `vkGetMemoryFdKHR`.
+- **VK_KHR_dedicated_allocation** (core in Vulkan 1.1) — dedicated image memory
+  (`VkMemoryDedicatedAllocateInfo`), the expected shape for exportable images;
+  **`vkGetImageSubresourceLayout`** (Vulkan 1.1 §12.7, linear tiling) — the
+  driver-reported offset/row-pitch the dma-buf import must advertise.
 - **linux-dmabuf-unstable-v1** Wayland protocol — vendored at
   `wayland/spec/linux-dmabuf-unstable-v1.xml`; the import path lives in
   `sc-wayland`'s client.
