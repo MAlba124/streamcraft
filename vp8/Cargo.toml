@@ -1,0 +1,22 @@
+[package]
+name = "sc-vp8"
+description = "VP8 (RFC 6386) codec plugin for streamcraft, backed by the pure-Rust oxideav-vp8"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_vp8"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+# The one sanctioned kind of dependency for a plugin crate (like libpipewire for
+# sc-pipewire): pure Rust, zero transitive deps with default features off, no
+# build.rs, no unsafe, MIT. See lib.rs for the adoption rationale and the
+# planned nativization steps (decode-into-pool-memory, conformance vectors).
+oxideav-vp8 = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
+streamcraft-video = { path = "../video" }

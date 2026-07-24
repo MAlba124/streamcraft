@@ -9,6 +9,7 @@ members = [
     "mkv",
     "audio",
     "video",
+    "vp8",
     "scope",
     "pipewire",
 ]
