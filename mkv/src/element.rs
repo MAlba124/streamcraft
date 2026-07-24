@@ -1,9 +1,8 @@
 //! `MkvMux` — the streamcraft **element** wrapping the tested [`MatroskaWriter`]
 //! (crate::MatroskaWriter) (spec: `spec/MATROSKA.md`; Writing elements). This is the
 //! **single-track** version: one sink pad, one src pad, fitting today's static pad model
-//! (spec: Elements and pads). The general multiplexer wants one *dynamic* sink pad per
-//! input stream plus fan-in — deferred until the core grows dynamic sink pads (the writer
-//! is already N-track ready; see the crate docs, "Not yet"). Everything here is a
+//! (spec: Elements and pads). The general multiplexer — one sink pad per input stream
+//! plus fan-in — is [`MkvMuxN`](crate::MkvMuxN) (`mux_multi`). Everything here is a
 //! **passive transform**: encoded frames in, MKV bytes out, inlining into the upstream
 //! group like `sc-ogg`'s `OggMux`.
 //!
@@ -292,8 +291,9 @@ impl MkvMux {
     /// block (RFC 9639 §8: a 4-octet block header of last-flag(1)+type(7) then a 24-bit
     /// big-endian length, repeated until the last-flag) — or `None` while `b` is still a
     /// proper prefix of one. A wrong magic is a hard error: the announced `flac` stream
-    /// does not start with a FLAC head.
-    fn flac_head_len(b: &[u8]) -> Result<Option<usize>, Error> {
+    /// does not start with a FLAC head. (`pub(crate)`: shared with the multi-track
+    /// [`MkvMuxN`](crate::MkvMuxN), whose per-pad flac setup absorbs the same head.)
+    pub(crate) fn flac_head_len(b: &[u8]) -> Result<Option<usize>, Error> {
         if b.len() >= 4 && &b[..4] != b"fLaC" {
             return Err(Error::Todo("mkvmux: announced flac stream does not start with fLaC"));
         }
@@ -317,8 +317,9 @@ impl MkvMux {
 
     /// The audio params out of a native FLAC head's STREAMINFO (RFC 9639 §8.2: the first
     /// metadata block, type 0, 34 octets — sample rate is the 20 bits at bit offset 80,
-    /// then 3 bits channels−1, then 5 bits bits-per-sample−1).
-    fn flac_streaminfo_params(head: &[u8]) -> Result<(f64, u32, u32), Error> {
+    /// then 3 bits channels−1, then 5 bits bits-per-sample−1). (`pub(crate)`: shared with
+    /// [`MkvMuxN`](crate::MkvMuxN).)
+    pub(crate) fn flac_streaminfo_params(head: &[u8]) -> Result<(f64, u32, u32), Error> {
         // head[..4] == "fLaC"; the STREAMINFO body starts after its 4-octet block header.
         let si = head
             .get(8..8 + 34)
@@ -338,8 +339,9 @@ impl MkvMux {
     /// Nanoseconds between synthesised frame timestamps when buffers carry no PTS: one FLAC
     /// block (4096 interchannel samples — the encoder's block size) at the track's sample
     /// rate. A defined, monotonic cadence so the muxed timestamps advance sensibly; a real
-    /// upstream that stamps PTS overrides this entirely.
-    fn frame_duration_ns(track: &TrackConfig) -> u64 {
+    /// upstream that stamps PTS overrides this entirely. (`pub(crate)`: shared with
+    /// [`MkvMuxN`](crate::MkvMuxN).)
+    pub(crate) fn frame_duration_ns(track: &TrackConfig) -> u64 {
         const FLAC_BLOCK: u64 = 4096;
         let rate = track.audio.sampling_frequency;
         if rate > 0.0 {

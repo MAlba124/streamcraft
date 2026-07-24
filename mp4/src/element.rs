@@ -62,7 +62,7 @@ const FAMILY_BYTES: &str = "bytes";
 /// `mp4demux.src_track<N> ! h264dec.sink` (etc.) negotiates (spec: RFC 6381 four-CCs;
 /// [`codec::family_for`]). All unconstrained byte families — concrete dims/rate ride the
 /// runtime announcement, not the offer.
-static DEMUX_SRC_OFFERS: [OfferDesc; 8] = [
+static DEMUX_SRC_OFFERS: [OfferDesc; 9] = [
     OfferDesc::any(FAMILY_BYTES),
     OfferDesc::any("h264/annexb"),
     OfferDesc::any("h265/annexb"),
@@ -74,6 +74,11 @@ static DEMUX_SRC_OFFERS: [OfferDesc; 8] = [
     OfferDesc::any("vp9"),
     OfferDesc::any("av1"),
     OfferDesc::any("opus"),
+    // `mp4a` with an esds-carried AudioSpecificConfig: raw AAC access units (exactly what
+    // MP4 stores, and exactly what Matroska A_AAC wants — RFC 9559 §12: no ADTS framing),
+    // led in-band by the ASC as the first buffer (the same first-buffer-is-CodecPrivate
+    // contract the NAL passthrough families use). ASC-less `mp4a` stays `bytes`.
+    OfferDesc::any("aac"),
 ];
 
 static DEMUX_PADS: [PadDesc; 1] = [PadDesc {
@@ -133,8 +138,10 @@ enum Announce {
     /// while decode pipelines never intern a "duration" field name, and an announcement
     /// with any un-interned name is dropped whole by `build_fixed`.
     Video { width: u32, height: u32, duration_ns: u64 },
-    /// An audio track: sample rate + channels (0 → bare family).
-    Audio { rate: u32, channels: u32 },
+    /// An audio track: sample rate + channels (0 → bare family), plus the mdhd track
+    /// duration in ns under the same passthrough-only rule as `Video` (0 elsewhere) — a
+    /// remuxing consumer takes the max across its pads for `Info\Duration`.
+    Audio { rate: u32, channels: u32, duration_ns: u64 },
     /// No declared params — a bare family announcement.
     Bare,
 }
@@ -543,12 +550,20 @@ impl Mp4Demux {
                     ctx.announce_format(pad, family, &dims);
                 }
             }
-            Announce::Audio { rate, channels } if rate != 0 || channels != 0 => {
-                ctx.announce_format(
-                    pad,
-                    family,
-                    &[("rate", ValueDesc::Int(rate as i64)), ("channels", ValueDesc::Int(channels as i64))],
-                );
+            Announce::Audio { rate, channels, duration_ns } if rate != 0 || channels != 0 => {
+                let params = [
+                    ("rate", ValueDesc::Int(rate as i64)),
+                    ("channels", ValueDesc::Int(channels as i64)),
+                ];
+                if duration_ns != 0 {
+                    // Passthrough/remux only (see `Announce::Audio`): the muxer folds this
+                    // into `Info\Duration` (max across its tracks).
+                    let mut fields = params.to_vec();
+                    fields.push(("duration", ValueDesc::Int(duration_ns as i64)));
+                    ctx.announce_format(pad, family, &fields);
+                } else {
+                    ctx.announce_format(pad, family, &params);
+                }
             }
             _ => ctx.announce_format(pad, family, &[]),
         }
@@ -574,8 +589,16 @@ impl Element for Mp4Demux {
                     height: track.height,
                     duration_ns: if self.passthrough { track.duration_ns } else { 0 },
                 }
-            } else if family == "opus" || track.entry.sample_rate != 0 || track.entry.channels != 0 {
-                Announce::Audio { rate: track.entry.sample_rate, channels: track.entry.channels }
+            } else if family == "opus"
+                || family == "aac"
+                || track.entry.sample_rate != 0
+                || track.entry.channels != 0
+            {
+                Announce::Audio {
+                    rate: track.entry.sample_rate,
+                    channels: track.entry.channels,
+                    duration_ns: if self.passthrough { track.duration_ns } else { 0 },
+                }
             } else {
                 Announce::Bare
             };

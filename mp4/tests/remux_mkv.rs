@@ -217,3 +217,114 @@ fn h264_mp4_remuxes_to_conformant_mkv() {
         assert_eq!(f.keyframe, *sync, "sample {i} sync bit survived as the keyframe flag");
     }
 }
+
+/// **Multi-track remux**: `mp4demux(passthrough) ! mkvmuxn` over the two-track (avc1 +
+/// mp4a) fixture — video AND audio in one output file. The load-bearing properties:
+///
+/// - two Matroska tracks: `V_MPEG4/ISO/AVC` with the `avcC` record as CodecPrivate and
+///   `A_AAC` with the esds-carried **AudioSpecificConfig** as CodecPrivate (RFC 9559
+///   §12) — both verbatim;
+/// - every sample of *both* tracks bit-exact (video still length-prefixed, audio raw
+///   AAC access units — no ADTS);
+/// - per-track sync bits survive as SimpleBlock keyframe flags (every AAC AU is sync);
+/// - blocks interleave in global pts order across the tracks;
+/// - `Info\Duration` = the max of the tracks' mdhd durations.
+#[test]
+fn av_mp4_remuxes_to_two_track_mkv() {
+    let file = fixture_bytes("tiny_av.mp4");
+    let head = head_through_moov(&file);
+
+    // Oracle: per-track config records + every sample, routed by track.
+    let mut oracle = Mp4Reader::new(&head).expect("oracle resolves");
+    assert_eq!(oracle.tracks().len(), 2, "fixture is two-track");
+    let vidx = oracle.tracks().iter().position(|t| t.width != 0).expect("video track");
+    let aidx = oracle.tracks().iter().position(|t| t.family() == "aac").expect("aac track");
+    let record = oracle.tracks()[vidx].entry.config_record.clone();
+    let asc = oracle.tracks()[aidx].entry.config_record.clone();
+    assert!(!record.is_empty(), "fixture has an avcC record");
+    assert!(!asc.is_empty(), "fixture's esds yields an AudioSpecificConfig");
+    let (rate, channels) =
+        (oracle.tracks()[aidx].entry.sample_rate, oracle.tracks()[aidx].entry.channels);
+    let want_dur = oracle.tracks().iter().map(|t| t.duration_ns).max().unwrap();
+    let pad_names: Vec<String> = oracle
+        .tracks()
+        .iter()
+        .map(|t| format!("src_track{}", t.track_id))
+        .collect();
+    oracle.push_bytes(&file);
+    // Per-track (pts_ns, sync, bytes) in file (== decode) order.
+    let mut want: Vec<Vec<(u64, bool, Vec<u8>)>> = vec![Vec::new(), Vec::new()];
+    while let Some(s) = oracle.next_sample() {
+        want[s.track_index].push((
+            oracle.ticks_to_ns(s.track_index, s.pts),
+            s.sync,
+            s.payload.data().to_vec(),
+        ));
+    }
+    assert!(!want[vidx].is_empty() && !want[aidx].is_empty(), "both tracks yield samples");
+
+    // The remux pipeline: bytesrc ! mp4demux(passthrough) ⇉ mkvmuxn ! collect.
+    // Video → sink_0 (track 1), audio → sink_1 (track 2).
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let mut p = Pipeline::new();
+    let src = p.add(ByteSrc { data: file, chunk: 1000, pos: 0 });
+    let demux = p.add(Mp4Demux::passthrough(head));
+    p.link((src, "src"), (demux, "sink")).expect("src -> demux");
+    let added = p.preroll().expect("preroll");
+    assert_eq!(added.len(), 2, "one dynamic pad per track");
+    let mux = p.add(sc_mkv::MkvMux::multi(2));
+    let sink = p.add(ByteCollect { got: Arc::clone(&got) });
+    for (i, &tidx) in [vidx, aidx].iter().enumerate() {
+        let ap = added
+            .iter()
+            .find(|ap| ap.name == pad_names[tidx])
+            .unwrap_or_else(|| panic!("pad {} discovered", pad_names[tidx]));
+        p.link((ap.element, &ap.name), (mux, &format!("sink_{i}")))
+            .expect("demux -> mux");
+    }
+    p.link((mux, "src"), (sink, "sink")).expect("mux -> sink");
+    p.run().expect("remux runs");
+    let out = got.lock().unwrap().clone();
+
+    // Verify the produced Matroska against the oracle.
+    let mut r = MatroskaReader::new();
+    r.push(&out).expect("remuxed MKV parses");
+    let tracks = r.tracks().to_vec();
+    assert_eq!(tracks.len(), 2, "two TrackEntries");
+    // The video track is the Cluster anchor and leads the Tracks element.
+    assert_eq!(tracks[0].codec_id, "V_MPEG4/ISO/AVC");
+    assert_eq!(tracks[0].track_number, 1, "video pad (sink_0) → track 1");
+    assert_eq!(tracks[0].codec_private, record, "video CodecPrivate = avcC verbatim");
+    assert_eq!(tracks[1].codec_id, "A_AAC");
+    assert_eq!(tracks[1].track_number, 2, "audio pad (sink_1) → track 2");
+    assert_eq!(tracks[1].codec_private, asc, "audio CodecPrivate = the ASC verbatim");
+    assert_eq!(tracks[1].sampling_frequency, rate as f64);
+    assert_eq!(tracks[1].channels, channels);
+
+    let got_dur = r.duration_ns().expect("Info\\Duration declared");
+    assert!(
+        got_dur.abs_diff(want_dur) <= sc_mkv::DEFAULT_TIMESTAMP_SCALE,
+        "duration {got_dur} ns ≈ max mdhd duration {want_dur} ns (within one ms tick)"
+    );
+
+    // Frames: bit-exact per track in decode order, keyframe bits, pts to the ms tick,
+    // and globally pts-ordered interleave (non-strict — both tracks start at pts 0).
+    let mut seen = [0usize, 0usize]; // [track1(video), track2(audio)]
+    let mut last_pts = 0u64;
+    while let Some(f) = r.next_frame() {
+        assert!(f.pts_ns >= last_pts, "blocks interleave in pts order");
+        last_pts = f.pts_ns;
+        let (tidx, si) = match f.track_number {
+            1 => (vidx, 0),
+            2 => (aidx, 1),
+            n => panic!("unexpected track {n}"),
+        };
+        let (pts_ns, sync, ref bytes) = want[tidx][seen[si]];
+        assert_eq!(&f.data, bytes, "track {} sample {} bit-exact", f.track_number, seen[si]);
+        assert_eq!(f.pts_ns, quantize_ms(pts_ns), "track {} sample {} pts", f.track_number, seen[si]);
+        assert_eq!(f.keyframe, sync, "track {} sample {} keyframe bit", f.track_number, seen[si]);
+        seen[si] += 1;
+    }
+    assert_eq!(seen[0], want[vidx].len(), "every video sample arrived");
+    assert_eq!(seen[1], want[aidx].len(), "every audio sample arrived");
+}

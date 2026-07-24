@@ -109,6 +109,22 @@ impl TrackConfig {
         }
     }
 
+    /// A generic audio track from its number, `CodecID`, `CodecPrivate`, and audio params
+    /// (RFC 9559 §12 codec mappings). The A_AAC case: `CodecPrivate` is the raw
+    /// **AudioSpecificConfig** (ISO/IEC 14496-3 §1.6.2.1) and each frame is one raw AAC
+    /// access unit — no ADTS framing (RFC 9559 §12: Matroska stores AAC "as is", the
+    /// stream parameters live in CodecPrivate). `bit_depth` 0 omits `BitDepth` (lossy
+    /// codecs have no meaningful one).
+    pub fn audio(track_number: u64, codec_id: &str, codec_private: Vec<u8>, sampling_frequency: f64, channels: u32, bit_depth: u32) -> Self {
+        Self {
+            track_number,
+            codec_id: codec_id.to_string(),
+            codec_private,
+            audio: AudioConfig { sampling_frequency, channels, bit_depth },
+            video: None,
+        }
+    }
+
     /// A video track from its number, `CodecID`, optional `CodecPrivate`, and pixel dimensions
     /// (RFC 9559 §5.1.4.1.28). WebM codecs (`V_VP8`/`V_VP9`/`V_AV1`) store frames raw with an
     /// empty CodecPrivate; `V_MPEG4/ISO/AVC` / `V_MPEGH/ISO/HEVC` carry their configuration

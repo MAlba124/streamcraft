@@ -62,10 +62,6 @@
 //! video mux **element** is a naming-only follow-up (see "Not yet").
 //!
 //! ## Not yet
-//! - **Multi-track *mux* element**: the writer is N-track, but [`MkvMux`] exposes one sink
-//!   pad. Multi-track wants one dynamic sink pad per input plus fan-in on the core side (a
-//!   documented follow-up, mirroring `sc-ogg`'s single-stream `OggMux`). The **demux** side
-//!   is already multi-track (one dynamic src pad per discovered track).
 //! - **Remux of av1 / h264 / h265**: [`MkvMux::from_caps`] muxes announced `flac` (CodecPrivate
 //!   absorbed from the in-band head), `vp8` and `vp9` tracks today; `av1` needs an `av1C`
 //!   CodecPrivate and the NAL codecs need Annex B → length-prefixed reframing + a config
@@ -82,11 +78,13 @@
 pub mod codec;
 pub mod ebml;
 pub mod element;
+pub mod mux_multi;
 pub mod reader;
 pub mod writer;
 
 pub use codec::{family_for, nal_head_from_config, Reframer, ReframeError};
 pub use element::{MkvDemux, MkvMux};
+pub use mux_multi::MkvMuxN;
 pub use reader::{Frame, MatroskaReader, Track};
 pub use writer::{
     AudioConfig, MatroskaWriter, MuxOut, MuxPiece, TrackConfig, VideoConfig, WriteError,
@@ -110,6 +108,7 @@ use streamcraft_core::registry::Registry;
 /// called, so the instances are dropped.
 pub fn register(registry: &mut Registry) {
     registry.register(MkvMux::from_caps().desc());
+    registry.register(MkvMuxN::new().desc());
     registry.register(MkvDemux::new(Vec::new()).desc());
 }
 
@@ -117,17 +116,25 @@ pub fn register(registry: &mut Registry) {
 mod tests {
     use super::*;
 
-    /// `register` exposes both elements under their descriptor names. `mkvmux` is
-    /// name-constructible (the caps-driven [`MkvMux::from_caps`] default — the remux
-    /// path); `mkvdemux` is not (it needs the stream header bytes at construction).
+    /// `register` exposes the elements under their descriptor names. `mkvmux` and
+    /// `mkvmuxn` are name-constructible (caps-driven defaults — the remux paths);
+    /// `mkvdemux` is not (it needs the stream header bytes at construction).
     #[test]
     fn register_exposes_both_elements() {
         let mut reg = Registry::new();
         register(&mut reg);
-        assert_eq!(reg.names(), vec!["mkvdemux", "mkvmux"], "both descriptors registered");
+        assert_eq!(
+            reg.names(),
+            vec!["mkvdemux", "mkvmux", "mkvmuxn"],
+            "all descriptors registered"
+        );
         assert!(
             reg.get("mkvmux").unwrap().make_default.is_some(),
             "mkvmux is name-constructible (caps-driven default)"
+        );
+        assert!(
+            reg.get("mkvmuxn").unwrap().make_default.is_some(),
+            "mkvmuxn is name-constructible (caps-driven default)"
         );
         assert!(reg.get("mkvdemux").unwrap().make_default.is_none(), "mkvdemux not name-constructible");
     }
