@@ -72,8 +72,16 @@ fn try_video_decoders(
 }
 
 fn main() {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: play_file FILE.mkv");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--vk`: present through the GPU sink (sc-vk) instead of the CPU shm path.
+    let use_vk = if let Some(i) = args.iter().position(|a| a == "--vk") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
+    let Some(path) = args.first().cloned() else {
+        eprintln!("usage: play_file [--vk] FILE.mkv");
         std::process::exit(2);
     };
 
@@ -111,7 +119,11 @@ fn main() {
         std::process::exit(1);
     };
 
-    let sink = p.add(WaylandVideoSink::new());
+    let sink = if use_vk {
+        p.add_boxed(Box::new(sc_vk::VkVideoSink::new().with_title("streamcraft — play_file (vk)")))
+    } else {
+        p.add_boxed(Box::new(WaylandVideoSink::new().with_title("streamcraft — play_file")))
+    };
     p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
 
     println!("playing {path} — close the window or Ctrl-C…");

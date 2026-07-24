@@ -27,3 +27,6 @@ sc-vp9 = { path = "../vp9" }
 sc-av1 = { path = "../av1" }
 sc-h264 = { path = "../h264" }
 sc-h265 = { path = "../h265" }
+# play_file's --vk switch. A dev-dep cycle (sc-vk depends on this crate's lib) is
+# fine: only the examples/tests link it.
+sc-vk = { path = "../vk" }

@@ -72,6 +72,7 @@ fn build_registry() -> Registry {
     sc_mkv::register(&mut r);
     sc_mp3::register(&mut r);
     sc_wayland::register(&mut r);
+    sc_vk::register(&mut r);
     r
 }
 
