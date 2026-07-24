@@ -816,6 +816,8 @@ name = "sc-wayland"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sc-mkv",
+ "sc-vp8",
  "streamcraft-core",
  "streamcraft-elements",
  "streamcraft-video",
@@ -928,9 +930,11 @@ dependencies = [
  "sc-flac",
  "sc-h264",
  "sc-h265",
+ "sc-mkv",
  "sc-ogg",
  "sc-vp8",
  "sc-vp9",
+ "sc-wayland",
  "streamcraft-audio",
  "streamcraft-core",
  "streamcraft-elements",

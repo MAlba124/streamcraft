@@ -31,3 +31,13 @@ pub mod wire;
 
 pub use client::WaylandClient;
 pub use sink::WaylandVideoSink;
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `streamcraft launch … ! waylandvideosink`). Typed `use` + constructor stays
+/// primary; the descriptor is `&'static`, taken from a throwaway default instance.
+pub fn register(registry: &mut Registry) {
+    registry.register(WaylandVideoSink::new().desc());
+}

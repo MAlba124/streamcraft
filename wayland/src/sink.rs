@@ -82,7 +82,9 @@ static DESC: ElementDesc = ElementDesc {
         is_live: true,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Config-free: the window is created at start(), dimensions arrive via the
+    // upstream's runtime announcement — so parse-launch can construct it.
+    make_default: Some(|| Box::new(WaylandVideoSink::new())),
 };
 
 /// The pixel format we accept and know how to convert.

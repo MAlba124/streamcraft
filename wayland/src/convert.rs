@@ -7,8 +7,17 @@
 //! compositor samples.
 //!
 //! The colour maths is **integer BT.601 studio-swing** (the ITU-R BT.601 limited-range
-//! matrix, the ubiquitous SD/`videotestsrc` default). Coefficients are scaled by 256 and
-//! shifted back, matching the classic FFmpeg/GStreamer fixed-point tables:
+//! matrix, the ubiquitous SD/`videotestsrc` default). Derivation, per Rec. ITU-R
+//! BT.601-7 (03/2011) — see `REFERENCES.md`:
+//!
+//! - §2.5.1 gives the luma weights Kr = 0.299, Kb = 0.114 (Kg = 1 − Kr − Kb), i.e.
+//!   R = Y' + 2(1−Kr)·Cr, B = Y' + 2(1−Kb)·Cb, G from the weight identity.
+//! - §3.5 quantizes studio swing: Y' spans 16..235 (219 steps), Cb/Cr span ±112
+//!   around 128, so the full-range expansion scales by 255/219 (luma) and 255/112·(…)
+//!   (chroma) before the matrix.
+//!
+//! Folding the range expansion into the matrix and scaling by 256 for 8-bit integer
+//! arithmetic (rounding term +128, shift >> 8) yields:
 //!
 //! ```text
 //!   C = Y - 16 ;  D = U - 128 ;  E = V - 128
@@ -16,6 +25,12 @@
 //!   G = clip(( 298*C -  100*D  - 208*E + 128) >> 8)
 //!   B = clip(( 298*C +  516*D          + 128) >> 8)
 //! ```
+//!
+//! where each coefficient is the analytic BT.601 value rounded to the nearest 1/256:
+//! 298 = ⌈256·255/219⌋; 409 = ⌈256·(255/224)·2(1−Kr)⌋; 516 = ⌈256·(255/224)·2(1−Kb)⌋;
+//! and the G-row terms 208/100 are those chroma gains weighted by Kr/Kg and Kb/Kg
+//! (Kg = 1 − Kr − Kb). Rounding error is < 1/2 LSB per term — within the ±1 LSB
+//! agreement the conversion tests assert.
 //!
 //! One pass, no intermediate buffer: for each output row we index the matching luma row
 //! and the *subsampled* chroma row (`y/2`), and each chroma sample serves two horizontal

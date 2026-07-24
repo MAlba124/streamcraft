@@ -19,3 +19,7 @@ libc = "0.2"
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
+# For the milestone-5 example only (examples/play_mkv.rs): the container + decoder
+# half of `filesrc ! mkvdemux ! vp8dec ! waylandvideosink`.
+sc-mkv = { path = "../mkv" }
+sc-vp8 = { path = "../vp8" }

@@ -69,6 +69,8 @@ fn build_registry() -> Registry {
     sc_av1::register(&mut r);
     sc_h264::register(&mut r);
     sc_h265::register(&mut r);
+    sc_mkv::register(&mut r);
+    sc_wayland::register(&mut r);
     r
 }
 
