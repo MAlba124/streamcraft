@@ -1,10 +1,13 @@
 //! Pool-backed, refcounted memory (spec: Memory; Device memory and sync points).
 //!
-//! Milestone 1 ships a **safe** recycling pool: a free-list of fixed-size boxed
-//! slots, handed out as [`Memory`] and returned on drop. Steady-state streaming
-//! reuses slots, so allocation count stays flat regardless of how long it runs
-//! (the zero-steady-state-allocation criterion). The unsafe arena / registration /
-//! sub-slicing version (spec) replaces the internals behind this same API later.
+//! A **safe** recycling pool (a free-list of fixed-size boxed slots) hands out
+//! [`Memory`]: a refcounted `(base, offset, len)` **view**. Clones and
+//! [`Memory::slice`] sub-views bump a refcount — fan-out and demuxer slicing never
+//! copy payload — and the slot recycles to the pool when the last view drops, so
+//! steady-state streaming allocates nothing. Mutable access is uniqueness-gated
+//! with copy-on-write for shared backings. Still future (spec): pluggable
+//! allocators, registration hooks (io_uring/RDMA/GPU), the `ExternalMemory`
+//! (dma-buf) variant, and per-link pools.
 //!
 //! `unsafe` is permitted here (one of the two audited modules, alongside the SPSC ring):
 //! the [`Arena`] bump allocator hands out disjoint `&mut [u8]` regions from reusable
@@ -84,11 +87,7 @@ impl Pool {
         let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.high_water.fetch_max(now, Ordering::Relaxed);
         drop(free);
-        Some(Memory {
-            buf: Some(buf),
-            len: 0,
-            pool: Arc::clone(&self.inner),
-        })
+        Some(Memory::from_box(buf, Arc::clone(&self.inner)))
     }
 
     /// Acquire a buffer of at least `n` usable bytes: a pooled slot when `n` fits and
@@ -110,11 +109,7 @@ impl Pool {
         self.inner.acquires.fetch_add(1, Ordering::Relaxed);
         let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.high_water.fetch_max(now, Ordering::Relaxed);
-        Memory {
-            buf: Some(vec![0u8; n.max(1)].into_boxed_slice()),
-            len: 0,
-            pool: Arc::clone(&self.inner),
-        }
+        Memory::from_box(vec![0u8; n.max(1)].into_boxed_slice(), Arc::clone(&self.inner))
     }
 
     /// Take a slot from the free-list, or heap-allocate one on a miss.
@@ -130,11 +125,7 @@ impl Pool {
         self.inner.acquires.fetch_add(1, Ordering::Relaxed);
         let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.high_water.fetch_max(now, Ordering::Relaxed);
-        Memory {
-            buf: Some(buf),
-            len: 0,
-            pool: Arc::clone(&self.inner),
-        }
+        Memory::from_box(buf, Arc::clone(&self.inner))
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -183,21 +174,59 @@ pub struct PoolStats {
     pub high_water: u64,
 }
 
-/// A pooled byte buffer, returned to its pool on drop. Milestone 1 is a movable
-/// owned handle; refcounted fan-out / sub-slicing (spec) come with `tee`.
-pub struct Memory {
-    buf: Option<Box<[u8]>>,
-    len: usize,
+/// The shared backing of one or more [`Memory`] views: the slot bytes plus the pool
+/// they recycle to. Dropping the **last** `Arc` to this returns the slot (spec:
+/// Memory — "recycled on last-ref drop").
+struct MemoryInner {
+    buf: Box<[u8]>,
     pool: Arc<PoolInner>,
 }
 
+impl Drop for MemoryInner {
+    fn drop(&mut self) {
+        self.pool.recycle(std::mem::take(&mut self.buf));
+    }
+}
+
+/// A **refcounted `(base, offset, len)` view** into pooled bytes (spec: Memory —
+/// "sub-buffer slicing is free: a demuxer slicing one 1 MB read into 300 packets
+/// does 300 refcount bumps and zero copies"; fan-out "bumps a refcount, never
+/// copies payload").
+///
+/// - [`Clone`] and [`slice`](Self::slice) bump a refcount; the backing slot
+///   recycles to its pool when the last view drops.
+/// - Mutable access ([`as_mut_full`](Self::as_mut_full)) is uniqueness-gated:
+///   a sole owner mutates in place; a shared view **copies-on-write** into a fresh
+///   backing first (spec: "CoW only when a downstream wants mutable access to a
+///   shared buffer") — readers of the other views never observe the mutation.
+pub struct Memory {
+    /// `None` is the dead husk [`take`](Self::take) leaves behind — reads empty,
+    /// recycles nothing.
+    inner: Option<Arc<MemoryInner>>,
+    /// Start of this view's window within the backing slot.
+    offset: usize,
+    /// Used bytes within the window — what [`data`](Self::data) exposes.
+    len: usize,
+}
+
 impl Memory {
-    /// Total slot capacity in bytes.
-    pub fn capacity(&self) -> usize {
-        self.buf.as_deref().map_or(0, <[u8]>::len)
+    fn from_box(buf: Box<[u8]>, pool: Arc<PoolInner>) -> Memory {
+        Memory {
+            inner: Some(Arc::new(MemoryInner { buf, pool })),
+            offset: 0,
+            len: 0,
+        }
     }
 
-    /// Bytes currently in use.
+    /// This view's window capacity in bytes (the backing slot minus the view's
+    /// offset). A fresh pool buffer's window is the whole slot.
+    pub fn capacity(&self) -> usize {
+        self.inner
+            .as_deref()
+            .map_or(0, |i| i.buf.len().saturating_sub(self.offset))
+    }
+
+    /// Bytes currently in use (within the window).
     pub fn len(&self) -> usize {
         self.len
     }
@@ -208,36 +237,75 @@ impl Memory {
 
     /// The used bytes.
     pub fn data(&self) -> &[u8] {
-        let b = self.buf.as_deref().expect("memory is live");
-        &b[..self.len]
+        let i = self.inner.as_deref().expect("memory is live");
+        &i.buf[self.offset..self.offset + self.len]
     }
 
-    /// The full capacity for filling from IO; contents are unspecified.
+    /// The full window capacity for filling from IO; contents are unspecified.
+    ///
+    /// Uniqueness-gated: if other views share this backing, the bytes are first
+    /// copied into a fresh backing from the same pool (CoW) so the sharers are
+    /// unaffected. The hot producer path (a fresh, never-shared pool buffer) takes
+    /// the in-place branch — no copy, no allocation.
     pub fn as_mut_full(&mut self) -> &mut [u8] {
-        self.buf.as_deref_mut().expect("memory is live")
+        let inner = self.inner.as_mut().expect("memory is live");
+        if Arc::get_mut(inner).is_none() {
+            // Shared: copy-on-write the whole backing (offset preserved). Cold by
+            // design — only a mutator downstream of a tee/slice pays it.
+            let pool = Pool { inner: Arc::clone(&inner.pool) };
+            let mut fresh = pool.acquire_exact(inner.buf.len());
+            let fresh_inner =
+                Arc::get_mut(fresh.inner.as_mut().expect("fresh")).expect("unshared");
+            let n = inner.buf.len().min(fresh_inner.buf.len());
+            fresh_inner.buf[..n].copy_from_slice(&inner.buf[..n]);
+            *inner = fresh.inner.take().expect("fresh backing");
+        }
+        let offset = self.offset;
+        let i = Arc::get_mut(inner).expect("unique after CoW");
+        &mut i.buf[offset..]
     }
 
-    /// Set the number of used bytes (clamped to capacity).
+    /// Set the number of used bytes (clamped to the window capacity).
     pub fn set_len(&mut self, n: usize) {
         self.len = n.min(self.capacity());
     }
 
-    /// Move the payload out, leaving a dead husk behind (len 0, no backing slot —
-    /// recycles nothing on drop). O(1); lets a SoA batch column hand out its front
-    /// buffer without shifting the tail (spec: Batching — queued hop budget).
+    /// A sub-view of this view's **used** bytes: `[offset, offset + len)` relative
+    /// to [`data`](Self::data). A refcount bump — zero copies; the backing stays
+    /// alive until every view drops. `None` when out of bounds (offsets come from
+    /// untrusted container data — never a panic).
+    pub fn slice(&self, offset: usize, len: usize) -> Option<Memory> {
+        let end = offset.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(Memory {
+            inner: self.inner.clone(),
+            offset: self.offset + offset,
+            len,
+        })
+    }
+
+    /// Move this view out, leaving a dead husk behind (empty, no backing — recycles
+    /// nothing on drop). O(1); lets a SoA batch column hand out its front buffer
+    /// without shifting the tail (spec: Batching — queued hop budget).
     pub(crate) fn take(&mut self) -> Memory {
         Memory {
-            buf: self.buf.take(),
+            inner: self.inner.take(),
+            offset: std::mem::replace(&mut self.offset, 0),
             len: std::mem::replace(&mut self.len, 0),
-            pool: Arc::clone(&self.pool),
         }
     }
 }
 
-impl Drop for Memory {
-    fn drop(&mut self) {
-        if let Some(buf) = self.buf.take() {
-            self.pool.recycle(buf);
+/// Fan-out: another view of the same bytes — a refcount bump, never a payload copy
+/// (spec: Memory — what `tee` does per downstream).
+impl Clone for Memory {
+    fn clone(&self) -> Self {
+        Memory {
+            inner: self.inner.clone(),
+            offset: self.offset,
+            len: self.len,
         }
     }
 }
@@ -390,6 +458,75 @@ impl Default for Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn views_share_the_backing_until_the_last_drops() {
+        // Fan-out semantics (spec: tee bumps a refcount, never copies): the slot
+        // returns to the pool exactly once, when the final view is gone.
+        let pool = Pool::bounded(64, 1);
+        let mut a = pool.acquire();
+        a.as_mut_full()[..4].copy_from_slice(b"abcd");
+        a.set_len(4);
+        let b = a.clone();
+        assert_eq!(b.data(), b"abcd");
+        assert!(pool.try_acquire().is_none(), "one slot, still outstanding");
+        drop(a);
+        assert!(pool.try_acquire().is_none(), "a clone still holds the backing");
+        drop(b);
+        assert_eq!(pool.stats().recycles, 1, "recycled once, not per view");
+        assert!(pool.try_acquire().is_some(), "last view recycled the slot");
+    }
+
+    #[test]
+    fn slice_is_a_zero_copy_window_and_never_panics_on_bad_ranges() {
+        let pool = Pool::new(64);
+        let mut m = pool.acquire();
+        m.as_mut_full()[..8].copy_from_slice(b"01234567");
+        m.set_len(8);
+        let s = m.slice(2, 4).expect("in bounds");
+        assert_eq!(s.data(), b"2345");
+        let ss = s.slice(1, 2).expect("slice of slice");
+        assert_eq!(ss.data(), b"34");
+        // Untrusted offsets: out-of-bounds and overflowing ranges are None, not panics.
+        assert!(m.slice(7, 2).is_none());
+        assert!(m.slice(9, 0).is_none());
+        assert!(m.slice(usize::MAX, 2).is_none());
+        // The backing outlives the original view.
+        drop(m);
+        assert_eq!(ss.data(), b"34");
+    }
+
+    #[test]
+    fn mutating_a_shared_view_copies_on_write() {
+        let pool = Pool::new(64);
+        let mut a = pool.acquire();
+        a.as_mut_full()[..4].copy_from_slice(b"aaaa");
+        a.set_len(4);
+        let b = a.clone();
+        // Mutation through `a` must not be visible through `b` (spec: CoW on
+        // shared mutable access).
+        a.as_mut_full()[..4].copy_from_slice(b"zzzz");
+        assert_eq!(a.data(), b"zzzz");
+        assert_eq!(b.data(), b"aaaa", "sharer unaffected by the CoW mutation");
+        // A unique view mutates in place: no further allocation happens.
+        let before = pool.stats().slot_allocations;
+        a.as_mut_full()[0] = b'q';
+        assert_eq!(pool.stats().slot_allocations, before, "unique path is in-place");
+    }
+
+    #[test]
+    fn taken_husk_reads_empty_and_recycles_nothing() {
+        let pool = Pool::bounded(64, 1);
+        let mut m = pool.acquire();
+        m.set_len(3);
+        let moved = m.take();
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.capacity(), 0);
+        drop(m); // husk: must not recycle
+        assert!(pool.try_acquire().is_none(), "moved view still owns the slot");
+        drop(moved);
+        assert!(pool.try_acquire().is_some());
+    }
 
     #[test]
     fn recycles_slots_flat_allocation() {
