@@ -24,6 +24,14 @@ pub enum Event {
     Eos,
     FlushStart,
     FlushStop,
+    /// The transport paused (spec: Clocking — "pause is a clock op, not a state"):
+    /// running time freezes, the scheduler parks the group after delivering this.
+    /// A device sink reacts by holding its hardware (render silence, keep the ring);
+    /// most elements ignore it.
+    Paused,
+    /// The transport resumed: running time continues (the pause interval is excised
+    /// by re-basing), delivered just before the group runs again.
+    Resumed,
 }
 
 /// Interned-key → value pairs, plus a blob reference for cover art. TODO(step 5).

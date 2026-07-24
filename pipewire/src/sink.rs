@@ -505,6 +505,12 @@ impl Element for PipeWireAudioSink {
                     producer.drain();
                 }
             }
+            // Transport pause (spec: Clocking — pause is a clock op): hold the
+            // hardware — the RT callback renders silence and keeps the ring, so no
+            // audio is lost and the device clock (and with it the whole pipeline's
+            // running time) freezes. Resume continues exactly where it left off.
+            Event::Paused => self.playback.paused.store(true, Ordering::Relaxed),
+            Event::Resumed => self.playback.paused.store(false, Ordering::Relaxed),
             _ => {}
         }
         Ok(())

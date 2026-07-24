@@ -10,7 +10,7 @@
 //! with a ring between them.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Inputs};
@@ -87,6 +87,154 @@ pub struct RunReport {
 /// is a follow-up).
 #[derive(Clone)]
 pub struct StopHandle(Arc<AtomicBool>);
+
+/// The shared pause transport (spec: Clocking — "pause is a clock op, not a
+/// state"). Pausing freezes **running time**: the resume re-bases `base_time`
+/// forward by the paused interval (measured on the pipeline clock, so a device
+/// clock that itself freezes while paused contributes zero shift), group threads
+/// park at their pass gate after `Event::Paused` is delivered, and a sink whose
+/// clock wait expires mid-pause blocks in `ctx.wait_until` until resume — then
+/// re-derives its deadline from the shifted base.
+pub(crate) struct PauseShared {
+    /// Lock-free mirror of `inner.paused` for the per-pass / per-render fast checks
+    /// (one relaxed load); the mutex is only taken when it reads `true` or on
+    /// transitions.
+    hint: AtomicBool,
+    inner: Mutex<PauseInner>,
+    cond: Condvar,
+    /// Raw ns of the running-time base — the same cell `TapHandle` reads; resume
+    /// shifts it forward so paused time never counts as running time.
+    base: Arc<AtomicU64>,
+    /// The pipeline stop flag, so a pause-parked wait still honours shutdown.
+    stop: Arc<AtomicBool>,
+}
+
+struct PauseInner {
+    paused: bool,
+    /// Clock reading at the moment of pause — the resume shift is `now - pause_at`.
+    pause_at: Timestamp,
+    /// The selected pipeline clock, installed by `run()` (clock selection happens
+    /// there); `None` before the first run — pause/resume still latch, without a
+    /// base shift (there is no running time to preserve yet).
+    clock: Option<Arc<dyn Clock>>,
+}
+
+impl PauseShared {
+    fn new(base: Arc<AtomicU64>, stop: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            hint: AtomicBool::new(false),
+            inner: Mutex::new(PauseInner {
+                paused: false,
+                pause_at: Timestamp::ZERO,
+                clock: None,
+            }),
+            cond: Condvar::new(),
+            base,
+            stop,
+        })
+    }
+
+    /// The hot-path check: one relaxed load while playing.
+    pub(crate) fn maybe_paused(&self) -> bool {
+        self.hint.load(Ordering::Relaxed)
+    }
+
+    /// Install the selected clock (run() → here, after clock selection).
+    fn install_clock(&self, clock: Arc<dyn Clock>) {
+        self.inner.lock().unwrap().clock = Some(clock);
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.inner.lock().unwrap().paused
+    }
+
+    fn pause(&self) {
+        let mut i = self.inner.lock().unwrap();
+        if !i.paused {
+            i.pause_at = i.clock.as_ref().map_or(Timestamp::ZERO, |c| c.now());
+            i.paused = true;
+            self.hint.store(true, Ordering::Release);
+        }
+    }
+
+    fn resume(&self) {
+        let mut i = self.inner.lock().unwrap();
+        if i.paused {
+            // Excise the paused interval from running time: shift the base forward by
+            // however far the clock moved while paused (a device clock frozen during
+            // pause moves zero — both cases come out right). Shift and state flip are
+            // under one lock, so a waiter re-deriving its deadline after the wake
+            // sees the shifted base.
+            if let Some(c) = &i.clock {
+                let delta = c.now().saturating_sub(i.pause_at);
+                let base = self.base.load(Ordering::Acquire);
+                if base != u64::MAX {
+                    self.base
+                        .store(base.saturating_add(delta.nanos().unwrap_or(0)), Ordering::Release);
+                }
+            }
+            i.paused = false;
+            self.hint.store(false, Ordering::Release);
+        }
+        drop(i);
+        self.cond.notify_all();
+    }
+
+    /// Block while paused (a sink's expired clock wait lands here; also the group
+    /// gate). Polls the stop flag so shutdown still wins over a paused pipeline.
+    /// Returns `false` if woken by stop.
+    pub(crate) fn block_while_paused(&self) -> bool {
+        let mut i = self.inner.lock().unwrap();
+        while i.paused {
+            if self.stop.load(Ordering::Acquire) {
+                return false;
+            }
+            let (guard, _) = self
+                .cond
+                .wait_timeout(i, std::time::Duration::from_millis(100))
+                .unwrap();
+            i = guard;
+        }
+        true
+    }
+}
+
+/// Cloneable pause/resume control (spec: Clocking — "pause is a clock op, not a
+/// state"), the same shape as `StopHandle`/`SeekHandle`/`PropHandle`. Obtain from
+/// [`Pipeline::pause_handle`]; usable from any thread while `run()` blocks.
+#[derive(Clone)]
+pub struct PauseHandle(pub(crate) Arc<PauseShared>);
+
+impl PauseHandle {
+    /// Freeze running time and park the streaming threads at their next safe point
+    /// (each group delivers `Event::Paused` to its elements first, so a device sink
+    /// holds its hardware). A sink already inside a clock wait finishes that wait
+    /// but blocks before rendering — nothing renders while paused.
+    pub fn pause(&self) {
+        self.0.pause();
+    }
+
+    /// Continue: running time resumes exactly where it stopped (the paused interval
+    /// is excised by re-basing), groups deliver `Event::Resumed` and run on.
+    pub fn resume(&self) {
+        self.0.resume();
+    }
+
+    /// Flip paused↔playing; returns `true` if now paused.
+    pub fn toggle(&self) -> bool {
+        if self.0.is_paused() {
+            self.0.resume();
+            false
+        } else {
+            self.0.pause();
+            true
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.is_paused()
+    }
+}
 
 impl StopHandle {
     pub fn stop(&self) {
@@ -173,6 +321,12 @@ pub struct Pipeline {
     /// (`u64::MAX` before the first run), shared into [`TapHandle`]s so observers can
     /// window counter deltas over running time (spec: Taps — bitrate is Δbytes/Δt).
     base_shared: Arc<AtomicU64>,
+    /// The pause transport (spec: Clocking — pause is a clock op). See [`PauseHandle`].
+    pause: Arc<PauseShared>,
+    /// Start the next [`run`](Self::run) paused (preroll-and-hold: everything spins
+    /// up, the first buffers queue to the sinks, nothing renders until
+    /// [`PauseHandle::resume`]). See [`start_paused`](Self::start_paused).
+    initial_paused: bool,
     /// Latency tracing gate (spec: Debuggability): while set, the scheduler times
     /// `process()` calls, stamps ring pushes for residency measurement, and sinks
     /// record wait overshoot — into the per-element histograms a [`TapHandle`]
@@ -197,6 +351,10 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new() -> Self {
         let (tx, rx) = Bus::channel();
+        // Bound first: the pause transport shares the running-time base cell and the
+        // stop flag (a paused wait must still honour shutdown).
+        let stop = Arc::new(AtomicBool::new(false));
+        let base_shared = Arc::new(AtomicU64::new(u64::MAX));
         Self {
             elements: Vec::new(),
             descs: Vec::new(),
@@ -205,7 +363,7 @@ impl Pipeline {
             formats: Interner::new(),
             fields: Interner::new(),
             values: Interner::new(),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Arc::clone(&stop),
             seek: Arc::new(SeekState::default()),
             bus_sender: tx,
             bus: rx,
@@ -222,7 +380,9 @@ impl Pipeline {
             log_queue_cap: 1024,
             clock: Arc::new(InstantClock::new()),
             clock_explicit: false,
-            base_shared: Arc::new(AtomicU64::new(u64::MAX)),
+            base_shared: Arc::clone(&base_shared),
+            pause: PauseShared::new(base_shared, stop),
+            initial_paused: false,
             tracing: Arc::new(AtomicBool::new(
                 std::env::var_os("STREAMCRAFT_TRACE").is_some_and(|v| v != "0"),
             )),
@@ -264,6 +424,20 @@ impl Pipeline {
     /// while `run()` is blocking.
     pub fn stop_handle(&self) -> StopHandle {
         StopHandle(Arc::clone(&self.stop))
+    }
+
+    /// Pause/resume control usable from any thread while `run()` blocks (spec:
+    /// Clocking — pause is a clock op, not a state). See [`PauseHandle`].
+    pub fn pause_handle(&self) -> PauseHandle {
+        PauseHandle(Arc::clone(&self.pause))
+    }
+
+    /// Start the next [`run`](Self::run) paused — preroll-and-hold: the pipeline
+    /// spins up, decoders fill the queues to the sinks, and nothing renders until
+    /// [`PauseHandle::resume`]. Running time starts at the resume (the pre-resume
+    /// interval is excised like any other pause).
+    pub fn start_paused(&mut self, on: bool) {
+        self.initial_paused = on;
     }
 
     /// A handle to seek this pipeline from another thread while `run()` is blocking
@@ -615,6 +789,12 @@ impl Pipeline {
         let base_time = clock.now();
         // Publish the base so TapHandles can window counter deltas over running time.
         self.base_shared.store(base_time.0, Ordering::Release);
+        // Arm the pause transport with the selected clock (its resume re-bases the
+        // shared base); a start-paused run holds at the first gate/render.
+        self.pause.install_clock(Arc::clone(&clock));
+        if self.initial_paused {
+            self.pause.pause();
+        }
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
         let total = self.elements.len();
@@ -770,6 +950,8 @@ impl Pipeline {
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
             let tracing = Arc::clone(&self.tracing);
+            let pause = Arc::clone(&self.pause);
+            let base = Arc::clone(&self.base_shared);
             let seek = Arc::clone(&seek);
             let vocabulary = Arc::clone(&vocabulary);
             let clock = Arc::clone(&clock);
@@ -778,7 +960,7 @@ impl Pipeline {
                     elems, ids, group_formats, group_logs, upstream, downstream, factory,
                     group_pools, bus, credits, group_counters, group_props, stop, seek,
                     vocabulary, clock,
-                    base_time, group_pad_infos, group_latencies, tracing,
+                    base, group_pad_infos, group_latencies, tracing, pause,
                 )
             }));
         }
@@ -1378,10 +1560,11 @@ fn run_group(
     seek: Arc<SeekState>,
     vocabulary: Arc<Vocabulary>,
     clock: Arc<dyn Clock>,
-    base_time: Timestamp,
+    base: Arc<AtomicU64>,
     pad_infos: Vec<(usize, Vec<usize>)>,
     path_latencies: Vec<Timestamp>,
     tracing: Arc<AtomicBool>,
+    pause: Arc<PauseShared>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_empty();
@@ -1426,13 +1609,15 @@ fn run_group(
     for ctx in ctxs.iter_mut() {
         ctx.set_vocabulary(Arc::clone(&vocabulary));
     }
-    // Install the pipeline clock + running-time base so elements read running time via
-    // `ctx.now()` and pace on it via `ctx.wait_until()` (spec: Clocking), and each
-    // element's computed upstream path latency so a sink's `wait_until(pts)` lands on
-    // `base_time + pts + path_latency` (spec: Latency — enforced at sinks).
+    // Install the pipeline clock + the *shared* running-time base (re-based by
+    // pause/resume) so elements read running time via `ctx.now()` and pace on it via
+    // `ctx.wait_until()` (spec: Clocking), each element's computed upstream path
+    // latency (spec: Latency — enforced at sinks), and the pause transport so an
+    // expired wait blocks instead of rendering while paused.
     for (ctx, lat) in ctxs.iter_mut().zip(path_latencies) {
-        ctx.set_clock(Arc::clone(&clock), base_time);
+        ctx.set_clock(Arc::clone(&clock), Arc::clone(&base));
         ctx.set_path_latency(lat);
+        ctx.set_pause(Arc::clone(&pause));
     }
     // Install the shared seek request so a source resolves its byte target and a sink its
     // frame target when the scheduler delivers `FlushStart` (spec: flush/seek).
@@ -1515,6 +1700,23 @@ fn run_group(
         }
 
         let mut progressed = false;
+
+        // Pause gate (spec: Clocking — pause is a clock op): notify every element
+        // (a device sink holds its hardware on `Paused`), park until resume or stop,
+        // notify again. One relaxed load while playing.
+        if pause.maybe_paused() && pause.is_paused() {
+            for i in 0..m {
+                if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Paused) {
+                    break 'group Err(e);
+                }
+            }
+            let _ = pause.block_while_paused(); // false = stop; the stop check below exits
+            for i in 0..m {
+                if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Resumed) {
+                    break 'group Err(e);
+                }
+            }
+        }
 
         // A. Feed the head from upstream.
         if fan_in {

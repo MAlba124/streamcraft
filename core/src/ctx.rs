@@ -154,7 +154,10 @@ pub struct Ctx {
     /// clock. `None` outside a run and for an unclocked byte pipeline, where `now()`
     /// reads `NONE` and `wait_until` returns at once (no pacing).
     clock: Option<Arc<dyn Clock>>,
-    base_time: Timestamp,
+    /// Raw ns of the running-time base — the pipeline's shared cell, read per call
+    /// so a pause/resume re-base (spec: Clocking — pause is a clock op) is observed
+    /// by the very next deadline computation. `u64::MAX` until a run samples it.
+    base: Arc<std::sync::atomic::AtomicU64>,
     /// This element's computed upstream path latency (spec: Latency — enforced at
     /// sinks): the pipeline installs the worst source→here sum of declared minimum
     /// latencies, and [`wait_until`](Self::wait_until) folds it into the deadline —
@@ -165,6 +168,9 @@ pub struct Ctx {
     /// gate, installed at run setup so [`wait_until`](Self::wait_until) can record how
     /// far past its deadline a sink wait actually returned. `None` outside a run.
     trace: Option<(Arc<crate::counters::ElementCounters>, Arc<std::sync::atomic::AtomicBool>)>,
+    /// The pause transport (spec: Clocking — pause is a clock op), installed at run
+    /// setup; `None` outside a run.
+    pause: Option<Arc<crate::pipeline::PauseShared>>,
     /// Shared seek request, installed at run setup (spec: flush/seek). A source reads the
     /// byte target and a sink the frame target from [`seek_target`](Self::seek_target) when
     /// the scheduler delivers `FlushStart`. `None` outside a run / for a pipeline that is
@@ -212,12 +218,13 @@ impl Ctx {
             announced: Vec::new(),
             vocabulary: None,
             clock: None,
-            base_time: Timestamp::ZERO,
+            base: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             seek: None,
             scratch: Arena::default(),
             props: None,
             path_latency: Timestamp::ZERO,
             trace: None,
+            pause: None,
         }
     }
 
@@ -309,9 +316,22 @@ impl Ctx {
 
     /// Install the pipeline clock and running-time base (pipeline → element at run
     /// setup). See [`now`](Self::now) and [`wait_until`](Self::wait_until).
-    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: Timestamp) {
+    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base: Arc<std::sync::atomic::AtomicU64>) {
         self.clock = Some(clock);
-        self.base_time = base_time;
+        self.base = base;
+    }
+
+    /// Install the pause transport (pipeline -> element at run setup; spec: Clocking
+    /// — pause is a clock op): a clock wait that expires while paused blocks here
+    /// until resume, then re-derives its deadline from the re-based shared base.
+    pub(crate) fn set_pause(&mut self, pause: Arc<crate::pipeline::PauseShared>) {
+        self.pause = Some(pause);
+    }
+
+    /// The current running-time base (shared, pause-re-based).
+    fn base_now(&self) -> Timestamp {
+        let raw = self.base.load(std::sync::atomic::Ordering::Acquire);
+        if raw == u64::MAX { Timestamp::ZERO } else { Timestamp(raw) }
     }
 
     /// Install this element's computed upstream path latency (pipeline → element at
@@ -452,7 +472,7 @@ impl Ctx {
     /// clock is installed (an unclocked byte pipeline — the milestone-1 default).
     pub fn now(&self) -> Timestamp {
         match &self.clock {
-            Some(c) => c.now().saturating_sub(self.base_time),
+            Some(c) => c.now().saturating_sub(self.base_now()),
             None => Timestamp::NONE,
         }
     }
@@ -468,27 +488,43 @@ impl Ctx {
     /// unclocked pipeline imposes no pacing. A `running` of [`Timestamp::NONE`] is
     /// "infinitely late": only an interrupt ends the wait.
     pub fn wait_until(&self, running: Timestamp) -> WaitOutcome {
-        match &self.clock {
-            Some(c) => {
-                let deadline = self
-                    .base_time
-                    .saturating_add(running)
-                    .saturating_add(self.path_latency);
-                let outcome = c.new_wait().wait_until(deadline);
-                // Latency tracing (spec: Debuggability): how far past the deadline the
-                // wait actually returned — scheduling jitter as the sink experiences
-                // it, in the pipeline clock's domain (deterministic under MockClock).
-                if outcome == WaitOutcome::Reached && running.is_some() {
-                    if let Some((counters, gate)) = &self.trace {
-                        if gate.load(std::sync::atomic::Ordering::Relaxed) {
-                            let late = c.now().saturating_sub(deadline);
-                            counters.wait_lateness_ns.record(late.nanos().unwrap_or(0));
+        let Some(c) = &self.clock else { return WaitOutcome::Reached };
+        loop {
+            // Deadline derived per iteration from the *shared* base: a pause/resume
+            // re-bases it, and the loop below re-derives after every resume.
+            let deadline = self
+                .base_now()
+                .saturating_add(running)
+                .saturating_add(self.path_latency);
+            match c.new_wait().wait_until(deadline) {
+                WaitOutcome::Interrupted => return WaitOutcome::Interrupted,
+                WaitOutcome::Reached => {
+                    // Pause gate (spec: Clocking — pause is a clock op): a wait that
+                    // expires while paused must not render — block until resume, then
+                    // re-derive the deadline from the shifted base and wait again.
+                    // One relaxed load on the playing path.
+                    if let Some(p) = &self.pause {
+                        if p.maybe_paused() && p.is_paused() {
+                            if !p.block_while_paused() {
+                                return WaitOutcome::Interrupted; // stop won
+                            }
+                            continue;
                         }
                     }
+                    // Latency tracing (spec: Debuggability): how far past the deadline
+                    // the wait actually returned — scheduling jitter as the sink
+                    // experiences it (deterministic under MockClock).
+                    if running.is_some() {
+                        if let Some((counters, gate)) = &self.trace {
+                            if gate.load(std::sync::atomic::Ordering::Relaxed) {
+                                let late = c.now().saturating_sub(deadline);
+                                counters.wait_lateness_ns.record(late.nanos().unwrap_or(0));
+                            }
+                        }
+                    }
+                    return WaitOutcome::Reached;
                 }
-                outcome
             }
-            None => WaitOutcome::Reached,
         }
     }
 
@@ -835,9 +871,15 @@ mod tests {
         assert!(ctx.now().is_none());
         assert_eq!(ctx.wait_until(Timestamp::from_secs(1)), WaitOutcome::Reached);
 
-        // Install a mock clock with the running-time base at 100ms.
+        // Install a mock clock with the running-time base at 100ms (the shared-cell
+        // form the pause transport re-bases in a real run).
         let clock = MockClock::new();
-        ctx.set_clock(Arc::new(clock.clone()), Timestamp::from_millis(100));
+        ctx.set_clock(
+            Arc::new(clock.clone()),
+            Arc::new(std::sync::atomic::AtomicU64::new(
+                Timestamp::from_millis(100).0,
+            )),
+        );
         assert_eq!(ctx.now(), Timestamp::ZERO, "at the base instant, running time is 0");
         clock.advance(Timestamp::from_millis(150));
         assert_eq!(ctx.now(), Timestamp::from_millis(50), "running = clock(150) - base(100)");

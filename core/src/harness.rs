@@ -183,7 +183,12 @@ impl Harness {
         ctx.configure_pads(npads, &src_pads);
         ctx.set_vocabulary(Arc::clone(&vocabulary));
         let clock = MockClock::new();
-        ctx.set_clock(Arc::new(clock.clone()), Timestamp::ZERO);
+        // A zero base on a fresh MockClock — running time == the mock's virtual time
+        // (the shared-cell form the pause transport re-bases in a real run).
+        ctx.set_clock(
+            Arc::new(clock.clone()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
         // Install the property mailbox where declared, so `ctx.prop(name)` resolves —
         // parity with `run_group` wiring props on elements that declare them.
         if !desc.props.is_empty() {
