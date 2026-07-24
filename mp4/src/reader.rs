@@ -289,8 +289,9 @@ pub struct ResolvedSample<'a> {
 
 /// Convert `ticks` (signed) at `timescale` ticks/second to **non-negative** nanoseconds via
 /// i128 so the intermediate `ticks * 1_000_000_000` never overflows (spec: i128-safe pts).
-/// Timescale 0 → passthrough. A negative result clamps to 0.
-fn ticks_to_ns(ticks: i64, timescale: u32) -> u64 {
+/// Timescale 0 → passthrough. A negative result clamps to 0. Crate-visible so the demux
+/// element can stamp pts while a sample still borrows the reader (zero-copy drain).
+pub(crate) fn ticks_to_ns(ticks: i64, timescale: u32) -> u64 {
     if timescale == 0 {
         return ticks.max(0) as u64;
     }

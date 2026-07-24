@@ -16,7 +16,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// A fixed-slot-size buffer pool. Cheap to clone (an `Arc` handle); every clone
 /// shares the same free-list and counters.
@@ -27,7 +27,12 @@ pub struct Pool {
 struct PoolInner {
     slot_size: usize,
     max_slots: u32,
-    free: Mutex<Vec<Box<[u8]>>>,
+    /// Recycled backings, **Arc and all**: reusing the whole `Arc<MemoryInner>`
+    /// (not just the byte box) makes a steady-state acquire/drop cycle allocate
+    /// *nothing* — the per-buffer `Arc::new` in `from_box` was a third of a movie
+    /// remux's 1.2M allocations. Entries hold `pool: Weak`, so this list creates no
+    /// refcount cycle with the pool that owns it.
+    free: Mutex<Vec<Arc<MemoryInner>>>,
     slot_allocations: AtomicU64, // boxes ever heap-allocated (misses)
     acquires: AtomicU64,
     recycles: AtomicU64,
@@ -73,21 +78,26 @@ impl Pool {
     /// concurrent acquirers can never collectively exceed `max_slots`.
     pub fn try_acquire(&self) -> Option<Memory> {
         let mut free = self.inner.free.lock().unwrap();
-        let buf = match free.pop() {
-            Some(b) => b,
+        let recycled = free.pop();
+        let mem = match recycled {
+            // Zero-alloc fast path: the whole backing (Arc included) comes back.
+            Some(arc) => Memory { inner: Some(arc), offset: 0, len: 0 },
             None => {
                 if self.inner.outstanding.load(Ordering::Relaxed) >= self.inner.max_slots as u64 {
                     return None;
                 }
                 self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
-                vec![0u8; self.inner.slot_size].into_boxed_slice()
+                Memory::from_box(
+                    vec![0u8; self.inner.slot_size].into_boxed_slice(),
+                    &self.inner,
+                )
             }
         };
         self.inner.acquires.fetch_add(1, Ordering::Relaxed);
         let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.high_water.fetch_max(now, Ordering::Relaxed);
         drop(free);
-        Some(Memory::from_box(buf, Arc::clone(&self.inner)))
+        Some(mem)
     }
 
     /// Acquire a buffer of at least `n` usable bytes: a pooled slot when `n` fits and
@@ -109,23 +119,26 @@ impl Pool {
         self.inner.acquires.fetch_add(1, Ordering::Relaxed);
         let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.high_water.fetch_max(now, Ordering::Relaxed);
-        Memory::from_box(vec![0u8; n.max(1)].into_boxed_slice(), Arc::clone(&self.inner))
+        Memory::from_box(vec![0u8; n.max(1)].into_boxed_slice(), &self.inner)
     }
 
     /// Take a slot from the free-list, or heap-allocate one on a miss.
     pub fn acquire(&self) -> Memory {
         let recycled = self.inner.free.lock().unwrap().pop();
-        let buf = match recycled {
-            Some(b) => b,
+        let mem = match recycled {
+            Some(arc) => Memory { inner: Some(arc), offset: 0, len: 0 },
             None => {
                 self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
-                vec![0u8; self.inner.slot_size].into_boxed_slice()
+                Memory::from_box(
+                    vec![0u8; self.inner.slot_size].into_boxed_slice(),
+                    &self.inner,
+                )
             }
         };
         self.inner.acquires.fetch_add(1, Ordering::Relaxed);
         let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.high_water.fetch_max(now, Ordering::Relaxed);
-        Memory::from_box(buf, Arc::clone(&self.inner))
+        mem
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -147,20 +160,38 @@ impl Clone for Pool {
 }
 
 impl PoolInner {
-    fn recycle(&self, buf: Box<[u8]>) {
+    /// Recycle a whole backing, Arc allocation included (the hot path, from
+    /// [`Memory`]'s drop when it holds the sole reference). Keeps only right-sized
+    /// slots, and never retains more free entries than the cap: a transient spike
+    /// from the unbounded `acquire` path must not inflate the free-list permanently.
+    /// A rejected backing is **disarmed** (bytes taken, pool link severed) before it
+    /// drops, so `MemoryInner::drop`'s fallback cannot double-decrement the counters.
+    fn recycle_arc(&self, mut arc: Arc<MemoryInner>) {
         self.recycles.fetch_add(1, Ordering::Relaxed);
-        // Keep only right-sized slots, and never retain more free slots than the cap: a
-        // transient spike from the unbounded `acquire` path must not inflate the free-list
-        // permanently (it would read as a steady-state leak). Excess boxes are dropped
-        // (freed) here. `bounded` pools cap at `max_slots`; unbounded pools (`max_slots ==
-        // u32::MAX`) keep everything, as before.
-        let keep = buf.len() == self.slot_size;
+        let keep = arc.buf.len() == self.slot_size;
         // Decrement outstanding under the free-list lock so it stays consistent with
         // try_acquire's cap check.
         let mut free = self.free.lock().unwrap();
         self.outstanding.fetch_sub(1, Ordering::Relaxed);
         if keep && (free.len() as u64) < self.max_slots as u64 {
-            free.push(buf);
+            free.push(arc);
+        } else if let Some(inner) = Arc::get_mut(&mut arc) {
+            // Wrong size (an `acquire_exact` heap fallback) or list at cap: free the
+            // bytes, and disarm so the fallback drop path is a no-op.
+            drop(std::mem::take(&mut inner.buf));
+            inner.pool = Weak::new();
+        }
+    }
+
+    /// The cold fallback (from [`MemoryInner::drop`] — a concurrent-last-drop race or
+    /// a CoW discard): only the bytes come back; re-wrapping pays one `Arc::new`.
+    fn recycle_box(self: &Arc<Self>, buf: Box<[u8]>) {
+        self.recycles.fetch_add(1, Ordering::Relaxed);
+        let keep = buf.len() == self.slot_size;
+        let mut free = self.free.lock().unwrap();
+        self.outstanding.fetch_sub(1, Ordering::Relaxed);
+        if keep && (free.len() as u64) < self.max_slots as u64 {
+            free.push(Arc::new(MemoryInner { buf, pool: Arc::downgrade(self) }));
         }
     }
 }
@@ -175,16 +206,23 @@ pub struct PoolStats {
 }
 
 /// The shared backing of one or more [`Memory`] views: the slot bytes plus the pool
-/// they recycle to. Dropping the **last** `Arc` to this returns the slot (spec:
-/// Memory — "recycled on last-ref drop").
+/// they recycle to (`Weak`, so pooled free-list entries don't cycle-keep the pool
+/// alive). The slot returns on last-view drop (spec: Memory — "recycled on
+/// last-ref drop"): normally as the whole Arc via `Memory`'s drop; this fallback
+/// only fires on a concurrent-last-drop race or a CoW discard.
 struct MemoryInner {
     buf: Box<[u8]>,
-    pool: Arc<PoolInner>,
+    pool: Weak<PoolInner>,
 }
 
 impl Drop for MemoryInner {
     fn drop(&mut self) {
-        self.pool.recycle(std::mem::take(&mut self.buf));
+        if self.buf.is_empty() {
+            return; // disarmed by recycle_arc, or a taken husk — nothing to return
+        }
+        if let Some(pool) = self.pool.upgrade() {
+            pool.recycle_box(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -209,10 +247,30 @@ pub struct Memory {
     len: usize,
 }
 
+impl Drop for Memory {
+    fn drop(&mut self) {
+        let Some(arc) = self.inner.take() else { return };
+        // Sole owner: recycle the WHOLE backing — Arc allocation included — so a
+        // steady-state acquire/drop cycle allocates nothing (the per-buffer
+        // `Arc::new` in `from_box` was ~a third of a movie remux's allocations).
+        // At strong_count 1 we hold the only handle, so no new clone can appear:
+        // the check is race-free. Two sharers dropping concurrently can both read
+        // count 2 — then neither takes this path and the plain Arc drop below runs
+        // `MemoryInner::drop`, whose byte-recycle fallback still returns the slot.
+        if Arc::strong_count(&arc) == 1 {
+            if let Some(pool) = arc.pool.upgrade() {
+                pool.recycle_arc(arc);
+                return;
+            }
+        }
+        drop(arc);
+    }
+}
+
 impl Memory {
-    fn from_box(buf: Box<[u8]>, pool: Arc<PoolInner>) -> Memory {
+    fn from_box(buf: Box<[u8]>, pool: &Arc<PoolInner>) -> Memory {
         Memory {
-            inner: Some(Arc::new(MemoryInner { buf, pool })),
+            inner: Some(Arc::new(MemoryInner { buf, pool: Arc::downgrade(pool) })),
             offset: 0,
             len: 0,
         }
@@ -251,9 +309,19 @@ impl Memory {
         let inner = self.inner.as_mut().expect("memory is live");
         if Arc::get_mut(inner).is_none() {
             // Shared: copy-on-write the whole backing (offset preserved). Cold by
-            // design — only a mutator downstream of a tee/slice pays it.
-            let pool = Pool { inner: Arc::clone(&inner.pool) };
-            let mut fresh = pool.acquire_exact(inner.buf.len());
+            // design — only a mutator downstream of a tee/slice pays it. A dead pool
+            // (all handles dropped mid-flight) degrades to an unpooled backing.
+            let mut fresh = match inner.pool.upgrade() {
+                Some(p) => Pool { inner: p }.acquire_exact(inner.buf.len()),
+                None => Memory {
+                    inner: Some(Arc::new(MemoryInner {
+                        buf: vec![0u8; inner.buf.len()].into_boxed_slice(),
+                        pool: Weak::new(),
+                    })),
+                    offset: 0,
+                    len: 0,
+                },
+            };
             let fresh_inner =
                 Arc::get_mut(fresh.inner.as_mut().expect("fresh")).expect("unshared");
             let n = inner.buf.len().min(fresh_inner.buf.len());

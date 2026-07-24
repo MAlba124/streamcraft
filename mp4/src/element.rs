@@ -101,6 +101,9 @@ static DEMUX_DESC: ElementDesc = ElementDesc {
 struct PadTrack {
     /// The runtime src pad this track's samples go out on ([`Ctx::add_pad`]).
     pad: PadId,
+    /// The track's media timescale (ticks/s), cached so pts can be stamped while a
+    /// sample still borrows the reader — the zero-copy drain never re-borrows it.
+    timescale: u32,
     /// The announce family for the pad ([`codec::family_for`]): `h264/annexb`,
     /// `h265/annexb`, `vp9`, `av1`, `opus`, or `bytes`.
     family: &'static str,
@@ -258,9 +261,10 @@ impl Mp4Demux {
     }
 
     /// Queue a blob for emission and try to emit it now; on pool exhaustion the remainder
-    /// parks in `pending` (drained first on the next pass).
+    /// parks in `pending` (drained first on the next pass). Takes the queue directly so
+    /// callers holding a reader borrow (the zero-copy drain) can still park.
     fn emit_or_park(
-        &mut self,
+        pending: &mut std::collections::VecDeque<Carry>,
         ctx: &mut Ctx,
         pad: PadId,
         pts_ns: Option<u64>,
@@ -269,7 +273,7 @@ impl Mp4Demux {
     ) {
         let off = Self::emit_bounded(ctx, pad, pts_ns, flags, &bytes, 0);
         if off < bytes.len() {
-            self.pending.push_back(Carry { pad, pts_ns, flags, bytes, off });
+            pending.push_back(Carry { pad, pts_ns, flags, bytes, off });
         }
     }
 
@@ -314,62 +318,32 @@ impl Mp4Demux {
     /// consuming input until it clears). On a track's first sample the Annex B codec head is
     /// emitted first and the pad's runtime format is announced (spec: dynamic caps). A sample
     /// that fails to reframe is warned-and-dropped, not fatal (spec: untrusted input).
+    /// Drain samples the reader has sliced, emitting each on its track's src pad —
+    /// **zero-copy on the hot path**: the sample bytes are borrowed straight out of the
+    /// reader's window into the pool slot (split field borrows keep `pad_tracks`/`pending`
+    /// usable while the sample borrow lives). The only per-sample heap traffic left is a
+    /// real NAL→Annex B conversion (decode mode) or a pool-dry carry — the old
+    /// copy-to-break-the-borrow pattern was 63% of a movie remux's 1.2M allocations.
+    /// Pool-bounded as before: returns `false` when slots ran out (remainder parked).
     fn drain(&mut self, ctx: &mut Ctx) -> bool {
         if !self.drain_pending(ctx) {
             return false;
         }
-        // Slice the next available sample; borrow the reframed bytes, compute the pts, then
-        // release the reader borrow before touching pool memory (the reader's window may be
-        // mutated by the next slice). `take_next` hands back owned locals so the reader borrow
-        // is dropped before emission (which may re-enter the reader).
-        while let Some((idx, pts_ns, sync, reframed, head_to_emit, announce)) = self.take_next(ctx) {
-            let pad = self.pad_tracks[idx].pad;
+        loop {
+            let Self { reader, pad_tracks, pending, .. } = self;
+            let Some(reader) = reader.as_mut() else { return true };
+            let Some(s) = reader.next_sample() else { return true };
+            let (idx, sync) = (s.track_index, s.sync);
+            let pt = &mut pad_tracks[idx];
+            let pts_ns = crate::reader::ticks_to_ns(s.pts, pt.timescale);
             // The sample table's sync bit rides the buffer (spec: Buffer flags), so a
             // remuxing consumer preserves seekability; DELTA is explicit — untagged would
             // read as "unknown", which a muxer defaults to keyframe.
             let flags = if sync { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
-
-            // First sample on this pad: announce the format, then emit the codec head.
-            if let Some((family, ann)) = announce {
-                Self::announce(ctx, pad, family, ann);
-            }
-            if let Some(head) = head_to_emit {
-                self.emit_or_park(ctx, pad, Some(pts_ns), BufferFlags::empty(), head);
-            }
-
-            let off = Self::emit_bounded(ctx, pad, Some(pts_ns), flags, &reframed, 0);
-            if off < reframed.len() {
-                self.pending.push_back(Carry { pad, pts_ns: Some(pts_ns), flags, bytes: reframed, off });
-            }
-            if !self.pending.is_empty() {
-                return false; // pool dry — carry parked, stop pulling reader samples
-            }
-        }
-        true
-    }
-
-    /// Slice + reframe the next available sample, returning its routing/bytes/pts and (on the
-    /// track's first sample) the announce params + codec head. `None` when no sample's bytes
-    /// are fully buffered yet. A sample that fails to reframe is warned-and-dropped (loops to
-    /// the next one). Written as a helper so the reader borrow is scoped tightly.
-    #[allow(clippy::type_complexity)]
-    fn take_next(
-        &mut self,
-        ctx: &mut Ctx,
-    ) -> Option<(usize, u64, bool, Vec<u8>, Option<Vec<u8>>, Option<(&'static str, Announce)>)> {
-        loop {
-            // Pull the next sample; copy its fields into owned locals so the `ResolvedSample`
-            // borrow of the reader's window is dropped before we call `ticks_to_ns` (a second
-            // `&self` borrow) or emit (which may re-enter the reader).
-            let reader = self.reader.as_mut()?;
-            let (idx, pts_ticks, sync, raw) = {
-                let s = reader.next_sample()?;
-                (s.track_index, s.pts, s.sync, s.bytes.to_vec())
-            };
-            let pts_ns = reader.ticks_to_ns(idx, pts_ticks);
-            let pt = &self.pad_tracks[idx];
-            let reframed = match pt.reframer.reframe_block(&raw) {
-                Ok(bytes) => bytes.into_owned(),
+            // Passthrough borrows the reader's window (`Cow::Borrowed` — no copy); only a
+            // real NAL→Annex B conversion allocates.
+            let reframed = match pt.reframer.reframe_block(s.bytes) {
+                Ok(bytes) => bytes,
                 Err(e) => {
                     let element = ctx.element();
                     ctx.post(BusMessage::Warning {
@@ -382,17 +356,31 @@ impl Mp4Demux {
                     continue; // drop this sample, try the next
                 }
             };
-            // On the first sample: hand back the announce params + the (taken) codec head.
-            let (head, announce) = if !self.pad_tracks[idx].started {
-                self.pad_tracks[idx].started = true;
-                let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
-                let head = (!head.is_empty()).then_some(head);
-                let pt = &self.pad_tracks[idx];
-                (head, Some((pt.family, pt.announce)))
-            } else {
-                (None, None)
-            };
-            return Some((idx, pts_ns, sync, reframed, head, announce));
+            // First sample on this pad: announce the format, then emit the codec head.
+            if !pt.started {
+                pt.started = true;
+                let (pad, family, ann) = (pt.pad, pt.family, pt.announce);
+                let head = std::mem::take(&mut pt.codec_head);
+                Self::announce(ctx, pad, family, ann);
+                if !head.is_empty() {
+                    Self::emit_or_park(pending, ctx, pad, Some(pts_ns), BufferFlags::empty(), head);
+                }
+            }
+            let pad = pt.pad;
+            let off = Self::emit_bounded(ctx, pad, Some(pts_ns), flags, &reframed, 0);
+            if off < reframed.len() {
+                // Pool dry: only now does the sample pay a copy (the parked carry owns it).
+                pending.push_back(Carry {
+                    pad,
+                    pts_ns: Some(pts_ns),
+                    flags,
+                    bytes: reframed.into_owned(),
+                    off,
+                });
+            }
+            if !pending.is_empty() {
+                return false; // pool dry — carry parked, stop pulling reader samples
+            }
         }
     }
 
@@ -404,16 +392,28 @@ impl Mp4Demux {
         while let Some(c) = self.pending.pop_front() {
             Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
         }
-        while let Some((idx, pts_ns, sync, reframed, head, announce)) = self.take_next(ctx) {
-            let pad = self.pad_tracks[idx].pad;
+        loop {
+            let Self { reader, pad_tracks, .. } = self;
+            let Some(reader) = reader.as_mut() else { return };
+            let Some(s) = reader.next_sample() else { return };
+            let (idx, sync) = (s.track_index, s.sync);
+            let pt = &mut pad_tracks[idx];
+            let pts_ns = crate::reader::ticks_to_ns(s.pts, pt.timescale);
             let flags = if sync { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
-            if let Some((family, ann)) = announce {
+            let reframed = match pt.reframer.reframe_block(s.bytes) {
+                Ok(bytes) => bytes,
+                Err(_) => continue, // tail flush: drop silently rather than warn-spam
+            };
+            if !pt.started {
+                pt.started = true;
+                let (pad, family, ann) = (pt.pad, pt.family, pt.announce);
+                let head = std::mem::take(&mut pt.codec_head);
                 Self::announce(ctx, pad, family, ann);
+                if !head.is_empty() {
+                    Self::emit_exact(ctx, pad, Some(pts_ns), BufferFlags::empty(), &head, 0);
+                }
             }
-            if let Some(head) = head {
-                Self::emit_exact(ctx, pad, Some(pts_ns), BufferFlags::empty(), &head, 0);
-            }
-            Self::emit_exact(ctx, pad, Some(pts_ns), flags, &reframed, 0);
+            Self::emit_exact(ctx, pt.pad, Some(pts_ns), flags, &reframed, 0);
         }
     }
 
@@ -479,6 +479,7 @@ impl Element for Mp4Demux {
             let pad = ctx.add_pad(Direction::Src, &name, &DEMUX_SRC_OFFERS);
             self.pad_tracks.push(PadTrack {
                 pad,
+                timescale: track.timescale,
                 family,
                 codec_head,
                 reframer,
