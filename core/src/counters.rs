@@ -140,11 +140,38 @@ impl TapHandle {
     }
 }
 
-/// Per-path, per-element latency breakdown — where every microsecond goes
-/// (spec: Latency). TODO(step 5).
+/// Per-path, per-element latency breakdown — where every microsecond goes (spec:
+/// Latency — "computed, per path... a graph traversal over data the pipeline
+/// already holds", never a distributed query protocol).
 #[derive(Clone, Debug, Default)]
 pub struct LatencyReport {
-    _priv: (),
+    /// One entry per sink (an element with no outgoing links), worst path first.
+    pub paths: Vec<PathLatency>,
+}
+
+impl LatencyReport {
+    /// The pipeline-wide latency: the worst sink path (what a live pipeline must
+    /// compensate end-to-end). Zero for an empty graph.
+    pub fn total(&self) -> Timestamp {
+        self.paths.first().map_or(Timestamp::ZERO, |p| p.total)
+    }
+}
+
+/// The worst source→sink path for one sink: its total declared latency and the
+/// per-element contributions along that path (in path order, source first).
+#[derive(Clone, Debug)]
+pub struct PathLatency {
+    pub sink: ElementId,
+    /// Sum of the declared minimum latencies of every element strictly upstream of
+    /// the sink on its worst path — what the sink adds to `base_time + pts` when it
+    /// waits (spec: Latency — enforced at sinks).
+    pub total: Timestamp,
+    /// `(element, declared min latency)` along the worst path, source first,
+    /// including the sink itself (whose own latency is reported but not waited on).
+    pub per_element: Vec<(ElementId, Timestamp)>,
+    /// Whether any element on the path declared itself live (spec: live pipelines
+    /// get exactly the delay the graph requires; non-live get throughput mode).
+    pub is_live: bool,
 }
 
 #[cfg(test)]

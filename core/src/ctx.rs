@@ -141,6 +141,12 @@ pub struct Ctx {
     /// reads `NONE` and `wait_until` returns at once (no pacing).
     clock: Option<Arc<dyn Clock>>,
     base_time: Timestamp,
+    /// This element's computed upstream path latency (spec: Latency — enforced at
+    /// sinks): the pipeline installs the worst source→here sum of declared minimum
+    /// latencies, and [`wait_until`](Self::wait_until) folds it into the deadline —
+    /// `base_time + running + path_latency` — so a sink automatically compensates
+    /// what its upstream needs. Zero unless the graph declares latencies.
+    path_latency: Timestamp,
     /// Shared seek request, installed at run setup (spec: flush/seek). A source reads the
     /// byte target and a sink the frame target from [`seek_target`](Self::seek_target) when
     /// the scheduler delivers `FlushStart`. `None` outside a run / for a pipeline that is
@@ -192,6 +198,7 @@ impl Ctx {
             seek: None,
             scratch: Arena::default(),
             props: None,
+            path_latency: Timestamp::ZERO,
         }
     }
 
@@ -269,6 +276,19 @@ impl Ctx {
     pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: Timestamp) {
         self.clock = Some(clock);
         self.base_time = base_time;
+    }
+
+    /// Install this element's computed upstream path latency (pipeline → element at
+    /// run setup; spec: Latency — computed per path from declared latencies).
+    pub(crate) fn set_path_latency(&mut self, latency: Timestamp) {
+        self.path_latency = latency;
+    }
+
+    /// This element's upstream path latency — what [`wait_until`](Self::wait_until)
+    /// already folds into its deadline. Exposed so QoS lateness checks can use the
+    /// same reference point a render wait does.
+    pub fn path_latency(&self) -> Timestamp {
+        self.path_latency
     }
 
     /// Install the shared seek request (pipeline → element at run setup). See
@@ -391,17 +411,23 @@ impl Ctx {
         }
     }
 
-    /// Block until the pipeline's running time reaches `running` — i.e. until the clock
-    /// reads `base_time + running` — returning [`WaitOutcome::Reached`], or
-    /// [`WaitOutcome::Interrupted`] if the wait is cut short (flush / shutdown). A timed
-    /// sink calls this with a buffer's PTS to render on the clock; upstream never waits
-    /// (spec: Clocking — only sinks wait; everything else runs as fast as backpressure
-    /// allows). With no clock installed this returns [`WaitOutcome::Reached`] at once —
-    /// an unclocked pipeline imposes no pacing. A `running` of [`Timestamp::NONE`] is
+    /// Block until the pipeline's running time reaches `running` **plus this
+    /// element's path latency** — the deadline is `base_time + running +
+    /// path_latency` (spec: Latency — "sinks render at `base_time + pts +
+    /// path_latency`"; the compensation is automatic, not sink code). Returns
+    /// [`WaitOutcome::Reached`], or [`WaitOutcome::Interrupted`] if the wait is cut
+    /// short (flush / shutdown). A timed sink calls this with a buffer's PTS to
+    /// render on the clock; upstream never waits (spec: Clocking — only sinks wait).
+    /// With no clock installed this returns [`WaitOutcome::Reached`] at once — an
+    /// unclocked pipeline imposes no pacing. A `running` of [`Timestamp::NONE`] is
     /// "infinitely late": only an interrupt ends the wait.
     pub fn wait_until(&self, running: Timestamp) -> WaitOutcome {
         match &self.clock {
-            Some(c) => c.new_wait().wait_until(self.base_time.saturating_add(running)),
+            Some(c) => c.new_wait().wait_until(
+                self.base_time
+                    .saturating_add(running)
+                    .saturating_add(self.path_latency),
+            ),
             None => WaitOutcome::Reached,
         }
     }

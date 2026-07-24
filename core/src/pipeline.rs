@@ -666,6 +666,10 @@ impl Pipeline {
             })
             .collect();
 
+        // Per-element upstream path latency (spec: Latency): computed once here from
+        // declared latencies, installed into each Ctx so sink waits compensate it.
+        let (path_latency, _) = self.compute_in_latency();
+
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
         for (gi, ids) in groups.into_iter().enumerate() {
@@ -695,6 +699,8 @@ impl Pipeline {
                 ids.iter().map(|id| pad_infos[id.0 as usize].clone()).collect();
             let group_pools: Vec<Pool> =
                 ids.iter().map(|id| pools[id.0 as usize].clone()).collect();
+            let group_latencies: Vec<Timestamp> =
+                ids.iter().map(|id| path_latency[id.0 as usize]).collect();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
@@ -706,7 +712,7 @@ impl Pipeline {
                     elems, ids, group_formats, group_logs, upstream, downstream, factory,
                     group_pools, bus, credits, group_counters, group_props, stop, seek,
                     vocabulary, clock,
-                    base_time, group_pad_infos,
+                    base_time, group_pad_infos, group_latencies,
                 )
             }));
         }
@@ -1093,8 +1099,68 @@ impl Pipeline {
         s
     }
 
+    /// The computed per-path latency breakdown (spec: Latency — a graph traversal
+    /// over data the pipeline already holds; no query protocol). Callable in any
+    /// state; the same numbers a sink's `wait_until` compensates while playing.
     pub fn latency_report(&self) -> LatencyReport {
-        todo!("spec: Latency")
+        let (in_lat, pred) = self.compute_in_latency();
+        let n = self.descs.len();
+        let mut has_out = vec![false; n];
+        for e in &self.edges {
+            has_out[e.src.0 as usize] = true;
+        }
+        let mut paths = Vec::new();
+        for i in 0..n {
+            if has_out[i] {
+                continue; // not a sink
+            }
+            // Reconstruct the worst path, sink back to source.
+            let mut chain = Vec::new();
+            let mut cur = Some(i);
+            let mut is_live = false;
+            while let Some(c) = cur {
+                let lat = &self.descs[c].latency;
+                is_live |= lat.is_live;
+                chain.push((ElementId(c as u32), lat.min));
+                cur = pred[c];
+            }
+            chain.reverse();
+            paths.push(crate::counters::PathLatency {
+                sink: ElementId(i as u32),
+                total: in_lat[i],
+                per_element: chain,
+                is_live,
+            });
+        }
+        paths.sort_by(|a, b| b.total.cmp(&a.total));
+        LatencyReport { paths }
+    }
+
+    /// The worst upstream declared-latency sum reaching each element (`in_lat`) and
+    /// the predecessor on that worst path (`pred`), by DP over the topological order
+    /// — the element's own latency is *not* included in its `in_lat` (a sink waits
+    /// out its upstream, not itself; spec: Latency). Queue-residency terms join once
+    /// formats carry rates.
+    fn compute_in_latency(&self) -> (Vec<Timestamp>, Vec<Option<usize>>) {
+        let n = self.descs.len();
+        let mut in_lat = vec![Timestamp::ZERO; n];
+        let mut pred: Vec<Option<usize>> = vec![None; n];
+        if let Ok(order) = self.topo_order() {
+            for id in order {
+                let u = id.0 as usize;
+                let via = in_lat[u].saturating_add(self.descs[u].latency.min);
+                for e in self.edges.iter().filter(|e| e.src.0 as usize == u) {
+                    let v = e.sink.0 as usize;
+                    // First predecessor always wins the slot (in_lat[v] is still its
+                    // ZERO init, and via >= ZERO); later ones only on a longer path.
+                    if pred[v].is_none() || via > in_lat[v] {
+                        in_lat[v] = via;
+                        pred[v] = Some(u);
+                    }
+                }
+            }
+        }
+        (in_lat, pred)
     }
 
     pub fn counters(&self, el: ElementId) -> CounterSnapshot {
@@ -1247,6 +1313,7 @@ fn run_group(
     clock: Arc<dyn Clock>,
     base_time: Timestamp,
     pad_infos: Vec<(usize, Vec<usize>)>,
+    path_latencies: Vec<Timestamp>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_empty();
@@ -1292,9 +1359,12 @@ fn run_group(
         ctx.set_vocabulary(Arc::clone(&vocabulary));
     }
     // Install the pipeline clock + running-time base so elements read running time via
-    // `ctx.now()` and pace on it via `ctx.wait_until()` (spec: Clocking).
-    for ctx in ctxs.iter_mut() {
+    // `ctx.now()` and pace on it via `ctx.wait_until()` (spec: Clocking), and each
+    // element's computed upstream path latency so a sink's `wait_until(pts)` lands on
+    // `base_time + pts + path_latency` (spec: Latency — enforced at sinks).
+    for (ctx, lat) in ctxs.iter_mut().zip(path_latencies) {
         ctx.set_clock(Arc::clone(&clock), base_time);
+        ctx.set_path_latency(lat);
     }
     // Install the shared seek request so a source resolves its byte target and a sink its
     // frame target when the scheduler delivers `FlushStart` (spec: flush/seek).
