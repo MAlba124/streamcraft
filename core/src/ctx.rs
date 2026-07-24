@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::batch::{Batch, OutBatch};
 use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
+use crate::clock::{Clock, WaitOutcome};
 use crate::format::{FixedFormat, ValueDesc, Vocabulary};
 use crate::id::{ElementId, FieldId, FormatId, PadId, ValueId};
 use crate::io::{Completion, Io, Submission};
@@ -65,6 +66,13 @@ pub struct Ctx {
     /// resolve the names in its negotiated format — `field_id("rate")`, `value_name(id)`.
     /// `None` outside a run (spec: Formats — elements read their caps by name).
     vocabulary: Option<Arc<Vocabulary>>,
+    /// The pipeline clock and the running-time base, installed at run setup (spec:
+    /// Clocking and synchronization). [`now`](Self::now) returns `clock.now() -
+    /// base_time`; [`wait_until`](Self::wait_until) parks on a `ClockWait` against this
+    /// clock. `None` outside a run and for an unclocked byte pipeline, where `now()`
+    /// reads `NONE` and `wait_until` returns at once (no pacing).
+    clock: Option<Arc<dyn Clock>>,
+    base_time: Timestamp,
 }
 
 impl Ctx {
@@ -91,6 +99,8 @@ impl Ctx {
             log: None,
             announced: None,
             vocabulary: None,
+            clock: None,
+            base_time: Timestamp::ZERO,
         }
     }
 
@@ -163,6 +173,13 @@ impl Ctx {
         self.vocabulary = Some(vocabulary);
     }
 
+    /// Install the pipeline clock and running-time base (pipeline → element at run
+    /// setup). See [`now`](Self::now) and [`wait_until`](Self::wait_until).
+    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: Timestamp) {
+        self.clock = Some(clock);
+        self.base_time = base_time;
+    }
+
     /// Resolve a format-field name to its interned id, for reading a negotiated
     /// [`FixedFormat`] by name (spec: Formats — an element acts on its caps). `None` before
     /// `run()` or for a name the graph never interned.
@@ -231,9 +248,30 @@ impl Ctx {
         self.bus.send(msg);
     }
 
-    /// The pipeline clock. Milestone 1 has no clock yet (spec: Clocking).
+    /// Running time on the pipeline clock: `clock.now() - base_time`, so it starts near
+    /// zero when the pipeline begins and only moves forward (spec: Clocking — elements
+    /// read running time here, never a wall clock). Returns [`Timestamp::NONE`] when no
+    /// clock is installed (an unclocked byte pipeline — the milestone-1 default).
     pub fn now(&self) -> Timestamp {
-        Timestamp::NONE
+        match &self.clock {
+            Some(c) => c.now().saturating_sub(self.base_time),
+            None => Timestamp::NONE,
+        }
+    }
+
+    /// Block until the pipeline's running time reaches `running` — i.e. until the clock
+    /// reads `base_time + running` — returning [`WaitOutcome::Reached`], or
+    /// [`WaitOutcome::Interrupted`] if the wait is cut short (flush / shutdown). A timed
+    /// sink calls this with a buffer's PTS to render on the clock; upstream never waits
+    /// (spec: Clocking — only sinks wait; everything else runs as fast as backpressure
+    /// allows). With no clock installed this returns [`WaitOutcome::Reached`] at once —
+    /// an unclocked pipeline imposes no pacing. A `running` of [`Timestamp::NONE`] is
+    /// "infinitely late": only an interrupt ends the wait.
+    pub fn wait_until(&self, running: Timestamp) -> WaitOutcome {
+        match &self.clock {
+            Some(c) => c.new_wait().wait_until(self.base_time.saturating_add(running)),
+            None => WaitOutcome::Reached,
+        }
     }
 
     /// Bump allocator, reset after each `process()` call (spec: Memory).
@@ -359,6 +397,36 @@ mod tests {
         assert!(matches!(rec.fields()[0].val, FieldValue::Uint(42)));
         assert!(matches!(rec.fields()[1].val, FieldValue::Bool(true)));
         assert!(drain.try_next().is_none(), "exactly one record");
+    }
+
+    #[test]
+    fn now_and_wait_until_track_the_installed_clock() {
+        use crate::clock::MockClock;
+        use crate::time::Timestamp;
+
+        let mut ctx = test_ctx(ElementId(1));
+        // No clock installed → running time is NONE and a wait never blocks (no pacing).
+        assert!(ctx.now().is_none());
+        assert_eq!(ctx.wait_until(Timestamp::from_secs(1)), WaitOutcome::Reached);
+
+        // Install a mock clock with the running-time base at 100ms.
+        let clock = MockClock::new();
+        ctx.set_clock(Arc::new(clock.clone()), Timestamp::from_millis(100));
+        assert_eq!(ctx.now(), Timestamp::ZERO, "at the base instant, running time is 0");
+        clock.advance(Timestamp::from_millis(150));
+        assert_eq!(ctx.now(), Timestamp::from_millis(50), "running = clock(150) - base(100)");
+
+        // A running-time deadline already behind us returns at once...
+        assert_eq!(
+            ctx.wait_until(Timestamp::from_millis(50)),
+            WaitOutcome::Reached
+        );
+        // ...and one exactly at the (advanced) clock, too — deadline = base + running.
+        clock.advance(Timestamp::from_millis(150)); // clock 300ms → running 200ms
+        assert_eq!(
+            ctx.wait_until(Timestamp::from_millis(200)),
+            WaitOutcome::Reached
+        );
     }
 
     #[test]

@@ -5,12 +5,19 @@
 //! can assert the pipeline transported the data with no loss, duplication, or
 //! reordering. Both are also the only elements that don't touch files or sockets,
 //! so they exercise the scheduler's non-IO path.
+//!
+//! [`TimedTestSrc`] and [`TimedTestSink`] are their clock-aware counterparts (spec:
+//! Clocking): the source stamps buffers with running-time PTS and the sink renders
+//! each on the pipeline clock, so a `MockClock` drives hours of virtual time in
+//! milliseconds of wall time.
 
 mod testsink;
 mod testsrc;
+mod timed;
 
 pub use testsink::{TestSink, TestSinkStats};
 pub use testsrc::TestSrc;
+pub use timed::{Render, TimedSinkStats, TimedTestSink, TimedTestSrc};
 
 /// FNV-1a offset basis.
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Inputs};
 use crate::bus::{Bus, BusMessage, BusSender, State};
+use crate::clock::{Clock, InstantClock};
 use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
 use crate::ctx::Ctx;
 use crate::element::{Direction, Element, Flow, SchedHint, Template};
@@ -97,6 +98,12 @@ pub struct Pipeline {
     /// (spec: never block a streaming thread), so this trades memory for tolerance of
     /// bursts before the low-priority drain catches up.
     log_queue_cap: usize,
+    /// The pipeline clock (spec: Clocking and synchronization). Defaults to the real
+    /// monotonic [`InstantClock`]; a test installs a `MockClock` for deterministic,
+    /// time-compressed runs, and later a sink can provide a device clock. [`run`](Self::run)
+    /// samples `base_time = clock.now()` at start, then every element shares this one
+    /// timeline via `ctx.now()` / `ctx.wait_until()`.
+    clock: Arc<dyn Clock>,
 }
 
 impl Pipeline {
@@ -122,6 +129,7 @@ impl Pipeline {
             last_report: None,
             log_level: None,
             log_queue_cap: 1024,
+            clock: Arc::new(InstantClock::new()),
         }
     }
 
@@ -130,6 +138,15 @@ impl Pipeline {
     /// [`SyncReactor`] (spec: IO — the reactor is the portability boundary).
     pub fn set_reactor_factory(&mut self, factory: ReactorFactory) {
         self.reactor_factory = Some(factory);
+    }
+
+    /// Install the pipeline clock (spec: Clocking and synchronization), replacing the
+    /// default real [`InstantClock`] — e.g. a `MockClock` for deterministic,
+    /// time-compressed tests, or (later) a clock a sink slaves to its device. Takes
+    /// effect at the next [`run`](Self::run), which samples the running-time base from
+    /// it; call before `run()`.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
     }
 
     /// A handle to stop this pipeline from another thread (or a signal handler)
@@ -314,6 +331,11 @@ impl Pipeline {
     /// joins them all, and returns the first error (if any).
     pub fn run(&mut self) -> Result<(), Error> {
         self.stop.store(false, Ordering::Release);
+        // Sample the running-time base once, at the instant the pipeline starts (spec:
+        // Clocking — running time = clock.now() - base_time). The clock and base are
+        // shared into every group so all elements share one timeline.
+        let clock = Arc::clone(&self.clock);
+        let base_time = clock.now();
         let order = self.linear_order()?;
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
@@ -390,10 +412,11 @@ impl Pipeline {
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
             let vocabulary = Arc::clone(&vocabulary);
+            let clock = Arc::clone(&clock);
             handles.push(std::thread::spawn(move || {
                 run_group(
                     elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
-                    bus, credits, group_counters, stop, vocabulary,
+                    bus, credits, group_counters, stop, vocabulary, clock, base_time,
                 )
             }));
         }
@@ -790,6 +813,8 @@ fn run_group(
     counters: Vec<Arc<ElementCounters>>,
     stop: Arc<AtomicBool>,
     vocabulary: Arc<Vocabulary>,
+    clock: Arc<dyn Clock>,
+    base_time: Timestamp,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_none();
@@ -829,6 +854,11 @@ fn run_group(
     // and the produce hook can build announced formats (spec: Formats — dynamic caps).
     for ctx in ctxs.iter_mut() {
         ctx.set_vocabulary(Arc::clone(&vocabulary));
+    }
+    // Install the pipeline clock + running-time base so elements read running time via
+    // `ctx.now()` and pace on it via `ctx.wait_until()` (spec: Clocking).
+    for ctx in ctxs.iter_mut() {
+        ctx.set_clock(Arc::clone(&clock), base_time);
     }
 
     // Start each element; hand any file it registered to this group's reactor.
