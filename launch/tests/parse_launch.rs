@@ -18,6 +18,12 @@ fn registry() -> Registry {
     streamcraft_audio::register(&mut r);
     sc_flac::register(&mut r);
     sc_ogg::register(&mut r);
+    streamcraft_video::register(&mut r);
+    sc_vp8::register(&mut r);
+    sc_vp9::register(&mut r);
+    sc_av1::register(&mut r);
+    sc_h264::register(&mut r);
+    sc_h265::register(&mut r);
     r
 }
 
@@ -131,4 +137,56 @@ fn parse_errors_do_not_run() {
         .parse(&mut p, "testsrc ! nosuchelement ! testsink")
         .expect_err("unknown element must fail");
     assert!(err.message.contains("nosuchelement"), "{}", err.message);
+}
+
+// --- The raw-video path through the parse layer (spec: Milestone applications §5) ----
+
+#[test]
+fn videotestsrc_to_videocksink_runs_to_eos() {
+    // The headline video one-liner: a raw-video source into the clock sink, driven to
+    // EOS. `videocksink` renders on the default real clock, so keep the frame count
+    // small (30 frames at the default 30 fps ≈ 1 s of wall time).
+    let mut p = Pipeline::new();
+    let ids = registry()
+        .parse(&mut p, "videotestsrc frames=30 ! videocksink")
+        .expect("parses");
+    assert_eq!(ids.len(), 2);
+    p.run().expect("runs to EOS");
+    // The sink saw one buffer per frame.
+    let sink = p.counters(ids[1]);
+    assert_eq!(sink.buffers_in, 30, "one buffer per frame reached the sink");
+}
+
+#[test]
+fn videotestsrc_props_override_and_run_to_eos() {
+    // Prop plumbing end to end: overriding width/height/frames through the parse layer
+    // produces a valid, smaller pipeline that runs to EOS. (The stats handle is
+    // unreachable through the parse path, so EOS + the sink's buffer count is the
+    // assertion.)
+    let mut p = Pipeline::new();
+    let ids = registry()
+        .parse(&mut p, "videotestsrc width=64 height=48 frames=5 ! videocksink")
+        .expect("parses");
+    p.run().expect("runs to EOS");
+    let sink = p.counters(ids[1]);
+    assert_eq!(sink.buffers_in, 5, "the frames prop took effect");
+}
+
+#[test]
+fn video_decoders_are_registered_and_listed() {
+    // Every video decoder registers and appears in the sorted name list `--list` prints.
+    let names = registry().names();
+    for dec in ["vp8dec", "vp9dec", "av1dec", "h264dec", "h265dec"] {
+        assert!(names.contains(&dec), "{dec} should be registered");
+        // A registered decoder is also constructible by name (it has a make_default).
+        let mut p = Pipeline::new();
+        // A decoder alone is a valid single-stage chain to construct; it just needs an
+        // input to actually run, so we only assert it parses/builds here.
+        let launch = format!("{dec}");
+        assert!(registry().parse(&mut p, &launch).is_ok(), "{dec} builds by name");
+    }
+    // The raw-video elements are listed too.
+    for e in ["videotestsrc", "rawvideoparse", "videocksink"] {
+        assert!(names.contains(&e), "{e} should be registered");
+    }
 }

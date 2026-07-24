@@ -19,3 +19,11 @@ streamcraft-elements = { path = "../elements" }
 streamcraft-audio = { path = "../audio" }
 sc-flac = { path = "../flac" }
 sc-ogg = { path = "../ogg" }
+# The raw-video path (videotestsrc / rawvideoparse / videocksink) plus the five
+# hand-wired video decoders.
+streamcraft-video = { path = "../video" }
+sc-vp8 = { path = "../vp8" }
+sc-vp9 = { path = "../vp9" }
+sc-av1 = { path = "../av1" }
+sc-h264 = { path = "../h264" }
+sc-h265 = { path = "../h265" }
