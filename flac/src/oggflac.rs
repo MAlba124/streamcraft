@@ -97,7 +97,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Name-constructible (spec: Plugins): config-free byte→byte de-framer.
+    make_default: Some(|| Box::new(OggFlacDeframe::new())),
 };
 
 /// De-frames a FLAC-in-Ogg logical bitstream into a native FLAC byte stream (spec:

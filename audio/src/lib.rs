@@ -26,3 +26,17 @@ pub use format::{
     RAW_ANY_OFFER,
 };
 pub use wav::{parse_wav_header, write_pcm_wav, WavError, WavHeader, WavParse};
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! wavparse ! audioconvert format=s16 ! …")`). Typed `use` + constructor
+/// stays primary. `wavparse` is config-free; `audioconvert` reads its target `format`
+/// prop and `audioresample` its target `rate` prop in `start()` (defaults S16 / 48 kHz).
+/// Descriptors are `&'static`, taken from a throwaway default instance.
+pub fn register(registry: &mut Registry) {
+    registry.register(WavParse::new().desc());
+    registry.register(AudioConvert::new(SampleFormat::S16).desc());
+    registry.register(AudioResample::new(48_000).desc());
+}

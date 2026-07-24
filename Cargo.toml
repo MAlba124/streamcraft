@@ -12,6 +12,7 @@ members = [
     "vp8",
     "scope",
     "pipewire",
+    "launch",
 ]
 
 [workspace.package]

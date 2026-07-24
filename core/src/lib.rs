@@ -13,6 +13,7 @@
 //! - [`io`] — the reactor submit/complete contract (spec: IO)
 //! - [`log`], [`counters`] — observability (spec: Debuggability, Taps)
 //! - [`props`] — dynamic element properties (spec: Dynamic element properties)
+//! - [`registry`] — the opt-in element-by-name table + parse-launch (spec: Plugins)
 
 // `unsafe` is permitted only in `memory` and the SPSC ring (audited, loom+miri
 // covered) once they land. `deny` (not `forbid`) so those modules can locally
@@ -38,6 +39,7 @@ pub mod log;
 pub mod memory;
 pub mod pipeline;
 pub mod props;
+pub mod registry;
 pub mod ring;
 pub mod sched;
 pub mod time;

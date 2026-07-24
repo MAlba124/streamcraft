@@ -109,7 +109,8 @@ static DEMUX_DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Name-constructible (spec: Plugins): config-free.
+    make_default: Some(|| Box::new(OggDemux::new())),
 };
 
 /// Demultiplexes a single logical Ogg bitstream: an Ogg byte stream on the sink pad,
@@ -252,7 +253,8 @@ static MUX_DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Name-constructible (spec: Plugins): the default serial; use `with_serial` in code.
+    make_default: Some(|| Box::new(OggMux::new())),
 };
 
 /// Multiplexes a single logical bitstream: one codec packet **per input buffer** on the

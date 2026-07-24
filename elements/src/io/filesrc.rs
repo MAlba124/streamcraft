@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
+use streamcraft_core::format::{Constraint, OfferDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::io::{FileHandle, IoResult};
 use streamcraft_core::log;
@@ -31,10 +31,21 @@ static PADS: [PadDesc; 1] = [PadDesc {
     validate: None,
 }];
 
+/// The file to read (spec: Plugins — `parse("filesrc path=…")`). A path is a free-form
+/// string: `Constraint::Any` (paths ride `Value::Id`; see [`Pipeline::set_str`]).
+/// Structural (`live: false`): opening the file is a `start()`-time act.
+///
+/// [`Pipeline::set_str`]: streamcraft_core::pipeline::Pipeline::set_str
+static PROPS: [PropDesc; 1] = [PropDesc {
+    name: "path",
+    allowed: Constraint::Any,
+    live: false,
+}];
+
 static DESC: ElementDesc = ElementDesc {
     name: "filesrc",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     sched: SchedHint::Active,
     inputs: InputPolicy::None,
     latency: LatencyDesc {
@@ -43,7 +54,7 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    make_default: Some(|| Box::new(FileSrc::new(""))),
 };
 
 pub struct FileSrc {
@@ -80,6 +91,14 @@ impl Element for FileSrc {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // A parsed `path=` overrides the constructor value (spec: Plugins — the string
+        // rides `Value::Id`, resolved by name off the value vocabulary). Falls back to
+        // the constructor path when unset (the typed `FileSrc::new(path)` path).
+        if let Some(streamcraft_core::format::Value::Id(id)) = ctx.prop("path") {
+            if let Some(s) = ctx.value_name(id) {
+                self.path = PathBuf::from(s);
+            }
+        }
         let f = File::open(&self.path)
             .map_err(|e| Error::Resource(format!("open {}: {e}", self.path.display())))?;
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);

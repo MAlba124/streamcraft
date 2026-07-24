@@ -3,11 +3,11 @@
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
+use streamcraft_core::format::{Constraint, OfferDesc, Value};
 use streamcraft_core::id::PadId;
 use streamcraft_core::log;
 use streamcraft_core::log::Level;
@@ -26,10 +26,18 @@ static PADS: [PadDesc; 1] = [PadDesc {
     validate: None,
 }];
 
+/// Total bytes to produce (spec: Plugins — settable via `parse("testsrc total=…")`).
+/// Structural (`live: false`): read once in `start()`, not a mid-stream knob.
+static PROPS: [PropDesc; 1] = [PropDesc {
+    name: "total",
+    allowed: Constraint::Any,
+    live: false,
+}];
+
 static DESC: ElementDesc = ElementDesc {
     name: "testsrc",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     sched: SchedHint::Active,
     inputs: InputPolicy::None,
     latency: LatencyDesc {
@@ -38,7 +46,7 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    make_default: Some(|| Box::new(TestSrc::new(0))),
 };
 
 pub struct TestSrc {
@@ -62,6 +70,13 @@ impl Element for TestSrc {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // A parsed `total=` property overrides the constructor value (spec: Plugins —
+        // elements read their props in `start()`, falling back to constructor config).
+        if let Some(Value::Int(n)) = ctx.prop("total") {
+            if n >= 0 {
+                self.total = n as u64;
+            }
+        }
         log!(&*ctx, Level::Debug, "start", total = self.total);
         Ok(())
     }

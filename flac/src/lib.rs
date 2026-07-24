@@ -52,6 +52,20 @@ pub use flacdec::FlacDec;
 pub use flacenc::FlacEnc;
 pub use oggflac::OggFlacDeframe;
 
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! flacenc ! …")`). Typed `use` + constructor stays primary; this powers
+/// `scraft-launch` and one-liner tests. Descriptors are `&'static`, taken from a
+/// throwaway default instance. `flacenc` reads its `rate`/`channels`/`format` props in
+/// `start()`; `flacdec`/`oggflacdeframe` are config-free.
+pub fn register(registry: &mut Registry) {
+    registry.register(FlacEnc::new(44_100, 2, SampleFormat::S16).desc());
+    registry.register(FlacDec::new().desc());
+    registry.register(OggFlacDeframe::new().desc());
+}
+
 /// Byte offset of the STREAMINFO block body within a stream produced by
 /// [`FlacEncoder::new`] (spec §8.2). A two-pass caller writes the finalised body from
 /// [`FlacEncoder::finish`] here to fill in the exact frame sizes and total samples.

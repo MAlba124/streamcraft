@@ -30,11 +30,11 @@
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::format::{Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -90,10 +90,19 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+/// The target output rate in Hz (spec: Plugins — `parse("audioresample rate=48000")`).
+/// Structural (`live: false`): the engine is built around it in `start()`. The input
+/// rate is discovered from caps; this is only the *output* rate.
+static PROPS: [PropDesc; 1] = [PropDesc {
+    name: "rate",
+    allowed: Constraint::Any,
+    live: false,
+}];
+
 static DESC: ElementDesc = ElementDesc {
     name: "audioresample",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     // Passive: a pure transform that inlines into the upstream group (spec: Scheduling).
     sched: SchedHint::Passive,
     inputs: InputPolicy::Single,
@@ -105,7 +114,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default target 48 kHz; override via the `rate` prop at parse time.
+    make_default: Some(|| Box::new(AudioResample::new(48_000))),
 };
 
 /// Per-channel streaming resamplers plus the shared input geometry, built once the input format
@@ -353,6 +363,12 @@ impl Element for AudioResample {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // A parsed `rate=` overrides the constructor target rate (spec: Plugins).
+        if let Some(Value::Int(r)) = ctx.prop("rate") {
+            if r > 0 {
+                self.target_rate = r as u32;
+            }
+        }
         // Link-time negotiation may already have fixed the sink format; infer the input now so a
         // statically-negotiated graph needs no runtime event.
         self.learn_from_sink(ctx);

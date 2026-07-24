@@ -28,11 +28,11 @@
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::format::{Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -84,10 +84,20 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+/// The target sample format (spec: Plugins — `parse("audioconvert format=s16")`); an
+/// interned `audio/raw` sample-format name (`u8`/`s16`/`s24`/`s32`/`f32`). Structural
+/// (`live: false`): read once in `start()`. The input format is still discovered from
+/// caps; only the *output* representation is this knob.
+static PROPS: [PropDesc; 1] = [PropDesc {
+    name: "format",
+    allowed: Constraint::Any,
+    live: false,
+}];
+
 static DESC: ElementDesc = ElementDesc {
     name: "audioconvert",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     // Passive: a pure transform that inlines into the upstream group (spec: Scheduling).
     sched: SchedHint::Passive,
     inputs: InputPolicy::Single,
@@ -97,7 +107,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default target S16; override via the `format` prop at parse time.
+    make_default: Some(|| Box::new(AudioConvert::new(SampleFormat::S16))),
 };
 
 /// Converts interleaved PCM to a fixed target [`SampleFormat`], preserving rate and channels.
@@ -276,6 +287,13 @@ impl Element for AudioConvert {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // A parsed `format=` overrides the constructor target (spec: Plugins — the
+        // interned sample-format name resolved off the value vocabulary).
+        if let Some(Value::Id(id)) = ctx.prop("format") {
+            if let Some(sf) = ctx.value_name(id).and_then(SampleFormat::from_caps_name) {
+                self.target = sf;
+            }
+        }
         // Link-time negotiation may already have fixed the sink format; infer the input
         // format now so a statically-negotiated graph needs no runtime event.
         self.learn_from_sink(ctx);

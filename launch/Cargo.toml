@@ -1,0 +1,21 @@
+[package]
+name = "scraft-launch"
+description = "gst-launch-style parse-launch runner for streamcraft (spec: Plugins)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "scraft-launch"
+path = "src/main.rs"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+# Every crate that exposes `register(&mut Registry)`; the binary aggregates them into
+# one registry (spec: Plugins). pipewire is intentionally omitted — it pulls a heavy
+# native libpipewire dependency the launch tool has no need for.
+streamcraft-elements = { path = "../elements" }
+streamcraft-audio = { path = "../audio" }
+sc-flac = { path = "../flac" }
+sc-ogg = { path = "../ogg" }

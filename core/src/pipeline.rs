@@ -247,6 +247,13 @@ impl Pipeline {
 
     /// Elements arrive already constructed: `pipeline.add(FileSrc::new(path))`.
     pub fn add(&mut self, element: impl Element + 'static) -> ElementId {
+        self.add_boxed(Box::new(element))
+    }
+
+    /// Add an already-boxed element (spec: Plugins — the parse layer builds elements by
+    /// name via `ElementDesc::make_default`, which yields a `Box<dyn Element>`). The
+    /// typed [`add`](Self::add) is the primary path; this is its type-erased twin.
+    pub fn add_boxed(&mut self, element: Box<dyn Element>) -> ElementId {
         let id = ElementId(self.elements.len() as u32);
         let desc = element.desc();
         self.descs.push(desc);
@@ -255,7 +262,7 @@ impl Pipeline {
         // element properties; Taps). Counters are cumulative across runs.
         self.props.push(Arc::new(PropTable::new(desc.props.len())));
         self.counters.push(Arc::new(ElementCounters::default()));
-        self.elements.push(Some(Box::new(element)));
+        self.elements.push(Some(element));
         self.dyn_pads.push(Vec::new());
         id
     }
@@ -920,6 +927,37 @@ impl Pipeline {
     pub fn set(&mut self, el: ElementId, prop: &str, v: Value) -> Result<(), Error> {
         let desc = self.descs.get(el.0 as usize).ok_or(Error::Todo("set: unknown element"))?;
         validate_and_set(el, desc, &self.props[el.0 as usize], prop, v, false)
+    }
+
+    /// Set a **string-valued** property (spec: Plugins — file paths ride `Value::Id`).
+    /// `Value` has no string variant by design (it is POD, memcmp-comparable), so a
+    /// string property is interned through this pipeline's value interner *here*, at set
+    /// time, and stored as the resulting [`Value::Id`]. Because interning happens before
+    /// `run()`, the string is in the value vocabulary snapshot the run reads, so the
+    /// element resolves it in `start()` via
+    /// [`ctx.value_name(id)`](crate::ctx::Ctx::value_name). Delegates to the validated
+    /// [`set`](Self::set), so the property's declared constraint still gates it (use
+    /// `Constraint::Any` for free-form paths).
+    pub fn set_str(&mut self, el: ElementId, prop: &str, s: &str) -> Result<(), Error> {
+        let id = ValueId(self.values.intern(s));
+        self.set(el, prop, Value::Id(id))
+    }
+
+    /// The current value of an element's property, if set (spec: Dynamic element
+    /// properties). Reads the same mailbox the element reads; for tests and tools
+    /// inspecting a parsed pipeline before `run()`. A string set via
+    /// [`set_str`](Self::set_str) reads back as a [`Value::Id`] — resolve it with
+    /// [`value_name`](Self::value_name).
+    pub fn prop_value(&self, el: ElementId, prop: &str) -> Option<Value> {
+        let desc = self.descs.get(el.0 as usize)?;
+        let idx = desc.props.iter().position(|p| p.name == prop)?;
+        self.props.get(el.0 as usize)?.get(idx)
+    }
+
+    /// Resolve an interned categorical/string value id back to its name (spec: Formats —
+    /// the value interner). Reverses a [`set_str`](Self::set_str) for tools and tests.
+    pub fn value_name(&self, id: ValueId) -> Option<&str> {
+        self.values.resolve(id.0)
     }
 
     /// A cloneable handle to set **live** properties from another thread while
