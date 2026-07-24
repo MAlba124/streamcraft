@@ -12,12 +12,15 @@
 //!   [`Ctx::announce_format`], so its own downstream re-fixates (spec: dynamic caps — the
 //!   producer side, using the `&'static` field/value names the scheduler resolves).
 //! * It learns its **input** format from the negotiated caps on the sink pad (spec: dynamic
-//!   caps — the consumer side). The rate and channels ride a `FormatChange`/negotiated
-//!   [`FixedFormat`] as plain [`Value::Int`]s and are read positionally (the sample id is
-//!   interned and cannot be reversed from an element until [`Ctx`] exposes the interners —
-//!   see the note on [`AudioConvert::new`]). For a fully-pinned, upstream-independent input —
-//!   which is what tests and statically-wired graphs use — construct with
-//!   [`AudioConvert::with_input`].
+//!   caps — the consumer side). Every field is read **by name** off the negotiated
+//!   [`FixedFormat`] through the shared [`Vocabulary`](streamcraft_core::format::Vocabulary):
+//!   `ctx.field_id("rate")` resolves the field id, `f.get(id)` the value, and
+//!   `ctx.value_name(id)` reverses the interned `sample` id back to a caps name (the same
+//!   pattern `flacdec` and `pipewireaudiosink` use). So [`AudioConvert::new`] **infers** the
+//!   full input [`AudioFormat`] — rate, channels *and* sample format — with no out-of-band
+//!   hint, whenever the sink carries a concrete `audio/raw` format (a link-time-fixed edge,
+//!   or a runtime `FormatChange` delivered to this element). [`AudioConvert::with_input`]
+//!   remains for callers that already know the input format and want it pinned up front.
 //!
 //! If the input sample format already equals the target, the payload passes through byte for
 //! byte (the announcement still fires, so downstream sees the format).
@@ -29,7 +32,7 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc};
+use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
@@ -115,10 +118,12 @@ pub struct AudioConvert {
     carry: Vec<u8>,
     /// Reused conversion output buffer, so steady-state conversion does not allocate.
     scratch: Vec<u8>,
-    /// The `(rate, channels)` recovered from negotiated caps when only those are readable
-    /// (the runtime-caps path, sample format still pending an id→name accessor on [`Ctx`]).
-    /// Used so [`output_format`](AudioConvert::output_format) reports the negotiated
-    /// rate/channels even before a full input format is pinned.
+    /// The `(rate, channels)` recovered from negotiated caps when the sample format is not
+    /// (yet) resolvable — e.g. the vocabulary is present but the negotiated `sample` id has
+    /// no name, or the edge fixed rate/channels but left `sample` open. Used so
+    /// [`output_format`](AudioConvert::output_format) reports the negotiated rate/channels
+    /// even before a full input format is pinned. Once all three fields resolve, `input` is
+    /// set and this is redundant.
     partial_in: Option<(u32, u16)>,
 }
 
@@ -126,16 +131,22 @@ impl AudioConvert {
     /// A converter targeting `target`, discovering its input format at runtime from the
     /// upstream's negotiated `audio/raw` caps (spec: dynamic caps — consumer side).
     ///
-    /// The input **rate** and **channels** are recovered from the negotiated
-    /// [`FixedFormat`] (they are plain [`Value::Int`]s). The input **sample format** is an
-    /// interned categorical id; an element cannot reverse it to a name until [`Ctx`] exposes
-    /// the interning tables (the `&'static`→id direction is already available for
-    /// *announcing*, via [`Ctx::announce_format`]; the id→`&'static` direction that
-    /// consumers need is the natural follow-up). Until then, prefer [`with_input`] whenever
-    /// the input format is known to the caller, which is the case for tests and every
-    /// statically-wired graph.
+    /// The whole input [`AudioFormat`] — **rate**, **channels** *and* **sample format** — is
+    /// read by name off the negotiated [`FixedFormat`] via the shared
+    /// [`Vocabulary`](streamcraft_core::format::Vocabulary): `ctx.field_id("rate")` /
+    /// `"channels"` / `"sample"`, then `ctx.value_name(id)` reverses the interned `sample` id
+    /// to its caps name (the [`flacdec`]/[`pipewireaudiosink`] pattern). No out-of-band hint
+    /// is needed; it works the moment the sink carries a concrete `audio/raw` format (a
+    /// link-time-fixed edge, read in [`start`], or a runtime `FormatChange`, read in
+    /// [`event`]/[`process`]). Use [`with_input`] to pin a known input format up front
+    /// instead.
     ///
     /// [`with_input`]: AudioConvert::with_input
+    /// [`start`]: Element::start
+    /// [`event`]: Element::event
+    /// [`process`]: Element::process
+    /// [`flacdec`]: https://docs.rs/sc-flac
+    /// [`pipewireaudiosink`]: https://docs.rs/sc-pipewire
     pub fn new(target: SampleFormat) -> Self {
         Self {
             target,
@@ -265,11 +276,9 @@ impl Element for AudioConvert {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
-        // Link-time negotiation may already have fixed the sink format; pick up what we can
-        // so a statically-negotiated graph learns rate/channels without a runtime event.
-        if let Some(fixed) = ctx.negotiated(SINK) {
-            self.merge_negotiated(fixed);
-        }
+        // Link-time negotiation may already have fixed the sink format; infer the input
+        // format now so a statically-negotiated graph needs no runtime event.
+        self.learn_from_sink(ctx);
         self.carry.clear();
         Ok(())
     }
@@ -277,9 +286,7 @@ impl Element for AudioConvert {
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
         // Late-arriving caps: an upstream may have announced after `start()`.
         if self.input.is_none() {
-            if let Some(fixed) = ctx.negotiated(SINK) {
-                self.merge_negotiated(fixed);
-            }
+            self.learn_from_sink(ctx);
         }
         // Announce our output format as soon as the input is known (once).
         self.announce_output(ctx);
@@ -317,14 +324,11 @@ impl Element for AudioConvert {
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         // An upstream's runtime format announcement arrives as a FormatChange on our sink
-        // (spec: dynamic caps). The pipeline updates `ctx.negotiated(sink)` before calling
-        // us; read the concrete format from either the event or the negotiated caps.
-        if let Event::FormatChange(fixed) = event {
-            self.merge_negotiated(fixed);
-        } else if self.input.is_none() {
-            if let Some(fixed) = ctx.negotiated(SINK) {
-                self.merge_negotiated(fixed);
-            }
+        // (spec: dynamic caps). The pipeline updates `ctx.negotiated(sink)` *before* calling
+        // us, so the fresh concrete format is already on the sink pad either way — a
+        // FormatChange re-arms inference, and any other event is a cheap no-op once learned.
+        if matches!(event, Event::FormatChange(_)) || self.input.is_none() {
+            self.learn_from_sink(ctx);
         }
         Ok(())
     }
@@ -338,38 +342,55 @@ impl Element for AudioConvert {
 }
 
 impl AudioConvert {
-    /// Recover the input rate and channels from a negotiated `audio/raw` [`FixedFormat`],
-    /// caching them so [`output_format`](AudioConvert::output_format) and diagnostics reflect
-    /// the negotiated stream even on the runtime-caps path. A pinned input (from
-    /// [`with_input`](AudioConvert::with_input)) always wins and short-circuits.
+    /// Infer the input [`AudioFormat`] from the `audio/raw` [`FixedFormat`] currently
+    /// negotiated on the sink pad, reading every field **by name** through the shared
+    /// vocabulary (spec: Formats — an element acts on its caps). A pinned input (from
+    /// [`with_input`](AudioConvert::with_input)) or an already-learned one always wins and
+    /// short-circuits.
     ///
-    /// Rate and channels are plain [`Value::Int`]s and ride the format in the canonical
-    /// announcement order `[rate, channels, sample]` (see the src offer and the way decoders
-    /// like `flacdec` announce); [`FixedFormat::fields`] preserves insertion order, so they
-    /// read positionally with no interner. The `sample` id is categorical and cannot be
-    /// reversed to a [`SampleFormat`] from an element yet — that needs the id→name table the
-    /// pipeline holds but does not expose on [`Ctx`] (the announce direction is already
-    /// available; the consume direction is the natural follow-up). Until then this cannot
-    /// finish inferring the input *sample format* from caps, so it records the rate/channels
-    /// as a partial hint and leaves `input` unset; construct with
-    /// [`with_input`](AudioConvert::with_input) to run without an id→name accessor.
-    fn merge_negotiated(&mut self, fixed: &FixedFormat) {
+    /// `rate` and `channels` are plain [`Value::Int`]s; `sample` is an interned categorical
+    /// id reversed to its caps name via [`Ctx::value_name`] and mapped with
+    /// [`SampleFormat::from_caps_name`] — exactly how `flacdec` announces and
+    /// `pipewireaudiosink` consumes. When all three resolve, [`set_input`](Self::set_input)
+    /// pins the format and re-arms the downstream announcement. When only rate/channels are
+    /// readable (no vocabulary yet, an unmapped `sample`, or an edge that left `sample`
+    /// open), they are cached as a [`partial_in`](Self::partial_in) hint so
+    /// [`output_format`](Self::output_format) still reflects the negotiated stream.
+    fn learn_from_sink(&mut self, ctx: &Ctx) {
         if self.input.is_some() {
             return; // pinned or already learned
         }
-        // Positional read of the two integer fields (rate, channels) in announcement order.
-        let ints: Vec<i64> = fixed
-            .fields()
-            .iter()
-            .filter_map(|(_, v)| match v {
-                Value::Int(n) => Some(*n),
+        let Some(fixed) = ctx.negotiated(SINK) else { return };
+
+        let int_field = |name: &str| -> Option<i64> {
+            ctx.field_id(name).and_then(|id| fixed.get(id)).and_then(|v| match v {
+                Value::Int(n) => Some(n),
                 _ => None,
             })
-            .collect();
-        if let (Some(&rate), Some(&channels)) = (ints.first(), ints.get(1)) {
-            if rate > 0 && channels > 0 {
-                self.partial_in = Some((rate as u32, channels as u16));
-            }
+        };
+        let (Some(rate), Some(channels)) = (int_field(FIELD_RATE), int_field(FIELD_CHANNELS))
+        else {
+            return;
+        };
+        if rate <= 0 || channels <= 0 {
+            return;
+        }
+
+        // The categorical `sample` id, reversed to a caps name, then to a `SampleFormat`.
+        let sample = ctx
+            .field_id(FIELD_SAMPLE)
+            .and_then(|id| fixed.get(id))
+            .and_then(|v| match v {
+                Value::Id(vid) => ctx.value_name(vid),
+                _ => None,
+            })
+            .and_then(SampleFormat::from_caps_name);
+
+        match sample {
+            Some(fmt) => self.set_input(AudioFormat::new(rate as u32, channels as u16, fmt)),
+            // Rate/channels known but the sample format is not resolvable yet — record the
+            // partial so output_format reports the negotiated stream; input stays unset.
+            None => self.partial_in = Some((rate as u32, channels as u16)),
         }
     }
 }
