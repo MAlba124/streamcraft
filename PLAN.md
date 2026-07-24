@@ -100,6 +100,22 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > leaky modes + benches) still in flight — leaky-queue integration follows it.
 > Remaining from the sweep: per-buffer mid-batch FormatChange boundaries.
 
+> **Update — session 4b (2026-07-24): remux.** `mkvdemux ! mkvmux` **works** for
+> flac/vp8/vp9: `MkvMux::from_caps()` (now the registry default → `mkvmux` is
+> name-constructible) builds its track from the upstream announcement; flac
+> CodecPrivate is absorbed from the in-band native head with params parsed from
+> STREAMINFO. Core grew `BufferFlags::DELTA`; `MkvDemux` stamps `KEYFRAME`/`DELTA`
+> from the container keyframe bit and the mux preserves it — remuxed video stays
+> seekable. **Vocabulary lesson**: a consumer that *reads* announced fields must
+> declare them in its offers (declaring interns the names `build_fixed` resolves
+> against; a wildcard pad admits everything but interns nothing — the announcement
+> silently fails to build). Remaining for remux: av1 (`av1C` from the Sequence
+> Header OBU), h264/h265 (Annex B → length-prefixed + config record, or a demux
+> passthrough/no-reframe mode — cleaner for remux generally), a frame-preserving
+> demux emission mode (frames bigger than a pool slot arrive split and would mux as
+> several blocks), multi-track fan-in `MkvMux`, and an `mp4 → mkv` test once
+> vp9/av1 passthrough lands end-to-end.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
