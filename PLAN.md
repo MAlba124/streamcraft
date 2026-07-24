@@ -207,11 +207,13 @@ Three loose ends from Stage-0 dynamic caps (see `memory/runtime-caps-gap.md`):
    peer speaks the announced family but no offer admits the values, it's a loud
    `Error::Element` on the bus; a family the peer doesn't offer (a `bytes`-bridge) installs
    tolerantly. Tested in `elements/tests/dynamic_caps.rs`.
-2. ⬜ **Per-buffer mid-batch boundaries**: `FormatChange` is delivered before *all* of a
+2. ◐ **Per-buffer mid-batch boundaries**: `FormatChange` is delivered before *all* of a
    batch's buffers — correct for announce-once-at-start, wrong for a change partway
    through one batch. Split the batch at the event position (needs `events` to carry a
-   batch position). Also open: **intra-group passive `FormatChange`** — a co-grouped
-   passive consumer never sees an upstream's runtime change (only group heads re-fixate).
+   batch position). ✅ **Intra-group passive `FormatChange`** — DONE (session 3c): non-head
+   group members get their input batch's events delivered (with re-validation) before the
+   buffers they precede, so `flacdec ! flacenc` inlined in one group re-fixates correctly
+   (`flac/tests/transcode.rs`).
 3. ✅ **`AudioConvert`'s dynamic consumer path** — DONE. `AudioConvert::new(target)` infers
    the full input format by name off the negotiated caps (`learn_from_sink`); no
    `with_input` needed. (`audioresample` landed alongside.)
