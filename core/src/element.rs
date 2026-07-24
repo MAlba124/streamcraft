@@ -1,7 +1,10 @@
 //! The element contract (spec: Elements and pads; Aggregation). One small
 //! object-safe trait; everything *static* lives in a descriptor, not on the trait.
 
+use std::sync::Arc;
+
 use crate::batch::Inputs;
+use crate::clock::Clock;
 use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::event::Event;
@@ -17,6 +20,16 @@ pub trait Element: Send {
     /// one src pad per discovered stream, then routes to them in `process`.
     fn preroll(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
         Ok(())
+    }
+    /// A clock this element can master the pipeline on (spec: Clocking — "a sink can
+    /// provide a device clock"). `run()` asks every element once, sinks first, before
+    /// sampling the running-time base; the most downstream provider wins, unless the
+    /// application forced a clock via `Pipeline::set_clock`. The default provides
+    /// none. An audio sink returns a clock derived from samples actually played, so
+    /// the whole pipeline paces on the device's true rate instead of the CPU's idea
+    /// of it — the classic audio-master A/V sync arrangement.
+    fn provide_clock(&mut self) -> Option<Arc<dyn Clock>> {
+        None
     }
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error>;
     fn process(&mut self, ctx: &mut Ctx, inputs: Inputs<'_>) -> Result<Flow, Error>;

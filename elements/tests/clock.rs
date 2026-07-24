@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use streamcraft_core::clock::MockClock;
+use streamcraft_core::clock::{Clock, MockClock};
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
 use streamcraft_elements::testing::{TimedTestSink, TimedTestSrc};
@@ -158,4 +158,66 @@ fn two_sinks_share_one_clock_and_stay_in_sync() {
         assert!(ra[i].rendered_at >= ra[i].pts, "A buffer {i} not early");
         assert!(rb[i].rendered_at >= rb[i].pts, "B buffer {i} not early");
     }
+}
+
+#[test]
+fn sink_provided_clock_masters_the_pipeline() {
+    // The audio-master arrangement (spec: Clocking — a sink provides a device
+    // clock): nobody calls `set_clock`, the sink *provides* a MockClock, and the
+    // proof it became the pipeline clock is that advancing it — and nothing else —
+    // releases the sink's one-hour wait. Had run() stayed on the default real
+    // clock, that deadline would sit an hour of wall time away.
+    let device = MockClock::new();
+    let (sink, stats) = TimedTestSink::providing(Arc::new(device.clone()));
+
+    let mut p = Pipeline::new();
+    let src = p.add(TimedTestSrc::new(2, Timestamp::from_secs(3600)));
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).expect("link");
+
+    let run = std::thread::spawn(move || p.run());
+
+    for _ in 0..60 {
+        if run.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!run.is_finished(), "sink not pacing on its provided clock");
+    assert_eq!(stats.count(), 1, "only the running-time-0 buffer rendered");
+
+    device.advance(Timestamp::from_secs(3600));
+    run.join().expect("run joined").expect("run ok");
+    assert_eq!(stats.renders().len(), 2, "provided clock drove the full schedule");
+}
+
+#[test]
+fn forced_clock_beats_a_providing_sink() {
+    // `set_clock` is the application forcing a timebase: the sink still offers its
+    // device clock, but the pipeline must ignore it — only advancing the *forced*
+    // clock completes the run (the provided one never moves at all).
+    let device = MockClock::new();
+    let forced = MockClock::new();
+    let (sink, stats) = TimedTestSink::providing(Arc::new(device.clone()));
+
+    let mut p = Pipeline::new();
+    let src = p.add(TimedTestSrc::new(2, Timestamp::from_secs(3600)));
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).expect("link");
+    p.set_clock(Arc::new(forced.clone()));
+
+    let run = std::thread::spawn(move || p.run());
+
+    for _ in 0..60 {
+        if run.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!run.is_finished(), "parked on the forced clock");
+
+    forced.advance(Timestamp::from_secs(3600));
+    run.join().expect("run joined").expect("run ok");
+    assert_eq!(stats.renders().len(), 2, "forced clock drove the schedule");
+    assert_eq!(device.now(), Timestamp::ZERO, "provided clock was never consulted");
 }

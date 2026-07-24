@@ -229,9 +229,35 @@ enum WaitKind {
     /// Real time: park with a `wait_timeout` sized to `deadline - now`, re-checking
     /// on each wake. `base` measures elapsed time; `wake` carries interrupts.
     Instant { base: Instant, wake: Arc<Wake> },
+    /// External time (a device clock): the timeline advances where no notify can
+    /// come from — e.g. an audio card's real-time callback, which may only bump
+    /// atomics — so the wait parks in `period`-sized `wait_timeout` slices on a
+    /// private station and re-reads `clock.now()` each wake. `period` bounds the
+    /// wake-up latency past the deadline; interrupts land on `wake` as usual.
+    Poll {
+        clock: Arc<dyn Clock>,
+        wake: Arc<Wake>,
+        period: Duration,
+    },
 }
 
 impl ClockWait {
+    /// Build a wait that *polls* an external clock — for [`Clock`] impls whose
+    /// timeline advances where no wakeup can be issued (a device clock fed by an
+    /// audio card's real-time callback, which may only bump atomics). The wait
+    /// re-reads `clock.now()` every `period` while parked, so `period` bounds how
+    /// late past the deadline the waiter can wake; ~1 ms suits A/V sync (frame
+    /// periods are 16 ms+). Use this from such a clock's `new_wait`.
+    pub fn polling(clock: Arc<dyn Clock>, period: Duration) -> ClockWait {
+        ClockWait {
+            kind: WaitKind::Poll {
+                clock,
+                wake: Wake::new(0),
+                period,
+            },
+        }
+    }
+
     /// Block until the clock reaches `deadline`, or an interrupt lands.
     ///
     /// Returns [`WaitOutcome::Reached`] once the bound clock's `now()` is `>=
@@ -243,6 +269,9 @@ impl ClockWait {
         match &self.kind {
             WaitKind::Mock { wake } => Self::wait_mock(wake, deadline),
             WaitKind::Instant { base, wake } => Self::wait_instant(*base, wake, deadline),
+            WaitKind::Poll { clock, wake, period } => {
+                Self::wait_poll(clock, wake, *period, deadline)
+            }
         }
     }
 
@@ -283,13 +312,38 @@ impl ClockWait {
         }
     }
 
+    fn wait_poll(
+        clock: &Arc<dyn Clock>,
+        wake: &Wake,
+        period: Duration,
+        deadline: Timestamp,
+    ) -> WaitOutcome {
+        // `NONE` reads as "infinitely late" via the raw `>=`, as in wait_mock. The
+        // external clock's `now()` must not touch this wait's station (device clocks
+        // read atomics), so calling it under our private lock cannot deadlock.
+        let deadline_ns = deadline.0;
+        let mut state = wake.state.lock().unwrap();
+        loop {
+            if state.interrupted {
+                return WaitOutcome::Interrupted;
+            }
+            if clock.now().0 >= deadline_ns {
+                return WaitOutcome::Reached;
+            }
+            let (guard, _timed_out) = wake.cvar.wait_timeout(state, period).unwrap();
+            state = guard;
+        }
+    }
+
     /// Trip the interrupt latch and promptly unblock the waiter (flush / seek /
     /// shutdown). Sticky: subsequent [`wait_until`](Self::wait_until) calls on this
     /// wait also return [`WaitOutcome::Interrupted`]. Safe to call from any thread,
     /// and idempotent.
     pub fn interrupt(&self) {
         match &self.kind {
-            WaitKind::Mock { wake } | WaitKind::Instant { wake, .. } => wake.interrupt(),
+            WaitKind::Mock { wake }
+            | WaitKind::Instant { wake, .. }
+            | WaitKind::Poll { wake, .. } => wake.interrupt(),
         }
     }
 }
@@ -525,6 +579,42 @@ mod tests {
         assert_eq!(handle.join().unwrap(), WaitOutcome::Interrupted);
         // Promptly: nowhere near the 3600s deadline.
         assert!(start.elapsed() < SANITY, "interrupt was not prompt");
+    }
+
+    #[test]
+    fn poll_wait_reaches_when_external_clock_advances() {
+        // A polling wait deliberately gets NO wakeup from the clock (that's its
+        // point: device clocks advance where no notify can come from). Advance the
+        // clock silently; the poll slices must observe it within the sanity cap.
+        let clock = Arc::new(MockClock::new());
+        let wait = ClockWait::polling(clock.clone(), Duration::from_millis(1));
+        let outcome = within(move || {
+            let handle = thread::spawn(move || wait.wait_until(Timestamp::from_millis(10)));
+            clock.advance(Timestamp::from_millis(10));
+            handle.join().unwrap()
+        });
+        assert_eq!(outcome, WaitOutcome::Reached);
+    }
+
+    #[test]
+    fn poll_wait_past_deadline_returns_immediately_and_interrupt_is_prompt() {
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::starting_at(Timestamp::from_secs(1)));
+        let wait = ClockWait::polling(Arc::clone(&clock), Duration::from_millis(1));
+        assert_eq!(wait.wait_until(Timestamp::ZERO), WaitOutcome::Reached);
+
+        // Far-future deadline on a clock that never moves: only interrupt ends it,
+        // and it must land promptly (not after a poll-period boundary pile-up).
+        let wait = Arc::new(ClockWait::polling(clock, Duration::from_secs(3600)));
+        let waiter = Arc::clone(&wait);
+        let (started_tx, started_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            waiter.wait_until(Timestamp::from_secs(3600))
+        });
+        started_rx.recv().unwrap();
+        thread::yield_now();
+        wait.interrupt();
+        assert_eq!(handle.join().unwrap(), WaitOutcome::Interrupted);
     }
 
     /// The wait is usable behind `&dyn Clock` — the object-safety guarantee the

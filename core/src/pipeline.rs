@@ -164,6 +164,11 @@ pub struct Pipeline {
     /// samples `base_time = clock.now()` at start, then every element shares this one
     /// timeline via `ctx.now()` / `ctx.wait_until()`.
     clock: Arc<dyn Clock>,
+    /// Whether the application forced the clock via [`set_clock`](Self::set_clock).
+    /// When false, [`run`](Self::run) lets the most downstream element that
+    /// [`provide_clock`](crate::element::Element::provide_clock)s master the pipeline
+    /// (spec: Clocking — an audio sink's device clock paces everyone).
+    clock_explicit: bool,
     /// Raw ns of the running-time base sampled by the current/last [`run`](Self::run)
     /// (`u64::MAX` before the first run), shared into [`TapHandle`]s so observers can
     /// window counter deltas over running time (spec: Taps — bitrate is Δbytes/Δt).
@@ -205,6 +210,7 @@ impl Pipeline {
             log_level: None,
             log_queue_cap: 1024,
             clock: Arc::new(InstantClock::new()),
+            clock_explicit: false,
             base_shared: Arc::new(AtomicU64::new(u64::MAX)),
             dyn_pads: Vec::new(),
             pool_overrides: Vec::new(),
@@ -218,13 +224,16 @@ impl Pipeline {
         self.reactor_factory = Some(factory);
     }
 
-    /// Install the pipeline clock (spec: Clocking and synchronization), replacing the
+    /// Force the pipeline clock (spec: Clocking and synchronization), replacing the
     /// default real [`InstantClock`] — e.g. a `MockClock` for deterministic,
-    /// time-compressed tests, or (later) a clock a sink slaves to its device. Takes
-    /// effect at the next [`run`](Self::run), which samples the running-time base from
-    /// it; call before `run()`.
+    /// time-compressed tests. Takes effect at the next [`run`](Self::run), which
+    /// samples the running-time base from it; call before `run()`. A forced clock
+    /// also wins over any element-provided one (see
+    /// [`Element::provide_clock`](crate::element::Element::provide_clock)); without
+    /// it, `run()` prefers the most downstream provider — the audio-master case.
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = clock;
+        self.clock_explicit = true;
     }
 
     /// A handle to stop this pipeline from another thread (or a signal handler)
@@ -548,6 +557,20 @@ impl Pipeline {
     /// joins them all, and returns the first error (if any).
     pub fn run(&mut self) -> Result<(), Error> {
         self.stop.store(false, Ordering::Release);
+        let order = self.topo_order()?;
+        // Clock selection (spec: Clocking): a clock forced by `set_clock` wins;
+        // otherwise the most downstream element offering one masters the pipeline —
+        // walked sinks-first so an audio sink's device clock beats anything upstream.
+        if !self.clock_explicit {
+            for id in order.iter().rev() {
+                if let Some(el) = self.elements[id.0 as usize].as_mut() {
+                    if let Some(c) = el.provide_clock() {
+                        self.clock = c;
+                        break;
+                    }
+                }
+            }
+        }
         // Sample the running-time base once, at the instant the pipeline starts (spec:
         // Clocking — running time = clock.now() - base_time). The clock and base are
         // shared into every group so all elements share one timeline.
@@ -555,7 +578,6 @@ impl Pipeline {
         let base_time = clock.now();
         // Publish the base so TapHandles can window counter deltas over running time.
         self.base_shared.store(base_time.0, Ordering::Release);
-        let order = self.topo_order()?;
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
         let total = self.elements.len();

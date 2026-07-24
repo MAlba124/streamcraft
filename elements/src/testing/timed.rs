@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use streamcraft_core::batch::Inputs;
-use streamcraft_core::clock::WaitOutcome;
+use streamcraft_core::clock::{Clock, WaitOutcome};
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
@@ -183,6 +183,7 @@ impl TimedSinkStats {
 /// so it paces the whole chain via backpressure exactly as a real device sink does.
 pub struct TimedTestSink {
     shared: Arc<SinkShared>,
+    provided: Option<Arc<dyn Clock>>,
 }
 
 impl TimedTestSink {
@@ -196,13 +197,27 @@ impl TimedTestSink {
             interrupted: AtomicBool::new(false),
         });
         let stats = TimedSinkStats(Arc::clone(&shared));
-        (Self { shared }, stats)
+        (Self { shared, provided: None }, stats)
+    }
+
+    /// Like [`new`](Self::new), but the sink also *provides* `clock` to the pipeline
+    /// (spec: Clocking — a device sink offers its own timebase; unless the
+    /// application forced one via `set_clock`, `run()` masters the pipeline on it).
+    /// The sink then waits on the very clock it provided — the audio-master shape.
+    pub fn providing(clock: Arc<dyn Clock>) -> (Self, TimedSinkStats) {
+        let (mut sink, stats) = Self::new();
+        sink.provided = Some(clock);
+        (sink, stats)
     }
 }
 
 impl Element for TimedTestSink {
     fn desc(&self) -> &'static ElementDesc {
         &SINK_DESC
+    }
+
+    fn provide_clock(&mut self) -> Option<Arc<dyn Clock>> {
+        self.provided.clone()
     }
 
     fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {

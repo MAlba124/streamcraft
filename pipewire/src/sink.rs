@@ -23,6 +23,7 @@ use pw::spa::pod::Pod;
 use pw::spa::sys as spa_sys;
 
 use streamcraft_core::batch::Inputs;
+use streamcraft_core::clock::{Clock, ClockWait};
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
@@ -177,6 +178,7 @@ fn run_pw(
                         } else {
                             consumer.pull(&mut slice[..n]);
                             pb.frames.fetch_add((n / stride) as u64, Ordering::Relaxed);
+                            pb.clock_frames.fetch_add((n / stride) as u64, Ordering::Relaxed);
                         }
                         n
                     } else {
@@ -268,7 +270,11 @@ fn run_pw(
 struct Playback {
     paused: AtomicBool,
     frames: AtomicU64, // whole interchannel frames the device has rendered
-    rate: AtomicU32,   // sample rate, published once at configure
+    /// Frames rendered since the device started, *never* re-based by seeks (unlike
+    /// `frames`, which tracks stream position): the monotonic timebase behind
+    /// [`AudioDeviceClock`]. Pausing stops it — and with it the pipeline clock.
+    clock_frames: AtomicU64,
+    rate: AtomicU32, // sample rate, published once at configure
     /// Set on seek; the RT callback flushes the PipeWire stream (drops the buffers already
     /// committed downstream — notably the rate-converter's, when the device rate differs from
     /// the stream's) so the new position is audible promptly instead of after that buffer.
@@ -306,6 +312,35 @@ impl AudioControl {
         } else {
             self.pb.frames.load(Ordering::Relaxed) as f64 / rate as f64
         }
+    }
+}
+
+/// The audio device as a [`Clock`] (spec: Clocking — a sink provides a device
+/// clock): `now()` is nanoseconds of audio the hardware has *actually rendered*
+/// (`clock_frames / rate`), so a pipeline mastered on it paces to the DAC's true
+/// rate — the audio-master A/V-sync arrangement. It reads zero until the device is
+/// configured and running, stops while paused (video freezes with the audio, as it
+/// should), and is never re-based by seeks. Waits against it poll (~1 ms slices):
+/// the RT callback only bumps atomics and can never notify a waiter.
+pub struct AudioDeviceClock {
+    pb: Arc<Playback>,
+}
+
+impl Clock for AudioDeviceClock {
+    fn now(&self) -> Timestamp {
+        let rate = self.pb.rate.load(Ordering::Relaxed);
+        if rate == 0 {
+            return Timestamp::ZERO;
+        }
+        let frames = self.pb.clock_frames.load(Ordering::Relaxed) as u128;
+        Timestamp::from_nanos((frames * 1_000_000_000 / rate as u128) as u64)
+    }
+
+    fn new_wait(&self) -> ClockWait {
+        ClockWait::polling(
+            Arc::new(AudioDeviceClock { pb: Arc::clone(&self.pb) }),
+            std::time::Duration::from_millis(1),
+        )
     }
 }
 
@@ -401,6 +436,13 @@ fn int_value(v: Value) -> Option<i64> {
 impl Element for PipeWireAudioSink {
     fn desc(&self) -> &'static ElementDesc {
         &DESC
+    }
+
+    fn provide_clock(&mut self) -> Option<Arc<dyn Clock>> {
+        // Master the pipeline on the DAC's rendered-frame count (unless the app
+        // forced a clock). Offered before the device is configured; the clock just
+        // reads zero until audio actually starts flowing.
+        Some(Arc::new(AudioDeviceClock { pb: Arc::clone(&self.playback) }))
     }
 
     fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
