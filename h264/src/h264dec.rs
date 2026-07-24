@@ -25,6 +25,8 @@
 //! re-primes SPS/PPS + the reference DPB); EOS flushes the DPB so trailing
 //! reordered pictures are not lost.
 
+use std::collections::VecDeque;
+
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 use oxideav_core::{CodecId, Decoder, Error as OxError, Frame, Packet, TimeBase, VideoFrame};
@@ -122,17 +124,25 @@ pub struct H264Dec {
     dec: H264CodecDecoder,
     announced: bool,
     pending: Option<PendingFrame>,
-    /// The pts of the access unit currently being fed. H.264 output is in
-    /// **display order** and one access unit may yield zero or several frames
-    /// (reordering / DPB delay), so a naive input-pts→output-frame pairing is
-    /// wrong. v1 policy (documented, honest): stamp each emitted frame with the
-    /// pts of the access unit whose `send_packet` produced it. For streams
-    /// without B-frames (Baseline, or Main/High with `max_num_reorder_frames ==
-    /// 0`) that is the exact display pts; for reordered streams it is the
-    /// decode-order pts and downstream A/V sync should prefer container-supplied
-    /// display timestamps until a full DTS/PTS reorder buffer lands (backlog).
-    feed_pts: Timestamp,
-    feed_duration: Timestamp,
+    /// FIFO of `(pts, duration)` for access units fed but not yet paired with an
+    /// output picture. The backing decoder emits pictures in **display (POC)
+    /// order** after §C.4 DPB bumping, and DPB delay means a picture is usually
+    /// released several access units after the one that coded it (and at EOS
+    /// several are drained at once) — so an emit-time "use the last fed pts" model
+    /// is wrong. Instead each `send_packet` enqueues its access unit's timing, and
+    /// each emitted frame dequeues the **head**.
+    ///
+    /// Correctness of this pairing: for streams **without reordering** (Baseline,
+    /// or Main/High with `max_num_reorder_frames == 0`) display order equals feed
+    /// order, so head-of-FIFO is the exact display timestamp. For **reordered**
+    /// (B-frame) streams the picture order and the feed order differ, so a frame
+    /// is paired with a feed-order timestamp — a documented v1 caveat: downstream
+    /// A/V sync should prefer container-supplied display timestamps until a proper
+    /// DTS→PTS reorder buffer lands (backlog). One access unit yielding several
+    /// pictures, or none, is handled naturally: the FIFO empties/refills as frames
+    /// are pulled; if it underflows (more pictures than fed units, e.g. a gap-fill)
+    /// the frame carries `Timestamp::NONE` rather than a stale stamp.
+    pts_fifo: VecDeque<(Timestamp, Timestamp)>,
 }
 
 impl H264Dec {
@@ -141,8 +151,7 @@ impl H264Dec {
             dec: H264CodecDecoder::new(CodecId::new("h264")),
             announced: false,
             pending: None,
-            feed_pts: Timestamp::NONE,
-            feed_duration: Timestamp::ZERO,
+            pts_fifo: VecDeque::new(),
         }
     }
 
@@ -279,10 +288,16 @@ impl H264Dec {
             }
             match self.dec.receive_frame() {
                 Ok(Frame::Video(vf)) => {
+                    // Pair this display-order picture with the head of the
+                    // feed-order pts FIFO (see `pts_fifo` for the reorder caveat).
+                    let (pts, duration) = self
+                        .pts_fifo
+                        .pop_front()
+                        .unwrap_or((Timestamp::NONE, Timestamp::ZERO));
                     self.pending = Some(PendingFrame {
                         frame: vf,
-                        pts: self.feed_pts,
-                        duration: self.feed_duration,
+                        pts,
+                        duration,
                     });
                 }
                 // A non-video frame from an H.264 stream should not happen; skip
@@ -331,14 +346,13 @@ impl Element for H264Dec {
                 return Ok(Flow::Ok);
             }
             let Some(inbuf) = inputs.pop() else { break };
-            self.feed_pts = inbuf.pts;
-            self.feed_duration = inbuf.duration;
             // One Annex B access unit per buffer. `TimeBase` here is cosmetic —
             // streamcraft carries timing on the buffer, not the packet — so a
             // unit base keeps the library's internal pts rescale a no-op.
             let packet = Packet::new(0, TimeBase::new(1, 1), inbuf.memory.data().to_vec());
             if let Err(e) = self.dec.send_packet(&packet) {
-                // Per-buffer error scope (spec: Supervision).
+                // Per-buffer error scope (spec: Supervision). A rejected access
+                // unit contributes no picture, so it also contributes no pts.
                 let element = ctx.element();
                 ctx.post(BusMessage::Warning {
                     element,
@@ -349,6 +363,8 @@ impl Element for H264Dec {
                 });
                 continue;
             }
+            // Accepted: remember its timing for the picture(s) it will produce.
+            self.pts_fifo.push_back((inbuf.pts, inbuf.duration));
         }
         Ok(Flow::Ok)
     }
@@ -362,6 +378,7 @@ impl Element for H264Dec {
             // stale-state risk and is not on a hot path.
             Event::FlushStart => {
                 self.pending = None;
+                self.pts_fifo.clear();
                 self.dec = H264CodecDecoder::new(CodecId::new("h264"));
                 // `announced` is intentionally NOT cleared: dimensions do not
                 // change across a seek within one stream, and re-announcing an
