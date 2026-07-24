@@ -86,6 +86,20 @@ impl Element for FileSink {
                 self.path = PathBuf::from(s);
             }
         }
+        // Unlink an existing regular file instead of truncating over it. Truncating a
+        // large file frees its extents *synchronously through the journal*, and the new
+        // run's first writes then stall behind that commit — measured on ext4-on-LUKS:
+        // back-to-back 1.4 GB remuxes to the same path froze ~1.5–3 s at ~5 MiB, while
+        // unlink-first runs were stall-free (the unlinked inode frees lazily via the
+        // orphan list, off the writer's path). Symlinks are left alone (removing one
+        // would unlink the link, not the target — truncate-through keeps that
+        // behavior), and errors are ignored — `create` surfaces anything real.
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(m) if m.file_type().is_file() => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            _ => {}
+        }
         let f = File::create(&self.path)
             .map_err(|e| Error::Resource(format!("create {}: {e}", self.path.display())))?;
         self.file = ctx.io().register(f);
