@@ -195,6 +195,17 @@ impl Memory {
     pub fn set_len(&mut self, n: usize) {
         self.len = n.min(self.capacity());
     }
+
+    /// Move the payload out, leaving a dead husk behind (len 0, no backing slot —
+    /// recycles nothing on drop). O(1); lets a SoA batch column hand out its front
+    /// buffer without shifting the tail (spec: Batching — queued hop budget).
+    pub(crate) fn take(&mut self) -> Memory {
+        Memory {
+            buf: self.buf.take(),
+            len: std::mem::replace(&mut self.len, 0),
+            pool: Arc::clone(&self.pool),
+        }
+    }
 }
 
 impl Drop for Memory {

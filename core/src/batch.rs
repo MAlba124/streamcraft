@@ -14,18 +14,27 @@ use crate::memory::Memory;
 use crate::time::Timestamp;
 
 /// Owned SoA storage for a span of buffers. Format-homogeneous.
+///
+/// Columns are private: consumed rows sit *before* the drain cursor (`head`), so
+/// raw column access would see them. Read through [`view`](Self::view), drain
+/// through [`pop_front`](Self::pop_front).
 pub struct Batch {
     pub format: FormatId,
-    pub memories: Vec<Memory>,
-    pub pts: Vec<Timestamp>,
-    pub durations: Vec<Timestamp>,
-    pub flags: Vec<BufferFlags>,
-    pub metas: Vec<Option<MetaRef>>,
+    memories: Vec<Memory>,
+    pts: Vec<Timestamp>,
+    durations: Vec<Timestamp>,
+    flags: Vec<BufferFlags>,
+    metas: Vec<Option<MetaRef>>,
+    /// Drain cursor: rows before it have been handed out by [`pop_front`](Self::pop_front)
+    /// (their `Memory` moved out, a dead husk left in the column). Popping is O(1) —
+    /// no per-buffer column shifting (spec: Batching — queued hop budget). The columns
+    /// compact (reset) when the last row is popped.
+    head: usize,
     /// In-band events riding with this span, delivered to the downstream element's
     /// `event()` at the batch boundary *before* its buffers (spec: Events travel with
     /// buffers through the same queues). A `FormatChange` here is how a decoder announces
     /// a runtime format to its peer (spec: Formats — dynamic caps). Usually empty.
-    pub events: Vec<Event>,
+    events: Vec<Event>,
     /// The seek generation this span was produced under (spec: flush/seek). The scheduler
     /// stamps it on each batch crossing a ring and drops any batch whose generation is
     /// older than the current one on the consuming side — so a seek can discard the data
@@ -43,32 +52,39 @@ impl Batch {
             durations: Vec::new(),
             flags: Vec::new(),
             metas: Vec::new(),
+            head: 0,
             events: Vec::new(),
             seek_gen: 0,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.memories.len()
+        self.memories.len() - self.head
     }
 
     pub fn is_empty(&self) -> bool {
-        self.memories.is_empty()
+        self.head == self.memories.len()
     }
 
-    /// Total used bytes across all buffers in the batch (for counters).
+    /// Total used bytes across all (undrained) buffers in the batch (for counters).
     pub fn total_bytes(&self) -> u64 {
-        self.memories.iter().map(|m| m.len() as u64).sum()
+        self.memories[self.head..].iter().map(|m| m.len() as u64).sum()
     }
 
     /// Clear all columns, retaining capacity (drops the `Memory`s → recycled).
     pub fn clear(&mut self) {
+        self.reset_columns();
+        self.events.clear();
+    }
+
+    /// Clear the data columns (not the events), resetting the drain cursor.
+    fn reset_columns(&mut self) {
         self.memories.clear();
         self.pts.clear();
         self.durations.clear();
         self.flags.clear();
         self.metas.clear();
-        self.events.clear();
+        self.head = 0;
     }
 
     /// Append one buffer, decomposing it into the SoA columns.
@@ -81,32 +97,40 @@ impl Batch {
         // buf.dts / buf.format / buf.sync are not carried per-row in milestone 1.
     }
 
-    /// Take the oldest buffer (FIFO), reconstructing it from the columns.
+    /// Take the oldest buffer (FIFO), reconstructing it from the columns. O(1): the
+    /// drain cursor advances and the row's `Memory` is moved out; nothing shifts.
     pub fn pop_front(&mut self) -> Option<Buffer> {
-        if self.memories.is_empty() {
+        if self.head == self.memories.len() {
             return None;
         }
-        let _ = self.metas.remove(0);
-        Some(Buffer {
-            memory: self.memories.remove(0),
-            pts: self.pts.remove(0),
+        let i = self.head;
+        self.head += 1;
+        let buf = Buffer {
+            memory: self.memories[i].take(),
+            pts: self.pts[i],
             dts: Timestamp::NONE,
-            duration: self.durations.remove(0),
-            flags: self.flags.remove(0),
+            duration: self.durations[i],
+            flags: self.flags[i],
             format: self.format,
             sync: None,
-        })
+        };
+        if self.head == self.memories.len() {
+            self.reset_columns(); // fully drained — drop the husks, reuse capacity
+        }
+        Some(buf)
     }
 
-    /// Move all buffers out of `other` (leaving it empty) onto the end of `self`,
-    /// carrying its in-band events too so they stay ordered with the data.
+    /// Move all (undrained) buffers out of `other` (leaving it empty) onto the end of
+    /// `self`, carrying its in-band events too so they stay ordered with the data.
     pub fn append(&mut self, other: &mut Batch) {
-        self.memories.append(&mut other.memories);
-        self.pts.append(&mut other.pts);
-        self.durations.append(&mut other.durations);
-        self.flags.append(&mut other.flags);
-        self.metas.append(&mut other.metas);
+        let h = other.head;
+        self.memories.extend(other.memories.drain(h..));
+        self.pts.extend_from_slice(&other.pts[h..]);
+        self.durations.extend_from_slice(&other.durations[h..]);
+        self.flags.extend_from_slice(&other.flags[h..]);
+        self.metas.extend_from_slice(&other.metas[h..]);
         self.events.append(&mut other.events);
+        other.reset_columns();
     }
 
     /// Attach an in-band event to this span (spec: Events travel with buffers).
@@ -122,17 +146,18 @@ impl Batch {
     /// Whether this batch carries no buffers *and* no events (so pushing it downstream
     /// would be a no-op).
     pub fn is_inert(&self) -> bool {
-        self.memories.is_empty() && self.events.is_empty()
+        self.is_empty() && self.events.is_empty()
     }
 
+    /// The undrained rows, as parallel SoA slices.
     pub fn view(&self) -> BatchRef<'_> {
         BatchRef {
             format: self.format,
-            memories: &self.memories,
-            pts: &self.pts,
-            durations: &self.durations,
-            flags: &self.flags,
-            metas: &self.metas,
+            memories: &self.memories[self.head..],
+            pts: &self.pts[self.head..],
+            durations: &self.durations[self.head..],
+            flags: &self.flags[self.head..],
+            metas: &self.metas[self.head..],
         }
     }
 }
@@ -224,5 +249,111 @@ impl<'a> Inputs<'a> {
     /// Borrow the inputs without taking ownership (for passive read-only elements).
     pub fn view(&self) -> Option<BatchRef<'_>> {
         self.batch.as_ref().map(|b| b.view())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::Pool;
+
+    fn buf(pool: &Pool, fill: u8, len: usize) -> Buffer {
+        let mut memory = pool.acquire();
+        memory.as_mut_full()[..len].fill(fill);
+        memory.set_len(len);
+        Buffer {
+            memory,
+            pts: Timestamp::from_nanos(fill as u64),
+            dts: Timestamp::NONE,
+            duration: Timestamp::NONE,
+            flags: BufferFlags::empty(),
+            format: FormatId(0),
+            sync: None,
+        }
+    }
+
+    #[test]
+    fn pop_front_is_fifo_and_view_tracks_the_cursor() {
+        let pool = Pool::bounded(64, 8);
+        let mut b = Batch::new(FormatId(0));
+        for (fill, len) in [(1u8, 10usize), (2, 20), (3, 30)] {
+            b.push(buf(&pool, fill, len));
+        }
+        assert_eq!(b.len(), 3);
+        assert_eq!(b.total_bytes(), 60);
+
+        let first = b.pop_front().unwrap();
+        assert_eq!(first.memory.data()[0], 1, "FIFO: oldest first");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.total_bytes(), 50, "drained rows don't count");
+        let v = b.view();
+        assert_eq!(v.len(), 2, "view starts at the cursor");
+        assert_eq!(v.memories[0].data()[0], 2);
+        assert_eq!(v.pts[0], Timestamp::from_nanos(2));
+
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 2);
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 3);
+        assert!(b.pop_front().is_none());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn drained_memory_recycles_immediately() {
+        // The popped buffer owns the payload; the husk left in the column must not
+        // pin the pool slot (a bounded pool would otherwise starve mid-drain).
+        let pool = Pool::bounded(64, 2);
+        let mut b = Batch::new(FormatId(0));
+        b.push(buf(&pool, 1, 1));
+        b.push(buf(&pool, 2, 1));
+        assert!(pool.try_acquire().is_none(), "pool exhausted");
+        let first = b.pop_front().unwrap();
+        drop(first); // recycles even though the batch still holds the husk row
+        assert!(pool.try_acquire().is_some(), "slot came back while batch part-drained");
+    }
+
+    #[test]
+    fn push_after_partial_drain_appends_undrained() {
+        let pool = Pool::bounded(64, 8);
+        let mut b = Batch::new(FormatId(0));
+        b.push(buf(&pool, 1, 1));
+        b.push(buf(&pool, 2, 1));
+        let _ = b.pop_front();
+        b.push(buf(&pool, 3, 1));
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 2);
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 3);
+        assert!(b.pop_front().is_none());
+    }
+
+    #[test]
+    fn append_moves_only_undrained_rows_and_events() {
+        let pool = Pool::bounded(64, 8);
+        let mut a = Batch::new(FormatId(0));
+        let mut b = Batch::new(FormatId(0));
+        b.push(buf(&pool, 1, 1));
+        b.push(buf(&pool, 2, 1));
+        b.push(buf(&pool, 3, 1));
+        let _ = b.pop_front(); // 1 is gone
+        b.push_event(Event::Eos);
+        a.append(&mut b);
+        assert!(b.is_empty() && b.take_events().is_empty(), "source emptied");
+        assert_eq!(a.len(), 2, "only undrained rows moved");
+        assert_eq!(a.take_events().len(), 1, "events ride along");
+        assert_eq!(a.pop_front().unwrap().memory.data()[0], 2);
+        assert_eq!(a.pop_front().unwrap().memory.data()[0], 3);
+    }
+
+    #[test]
+    fn clear_resets_cursor_and_recycles() {
+        let pool = Pool::bounded(64, 2);
+        let mut b = Batch::new(FormatId(0));
+        b.push(buf(&pool, 1, 1));
+        b.push(buf(&pool, 2, 1));
+        let _ = b.pop_front();
+        b.clear();
+        assert!(b.is_empty());
+        assert!(pool.try_acquire().is_some(), "clear recycled the undrained row");
+        b.push(buf(&pool, 4, 1));
+        assert_eq!(b.pop_front().unwrap().memory.data()[0], 4);
     }
 }
