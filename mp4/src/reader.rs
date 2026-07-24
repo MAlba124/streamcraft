@@ -13,15 +13,24 @@
 //!    `(offset, size, dts, pts, sync)` is materialised here, in **file-offset order**
 //!    across all tracks (an interleaved playback order), so streaming is a forward walk.
 //! 2. **Streaming** ([`Mp4Reader::push`]/[`next_sample`]): the whole file (from byte 0)
-//!    arrives on the sink pad in arbitrary chunks; the reader buffers a bounded window and
-//!    emits each resolved sample as soon as its `[offset, offset+size)` bytes are present,
-//!    dropping consumed bytes so steady-state memory is one interleave-gap, not the file.
+//!    arrives on the sink pad in arbitrary chunks; the reader **retains the input
+//!    [`Memory`] buffers themselves** (a refcount bump per chunk — ZERO-COPY.md Stage 1)
+//!    and resolves each sample to a slice of a retained chunk as soon as its
+//!    `[offset, offset+size)` bytes are present, dropping wholly-consumed chunks so
+//!    steady-state retention is one interleave-gap of chunks, not the file. The pool
+//!    those chunks came from is what bounds memory: a downstream consumer holding
+//!    emitted slices keeps the backing slots outstanding, which stalls the source's
+//!    `try_alloc` — that *is* the backpressure.
 //!
 //! ## Untrusted input (spec: "a crash on bad input is a P0")
 //! Resolution is fully bounds-checked (via [`crate::boxes`]); a truncated/over-long/
 //! self-referential table yields an [`Mp4Error`] the element maps to a `streamcraft`
 //! error. Streaming never reads past the buffered window. Fragmented (`moof`) files are
 //! detected in resolution and errored loudly — their samples are not in `stbl`.
+
+use std::collections::VecDeque;
+
+use streamcraft_core::memory::Memory;
 
 use crate::boxes::{self, BoxError, BoxHeader};
 use crate::codec::{self, Reframer, SampleEntry};
@@ -127,12 +136,57 @@ pub struct Mp4Reader {
     samples: Vec<Sample>,
     /// Index into `samples` of the next sample to emit during streaming.
     next: usize,
-    /// Absolute file offset of `buf[0]` — the streaming window's base. Advances as consumed
-    /// bytes are dropped.
+    /// Absolute file offset of the first byte of `chunks[0]` — the retained window's base.
+    /// Advances as wholly-consumed chunks are dropped.
     stream_base: u64,
-    /// The buffered streaming window: `file[stream_base .. stream_base + buf.len()]`.
-    buf: Vec<u8>,
+    /// The retained input chunks (refcounted [`Memory`] views — ZERO-COPY.md Stage 1),
+    /// holding the contiguous file bytes `[stream_base, stream_base + buffered)`. Chunks
+    /// are dropped from the front as soon as no unresolved sample needs them, so the
+    /// window is bounded by the largest interleave gap, not the file size. Tiny input
+    /// chunks are compacted into owned byte runs instead of retained (see
+    /// [`push`](Self::push) — retaining a near-empty pool slot starves the pool).
+    chunks: VecDeque<Chunk>,
+    /// Total bytes across `chunks` (the window's extent past `stream_base`).
+    buffered: u64,
 }
+
+/// One window chunk: a retained input buffer (the zero-copy hot path) or a compacted run
+/// of bytes from inputs too small to be worth pinning a pool slot for.
+enum Chunk {
+    /// A retained input `Memory` — samples inside it emit as [`Memory::slice`] views.
+    Retained(Memory),
+    /// Copied bytes from small inputs (and byte-`push`ing tests) — samples touching an
+    /// owned chunk always gather-copy.
+    Owned(Vec<u8>),
+}
+
+impl Chunk {
+    fn len(&self) -> usize {
+        match self {
+            Chunk::Retained(m) => m.len(),
+            Chunk::Owned(v) => v.len(),
+        }
+    }
+
+    fn data(&self) -> &[u8] {
+        match self {
+            Chunk::Retained(m) => m.data(),
+            Chunk::Owned(v) => v,
+        }
+    }
+}
+
+/// Input chunks below this many bytes are **copied** (compacted into an owned chunk)
+/// instead of retained. Retention pins the chunk's whole backing pool slot until the
+/// window passes it; a producer dribbling 1-byte buffers out of 128 KiB slots would pin
+/// a slot per byte and starve its pool into a livelock (seen in the ragged-chunking
+/// tests). A real IO source (filesrc) fills its slots, so the hot path always retains;
+/// only dribblers pay the (tiny) copy.
+const RETAIN_MIN: usize = 4096;
+
+/// Cap on one compacted owned chunk, so the prefix drop (whole chunks only) can still
+/// release memory for a long dribbled stream.
+const OWNED_CHUNK_CAP: usize = 64 * 1024;
 
 impl Mp4Reader {
     /// Resolve a progressive MP4 from its **file head** — the leading bytes that MUST cover
@@ -187,7 +241,8 @@ impl Mp4Reader {
             samples,
             next: 0,
             stream_base: 0,
-            buf: Vec::new(),
+            chunks: VecDeque::new(),
+            buffered: 0,
         })
     }
 
@@ -206,24 +261,55 @@ impl Mp4Reader {
     pub fn reset_stream(&mut self) {
         self.next = 0;
         self.stream_base = 0;
-        self.buf.clear();
+        self.chunks.clear();
+        self.buffered = 0;
     }
 
-    /// Feed the next chunk of the **whole file** (byte-0-anchored) into the streaming window.
-    /// The caller pushes strictly forward, contiguous file bytes; the reader appends them and
-    /// drops the consumed prefix so the window stays bounded.
-    pub fn push(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
+    /// Feed the next chunk of the **whole file** (byte-0-anchored) into the streaming
+    /// window, **retaining the caller's [`Memory`] itself** — a refcount move, no copy
+    /// (ZERO-COPY.md Stage 1) — when it is at least [`RETAIN_MIN`] bytes; smaller chunks
+    /// are compacted by copy instead (retaining a near-empty pool slot per dribble
+    /// starves the pool — see [`RETAIN_MIN`]). The caller pushes strictly forward,
+    /// contiguous file bytes; the reader keeps each chunk alive only until every sample
+    /// resolved from it has been emitted (see [`next_sample`](Self::next_sample)'s
+    /// prefix drop).
+    pub fn push(&mut self, chunk: Memory) {
+        if chunk.is_empty() {
+            return;
+        }
+        if chunk.len() >= RETAIN_MIN {
+            self.buffered += chunk.len() as u64;
+            self.chunks.push_back(Chunk::Retained(chunk));
+        } else {
+            self.push_bytes(chunk.data());
+        }
     }
 
-    /// Emit the next resolved sample whose bytes are fully buffered, as `(track_index, pts,
-    /// dts, sync, bytes)`. Returns `None` when the next sample's bytes have not all arrived
-    /// yet (wait for more [`push`](Self::push)) or when every sample has been emitted.
+    /// [`push`](Self::push) for plain bytes (small chunks, tests, oracle tools): copies
+    /// `data` into a compacted owned chunk. Never on the full-slot streaming hot path.
+    pub fn push_bytes(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.buffered += data.len() as u64;
+        match self.chunks.back_mut() {
+            Some(Chunk::Owned(v)) if v.len() < OWNED_CHUNK_CAP => v.extend_from_slice(data),
+            _ => self.chunks.push_back(Chunk::Owned(data.to_vec())),
+        }
+    }
+
+    /// Emit the next resolved sample whose bytes are fully buffered. Returns `None` when
+    /// the next sample's bytes have not all arrived yet (wait for more
+    /// [`push`](Self::push)) or when every sample has been emitted.
     ///
-    /// Samples are served in file-offset order (the resolution sort), so the buffered window
-    /// only needs to span from the current sample's offset to the next — the reader drops
-    /// everything before the current sample's offset first.
-    pub fn next_sample(&mut self) -> Option<ResolvedSample<'_>> {
+    /// Samples are served in file-offset order (the resolution sort), so the retained
+    /// window only needs to span from the current sample's offset forward — chunks wholly
+    /// before it are dropped first. The payload is a **zero-copy slice** of the retained
+    /// chunk ([`Memory::slice`] — a refcount bump) whenever the sample lies inside one
+    /// chunk; a sample straddling a chunk boundary pays a gather-copy instead (the
+    /// documented cold path — at most one sample per retained-chunk boundary — kept
+    /// simple rather than inventing multi-`Memory` buffers).
+    pub fn next_sample(&mut self) -> Option<ResolvedSample> {
         if self.next >= self.samples.len() {
             return None;
         }
@@ -231,34 +317,83 @@ impl Mp4Reader {
         let start = s.offset;
         let end = s.offset.checked_add(s.size as u64)?;
 
-        // Drop any buffered bytes before this sample (an interleave gap, or slack from the
-        // previous sample). This keeps the window bounded to one sample's span.
-        if start > self.stream_base {
-            let skip = (start - self.stream_base) as usize;
-            if skip >= self.buf.len() {
-                // The whole window is before this sample — discard it and wait for more.
-                self.stream_base += self.buf.len() as u64;
-                self.buf.clear();
-                return None;
+        // Drop retained chunks wholly before this sample (an interleave gap, or slack from
+        // the previous sample). Samples are offset-sorted, so no later sample needs them
+        // either; this bounds the window and releases the source's pool slots (the
+        // backpressure loop). Whole chunks only — a partially-consumed chunk stays until
+        // the walk passes its end.
+        while let Some(front) = self.chunks.front() {
+            let flen = front.len() as u64;
+            if self.stream_base + flen > start {
+                break;
             }
-            self.buf.drain(..skip);
-            self.stream_base = start;
+            self.stream_base += flen;
+            self.buffered -= flen;
+            self.chunks.pop_front();
         }
 
         // Are the sample's bytes all present?
-        let avail_end = self.stream_base + self.buf.len() as u64;
-        if end > avail_end {
+        if end > self.stream_base + self.buffered {
             return None; // not all arrived yet
         }
-        let lo = (start - self.stream_base) as usize;
-        let hi = (end - self.stream_base) as usize;
         self.next += 1;
+        if s.size == 0 {
+            // Degenerate zero-length sample: nothing to slice, nothing to retain.
+            return Some(ResolvedSample {
+                track_index: s.track_index,
+                pts: s.pts,
+                dts: s.dts,
+                sync: s.sync,
+                payload: SamplePayload::Copied(Vec::new()),
+            });
+        }
+
+        // Locate the chunk holding `start`. After the prefix drop it is nearly always the
+        // front; the walk stays O(window chunks). Invariant: `stream_base <= start` (only
+        // chunks ending at or before a previous — hence smaller-or-equal — offset were
+        // dropped), and `start < stream_base + buffered` (checked above), so a containing
+        // chunk exists.
+        let mut base = self.stream_base;
+        let mut idx = 0usize;
+        while idx < self.chunks.len() {
+            let clen = self.chunks[idx].len() as u64;
+            if start < base + clen {
+                break;
+            }
+            base += clen;
+            idx += 1;
+        }
+        let rel = (start - base) as usize;
+        // Zero-copy: the sample lies inside one *retained* chunk — a refcount bump.
+        let sliced = match &self.chunks[idx] {
+            Chunk::Retained(m) => m.slice(rel, s.size as usize),
+            Chunk::Owned(_) => None,
+        };
+        let payload = match sliced {
+            Some(m) => SamplePayload::Slice(m),
+            // Straddle across chunks, or bytes living in a compacted owned chunk: gather
+            // the range by copy (bounds proven by the checks above). The cold path.
+            None => {
+                let mut v = Vec::with_capacity(s.size as usize);
+                let (mut at, mut cbase, mut i) = (start, base, idx);
+                while at < end {
+                    let c = &self.chunks[i];
+                    let lo = (at - cbase) as usize;
+                    let take = ((end - at) as usize).min(c.len() - lo);
+                    v.extend_from_slice(&c.data()[lo..lo + take]);
+                    at += take as u64;
+                    cbase += c.len() as u64;
+                    i += 1;
+                }
+                SamplePayload::Copied(v)
+            }
+        };
         Some(ResolvedSample {
             track_index: s.track_index,
             pts: s.pts,
             dts: s.dts,
             sync: s.sync,
-            bytes: &self.buf[lo..hi],
+            payload,
         })
     }
 
@@ -273,10 +408,10 @@ impl Mp4Reader {
     }
 }
 
-/// A sample the streaming walk produced: its route, timing, sync flag, and a borrow of its
-/// bytes out of the reader's window (valid until the next [`Mp4Reader::next_sample`] /
-/// [`push`](Mp4Reader::push)).
-pub struct ResolvedSample<'a> {
+/// A sample the streaming walk produced: its route, timing, sync flag, and its **owned**
+/// payload — a refcounted slice of the retained input on the hot path, so emitting it is
+/// a refcount bump, never a copy (ZERO-COPY.md Stage 1).
+pub struct ResolvedSample {
     pub track_index: usize,
     /// Presentation timestamp in media-timescale ticks (signed; use [`Mp4Reader::ticks_to_ns`]
     /// which clamps to non-negative nanoseconds).
@@ -284,7 +419,29 @@ pub struct ResolvedSample<'a> {
     /// Decode timestamp in media-timescale ticks (signed — may be negative after an edit trim).
     pub dts: i64,
     pub sync: bool,
-    pub bytes: &'a [u8],
+    pub payload: SamplePayload,
+}
+
+/// How a resolved sample's bytes are carried out of the reader.
+pub enum SamplePayload {
+    /// The hot path: a refcounted sub-view of one retained input chunk
+    /// ([`Memory::slice`]) — zero-copy; the backing pool slot stays outstanding until
+    /// the last downstream view drops.
+    Slice(Memory),
+    /// The cold path: the sample straddled a retained-chunk boundary (at most one per
+    /// boundary) and its bytes were gathered by copy. Also carries the degenerate
+    /// zero-length sample.
+    Copied(Vec<u8>),
+}
+
+impl SamplePayload {
+    /// The sample's bytes, whichever way they are carried.
+    pub fn data(&self) -> &[u8] {
+        match self {
+            SamplePayload::Slice(m) => m.data(),
+            SamplePayload::Copied(v) => v,
+        }
+    }
 }
 
 /// Convert `ticks` (signed) at `timescale` ticks/second to **non-negative** nanoseconds via

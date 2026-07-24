@@ -21,15 +21,19 @@
 //! because its sample tables live in `moov` and cannot be resolved incrementally at all.
 //!
 //! ## The backpressure discipline (spec: the pool bounds a demuxer, not the heap)
-//! Copied verbatim from `mkvdemux` after the movie-OOM fix: emission is via
-//! [`Ctx::try_alloc`] with a bounded **pending carry** — input is consumed **only while
+//! On the hot path samples are emitted as **refcounted slices of the retained input
+//! chunks** (ZERO-COPY.md Stage 1) — no pool slot, no memcpy; the *source's* pool bounds
+//! memory, because a downstream consumer holding slices keeps the read slots outstanding
+//! and stalls the source's `try_alloc`. This element's own pool serves only the cold
+//! byte paths — codec heads, chunk-straddle gathers, NAL→Annex B conversions — via
+//! [`Ctx::try_alloc`] with a bounded **pending carry**: input is consumed **only while
 //! emission keeps up** (un-popped input stays buffered, so upstream backs up into the
 //! scheduler's gates, not this element's memory); the EOS/stop flush uses
 //! [`Ctx::alloc_exact`] (right-sized, never a slot-sized over-allocation per small sample).
 //! Unbounded `ctx.alloc` in a demuxer is **banned** — it OOM'd a real movie.
 
 use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::BufferFlags;
+use streamcraft_core::buffer::{Buffer, BufferFlags};
 use streamcraft_core::bus::BusMessage;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
@@ -38,11 +42,12 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
+use streamcraft_core::id::{FormatId, PadId};
+use streamcraft_core::memory::Memory;
 use streamcraft_core::time::Timestamp;
 
 use crate::codec::{self, Reframer};
-use crate::reader::{Mp4Error, Mp4Reader};
+use crate::reader::{Mp4Error, Mp4Reader, SamplePayload};
 
 /// The `bytes` offer on the sink pad: a raw MP4 byte stream (the container is codec-agnostic,
 /// matching `MkvDemux`'s sink and any byte-producing upstream like `filesrc`).
@@ -134,13 +139,22 @@ enum Announce {
     Bare,
 }
 
-/// A partially-emitted blob: `bytes[off..]` still needs pool slots on `pad`, stamped `pts_ns`.
+/// A partially-emitted blob parked on pool exhaustion — or queued *behind* one, to keep
+/// per-pad ordering: `payload[off..]` still needs emitting on `pad`, stamped `pts_ns`.
 struct Carry {
     pad: PadId,
     pts_ns: Option<u64>,
     flags: BufferFlags,
-    bytes: Vec<u8>,
+    payload: CarryPayload,
     off: usize,
+}
+
+/// What a parked emission owns: copied bytes (a codec head, a reframed access unit, a
+/// chunk-straddle gather — these need pool slots), or a zero-copy retained slice, which
+/// needs no slot and parks only to stay ordered behind an owned carry that hit a dry pool.
+enum CarryPayload {
+    Owned(Vec<u8>),
+    Slice(Memory),
 }
 
 /// Demultiplexes a progressive MP4 byte stream into one src pad per track (spec: dynamic
@@ -161,6 +175,12 @@ pub struct Mp4Demux {
     /// Emissions stalled on pool exhaustion (spec: the backpressure rule). While non-empty
     /// the demuxer consumes **no input**. Holds at most a codec head + one sample.
     pending: std::collections::VecDeque<Carry>,
+    /// The `FormatId` a pool-allocated buffer on a src pad would carry (`Ctx` stamps its
+    /// out-format; there is no public accessor), probed once at `start` so the zero-copy
+    /// slice path can construct [`Buffer`]s identical to pooled ones. Not load-bearing on
+    /// the milestone-1 transport — `Batch::push` drops the per-row format and `pop_front`
+    /// restamps from the batch — but kept faithful for later transports.
+    out_fmt: FormatId,
 }
 
 impl Mp4Demux {
@@ -179,6 +199,7 @@ impl Mp4Demux {
             pad_tracks: Vec::new(),
             reader: None, // resolved in `preroll`
             pending: std::collections::VecDeque::new(),
+            out_fmt: FormatId(0), // probed at `start`
         }
     }
 
@@ -260,9 +281,32 @@ impl Mp4Demux {
         ctx.out(pad).push(buf);
     }
 
-    /// Queue a blob for emission and try to emit it now; on pool exhaustion the remainder
-    /// parks in `pending` (drained first on the next pass). Takes the queue directly so
-    /// callers holding a reader borrow (the zero-copy drain) can still park.
+    /// Emit a retained-input slice as **one buffer** — a refcount bump, no pool slot, no
+    /// memcpy (ZERO-COPY.md Stage 1). Never blocks: the backing is already accounted for
+    /// by the pool the input chunk came from, and downstream retention of the slice is
+    /// exactly what keeps that slot outstanding (the backpressure loop).
+    fn emit_slice(
+        ctx: &mut Ctx,
+        pad: PadId,
+        pts_ns: Option<u64>,
+        flags: BufferFlags,
+        memory: Memory,
+        format: FormatId,
+    ) {
+        ctx.out(pad).push(Buffer {
+            memory,
+            pts: pts_ns.map_or(Timestamp::NONE, Timestamp::from_nanos),
+            dts: Timestamp::NONE,
+            duration: Timestamp::NONE,
+            flags,
+            format,
+            sync: None,
+        });
+    }
+
+    /// Queue a byte blob for emission and try to emit it now; on pool exhaustion the
+    /// remainder parks in `pending` (drained first on the next pass). Takes the queue
+    /// directly so callers under the drain's split field borrows can still park.
     fn emit_or_park(
         pending: &mut std::collections::VecDeque<Carry>,
         ctx: &mut Ctx,
@@ -273,17 +317,32 @@ impl Mp4Demux {
     ) {
         let off = Self::emit_bounded(ctx, pad, pts_ns, flags, &bytes, 0);
         if off < bytes.len() {
-            pending.push_back(Carry { pad, pts_ns, flags, bytes, off });
+            pending.push_back(Carry { pad, pts_ns, flags, payload: CarryPayload::Owned(bytes), off });
         }
     }
 
-    /// Resume parked emissions. `true` when everything pending has drained.
+    /// Resume parked emissions. `true` when everything pending has drained. Owned carries
+    /// go through pool slots (and re-park when the pool is still dry); slice carries never
+    /// block — they were only parked to stay ordered behind an owned one.
     fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
-        while let Some(mut c) = self.pending.pop_front() {
-            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
-            if c.off < c.bytes.len() {
-                self.pending.push_front(c);
-                return false;
+        while let Some(c) = self.pending.pop_front() {
+            match c.payload {
+                CarryPayload::Owned(bytes) => {
+                    let off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, &bytes, c.off);
+                    if off < bytes.len() {
+                        self.pending.push_front(Carry {
+                            pad: c.pad,
+                            pts_ns: c.pts_ns,
+                            flags: c.flags,
+                            payload: CarryPayload::Owned(bytes),
+                            off,
+                        });
+                        return false;
+                    }
+                }
+                CarryPayload::Slice(mem) => {
+                    Self::emit_slice(ctx, c.pad, c.pts_ns, c.flags, mem, self.out_fmt);
+                }
             }
         }
         true
@@ -313,22 +372,25 @@ impl Mp4Demux {
         Ok((track.family(), track.codec_head().to_vec(), track.reframer().clone()))
     }
 
-    /// Drain samples the reader has sliced, emitting each on its track's src pad — **pool
-    /// bounded**: returns `false` when slots ran out (remainder parked in `pending`; stop
-    /// consuming input until it clears). On a track's first sample the Annex B codec head is
-    /// emitted first and the pad's runtime format is announced (spec: dynamic caps). A sample
-    /// that fails to reframe is warned-and-dropped, not fatal (spec: untrusted input).
-    /// Drain samples the reader has sliced, emitting each on its track's src pad —
-    /// **zero-copy on the hot path**: the sample bytes are borrowed straight out of the
-    /// reader's window into the pool slot (split field borrows keep `pad_tracks`/`pending`
-    /// usable while the sample borrow lives). The only per-sample heap traffic left is a
-    /// real NAL→Annex B conversion (decode mode) or a pool-dry carry — the old
-    /// copy-to-break-the-borrow pattern was 63% of a movie remux's 1.2M allocations.
-    /// Pool-bounded as before: returns `false` when slots ran out (remainder parked).
+    /// Drain samples the reader has resolved, emitting each on its track's src pad —
+    /// **zero-copy on the hot path** (ZERO-COPY.md Stage 1): a passthrough sample goes out
+    /// as the reader's retained-input slice itself — a refcount bump, no pool slot, no
+    /// memcpy. The remaining per-sample byte traffic is exactly: a real NAL→Annex B
+    /// conversion (decode mode), a chunk-straddle gather (cold, ~one per retained-chunk
+    /// boundary), or a pool-dry carry — all owned blobs through pool slots under the
+    /// carry discipline. Pool-bounded as before: returns `false` when slots ran out
+    /// (remainder parked in `pending`; stop consuming input until it clears), and a slice
+    /// arriving while an owned carry is parked queues *behind* it to keep per-pad order.
+    /// On a track's first sample the codec head is emitted first and the pad's runtime
+    /// format announced (spec: dynamic caps). A sample that fails to reframe is
+    /// warned-and-dropped, not fatal (spec: untrusted input). The split field borrows
+    /// (`let Self { reader, pad_tracks, pending, .. }`) keep the queue usable while the
+    /// reader is borrowed.
     fn drain(&mut self, ctx: &mut Ctx) -> bool {
         if !self.drain_pending(ctx) {
             return false;
         }
+        let fmt = self.out_fmt;
         loop {
             let Self { reader, pad_tracks, pending, .. } = self;
             let Some(reader) = reader.as_mut() else { return true };
@@ -340,22 +402,6 @@ impl Mp4Demux {
             // remuxing consumer preserves seekability; DELTA is explicit — untagged would
             // read as "unknown", which a muxer defaults to keyframe.
             let flags = if sync { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
-            // Passthrough borrows the reader's window (`Cow::Borrowed` — no copy); only a
-            // real NAL→Annex B conversion allocates.
-            let reframed = match pt.reframer.reframe_block(s.bytes) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    let element = ctx.element();
-                    ctx.post(BusMessage::Warning {
-                        element,
-                        error: Error::Element {
-                            element,
-                            message: format!("mp4demux: dropping malformed sample on track {idx}: {e:?}"),
-                        },
-                    });
-                    continue; // drop this sample, try the next
-                }
-            };
             // First sample on this pad: announce the format, then emit the codec head.
             if !pt.started {
                 pt.started = true;
@@ -367,14 +413,54 @@ impl Mp4Demux {
                 }
             }
             let pad = pt.pad;
-            let off = Self::emit_bounded(ctx, pad, Some(pts_ns), flags, &reframed, 0);
-            if off < reframed.len() {
-                // Pool dry: only now does the sample pay a copy (the parked carry owns it).
+            // Route the payload: slice-through for passthrough (the zero-copy path),
+            // otherwise an owned blob (straddle gather / Annex B conversion).
+            let owned: Vec<u8> = match (&pt.reframer, s.payload) {
+                (Reframer::Passthrough, SamplePayload::Slice(mem)) => {
+                    if pending.is_empty() {
+                        Self::emit_slice(ctx, pad, Some(pts_ns), flags, mem, fmt);
+                    } else {
+                        // A parked head precedes this sample — keep order, park behind it.
+                        pending.push_back(Carry {
+                            pad,
+                            pts_ns: Some(pts_ns),
+                            flags,
+                            payload: CarryPayload::Slice(mem),
+                            off: 0,
+                        });
+                        return false;
+                    }
+                    continue;
+                }
+                (Reframer::Passthrough, SamplePayload::Copied(v)) => v,
+                (reframer, payload) => match reframer.reframe_block(payload.data()) {
+                    Ok(bytes) => bytes.into_owned(),
+                    Err(e) => {
+                        let element = ctx.element();
+                        ctx.post(BusMessage::Warning {
+                            element,
+                            error: Error::Element {
+                                element,
+                                message: format!(
+                                    "mp4demux: dropping malformed sample on track {idx}: {e:?}"
+                                ),
+                            },
+                        });
+                        continue; // drop this sample, try the next
+                    }
+                },
+            };
+            let off = if pending.is_empty() {
+                Self::emit_bounded(ctx, pad, Some(pts_ns), flags, &owned, 0)
+            } else {
+                0 // a parked head precedes this sample — keep order, park whole
+            };
+            if off < owned.len() {
                 pending.push_back(Carry {
                     pad,
                     pts_ns: Some(pts_ns),
                     flags,
-                    bytes: reframed.into_owned(),
+                    payload: CarryPayload::Owned(owned),
                     off,
                 });
             }
@@ -384,13 +470,23 @@ impl Mp4Demux {
         }
     }
 
-    /// The EOS/stop flush: everything parked or still sliceable goes out with **exact-size**
-    /// allocations (no slot to wait for at end of stream, and no slot-sized over-allocation
-    /// per small sample). Bounded in volume: the steady-state path only consumed input while
-    /// it could emit, so at most one input batch's worth of samples sits here.
+    /// The EOS/stop flush: everything parked or still resolvable goes out — retained
+    /// slices as-is (still zero-copy; no slot needed even here), owned blobs with
+    /// **exact-size** allocations (no slot to wait for at end of stream, and no
+    /// slot-sized over-allocation per small sample). Bounded in volume: the steady-state
+    /// path only consumed input while it could emit, so at most one input batch's worth
+    /// of samples sits here.
     fn flush_exact(&mut self, ctx: &mut Ctx) {
+        let fmt = self.out_fmt;
         while let Some(c) = self.pending.pop_front() {
-            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
+            match c.payload {
+                CarryPayload::Owned(bytes) => {
+                    Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &bytes, c.off)
+                }
+                CarryPayload::Slice(mem) => {
+                    Self::emit_slice(ctx, c.pad, c.pts_ns, c.flags, mem, fmt)
+                }
+            }
         }
         loop {
             let Self { reader, pad_tracks, .. } = self;
@@ -400,10 +496,6 @@ impl Mp4Demux {
             let pt = &mut pad_tracks[idx];
             let pts_ns = crate::reader::ticks_to_ns(s.pts, pt.timescale);
             let flags = if sync { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
-            let reframed = match pt.reframer.reframe_block(s.bytes) {
-                Ok(bytes) => bytes,
-                Err(_) => continue, // tail flush: drop silently rather than warn-spam
-            };
             if !pt.started {
                 pt.started = true;
                 let (pad, family, ann) = (pt.pad, pt.family, pt.announce);
@@ -413,7 +505,19 @@ impl Mp4Demux {
                     Self::emit_exact(ctx, pad, Some(pts_ns), BufferFlags::empty(), &head, 0);
                 }
             }
-            Self::emit_exact(ctx, pt.pad, Some(pts_ns), flags, &reframed, 0);
+            let pad = pt.pad;
+            match (&pt.reframer, s.payload) {
+                (Reframer::Passthrough, SamplePayload::Slice(mem)) => {
+                    Self::emit_slice(ctx, pad, Some(pts_ns), flags, mem, fmt)
+                }
+                (Reframer::Passthrough, SamplePayload::Copied(v)) => {
+                    Self::emit_exact(ctx, pad, Some(pts_ns), flags, &v, 0)
+                }
+                (reframer, payload) => match reframer.reframe_block(payload.data()) {
+                    Ok(bytes) => Self::emit_exact(ctx, pad, Some(pts_ns), flags, &bytes, 0),
+                    Err(_) => continue, // tail flush: drop silently rather than warn-spam
+                },
+            }
         }
     }
 
@@ -492,7 +596,10 @@ impl Element for Mp4Demux {
         Ok(())
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // Probe the out-format a pooled buffer would carry (see the `out_fmt` field): one
+        // throwaway right-sized allocation, recycled on drop — never a steady-state cost.
+        self.out_fmt = ctx.alloc_exact(PadId(0), 1).format;
         // Rewind the streaming cursor; the whole file (from byte 0) arrives on the sink pad.
         // The resolved tables are retained (resolution happened once, in `preroll`).
         let Some(reader) = self.reader.as_mut() else {
@@ -526,10 +633,13 @@ impl Element for Mp4Demux {
             return Ok(Flow::Ok);
         }
         while let Some(buf) = inputs.pop() {
-            // Feed the file bytes to the slicer; it emits samples as their bytes arrive.
-            // `buf` recycles on drop at the end of this iteration.
+            // Retain the input chunk's `Memory` itself (a refcount move, no copy —
+            // ZERO-COPY.md Stage 1); the reader keeps it alive exactly until every sample
+            // sliced from it has been emitted. The chunk's pool slot stays outstanding
+            // for as long as the reader — or any downstream holder of an emitted slice —
+            // needs the bytes; that retention is the demuxer's backpressure.
             if let Some(reader) = self.reader.as_mut() {
-                reader.push(buf.memory.data());
+                reader.push(buf.memory);
             }
             if !self.drain(ctx) {
                 return Ok(Flow::Ok);
