@@ -594,14 +594,52 @@ mod tests {
         drop(p);
         drop(c); // Inner::drop must drop the two boxed values exactly once
     }
+
+    #[test]
+    fn leaky_drop_newest_counts_and_never_blocks() {
+        // A full DropNewest ring must not block `push`; it drops the incoming value
+        // and tallies it. Capacity rounds up to 2.
+        let (p, _c) = spsc_leaky::<usize>(2, Leaky::DropNewest);
+        assert_eq!(p.dropped(), 0);
+        p.push(0).unwrap();
+        p.push(1).unwrap(); // ring now full (cap 2)
+        // These would block a `Leaky::Block` ring forever; here they drop + count and
+        // return Ok immediately (the test itself completing proves "never blocks").
+        p.push(2).unwrap();
+        p.push(3).unwrap();
+        assert_eq!(p.dropped(), 2, "two overflow values dropped and counted");
+    }
+
+    #[test]
+    fn leaky_drop_newest_keeps_the_oldest_in_order() {
+        // Dropping the *newest* means the two survivors are the *first* two pushed,
+        // still in FIFO order — the queued prefix is untouched.
+        let (p, c) = spsc_leaky::<usize>(2, Leaky::DropNewest);
+        for v in 0..5 {
+            p.push(v).unwrap();
+        }
+        assert_eq!(p.dropped(), 3);
+        assert_eq!(c.try_pop(), Some(0));
+        assert_eq!(c.try_pop(), Some(1));
+        assert_eq!(c.try_pop(), None, "only the first two survived");
+    }
+
+    #[test]
+    fn block_default_has_zero_drops() {
+        // The plain `spsc` constructor is `Leaky::Block`: `dropped()` stays 0.
+        let (p, c) = spsc::<usize>(2);
+        p.push(0).unwrap();
+        assert_eq!(c.try_pop(), Some(0));
+        assert_eq!(p.dropped(), 0);
+    }
 }
 
 // Loom model-checks the lock-free core (`try_push`/`try_pop`) across *every*
 // interleaving, verifying the head/tail Acquire/Release protocol, the cached-index
-// fast path, the edge-gated SeqCst fence, and the `*_waiting` loads. The blocking
-// `push`/`pop` themselves (Mutex + Condvar) are intentionally *not* modelled, but
-// the *lock-free half* of their wake handshake — the part that must not lose a
-// wakeup — is modelled directly in `no_lost_wakeup_on_empty_edge`.
+// room/emptiness fast path, the per-publish SeqCst wake fence, and the `*_waiting`
+// loads. The blocking `push`/`pop` themselves (Mutex + Condvar) are intentionally
+// *not* modelled, but the *lock-free half* of their wake handshake — the part that
+// must not lose a wakeup — is modelled directly in `no_lost_wakeup_on_empty_edge`.
 //
 // Run with: `RUSTFLAGS="--cfg loom" cargo test -p streamcraft-core --lib loom`
 #[cfg(loom)]
@@ -614,9 +652,9 @@ mod loom_tests {
         // exponentially (N=4 over cap=2 already runs for minutes). 3 pushes over a
         // capacity-2 ring forces at least one full/empty oscillation (a wrap), which
         // is what exercises the cached_head/cached_tail refresh: the cache goes stale,
-        // says full/empty, then reloads the shared index — on both the room/emptiness
-        // check and the wake-edge detection. The dedicated `no_lost_wakeup_*` models
-        // cover the fence/flag handshake at the empty and full edges directly.
+        // says full/empty, then reloads the shared index on the room/emptiness check.
+        // The dedicated `no_lost_wakeup_*` models cover the fence/flag handshake when
+        // a publish/pop races a parking peer.
         const N: usize = 3;
 
         loom::model(|| {
