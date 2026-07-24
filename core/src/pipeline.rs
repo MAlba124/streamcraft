@@ -336,7 +336,7 @@ impl Pipeline {
         // shared into every group so all elements share one timeline.
         let clock = Arc::clone(&self.clock);
         let base_time = clock.now();
-        let order = self.linear_order()?;
+        let order = self.topo_order()?;
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
         let total = self.elements.len();
@@ -347,13 +347,40 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(|| Arc::new(|| Ok(Box::new(SyncReactor::new()) as Box<dyn Reactor>)));
 
-        // Rings between consecutive groups: ring i connects group i → group i+1.
-        let mut producers: Vec<Option<Producer<Batch>>> = (0..ng).map(|_| None).collect();
-        let mut consumers: Vec<Option<Consumer<Batch>>> = (0..ng).map(|_| None).collect();
-        for i in 0..ng.saturating_sub(1) {
+        // Map each element to its group, so an edge is intra-group (inlined — a function
+        // call) or inter-group (a ring).
+        let mut group_of = vec![0usize; total];
+        for (gi, ids) in groups.iter().enumerate() {
+            for id in ids {
+                group_of[id.0 as usize] = gi;
+            }
+        }
+
+        // One SPSC ring per inter-group edge. A group may have several downstream rings
+        // (fan-out — a demuxer's src pads), each tagged with the tail's src pad so the
+        // scheduler routes that pad's output to it; it has at most one upstream ring
+        // (fan-in / aggregation is not yet supported).
+        let mut group_downstream: Vec<Vec<(PadId, Producer<Batch>)>> =
+            (0..ng).map(|_| Vec::new()).collect();
+        let mut group_upstream: Vec<Option<Consumer<Batch>>> = (0..ng).map(|_| None).collect();
+        for edge in &self.edges {
+            let gs = group_of[edge.src.0 as usize];
+            let gd = group_of[edge.sink.0 as usize];
+            if gs == gd {
+                continue; // inlined into one thread
+            }
+            if *groups[gs].last().unwrap() != edge.src {
+                return Err(Error::Todo(
+                    "inter-group branch from a non-tail element is unsupported \
+                     (make the branch point active so it forms its own group)",
+                ));
+            }
+            if group_upstream[gd].is_some() {
+                return Err(Error::Todo("fan-in / aggregation not yet supported"));
+            }
             let (p, c) = spsc::<Batch>(self.queue_cap);
-            producers[i] = Some(p);
-            consumers[i + 1] = Some(c);
+            group_downstream[gs].push((PadId(edge.src_pad as u32), p));
+            group_upstream[gd] = Some(c);
         }
 
         // Per-element counters, shared with the app via `counters()` after run.
@@ -405,8 +432,8 @@ impl Pipeline {
                 .iter()
                 .map(|id| per_elem_logs[id.0 as usize].take())
                 .collect();
-            let upstream = consumers[gi].take();
-            let downstream = producers[gi].take();
+            let upstream = group_upstream[gi].take();
+            let downstream = std::mem::take(&mut group_downstream[gi]);
             let pool = pool.clone();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
@@ -548,47 +575,70 @@ impl Pipeline {
     }
 
     /// Order the elements into a single source→sink chain (milestone topology).
-    fn linear_order(&self) -> Result<Vec<ElementId>, Error> {
+    fn topo_order(&self) -> Result<Vec<ElementId>, Error> {
         let n = self.elements.len();
         if n == 0 {
             return Err(Error::Todo("empty pipeline"));
         }
+        // Kahn's over the (possibly branching) DAG. Fan-out is fine — one element with
+        // several src pads feeds several downstreams. Fan-in (a node with two incoming
+        // edges) is left for aggregation and rejected at group wiring.
         let mut indeg = vec![0usize; n];
-        let mut next: Vec<Option<ElementId>> = vec![None; n];
+        let mut adj: Vec<Vec<ElementId>> = vec![Vec::new(); n];
         for e in &self.edges {
             indeg[e.sink.0 as usize] += 1;
-            next[e.src.0 as usize] = Some(e.sink);
+            adj[e.src.0 as usize].push(e.sink);
         }
-        let mut start = None;
-        for (i, &deg) in indeg.iter().enumerate() {
-            if deg == 0 {
-                if start.is_some() {
-                    return Err(Error::Todo("not a linear chain (multiple sources)"));
-                }
-                start = Some(ElementId(i as u32));
+        let mut ready: Vec<ElementId> = indeg
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d == 0)
+            .map(|(i, _)| ElementId(i as u32))
+            .collect();
+        match ready.len() {
+            0 => return Err(Error::Todo("no source (cycle?)")),
+            1 => {}
+            _ => {
+                return Err(Error::Todo(
+                    "multiple sources (fan-in / aggregation not yet supported)",
+                ))
             }
         }
-        let mut cur = start.ok_or(Error::Todo("no source (cycle?)"))?;
         let mut order = Vec::with_capacity(n);
-        loop {
-            order.push(cur);
-            if order.len() > n {
-                return Err(Error::Todo("cycle detected"));
-            }
-            match next[cur.0 as usize] {
-                Some(d) => cur = d,
-                None => break,
+        while let Some(u) = ready.pop() {
+            order.push(u);
+            for &v in &adj[u.0 as usize] {
+                let d = &mut indeg[v.0 as usize];
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(v);
+                }
             }
         }
         if order.len() != n {
-            return Err(Error::Todo("disconnected graph (not a single chain)"));
+            return Err(Error::Todo("disconnected graph or cycle"));
         }
         Ok(order)
     }
 
-    /// Split the ordered chain into thread groups: a new group begins at each active
-    /// element; passive elements inline into the current group (spec: Scheduling).
+    /// Assign elements to thread groups over the (possibly branching) DAG: the source and
+    /// every active element start a group; a passive element inlines into its single
+    /// upstream's group, extending that group's chain (spec: Scheduling — passive chains
+    /// run inline). Branching (fan-out) therefore lives *between* groups, wired as rings.
+    /// Passive fan-out (a passive with two downstreams, or two passives sharing one
+    /// upstream) is rejected — make the branch point active.
     fn compute_groups(&self, order: &[ElementId]) -> Result<Vec<Vec<ElementId>>, Error> {
+        let n = self.elements.len();
+        // Each element's single upstream (via its incoming edge); fan-in is caught here.
+        let mut upstream_of: Vec<Option<ElementId>> = vec![None; n];
+        for e in &self.edges {
+            let slot = &mut upstream_of[e.sink.0 as usize];
+            if slot.is_some() {
+                return Err(Error::Todo("fan-in / aggregation not yet supported"));
+            }
+            *slot = Some(e.src);
+        }
+        let mut group_of: Vec<Option<usize>> = vec![None; n];
         let mut groups: Vec<Vec<ElementId>> = Vec::new();
         for &id in order {
             let sched = self.elements[id.0 as usize]
@@ -596,10 +646,24 @@ impl Pipeline {
                 .ok_or(Error::Todo("element already consumed"))?
                 .desc()
                 .sched;
-            if groups.is_empty() || matches!(sched, SchedHint::Active) {
+            let is_source = upstream_of[id.0 as usize].is_none();
+            if is_source || matches!(sched, SchedHint::Active) {
+                group_of[id.0 as usize] = Some(groups.len());
                 groups.push(vec![id]);
             } else {
-                groups.last_mut().unwrap().push(id);
+                // Passive: inline into the single upstream's group, but only if that
+                // upstream is the group's current tail — otherwise this is a passive
+                // fan-out, which the linear-chain group model does not support.
+                let up = upstream_of[id.0 as usize].unwrap();
+                let g = group_of[up.0 as usize]
+                    .ok_or(Error::Todo("passive scheduled before its upstream (internal)"))?;
+                if *groups[g].last().unwrap() != up {
+                    return Err(Error::Todo(
+                        "passive fan-out not supported (make the branch point active)",
+                    ));
+                }
+                groups[g].push(id);
+                group_of[id.0 as usize] = Some(g);
             }
         }
         Ok(groups)
@@ -668,7 +732,7 @@ impl Pipeline {
             s.push_str(&format!("  e{i} [label=\"{name}\"];\n"));
         }
         // Group clusters — each group is one thread (spec: Scheduling).
-        if let Ok(order) = self.linear_order() {
+        if let Ok(order) = self.topo_order() {
             if let Ok(groups) = self.compute_groups(&order) {
                 for (gi, ids) in groups.iter().enumerate() {
                     s.push_str(&format!(
@@ -835,7 +899,7 @@ fn run_group(
     formats: Vec<Vec<Option<FixedFormat>>>,
     logs: Vec<Option<Log>>,
     upstream: Option<Consumer<Batch>>,
-    downstream: Option<Producer<Batch>>,
+    downstream: Vec<(PadId, Producer<Batch>)>,
     factory: ReactorFactory,
     pool: Pool,
     bus: BusSender,
@@ -997,13 +1061,12 @@ fn run_group(
             // FormatChange to its output batch so the peer re-fixates (spec: Formats).
             if let Some(ann) = ctxs[i].take_announcement() {
                 if let Some(f) = vocabulary.build_fixed(ann.family, &ann.fields) {
-                    ctxs[i].output_mut().push_event(Event::FormatChange(f));
+                    // Ride the FormatChange on the announced src pad's batch so it travels
+                    // to that pad's downstream (correct when the element branches).
+                    ctxs[i].output_on(ann.pad).push_event(Event::FormatChange(f));
                 }
             }
-            let (nbuf, nbytes) = {
-                let out = ctxs[i].output_mut();
-                (out.len() as u64, out.total_bytes())
-            };
+            let (nbuf, nbytes) = ctxs[i].total_output();
             counters[i].record_out(nbuf, nbytes);
             reactor.submit(ctxs[i].take_submissions());
             if i + 1 < m {
@@ -1016,17 +1079,21 @@ fn run_group(
             break Err(e);
         }
 
-        // C. Push the last element's output downstream (blocking backpressure).
-        if let Some(down) = &downstream {
-            let out = std::mem::replace(ctxs[m - 1].output_mut(), Batch::new(BYTES));
-            if !out.is_inert() {
-                progressed = true;
-                if down.push(out).is_err() {
-                    break 'group Ok(()); // downstream gone
+        // C. Route the tail element's per-pad output to each downstream ring (blocking
+        // backpressure). A branching tail (a demuxer) has one ring per src pad; a linear
+        // tail has one; a sink has none, so its (empty) outputs are just cleared.
+        if downstream.is_empty() {
+            ctxs[m - 1].clear_outputs();
+        } else {
+            for (src_pad, down) in &downstream {
+                let out = ctxs[m - 1].take_output(*src_pad);
+                if !out.is_inert() {
+                    progressed = true;
+                    if down.push(out).is_err() {
+                        break 'group Ok(()); // this downstream is gone
+                    }
                 }
             }
-        } else {
-            ctxs[m - 1].output_mut().clear();
         }
 
         // D. Drive this group's reactor and route completions back to their elements.

@@ -25,7 +25,8 @@ use crate::time::Timestamp;
 /// [`Event::FormatChange`](crate::event::Event::FormatChange) so the peer re-fixates its
 /// edge (spec: Formats — dynamic caps).
 pub(crate) struct Announcement {
-    #[allow(dead_code)] // which src pad announced — used once multi-src pads land
+    /// Which src pad announced — the scheduler rides the `FormatChange` on that pad's
+    /// output batch, so it travels to that pad's downstream (branching-correct).
     pub(crate) pad: PadId,
     pub(crate) family: &'static str,
     pub(crate) fields: Vec<(&'static str, ValueDesc)>,
@@ -354,6 +355,14 @@ impl Ctx {
         self.outs
             .iter()
             .fold((0u64, 0u64), |(n, b), o| (n + o.len() as u64, b + o.total_bytes()))
+    }
+
+    /// Clear every src pad's output batch (retaining capacity). Used when a group has no
+    /// downstream (a sink) so any stray output is dropped rather than left to grow.
+    pub(crate) fn clear_outputs(&mut self) {
+        for out in &mut self.outs {
+            out.clear();
+        }
     }
 
     pub(crate) fn take_input(&mut self) -> Batch {
