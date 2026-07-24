@@ -202,6 +202,57 @@ fn transcode_is_lossless_and_learns_the_announced_format() {
 }
 
 #[test]
+fn parallel_chains_transcode_in_one_pipeline() {
+    // The forest case (spec: Scheduling — thread groups): N *independent* transcode
+    // chains in one Pipeline. The scheduler must give each chain its own groups and
+    // rings (2 threads per chain here) and drive them all to EOS concurrently. The
+    // shared pool is the one cross-chain coupling point, so it is sized for the sum
+    // of every chain's bounded appetite (inline gate + rings + carry) — the
+    // app-level rule until per-link pool negotiation lands.
+    const CHAINS: usize = 4;
+    let mut p = Pipeline::new();
+    p.set_pool(4096, (CHAINS as u32) * 32 + 32);
+
+    let mut expects = Vec::new();
+    let mut gots = Vec::new();
+    for i in 0..CHAINS {
+        // Distinct content per chain (different lengths ⇒ different signals), so a
+        // cross-wired buffer would be caught by the per-chain lossless check.
+        let (pcm, expected) = gen_s16(6_000 + i * 3_500);
+        let stream = encode_stream(&pcm);
+        let packets: Vec<Vec<u8>> = stream.chunks(1500).map(<[u8]>::to_vec).collect();
+
+        let src = p.add(PacketSrc { packets, next: 0, burst: 2 });
+        let dec = p.add(FlacDec::new());
+        let enc = p.add(FlacEnc::new(8_000, 1, SampleFormat::S32)); // learned per chain
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink = p.add(ByteSink { got: Arc::clone(&got) });
+        p.link((src, "src"), (dec, "sink")).expect("src!dec");
+        p.link((dec, "src"), (enc, "sink")).expect("dec!enc");
+        p.link((enc, "src"), (sink, "sink")).expect("enc!sink");
+        expects.push(expected);
+        gots.push(got);
+    }
+
+    let run = std::thread::spawn(move || p.run());
+    for _ in 0..600 {
+        if run.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(run.is_finished(), "parallel forest did not reach EOS");
+    run.join().expect("joined").expect("run ok");
+
+    for (i, (got, expected)) in gots.iter().zip(&expects).enumerate() {
+        let flac = got.lock().unwrap().clone();
+        let out = FlacDecoder::decode(&flac).unwrap_or_else(|e| panic!("chain {i}: {e:?}"));
+        assert_eq!(out.info.sample_rate, RATE, "chain {i} rate learned");
+        assert_eq!(&out.samples, expected, "chain {i} lossless and not cross-wired");
+    }
+}
+
+#[test]
 fn bursty_source_with_starved_pool_does_not_deadlock() {
     // Regression: `filesrc ! flacdec ! flacenc ! filesink` livelocked — the source,
     // inlined ahead of the latency-bounded decoder, free-ran until every pool slot
