@@ -19,33 +19,51 @@
 //!
 //! ## Numbers (this machine — Linux x86_64, `cargo bench`, release)
 //!
-//! Measurement method: 8 trials per shape, warmup discarded, median reported. The
-//! values below are medians from a representative run; absolute numbers move with
+//! Measurement method: median of `TRIALS` trials per shape, warmup discarded. The
+//! values below are medians from representative runs; absolute numbers move with
 //! CPU/thermal state — the before/after *delta* on the same machine is the signal.
+//! (The two-thread shape is inherently noisy on a shared box; treat it as a band.)
 //!
-//! ### BEFORE (SeqCst fence on every try_push/try_pop fast path)
+//! ### BEFORE — original: `SeqCst` fence AND a shared `head`/`tail` Acquire load on
+//! every try_push/try_pop.
 //!
-//! | shape        | ns/item (median) |
+//! | shape        | ns/item          |
 //! |--------------|------------------|
-//! | same_thread  |            19.4  |
-//! | ping_stream  |          112–121 |
+//! | same_thread  |            19.35 |
+//! | ping_stream  |     ~120 (112–133) |
 //!
-//! ### AFTER (fenceless fast path — cached_head/cached_tail, fence only on park)
+//! ### AFTER — cached-index room/emptiness check (`cached_head`/`cached_tail`) spares
+//! the shared peer load on the busy path; the `SeqCst` wake fence STAYS on every op.
 //!
-//! | shape        | ns/item (median) |
+//! | shape        | ns/item          |
 //! |--------------|------------------|
-//! | same_thread  | FILL_AFTER_ST    |
-//! | ping_stream  | FILL_AFTER_PS    |
+//! | same_thread  |            19.75 |
+//! | ping_stream  |     ~90 (64–110)  |
+//!
+//! Verdict (budgets, not vibes): the same-thread cost is unchanged — the `SeqCst`
+//! fence dominates it and the depth-1 ring never pays the peer load the cache elides.
+//! The two-thread stream improves by removing the producer's per-push cross-core
+//! `head` Acquire; the cache is a real win exactly where coherence traffic is real.
+//!
+//! A *fenceless* wake path (fence only on an "empty/full edge") was prototyped and
+//! measured ~8-11 ns same_thread — but it is UNSOUND: the peer advances its index
+//! concurrently, so an edge-gated fence loses wakeups and deadlocks a two-thread
+//! stream within ~10k items. The bench decided; correctness kept the fence.
 
 use std::time::Instant;
 
 use streamcraft_core::ring::spsc;
 
-/// Items pushed/popped per timed trial. Big enough to dwarf the `Instant` call
-/// overhead (~20 ns) at the divisor, small enough to stay in a few seconds total.
-const ITEMS: usize = 20_000_000;
+/// Items per same-thread trial. Single-core, cheap (~10-20 ns/item), so a large
+/// count both dwarfs the `Instant` overhead at the divisor and gives a stable median.
+const ITEMS_ST: usize = 5_000_000;
+/// Items per two-thread trial. Deliberately smaller: the ping stream is a sustained
+/// two-core busy workload, and on a shared/limited machine a multi-second saturating
+/// run risks being reaped, so we keep each trial short (~0.1 s) — still 1M cross-core
+/// hops, far above measurement noise.
+const ITEMS_PS: usize = 1_000_000;
 /// Timed trials per shape; the median is reported (robust to a scheduler hiccup).
-const TRIALS: usize = 8;
+const TRIALS: usize = 7;
 /// Warmup trials run first and discarded (page-ins, branch predictor, turbo ramp).
 const WARMUP: usize = 2;
 
@@ -67,13 +85,13 @@ fn bench_same_thread() -> f64 {
     for trial in 0..(WARMUP + TRIALS) {
         let (p, c) = spsc::<usize>(1024);
         let start = Instant::now();
-        for i in 0..ITEMS {
+        for i in 0..ITEMS_ST {
             // The popped value feeds the assertion below via the dependency chain,
             // so the optimizer can't elide the round-trip.
             p.try_push(i).expect("depth-1 ring is never full");
             let _ = c.try_pop().expect("just pushed one");
         }
-        let per_item = start.elapsed().as_nanos() as f64 / ITEMS as f64;
+        let per_item = start.elapsed().as_nanos() as f64 / ITEMS_ST as f64;
         if trial >= WARMUP {
             samples.push(per_item);
         }
@@ -90,13 +108,13 @@ fn bench_ping_stream() -> f64 {
         let (p, c) = spsc::<usize>(256);
         let start = Instant::now();
         let producer = std::thread::spawn(move || {
-            for i in 0..ITEMS {
+            for i in 0..ITEMS_PS {
                 p.push(i).expect("consumer alive");
             }
         });
         let consumer = std::thread::spawn(move || {
             let mut acc = 0usize;
-            for _ in 0..ITEMS {
+            for _ in 0..ITEMS_PS {
                 acc = acc.wrapping_add(c.pop().expect("producer alive until N"));
             }
             acc
@@ -104,8 +122,8 @@ fn bench_ping_stream() -> f64 {
         producer.join().unwrap();
         let acc = consumer.join().unwrap();
         // Force the accumulator to be observed so nothing is optimized away.
-        assert_eq!(acc, ITEMS.wrapping_mul(ITEMS.wrapping_sub(1)) / 2);
-        let per_item = start.elapsed().as_nanos() as f64 / ITEMS as f64;
+        assert_eq!(acc, ITEMS_PS.wrapping_mul(ITEMS_PS.wrapping_sub(1)) / 2);
+        let per_item = start.elapsed().as_nanos() as f64 / ITEMS_PS as f64;
         if trial >= WARMUP {
             samples.push(per_item);
         }
@@ -114,12 +132,19 @@ fn bench_ping_stream() -> f64 {
 }
 
 fn main() {
-    println!("ring_hop microbench — {ITEMS} items/trial, {TRIALS} trials (median), {WARMUP} warmup");
+    use std::io::Write;
+    println!(
+        "ring_hop microbench — {TRIALS} trials (median), {WARMUP} warmup \
+         (same_thread {ITEMS_ST} items/trial, ping_stream {ITEMS_PS})"
+    );
     println!("(spec: Performance doctrine — budgets, not vibes)\n");
+    std::io::stdout().flush().ok();
 
     let st = bench_same_thread();
     println!("same_thread  try_push+try_pop : {st:>7.2} ns/item");
+    std::io::stdout().flush().ok();
 
     let ps = bench_ping_stream();
     println!("ping_stream  push->pop 2-thread: {ps:>7.2} ns/item");
+    std::io::stdout().flush().ok();
 }
