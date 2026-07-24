@@ -144,11 +144,9 @@ fn main() {
             let target = (ctrl.position_secs() + delta).clamp(0.0, media.total_secs);
             let to_byte = (target / media.total_secs * media.file_len as f64) as u64;
             let to_frame = (target * media.rate as f64) as u64;
-            // A paused pipeline is frozen (backpressured to a stop), so the flush can't
-            // propagate — resume so the seek takes effect, matching player convention.
-            if ctrl.is_paused() {
-                ctrl.resume();
-            }
+            // Seeking while paused stays paused: the interruptible sink push lets the flush
+            // propagate through the frozen graph, so it re-primes at the new position and the
+            // shown time jumps there, without starting playback (spec: flush/seek).
             seek.seek(to_byte, to_frame);
         };
         std::thread::spawn(move || {

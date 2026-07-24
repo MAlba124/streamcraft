@@ -575,12 +575,17 @@ impl Ctx {
         self.registration.take()
     }
 
-    /// Drop every buffer staged in this `Ctx` — pending input, each src pad's output, any
-    /// fan-in per-pad inputs, and queued IO completions/submissions — recycling them to the
-    /// pool (spec: flush/seek). The scheduler calls this on each element of a group when a
-    /// flush begins, so no pre-seek data lingers inside an element between passes. In-flight
-    /// reactor reads are not here (the reactor owns them); a source drops their stale
-    /// completions itself once they land.
+    /// Drop the pipeline data staged in this `Ctx` — pending input, each src pad's output,
+    /// and any fan-in per-pad inputs — recycling their buffers to the pool (spec: flush/seek).
+    /// The scheduler calls this on each element of a group when a flush begins, so no pre-seek
+    /// data lingers inside an element between passes.
+    ///
+    /// The IO mailbox (`io_in` completions / `io_out` submissions) is deliberately **left
+    /// intact**: it is the element's own in-flight accounting (a source counts every submitted
+    /// read and decrements only when it drains the completion), so clearing it here would
+    /// strand completions the element never counted as done and desync that count — throttling
+    /// or stalling the source across a seek. The source drops the *stale data* itself when it
+    /// drains those completions (filesrc's `valid_from` seq floor), which keeps the count exact.
     pub(crate) fn discard_buffers(&mut self) {
         self.input.clear();
         for o in &mut self.outs {
@@ -589,8 +594,6 @@ impl Ctx {
         for i in &mut self.ins {
             i.clear();
         }
-        self.io_in.clear();
-        self.io_out.clear();
     }
 }
 

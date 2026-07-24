@@ -144,26 +144,39 @@ impl Producer {
     }
 
     /// Append all of `bytes`, blocking while the ring is full so the audio device paces the
-    /// pipeline (backpressure). Returns early if the sink was closed (the PW thread went away),
-    /// dropping any unwritten tail — nothing downstream can consume it anymore.
-    pub fn push(&self, mut bytes: &[u8]) {
+    /// pipeline (backpressure). A test-only convenience over
+    /// [`push_interruptible`](Self::push_interruptible) (never aborts); production code uses the
+    /// interruptible form so a seek can unblock a paused sink.
+    #[cfg(test)]
+    pub fn push(&self, bytes: &[u8]) {
+        self.push_interruptible(bytes, || false);
+    }
+
+    /// Append all of `bytes`, blocking while the ring is full so the audio device paces the
+    /// pipeline (backpressure), but give up (returning `false`, dropping the unwritten tail) as
+    /// soon as `abort` reads true — so a **paused** sink, blocked here on a full ring the RT
+    /// callback is deliberately not draining, can still notice a seek and return control to the
+    /// scheduler to run the flush (spec: flush/seek). `abort` is re-checked each park cycle, so
+    /// the wait ends within one `PARK` even though the consumer never signals. Returns `true`
+    /// when every byte was pushed. Also returns early if the sink was closed (PW thread gone).
+    pub fn push_interruptible(&self, mut bytes: &[u8], abort: impl Fn() -> bool) -> bool {
         while !bytes.is_empty() {
-            if self.inner.closed.load(Ordering::Acquire) {
-                return;
+            if self.inner.closed.load(Ordering::Acquire) || abort() {
+                return false;
             }
             let n = self.try_push(bytes);
             bytes = &bytes[n..];
             if !bytes.is_empty() {
-                // Still full. Park briefly, then re-poll: the RT consumer frees space by
-                // advancing `head` and deliberately never signals us (it must not lock),
-                // so we time out and check for room ourselves rather than wait forever.
                 let g = self.inner.gate.lock().unwrap();
-                if self.inner.len() == self.inner.cap && !self.inner.closed.load(Ordering::Acquire)
+                if self.inner.len() == self.inner.cap
+                    && !self.inner.closed.load(Ordering::Acquire)
+                    && !abort()
                 {
                     let _ = self.inner.cvar.wait_timeout(g, PARK).unwrap();
                 }
             }
         }
+        true
     }
 
     /// Discard the currently-buffered PCM on a seek (spec: flush/seek). Publishes the current

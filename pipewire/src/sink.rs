@@ -385,11 +385,13 @@ impl Element for PipeWireAudioSink {
             let data = buf.memory.data();
             let mut off = 0;
             while off < data.len() {
-                if ctx.seek_gen() != start_gen {
-                    return Ok(Flow::Ok); // a seek arrived: stop pushing; the loop top flushes
-                }
                 let end = (off + SLICE).min(data.len());
-                producer.push(&data[off..end]); // blocks when full → backpressure
+                // Interruptible push: bail the instant a seek is requested — even mid-slice on
+                // a full ring, which is the paused case (the RT callback holds the ring, so a
+                // plain blocking push would never return and the flush could not propagate).
+                if !producer.push_interruptible(&data[off..end], || ctx.seek_gen() != start_gen) {
+                    return Ok(Flow::Ok); // seek (or shutdown): stop; the loop top flushes
+                }
                 off = end;
             }
         }
