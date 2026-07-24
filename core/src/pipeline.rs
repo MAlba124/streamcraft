@@ -478,12 +478,13 @@ impl Pipeline {
         }
 
         // One SPSC ring per inter-group edge. A group may have several downstream rings
-        // (fan-out — a demuxer's src pads), each tagged with the tail's src pad so the
-        // scheduler routes that pad's output to it; it has at most one upstream ring
-        // (fan-in / aggregation is not yet supported).
+        // (fan-out — a demuxer's src pads), each tagged with the tail's src pad; and
+        // several upstream rings (fan-in — a muxer's sink pads), each tagged with the
+        // head's sink pad so the aggregator reads each pad independently.
         let mut group_downstream: Vec<Vec<(PadId, Producer<Batch>)>> =
             (0..ng).map(|_| Vec::new()).collect();
-        let mut group_upstream: Vec<Option<Consumer<Batch>>> = (0..ng).map(|_| None).collect();
+        let mut group_upstream: Vec<Vec<(PadId, Consumer<Batch>)>> =
+            (0..ng).map(|_| Vec::new()).collect();
         for edge in &self.edges {
             let gs = group_of[edge.src.0 as usize];
             let gd = group_of[edge.sink.0 as usize];
@@ -496,12 +497,9 @@ impl Pipeline {
                      (make the branch point active so it forms its own group)",
                 ));
             }
-            if group_upstream[gd].is_some() {
-                return Err(Error::Todo("fan-in / aggregation not yet supported"));
-            }
             let (p, c) = spsc::<Batch>(self.queue_cap);
             group_downstream[gs].push((PadId(edge.src_pad as u32), p));
-            group_upstream[gd] = Some(c);
+            group_upstream[gd].push((PadId(edge.sink_pad as u32), c));
         }
 
         // Per-element counters, shared with the app via `counters()` after run.
@@ -576,7 +574,7 @@ impl Pipeline {
                 .iter()
                 .map(|id| per_elem_logs[id.0 as usize].take())
                 .collect();
-            let upstream = group_upstream[gi].take();
+            let upstream = std::mem::take(&mut group_upstream[gi]);
             let downstream = std::mem::take(&mut group_downstream[gi]);
             let group_pad_infos: Vec<(usize, Vec<usize>)> =
                 ids.iter().map(|id| pad_infos[id.0 as usize].clone()).collect();
@@ -727,9 +725,9 @@ impl Pipeline {
         if n == 0 {
             return Err(Error::Todo("empty pipeline"));
         }
-        // Kahn's over the (possibly branching) DAG. Fan-out is fine — one element with
-        // several src pads feeds several downstreams. Fan-in (a node with two incoming
-        // edges) is left for aggregation and rejected at group wiring.
+        // Kahn's over the DAG. Both fan-out (one element → several downstreams via
+        // distinct src pads) and fan-in (an active aggregator with several sink pads) are
+        // fine; a passive element with two inputs is caught in compute_groups.
         let mut indeg = vec![0usize; n];
         let mut adj: Vec<Vec<ElementId>> = vec![Vec::new(); n];
         for e in &self.edges {
@@ -742,14 +740,10 @@ impl Pipeline {
             .filter(|(_, &d)| d == 0)
             .map(|(i, _)| ElementId(i as u32))
             .collect();
-        match ready.len() {
-            0 => return Err(Error::Todo("no source (cycle?)")),
-            1 => {}
-            _ => {
-                return Err(Error::Todo(
-                    "multiple sources (fan-in / aggregation not yet supported)",
-                ))
-            }
+        // One or more sources are fine (a muxer graph fans several streams into one
+        // aggregator); zero means a cycle with no entry point.
+        if ready.is_empty() {
+            return Err(Error::Todo("no source (cycle?)"));
         }
         let mut order = Vec::with_capacity(n);
         while let Some(u) = ready.pop() {
@@ -776,14 +770,12 @@ impl Pipeline {
     /// upstream) is rejected — make the branch point active.
     fn compute_groups(&self, order: &[ElementId]) -> Result<Vec<Vec<ElementId>>, Error> {
         let n = self.elements.len();
-        // Each element's single upstream (via its incoming edge); fan-in is caught here.
-        let mut upstream_of: Vec<Option<ElementId>> = vec![None; n];
+        // Incoming edges per element. A passive element must have exactly one (it inlines
+        // into that upstream's group); an active element may have several — a fan-in
+        // aggregator (a muxer) is its own group head reading N upstream rings.
+        let mut incoming: Vec<Vec<ElementId>> = vec![Vec::new(); n];
         for e in &self.edges {
-            let slot = &mut upstream_of[e.sink.0 as usize];
-            if slot.is_some() {
-                return Err(Error::Todo("fan-in / aggregation not yet supported"));
-            }
-            *slot = Some(e.src);
+            incoming[e.sink.0 as usize].push(e.src);
         }
         let mut group_of: Vec<Option<usize>> = vec![None; n];
         let mut groups: Vec<Vec<ElementId>> = Vec::new();
@@ -793,15 +785,20 @@ impl Pipeline {
                 .ok_or(Error::Todo("element already consumed"))?
                 .desc()
                 .sched;
-            let is_source = upstream_of[id.0 as usize].is_none();
+            let is_source = incoming[id.0 as usize].is_empty();
             if is_source || matches!(sched, SchedHint::Active) {
                 group_of[id.0 as usize] = Some(groups.len());
                 groups.push(vec![id]);
             } else {
-                // Passive: inline into the single upstream's group, but only if that
+                // Passive: inline into its single upstream's group, but only if that
                 // upstream is the group's current tail — otherwise this is a passive
-                // fan-out, which the linear-chain group model does not support.
-                let up = upstream_of[id.0 as usize].unwrap();
+                // fan-out (unsupported), and >1 input is a passive aggregator (unsupported).
+                if incoming[id.0 as usize].len() != 1 {
+                    return Err(Error::Todo(
+                        "passive element with multiple inputs (an aggregator must be active)",
+                    ));
+                }
+                let up = incoming[id.0 as usize][0];
                 let g = group_of[up.0 as usize]
                     .ok_or(Error::Todo("passive scheduled before its upstream (internal)"))?;
                 if *groups[g].last().unwrap() != up {
@@ -1045,7 +1042,7 @@ fn run_group(
     ids: Vec<ElementId>,
     formats: Vec<Vec<Option<FixedFormat>>>,
     logs: Vec<Option<Log>>,
-    upstream: Option<Consumer<Batch>>,
+    upstream: Vec<(PadId, Consumer<Batch>)>,
     downstream: Vec<(PadId, Producer<Batch>)>,
     factory: ReactorFactory,
     pool: Pool,
@@ -1059,18 +1056,15 @@ fn run_group(
     pad_infos: Vec<(usize, Vec<usize>)>,
 ) -> Result<(), Error> {
     let m = elements.len();
-    let is_source = upstream.is_none();
-    // The head element's sink pad (the one the upstream ring feeds), so a FormatChange's
-    // re-fixation lands on the right pad (spec: Formats — dynamic caps).
-    let head_sink_pad: Option<PadId> = if is_source {
+    let is_source = upstream.is_empty();
+    // A fan-in (aggregator) head reads several upstream rings; a single-input head reads
+    // one. The single-input head's sink pad (the one the ring feeds) is where a
+    // FormatChange re-fixates; a fan-in head re-fixates per pad in the feed loop instead.
+    let fan_in = upstream.len() > 1;
+    let head_sink_pad: Option<PadId> = if is_source || fan_in {
         None
     } else {
-        elements[0]
-            .desc()
-            .pads
-            .iter()
-            .position(|p| p.direction == Direction::Sink)
-            .map(|i| PadId(i as u32))
+        Some(upstream[0].0)
     };
     let mut reactor: Box<dyn Reactor> =
         factory().map_err(|e| Error::Resource(format!("reactor init: {e}")))?;
@@ -1129,8 +1123,35 @@ fn run_group(
         }
         let mut progressed = false;
 
-        // A. Feed the head from upstream (non-source groups only).
-        if let Some(up) = &upstream {
+        // A. Feed the head from upstream.
+        if fan_in {
+            // Aggregator: poll every upstream ring non-blockingly, feeding each into its
+            // own sink pad and marking a pad closed when its ring closes (so a muxer can
+            // stop waiting for it). An efficient multi-ring park is a follow-up; the
+            // yield-on-no-progress net at the loop's end covers the idle case for now.
+            let mut all_closed = true;
+            for (pad, cons) in &upstream {
+                while let Some(mut batch) = cons.try_pop() {
+                    counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    let events = batch.take_events();
+                    ctxs[0].append_input_on(*pad, &mut batch);
+                    if let Err(e) =
+                        deliver_events(&mut *elements[0], &mut ctxs[0], Some(*pad), events, &vocabulary)
+                    {
+                        break 'group Err(e);
+                    }
+                    progressed = true;
+                }
+                if cons.is_closed() {
+                    ctxs[0].set_pad_closed(*pad);
+                } else {
+                    all_closed = false;
+                }
+            }
+            if all_closed {
+                upstream_closed = true;
+            }
+        } else if let Some((_pad, up)) = upstream.first() {
             let closed = up.is_closed();
             let head_idle =
                 ctxs[0].input_is_empty() && ctxs[0].inbox_empty() && reactor.is_idle();
@@ -1179,7 +1200,9 @@ fn run_group(
         // B. Run the group's elements inline (head active, passive tail).
         let mut fatal = None;
         for i in 0..m {
-            let flow = if i == 0 && is_source {
+            let flow = if i == 0 && (is_source || fan_in) {
+                // A source has no input; a fan-in head reads its pads via
+                // `ctx.take_input_on(pad)`, so both get an empty `Inputs` here.
                 elements[0].process(&mut ctxs[0], Inputs::empty())
             } else {
                 let mut input = ctxs[i].take_input();
@@ -1251,7 +1274,7 @@ fn run_group(
         // E. Termination: the head is finished and nothing is buffered or in flight.
         let head_done = if is_source { source_eos } else { upstream_closed };
         let quiescent = reactor.is_idle()
-            && ctxs.iter().all(|c| c.inbox_empty() && c.input_is_empty());
+            && ctxs.iter().all(|c| c.inbox_empty() && c.inputs_empty());
         if head_done && quiescent {
             if eos_next < m {
                 // Deliver EOS to one element per pass, in chain order, then loop so its

@@ -69,6 +69,14 @@ pub struct Ctx {
     /// Next local pad index [`add_pad`](Self::add_pad) hands out — past the static pads
     /// (set by [`configure_pads`](Self::configure_pads)).
     next_pad: u32,
+    /// Per-sink-pad input batches for a fan-in (aggregating) element — a muxer reads each
+    /// upstream via [`take_input_on`](Self::take_input_on) (spec: Aggregation). Empty and
+    /// unused for the single-input majority, which use the primary `input`.
+    ins: Vec<Batch>,
+    /// Per-sink-pad end-of-stream flags: the scheduler sets a pad closed when its upstream
+    /// ring closes, so an aggregator knows that pad will produce no more and can stop
+    /// waiting for it (spec: Aggregation). Grown on demand.
+    pad_eos: Vec<bool>,
     bus: BusSender,
     element: ElementId,
     out_format: FormatId,
@@ -124,6 +132,8 @@ impl Ctx {
             single_src: None,
             added_pads: Vec::new(),
             next_pad: 0,
+            ins: Vec::new(),
+            pad_eos: Vec::new(),
             pool,
             bus,
             element,
@@ -430,6 +440,48 @@ impl Ctx {
 
     pub(crate) fn input_is_empty(&self) -> bool {
         self.input.is_empty()
+    }
+
+    /// True if no pad has pending input — the primary sink pad *and* every fan-in pad.
+    /// The scheduler's quiescence check (works for single- and multi-input elements).
+    pub(crate) fn inputs_empty(&self) -> bool {
+        self.input.is_empty() && self.ins.iter().all(|b| b.is_empty())
+    }
+
+    /// Append an upstream batch to a specific sink pad's input (scheduler hook, fan-in).
+    pub(crate) fn append_input_on(&mut self, pad: PadId, other: &mut Batch) {
+        let i = pad.0 as usize;
+        if self.ins.len() <= i {
+            self.ins.resize_with(i + 1, || Batch::new(self.out_format));
+        }
+        self.ins[i].append(other);
+    }
+
+    /// Take (replace with empty) a sink pad's accumulated input — an aggregating element's
+    /// per-pad read (spec: Aggregation). Pairs with [`is_pad_closed`](Self::is_pad_closed)
+    /// so a muxer knows when a pad is done.
+    pub fn take_input_on(&mut self, pad: PadId) -> Batch {
+        let i = pad.0 as usize;
+        if self.ins.len() <= i {
+            self.ins.resize_with(i + 1, || Batch::new(self.out_format));
+        }
+        let fmt = self.out_format;
+        std::mem::replace(&mut self.ins[i], Batch::new(fmt))
+    }
+
+    /// Whether a sink pad's upstream has closed (no more input will arrive on it), so an
+    /// aggregator can stop waiting for that pad and drain the rest (spec: Aggregation).
+    pub fn is_pad_closed(&self, pad: PadId) -> bool {
+        self.pad_eos.get(pad.0 as usize).copied().unwrap_or(false)
+    }
+
+    /// Mark a sink pad's upstream closed (scheduler hook).
+    pub(crate) fn set_pad_closed(&mut self, pad: PadId) {
+        let i = pad.0 as usize;
+        if self.pad_eos.len() <= i {
+            self.pad_eos.resize(i + 1, false);
+        }
+        self.pad_eos[i] = true;
     }
 
     pub(crate) fn take_submissions(&mut self) -> Vec<Submission> {
