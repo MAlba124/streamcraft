@@ -525,6 +525,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sc-mkv"
+version = "0.1.0"
+dependencies = [
+ "sc-flac",
+ "streamcraft-core",
+]
+
+[[package]]
 name = "sc-ogg"
 version = "0.1.0"
 dependencies = [
