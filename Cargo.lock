@@ -577,15 +577,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-opus"
-version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2943bf31fa7d818c94023d4a9f7d3da122be8a73679d6eaa8b3646614a5f0dcb"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-vp8"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -785,9 +776,7 @@ dependencies = [
 name = "sc-opus"
 version = "0.1.0"
 dependencies = [
- "oxideav-opus",
  "streamcraft-core",
- "streamcraft-elements",
 ]
 
 [[package]]

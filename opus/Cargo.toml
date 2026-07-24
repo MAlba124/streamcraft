@@ -1,6 +1,6 @@
 [package]
 name = "sc-opus"
-description = "Opus (RFC 6716) codec plugin for streamcraft backed by the pure-Rust oxideav-opus (adoption pending evaluation)"
+description = "Opus (RFC 6716) codec plugin for streamcraft — stub; oxideav-opus 0.0.13 rejected on conformance (see src/lib.rs), pending a publishable version"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ name = "sc_opus"
 
 [dependencies]
 streamcraft-core = { path = "../core" }
-oxideav-opus = { version = "0.0.13", default-features = false }
-
-[dev-dependencies]
-streamcraft-elements = { path = "../elements" }
+# oxideav-opus is intentionally NOT a dependency: the published 0.0.13 does not
+# decode Opus (RFC 6716 test vectors score ≤ 0 dB SNR; CELT/hybrid emit silence,
+# SILK emits noise). See src/lib.rs for the full evaluation and the turnkey
+# re-vetting path once a working version publishes.
