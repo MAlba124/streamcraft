@@ -12,7 +12,8 @@ use crate::batch::{Batch, OutBatch};
 use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
 use crate::clock::{Clock, WaitOutcome};
-use crate::format::{FixedFormat, ValueDesc, Vocabulary};
+use crate::element::Direction;
+use crate::format::{FixedFormat, OfferDesc, ValueDesc, Vocabulary};
 use crate::id::{ElementId, FieldId, FormatId, PadId, ValueId};
 use crate::io::{Completion, Io, Submission};
 use crate::log::{Field, Level, Log, Loggable};
@@ -30,6 +31,18 @@ pub(crate) struct Announcement {
     pub(crate) pad: PadId,
     pub(crate) family: &'static str,
     pub(crate) fields: Vec<(&'static str, ValueDesc)>,
+}
+
+/// A pad an element instantiated at runtime via [`Ctx::add_pad`] during preroll (spec:
+/// dynamic pads). The pipeline drains these: it registers each so [`link`] can find it
+/// by name and posts a `PadAdded` bus message.
+///
+/// [`link`]: crate::pipeline::Pipeline::link
+pub(crate) struct AddedPad {
+    pub(crate) direction: Direction,
+    pub(crate) name: String,
+    pub(crate) offers: &'static [OfferDesc],
+    pub(crate) pad: PadId,
 }
 
 pub struct Ctx {
@@ -50,6 +63,12 @@ pub struct Ctx {
     /// output, pad ignored). `None` for a branching element (≥2 src pads), where `out`
     /// routes strictly by pad, and for a sink (no src pad).
     single_src: Option<usize>,
+    /// Pads instantiated at runtime via [`add_pad`](Self::add_pad), drained by the
+    /// pipeline during preroll (spec: dynamic pads). Empty for the overwhelming majority.
+    added_pads: Vec<AddedPad>,
+    /// Next local pad index [`add_pad`](Self::add_pad) hands out — past the static pads
+    /// (set by [`configure_pads`](Self::configure_pads)).
+    next_pad: u32,
     bus: BusSender,
     element: ElementId,
     out_format: FormatId,
@@ -103,6 +122,8 @@ impl Ctx {
             outs: Vec::new(),
             primary_out: 0,
             single_src: None,
+            added_pads: Vec::new(),
+            next_pad: 0,
             pool,
             bus,
             element,
@@ -331,6 +352,34 @@ impl Ctx {
         self.outs = (0..npads).map(|_| Batch::new(self.out_format)).collect();
         self.primary_out = src_pads.first().copied().unwrap_or(0);
         self.single_src = if src_pads.len() == 1 { Some(src_pads[0]) } else { None };
+        self.next_pad = npads as u32;
+    }
+
+    /// Instantiate a new pad at runtime and return its [`PadId`] (spec: dynamic pads).
+    /// Called from an element's [`preroll`](crate::element::Element::preroll) after it
+    /// discovers a stream: the id (past the static pads) is what the element writes to via
+    /// [`out`](Self::out), and the pad is recorded so the pipeline can link it and post a
+    /// `PadAdded`. `offers` is the pad's format menu, exactly like a static pad's.
+    pub fn add_pad(
+        &mut self,
+        direction: Direction,
+        name: &str,
+        offers: &'static [OfferDesc],
+    ) -> PadId {
+        let pad = PadId(self.next_pad);
+        self.next_pad += 1;
+        self.added_pads.push(AddedPad {
+            direction,
+            name: name.to_string(),
+            offers,
+            pad,
+        });
+        pad
+    }
+
+    /// Drain the runtime-added pads (pipeline hook, during preroll).
+    pub(crate) fn take_added_pads(&mut self) -> Vec<AddedPad> {
+        std::mem::take(&mut self.added_pads)
     }
 
     /// The element's primary output batch (its first src pad). Used by the scheduler for

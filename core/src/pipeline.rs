@@ -21,7 +21,7 @@ use crate::ctx::Ctx;
 use crate::element::{Direction, Element, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::event::Event;
-use crate::format::{negotiate, FieldConstraint, FixedFormat, Value, Vocabulary};
+use crate::format::{negotiate, FieldConstraint, FixedFormat, OfferDesc, Value, Vocabulary};
 use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, PadId, ValueId};
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::log::{log_channel, Level, LevelFilter, Log, LogDrain};
@@ -41,6 +41,27 @@ struct Edge {
     sink: ElementId,
     sink_pad: usize,
     format: FixedFormat,
+}
+
+/// A pad instantiated at runtime (spec: dynamic pads), registered by
+/// [`Pipeline::preroll`] so [`Pipeline::link`] can resolve it by name and the scheduler
+/// can size the element's per-pad tables. Its `offers` are `&'static` (the element hands
+/// `add_pad` a static offer menu), so negotiating a dynamic edge is identical to a static
+/// one.
+struct DynPad {
+    name: String,
+    direction: Direction,
+    offers: &'static [OfferDesc],
+    index: usize,
+}
+
+/// A pad that appeared during [`Pipeline::preroll`] (spec: dynamic pads). Link it to a
+/// downstream with [`Pipeline::link`] using `name`; `pad` is its local id on `element`.
+#[derive(Clone, Debug)]
+pub struct AddedPadInfo {
+    pub element: ElementId,
+    pub pad: PadId,
+    pub name: String,
 }
 
 /// A summary of a finished [`Pipeline::run`], for tests and profiling.
@@ -104,6 +125,10 @@ pub struct Pipeline {
     /// samples `base_time = clock.now()` at start, then every element shares this one
     /// timeline via `ctx.now()` / `ctx.wait_until()`.
     clock: Arc<dyn Clock>,
+    /// Pads instantiated at runtime, per element (spec: dynamic pads). Indexed by
+    /// `ElementId`; grown to match `elements` in [`add`](Self::add) and populated by
+    /// [`preroll`](Self::preroll). Empty for a static pipeline.
+    dyn_pads: Vec<Vec<DynPad>>,
 }
 
 impl Pipeline {
@@ -130,6 +155,7 @@ impl Pipeline {
             log_level: None,
             log_queue_cap: 1024,
             clock: Arc::new(InstantClock::new()),
+            dyn_pads: Vec::new(),
         }
     }
 
@@ -176,6 +202,7 @@ impl Pipeline {
     pub fn add(&mut self, element: impl Element + 'static) -> ElementId {
         let id = ElementId(self.elements.len() as u32);
         self.elements.push(Some(Box::new(element)));
+        self.dyn_pads.push(Vec::new());
         id
     }
 
@@ -191,17 +218,20 @@ impl Pipeline {
         let sink_pad = self.check_pad(sink.0, sink.1, Direction::Sink)?;
 
         // Lower both pads' string-keyed offers to id-based offers (interning family/
-        // field/value names once, here), then intersect. Descriptors are `'static`, so
-        // these borrows are fine to hold across the two lowering passes.
-        let src_desc = &self.elements[src.0 .0 as usize].as_ref().unwrap().desc().pads[src_pad];
-        let src_offers: Vec<_> = src_desc
-            .offers
+        // field/value names once, here), then intersect. Offer menus are `'static`
+        // (static pads *and* dynamic ones, whose `add_pad` menu is `&'static`), so the
+        // borrows survive the two `&mut self` lowering passes.
+        let src_offers_desc = self
+            .pad_offers(src.0, src_pad)
+            .ok_or(Error::Todo("link: no offers for src pad"))?;
+        let src_offers: Vec<_> = src_offers_desc
             .iter()
             .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
             .collect();
-        let sink_desc = &self.elements[sink.0 .0 as usize].as_ref().unwrap().desc().pads[sink_pad];
-        let sink_offers: Vec<_> = sink_desc
-            .offers
+        let sink_offers_desc = self
+            .pad_offers(sink.0, sink_pad)
+            .ok_or(Error::Todo("link: no offers for sink pad"))?;
+        let sink_offers: Vec<_> = sink_offers_desc
             .iter()
             .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
             .collect();
@@ -228,24 +258,59 @@ impl Pipeline {
         Ok(id)
     }
 
-    /// Verify a named pad exists on an element with the expected direction, returning
-    /// its index in the element's `desc().pads` (which is the pad's local `PadId`).
+    /// Verify a named pad exists on an element with the expected direction, returning its
+    /// local pad index (`PadId`). Searches the static `desc().pads` first, then the
+    /// runtime-added (dynamic) pads registered by [`preroll`](Self::preroll).
     fn check_pad(&self, el: ElementId, pad: &str, dir: Direction) -> Result<usize, Error> {
         let e = self
             .elements
             .get(el.0 as usize)
             .and_then(|o| o.as_ref())
             .ok_or(Error::Todo("link: unknown element"))?;
-        match e.desc().pads.iter().position(|p| p.name == pad) {
-            Some(i) if e.desc().pads[i].direction == dir => Ok(i),
-            Some(_) => Err(Error::Resource(format!(
-                "link: pad '{pad}' on '{}' has the wrong direction",
-                e.desc().name
-            ))),
-            None => Err(Error::Resource(format!(
-                "link: element '{}' has no pad '{pad}'",
-                e.desc().name
-            ))),
+        if let Some(i) = e.desc().pads.iter().position(|p| p.name == pad) {
+            return if e.desc().pads[i].direction == dir {
+                Ok(i)
+            } else {
+                Err(Error::Resource(format!(
+                    "link: pad '{pad}' on '{}' has the wrong direction",
+                    e.desc().name
+                )))
+            };
+        }
+        if let Some(dp) = self
+            .dyn_pads
+            .get(el.0 as usize)
+            .and_then(|dps| dps.iter().find(|d| d.name == pad))
+        {
+            return if dp.direction == dir {
+                Ok(dp.index)
+            } else {
+                Err(Error::Resource(format!(
+                    "link: dynamic pad '{pad}' on '{}' has the wrong direction",
+                    e.desc().name
+                )))
+            };
+        }
+        Err(Error::Resource(format!(
+            "link: element '{}' has no pad '{pad}'",
+            e.desc().name
+        )))
+    }
+
+    /// The `&'static` offer menu for a pad by index — static (`desc().pads[i]`) or
+    /// dynamic ([`preroll`](Self::preroll)-added). `&'static`, so a caller can hold it
+    /// across the `&mut self` interning passes in [`link`](Self::link).
+    fn pad_offers(&self, el: ElementId, index: usize) -> Option<&'static [OfferDesc]> {
+        let e = self.elements.get(el.0 as usize)?.as_ref()?;
+        let static_pads = e.desc().pads;
+        if index < static_pads.len() {
+            Some(static_pads[index].offers)
+        } else {
+            self.dyn_pads
+                .get(el.0 as usize)?
+                .iter()
+                .find(|d| d.index == index)
+                .map(|d| d.offers)
         }
     }
 
@@ -275,9 +340,16 @@ impl Pipeline {
         let mut per: Vec<Vec<Option<FixedFormat>>> = self
             .elements
             .iter()
-            .map(|e| {
-                let n = e.as_ref().map_or(0, |el| el.desc().pads.len());
-                vec![None; n]
+            .enumerate()
+            .map(|(i, e)| {
+                let static_n = e.as_ref().map_or(0, |el| el.desc().pads.len());
+                // Cover runtime-added pad indices too, so a dynamic edge's format lands.
+                let dyn_n = self
+                    .dyn_pads
+                    .get(i)
+                    .and_then(|d| d.iter().map(|p| p.index + 1).max())
+                    .unwrap_or(0);
+                vec![None; static_n.max(dyn_n)]
             })
             .collect();
         for edge in &self.edges {
@@ -323,6 +395,55 @@ impl Pipeline {
     /// negotiated categorical value (pixel format, sample format).
     pub fn value_id(&self, name: &str) -> Option<ValueId> {
         self.values.get(name).map(ValueId)
+    }
+
+    // --- Preroll (spec: dynamic pads — topology settles, then freezes) ---
+
+    /// Run each element's discovery phase so a demuxer can instantiate its dynamic src
+    /// pads (spec: dynamic pads). Returns the pads that appeared — link each to a
+    /// downstream with [`link`](Self::link) (by `name`) before calling [`run`](Self::run);
+    /// each is also posted as a [`BusMessage::PadAdded`](crate::bus::BusMessage). Call
+    /// after the static edges are linked. Topology is expected to settle here and then be
+    /// frozen for the streaming phase — mid-stream topology change is out of scope. A
+    /// static pipeline need not call this (every `preroll` defaults to a no-op).
+    pub fn preroll(&mut self) -> Result<Vec<AddedPadInfo>, Error> {
+        // A throwaway pool: preroll only instantiates pads, it does not stream buffers.
+        let pool = Pool::bounded(self.slot_size, 1);
+        let mut appeared = Vec::new();
+        for i in 0..self.elements.len() {
+            let static_len = match &self.elements[i] {
+                Some(e) => e.desc().pads.len(),
+                None => continue,
+            };
+            let id = ElementId(i as u32);
+            let mut ctx = Ctx::new(pool.clone(), self.bus_sender.clone(), id, BYTES, self.credits);
+            ctx.configure_pads(static_len, &[]); // hand out dynamic ids past the static pads
+            if let Some(el) = self.elements[i].as_mut() {
+                el.preroll(&mut ctx)?;
+            }
+            for ap in ctx.take_added_pads() {
+                // A best-effort family for the notification; the concrete format is fixed
+                // when the pad is linked (interning happens there too).
+                let family = ap
+                    .offers
+                    .first()
+                    .map(|o| FormatId(self.formats.intern(o.family)))
+                    .unwrap_or(FormatId(0));
+                self.bus_sender.send(BusMessage::PadAdded {
+                    element: id,
+                    pad: ap.pad,
+                    format: FixedFormat::new(family),
+                });
+                appeared.push(AddedPadInfo { element: id, pad: ap.pad, name: ap.name.clone() });
+                self.dyn_pads[i].push(DynPad {
+                    name: ap.name,
+                    direction: ap.direction,
+                    offers: ap.offers,
+                    index: ap.pad.0 as usize,
+                });
+            }
+        }
+        Ok(appeared)
     }
 
     // --- Running (finite: drives to EOS across all group threads) ---
@@ -411,6 +532,29 @@ impl Pipeline {
         // disabled path stays at zero cost, which is the point (performance is #1).
         let (mut per_elem_logs, log_drain) = self.build_logging(total);
 
+        // Per-element pad shape (total pad count, src pad indices) — static pads plus any
+        // runtime-added dynamic pads — so each Ctx sizes its per-pad output table and the
+        // single-src leniency right (a demuxer with dynamic src pads is not single-src).
+        let pad_infos: Vec<(usize, Vec<usize>)> = (0..total)
+            .map(|i| {
+                let static_pads = self.elements[i].as_ref().map(|e| e.desc().pads).unwrap_or(&[]);
+                let mut n = static_pads.len();
+                let mut srcs: Vec<usize> = static_pads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.direction == Direction::Src)
+                    .map(|(j, _)| j)
+                    .collect();
+                for dp in &self.dyn_pads[i] {
+                    n = n.max(dp.index + 1);
+                    if dp.direction == Direction::Src {
+                        srcs.push(dp.index);
+                    }
+                }
+                (n, srcs)
+            })
+            .collect();
+
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
         for (gi, ids) in groups.into_iter().enumerate() {
@@ -434,6 +578,8 @@ impl Pipeline {
                 .collect();
             let upstream = group_upstream[gi].take();
             let downstream = std::mem::take(&mut group_downstream[gi]);
+            let group_pad_infos: Vec<(usize, Vec<usize>)> =
+                ids.iter().map(|id| pad_infos[id.0 as usize].clone()).collect();
             let pool = pool.clone();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
@@ -444,6 +590,7 @@ impl Pipeline {
                 run_group(
                     elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
                     bus, credits, group_counters, stop, vocabulary, clock, base_time,
+                    group_pad_infos,
                 )
             }));
         }
@@ -909,6 +1056,7 @@ fn run_group(
     vocabulary: Arc<Vocabulary>,
     clock: Arc<dyn Clock>,
     base_time: Timestamp,
+    pad_infos: Vec<(usize, Vec<usize>)>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_none();
@@ -933,15 +1081,8 @@ fn run_group(
     // Size each Ctx's per-pad output table and record its primary (first) src pad, so
     // `ctx.out(pad)` routes per pad and the scheduler can pull each src pad's output for
     // its downstream ring (spec: dynamic pads / branching).
-    for (ctx, elem) in ctxs.iter_mut().zip(elements.iter()) {
-        let pads = elem.desc().pads;
-        let src_pads: Vec<usize> = pads
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.direction == Direction::Src)
-            .map(|(i, _)| i)
-            .collect();
-        ctx.configure_pads(pads.len(), &src_pads);
+    for (ctx, (npads, src_pads)) in ctxs.iter_mut().zip(pad_infos.iter()) {
+        ctx.configure_pads(*npads, src_pads);
     }
     // Install each element's link-time-negotiated formats before `start()`, so an
     // element can read `ctx.negotiated(pad)` in `start()` as well as `process()`.

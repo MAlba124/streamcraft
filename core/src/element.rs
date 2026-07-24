@@ -11,6 +11,13 @@ use crate::time::Timestamp;
 pub trait Element: Send {
     /// Points at a shared `static` descriptor — the element's identity and shape.
     fn desc(&self) -> &'static ElementDesc;
+    /// Discover streams and instantiate dynamic pads (spec: dynamic pads). Called by
+    /// [`Pipeline::preroll`](crate::pipeline::Pipeline::preroll) before linking and
+    /// streaming; the default adds none. A demuxer overrides this to `ctx.add_pad(...)`
+    /// one src pad per discovered stream, then routes to them in `process`.
+    fn preroll(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+        Ok(())
+    }
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error>;
     fn process(&mut self, ctx: &mut Ctx, inputs: Inputs<'_>) -> Result<Flow, Error>;
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error>;
