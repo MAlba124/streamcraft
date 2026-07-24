@@ -25,6 +25,13 @@ impl BufferFlags {
     pub const KEYFRAME: Self = Self(1 << 0);
     pub const DISCONT: Self = Self(1 << 1);
     pub const GAP: Self = Self(1 << 2);
+    /// Explicitly **not** a random-access point (an inter/predicted frame) — the
+    /// complement of [`KEYFRAME`](Self::KEYFRAME) for producers that tag every
+    /// buffer (a demuxer reading a container's keyframe bits). Untagged (empty)
+    /// flags stay "unknown", which consumers may default as they see fit — a muxer
+    /// of all-independent frames (FLAC) treats unknown as keyframe, so only an
+    /// explicit `DELTA` marks a block non-seekable.
+    pub const DELTA: Self = Self(1 << 3);
 
     pub const fn empty() -> Self {
         Self(0)
