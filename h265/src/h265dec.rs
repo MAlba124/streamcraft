@@ -148,7 +148,22 @@ pub struct H265Dec {
     /// Output-order frames released from the reorder window, awaiting a pool slot,
     /// front first — the backpressure carry.
     ready: std::collections::VecDeque<ReadyFrame>,
+    /// Consecutive access units the decoder rejected (reset by any success). Guards
+    /// the give-up below.
+    failures: u32,
+    /// Set once [`GIVE_UP_AFTER`] consecutive AUs failed: the stream uses features
+    /// the decoder lacks (a real case: BluRay-class inter tooling upstream 0.0.9
+    /// rejects with `InterNotSupported`). Rebuilding the decoder per failed AU is an
+    /// allocation storm that once ballooned a movie to an OOM — a dead stream is
+    /// dropped cheaply instead, after one loud warning. Cleared on flush (a seek may
+    /// land on decodable content).
+    dead: bool,
 }
+
+/// Give up after ~5 seconds' worth of consecutively-rejected AUs at typical rates —
+/// enough to ride out damage, short enough that a wholly-unsupported stream is
+/// reported before it wastes real time or memory.
+const GIVE_UP_AFTER: u32 = 120;
 
 impl H265Dec {
     pub fn new() -> Self {
@@ -158,6 +173,8 @@ impl H265Dec {
             reorder: Vec::new(),
             pts_queue: BinaryHeap::new(),
             ready: std::collections::VecDeque::new(),
+            failures: 0,
+            dead: false,
         }
     }
 
@@ -283,6 +300,10 @@ impl Element for H265Dec {
                 return Ok(Flow::Ok);
             }
             let Some(inbuf) = inputs.pop() else { break };
+            // A dead stream (see `dead`): drop input cheaply, no decode, no spam.
+            if self.dead {
+                continue;
+            }
             // One buffer = one Annex B access unit. Record its pts for output-order
             // re-attachment, then decode.
             if let Some(ns) = inbuf.pts.nanos() {
@@ -297,19 +318,45 @@ impl Element for H265Dec {
                 // the already-decoded frames pending in `reorder` are valid and MUST
                 // survive the reset (they are output, just not yet released).
                 self.drain(false);
+                self.failures += 1;
                 let element = ctx.element();
-                ctx.post(BusMessage::Warning {
-                    element,
-                    error: Error::Element {
+                // Warn on the first few and at the give-up — not once per frame of a
+                // 24 fps stream into a bus nobody may be draining.
+                if self.failures <= 3 {
+                    ctx.post(BusMessage::Warning {
                         element,
-                        message: format!("h265dec: access unit dropped: {e}"),
-                    },
-                });
-                self.seq = SequenceDecoder::new();
+                        error: Error::Element {
+                            element,
+                            message: format!("h265dec: access unit dropped: {e}"),
+                        },
+                    });
+                }
+                if self.failures >= GIVE_UP_AFTER {
+                    self.dead = true;
+                    ctx.post(BusMessage::Warning {
+                        element,
+                        error: Error::Element {
+                            element,
+                            message: format!(
+                                "h265dec: giving up — {GIVE_UP_AFTER} consecutive access \
+                                 units rejected (last: {e}); the stream likely uses \
+                                 features this decoder does not support yet"
+                            ),
+                        },
+                    });
+                    continue;
+                }
+                // Rebuild only on the first failure after a success: a fresh decoder
+                // fed the next non-IDR AU fails identically, and rebuilding the DPB
+                // per frame is an allocation storm (the movie-OOM lesson).
+                if self.failures == 1 {
+                    self.seq = SequenceDecoder::new();
+                }
                 // The dropped AU's pts is now orphaned; the ascending re-attach still
                 // matches the surviving frames in order, so leave the heap as is.
                 continue;
             }
+            self.failures = 0;
             self.drain(false);
         }
         Ok(Flow::Ok)
@@ -326,6 +373,9 @@ impl Element for H265Dec {
                 self.ready.clear();
                 self.pts_queue.clear();
                 self.announced = false;
+                // A seek may land on decodable content — give the stream a new chance.
+                self.failures = 0;
+                self.dead = false;
             }
             // Drain the whole reorder window at EOS so no picture is lost, then flush
             // the carry into the pool.

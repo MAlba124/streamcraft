@@ -80,8 +80,27 @@ fn main() {
     } else {
         false
     };
+    // `--probe`: demux only — every pad to a drop-sink, no decoder, no window.
+    // Isolates container-side behavior (throughput, memory) from decode/display.
+    let probe = if let Some(i) = args.iter().position(|a| a == "--probe") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
+    // `--max-secs N`: stop the pipeline cleanly after N wall seconds (cooperative
+    // StopHandle) — bounded runs for diagnostics/profiling where SIGKILL would
+    // truncate a heaptrack capture.
+    let max_secs: Option<u64> = args
+        .iter()
+        .position(|a| a == "--max-secs")
+        .map(|i| {
+            let v = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            args.drain(i..=i + 1);
+            v
+        });
     let Some(path) = args.first().cloned() else {
-        eprintln!("usage: play_file [--vk] FILE.mkv");
+        eprintln!("usage: play_file [--vk|--probe] [--max-secs N] FILE.mkv");
         std::process::exit(2);
     };
 
@@ -100,7 +119,7 @@ fn main() {
 
     let mut video_dec = None;
     for ap in &added {
-        if video_dec.is_none() {
+        if !probe && video_dec.is_none() {
             if let Some(dec) = try_video_decoders(&mut p, (ap.element, &ap.name)) {
                 video_dec = Some(dec);
                 continue;
@@ -114,20 +133,47 @@ fn main() {
             .unwrap_or_else(|e| panic!("drop-link {}: {e:?}", ap.name));
         println!("  {} -> (dropped: no decoder)", ap.name);
     }
-    let Some(dec) = video_dec else {
-        eprintln!("no track linked to a video decoder");
-        std::process::exit(1);
+    let dec = match video_dec {
+        Some(d) => Some(d),
+        None if probe => None,
+        None => {
+            eprintln!("no track linked to a video decoder");
+            std::process::exit(1);
+        }
     };
 
-    let sink = if use_vk {
-        p.add_boxed(Box::new(sc_vk::VkVideoSink::new().with_title("streamcraft — play_file (vk)")))
-    } else {
-        p.add_boxed(Box::new(WaylandVideoSink::new().with_title("streamcraft — play_file")))
-    };
-    p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
+    if let Some(dec) = dec {
+        let sink = if use_vk {
+            p.add_boxed(Box::new(sc_vk::VkVideoSink::new().with_title("streamcraft — play_file (vk)")))
+        } else {
+            p.add_boxed(Box::new(WaylandVideoSink::new().with_title("streamcraft — play_file")))
+        };
+        p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
+    }
 
     println!("playing {path} — close the window or Ctrl-C…");
-    match p.run() {
+    if let Some(secs) = max_secs {
+        let stop = p.stop_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.stop();
+        });
+    }
+    let result = p.run();
+    // Surface sink warnings — a display/GPU fallback is reported here, and silence
+    // plus no window would otherwise be undiagnosable.
+    while let Some(msg) = p.bus().try_recv() {
+        match msg {
+            streamcraft_core::bus::BusMessage::Warning { error, .. } => {
+                eprintln!("warning: {error:?}")
+            }
+            streamcraft_core::bus::BusMessage::Qos { lateness_ns, .. } => {
+                eprintln!("qos: frame dropped {:.1} ms late", lateness_ns as f64 / 1e6)
+            }
+            _ => {}
+        }
+    }
+    match result {
         Ok(()) => println!("done."),
         Err(e) => {
             eprintln!("run error: {e:?}");

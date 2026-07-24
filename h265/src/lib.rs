@@ -41,6 +41,31 @@
 //! 8-bit output**, intra + inter (P and B) pictures, Annex B access-unit-per-buffer
 //! input. See [`h265dec`] for the runtime model.
 //!
+//! ## Real-world caveat (found 2026-07-24, playing a BluRay-class file)
+//!
+//! The synthetic-fixture verdict above did **not** transfer to a real x265 BluRay
+//! remaster (1920×1038 Main). Two independent failures in published 0.0.9, both
+//! demonstrated with `mkv/examples/dump_track` + `h265/examples/decode_annexb`
+//! (the dumped Annex B stream decodes cleanly in ffmpeg, so the demux side is
+//! exonerated):
+//!
+//! - **`Recon(InterNotSupported)` on ordinary mid-movie content** (plus
+//!   `Malformed("entry point past slice data")` on WPP entry points): the stream's
+//!   inter tooling is rejected — zero frames decode outside the near-empty intro.
+//!   [`H265Dec`] now **gives up loudly** after 120 consecutive rejected access
+//!   units (one bus warning) instead of rebuilding the decoder per frame forever.
+//! - **Unbounded picture retention across a CVS**: heaptrack shows hundreds of
+//!   full-picture SAO/inter-recon buffers alive simultaneously inside the library
+//!   during a long-GOP sequence (~1 GB for an 8 s clip) — its DPB pruning appears
+//!   sized for its few-frame fixtures. Memory scales with CVS length, so even the
+//!   streams it *can* decode are unsafe at movie length.
+//!
+//! Verdict: fine for short/synthetic Main streams (the in-tree tests), **not
+//! usable for real-world HEVC playback at 0.0.9**. Re-vet on the next upstream
+//! publish (crates.io is at 0.0.9; the git HEAD advertises more but is
+//! unpublished — the vp9/opus lesson). Real 1080p HEVC playback needs the
+//! hardware-decode track (VA-API) regardless of these fixes.
+//!
 //! ## The one wart, and the nativization debt (tracked in PLAN.md)
 //!
 //! - **Non-zero dependency, unlike sc-vp8.** At 0.0.9 (the only non-yanked version)
