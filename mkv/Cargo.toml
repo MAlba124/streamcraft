@@ -1,0 +1,23 @@
+[package]
+name = "sc-mkv"
+description = "Hand-written, dependency-free Matroska (EBML, RFC 8794) container muxer plugin for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_mkv"
+
+[dependencies]
+# Hand-written container — the whole point is zero container/codec dependencies. Only
+# the framework's core vocabulary (buffers, batches, the element contract) is pulled in
+# for the element wrapper; the EBML primitives and the writer are core-independent.
+streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+# Only for the end-to-end structural round-trip test: produce real A_FLAC frames +
+# STREAMINFO with the hand-written FLAC encoder, mux them, and read them back. No
+# dependency cycle: sc-flac does not depend on sc-mkv (the container is codec-agnostic),
+# so mkv depending on flac for tests is one-directional (mirrors how flac dev-deps ogg).
+sc-flac = { path = "../flac" }
