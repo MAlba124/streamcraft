@@ -132,12 +132,17 @@ impl Clone for Pool {
 impl PoolInner {
     fn recycle(&self, buf: Box<[u8]>) {
         self.recycles.fetch_add(1, Ordering::Relaxed);
+        // Keep only right-sized slots, and never retain more free slots than the cap: a
+        // transient spike from the unbounded `acquire` path must not inflate the free-list
+        // permanently (it would read as a steady-state leak). Excess boxes are dropped
+        // (freed) here. `bounded` pools cap at `max_slots`; unbounded pools (`max_slots ==
+        // u32::MAX`) keep everything, as before.
         let keep = buf.len() == self.slot_size;
         // Decrement outstanding under the free-list lock so it stays consistent with
         // try_acquire's cap check.
         let mut free = self.free.lock().unwrap();
         self.outstanding.fetch_sub(1, Ordering::Relaxed);
-        if keep {
+        if keep && (free.len() as u64) < self.max_slots as u64 {
             free.push(buf);
         }
     }
@@ -405,6 +410,24 @@ mod tests {
         let _c = pool.try_acquire().expect("slot freed after drop");
         assert!(pool.try_acquire().is_none());
         drop(b);
+    }
+
+    #[test]
+    fn bounded_pool_free_list_does_not_retain_beyond_cap() {
+        let pool = Pool::bounded(8, 2);
+        // Allocate 5 at once via the *unbounded* `acquire` (bypasses the cap) — a transient
+        // spike, as an unbounded producer would cause.
+        let held: Vec<_> = (0..5).map(|_| pool.acquire()).collect();
+        assert_eq!(pool.stats().slot_allocations, 5, "5 distinct boxes while all outstanding");
+        drop(held); // recycle all 5 → free-list keeps at most max_slots (2), drops 3
+        // Two acquires reuse the retained slots (no new allocation)…
+        let a = pool.acquire();
+        let b = pool.acquire();
+        assert_eq!(pool.stats().slot_allocations, 5, "reused the 2 retained free slots");
+        // …a third finds the free-list empty (the excess was freed) → one fresh allocation.
+        let c = pool.acquire();
+        assert_eq!(pool.stats().slot_allocations, 6, "free-list capped — the spike was not retained");
+        drop((a, b, c));
     }
 
     // --- scratch arena ---

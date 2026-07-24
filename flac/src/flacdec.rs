@@ -99,6 +99,12 @@ pub struct FlacDec {
     announced: bool,
     /// Bytes per single-channel sample, known once the header is decoded.
     bytes_per_sample: usize,
+    /// Decoded samples of the current frame not yet emitted — the backpressure carry.
+    /// Bounded to one frame: the decode loop never pulls another frame until this drains,
+    /// so a slow sink cannot make the decoder run ahead and balloon the pool.
+    pending: Vec<i64>,
+    /// How many of `pending` have already been emitted.
+    pending_pos: usize,
 }
 
 impl FlacDec {
@@ -106,34 +112,63 @@ impl FlacDec {
         Self::default()
     }
 
-    /// Serialise a decoded frame's samples as interleaved little-endian PCM **directly
-    /// into pool output buffers** — no per-frame intermediate allocation (spec: Memory —
-    /// zero steady-state heap traffic). Each sample is `bytes` wide (the low bytes of the
-    /// sign-extended two's-complement `i64` are the correct LE PCM for that width); a
-    /// buffer is flushed and a fresh one taken whenever the next whole sample would not
-    /// fit, so a sample never straddles a buffer boundary.
-    fn emit_frame(ctx: &mut Ctx, samples: &[i64], bytes: usize) -> Result<(), Error> {
-        if samples.is_empty() {
+    /// Emit the pending frame's not-yet-written samples as interleaved little-endian PCM,
+    /// **directly into pool buffers** (no per-frame intermediate). Each sample is
+    /// `bytes_per_sample` wide (the low bytes of the sign-extended two's-complement `i64`
+    /// are the correct LE PCM). With `bounded` it uses the capped pool (`try_alloc`) and
+    /// returns `Ok(false)` when the pool is full — the caller then yields so the sink
+    /// drains (backpressure). With `!bounded` it uses the unbounded pool (never fails), to
+    /// guarantee the stream tail is flushed at EOS. Returns `Ok(true)` once fully drained.
+    fn emit_pending(&mut self, ctx: &mut Ctx, bounded: bool) -> Result<bool, Error> {
+        let bytes = self.bytes_per_sample;
+        while self.pending_pos < self.pending.len() {
+            debug_assert!(bytes > 0, "flacdec: emit before header decoded");
+            let mut buf = if bounded {
+                match ctx.try_alloc(PadId(1)) {
+                    Some(b) => b,
+                    None => return Ok(false), // pool full → backpressure
+                }
+            } else {
+                ctx.alloc(PadId(1))
+            };
+            let per = (buf.memory.capacity() / bytes).max(1); // whole samples per buffer
+            let end = (self.pending_pos + per).min(self.pending.len());
+            let dst = buf.memory.as_mut_full();
+            let mut n = 0;
+            for &s in &self.pending[self.pending_pos..end] {
+                dst[n..n + bytes].copy_from_slice(&s.to_le_bytes()[..bytes]);
+                n += bytes;
+            }
+            buf.memory.set_len(n);
+            ctx.out(PadId(1)).push(buf);
+            self.pending_pos = end;
+        }
+        self.pending.clear();
+        self.pending_pos = 0;
+        Ok(true)
+    }
+
+    /// Announce the runtime `audio/raw` format once, from STREAMINFO (spec: dynamic caps).
+    /// Called after the first frame decodes, so `info()` is populated.
+    fn announce_if_needed(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        if self.announced {
             return Ok(());
         }
-        let mut buf = ctx.alloc(PadId(1));
-        let cap = buf.memory.capacity();
-        debug_assert!(bytes > 0 && cap >= bytes, "flacdec: pool slot too small for a sample");
-        let mut n = 0; // bytes written into the current buffer
-        for &s in samples {
-            if n + bytes > cap {
-                buf.memory.set_len(n);
-                ctx.out(PadId(1)).push(buf);
-                buf = ctx.alloc(PadId(1));
-                n = 0;
-            }
-            buf.memory.as_mut_full()[n..n + bytes].copy_from_slice(&s.to_le_bytes()[..bytes]);
-            n += bytes;
-        }
-        // The final buffer always holds at least one sample here (empty frames returned
-        // early, and a flush is always followed by a write).
-        buf.memory.set_len(n);
-        ctx.out(PadId(1)).push(buf);
+        let info = self
+            .dec
+            .info()
+            .ok_or(Error::Todo("flacdec: frame decoded without streaminfo"))?;
+        self.bytes_per_sample = (info.bits_per_sample as usize).div_ceil(8);
+        ctx.announce_format(
+            PadId(1),
+            FAMILY,
+            &[
+                (F_RATE, ValueDesc::Int(info.sample_rate as i64)),
+                (F_CHANNELS, ValueDesc::Int(info.channels as i64)),
+                (F_SAMPLE, ValueDesc::Id(sample_name(info.bits_per_sample))),
+            ],
+        );
+        self.announced = true;
         Ok(())
     }
 }
@@ -147,47 +182,57 @@ impl Element for FlacDec {
         self.dec = StreamDecoder::new();
         self.announced = false;
         self.bytes_per_sample = 0;
+        self.pending.clear();
+        self.pending_pos = 0;
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
-        while let Some(buf) = inputs.pop() {
-            self.dec.push(buf.memory.data());
-            // `buf` recycles on drop here; decode every whole frame now buffered.
-            loop {
-                let frame = match self.dec.pull() {
-                    Ok(Some(f)) => f,
-                    Ok(None) => break, // need more input
-                    Err(e) => return Err(Error::Resource(format!("flacdec: {e:?}"))),
-                };
-
-                // The first decoded frame means the header is known: announce the runtime
-                // audio format so the peer can configure itself (spec: dynamic caps).
-                if !self.announced {
-                    let info = self
-                        .dec
-                        .info()
-                        .ok_or(Error::Todo("flacdec: frame decoded without streaminfo"))?;
-                    self.bytes_per_sample = (info.bits_per_sample as usize).div_ceil(8);
-                    ctx.announce_format(
-                        PadId(1),
-                        FAMILY,
-                        &[
-                            (F_RATE, ValueDesc::Int(info.sample_rate as i64)),
-                            (F_CHANNELS, ValueDesc::Int(info.channels as i64)),
-                            (F_SAMPLE, ValueDesc::Id(sample_name(info.bits_per_sample))),
-                        ],
-                    );
-                    self.announced = true;
+        loop {
+            // Flush any carry from a prior backpressured call before decoding more.
+            if !self.emit_pending(ctx, true)? {
+                // Pool full: yield without consuming more input, so the sink drains first.
+                // Leaving input buffered keeps the group non-quiescent (backpressure).
+                return Ok(Flow::Ok);
+            }
+            // Decode the next buffered frame; if the decoder is hungry, feed it one input
+            // buffer; when there is neither a frame nor more input, we are done this call.
+            match self.dec.pull() {
+                Ok(Some(frame)) => {
+                    self.announce_if_needed(ctx)?; // first frame → header known
+                    self.pending = frame.samples;
+                    self.pending_pos = 0;
+                    if !self.emit_pending(ctx, true)? {
+                        return Ok(Flow::Ok); // pool filled mid-frame — carry the rest, yield
+                    }
                 }
-
-                Self::emit_frame(ctx, &frame.samples, self.bytes_per_sample)?;
+                Ok(None) => match inputs.pop() {
+                    Some(buf) => self.dec.push(buf.memory.data()), // `buf` recycles on drop
+                    None => return Ok(Flow::Ok),
+                },
+                Err(e) => return Err(Error::Resource(format!("flacdec: {e:?}"))),
             }
         }
-        Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::Eos) {
+            // End of stream: flush the carry and every remaining buffered frame through the
+            // unbounded pool, so the tail is emitted even if we were backpressured here.
+            self.emit_pending(ctx, false)?;
+            loop {
+                match self.dec.pull() {
+                    Ok(Some(frame)) => {
+                        self.announce_if_needed(ctx)?;
+                        self.pending = frame.samples;
+                        self.pending_pos = 0;
+                        self.emit_pending(ctx, false)?;
+                    }
+                    Ok(None) => break, // no more whole frames (a truncated tail is dropped)
+                    Err(e) => return Err(Error::Resource(format!("flacdec: {e:?}"))),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -195,5 +240,7 @@ impl Element for FlacDec {
         self.dec = StreamDecoder::new();
         self.announced = false;
         self.bytes_per_sample = 0;
+        self.pending.clear();
+        self.pending_pos = 0;
     }
 }
