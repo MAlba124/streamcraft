@@ -165,14 +165,14 @@ fn h264_mp4_remuxes_to_conformant_mkv() {
     let (width, height) = (oracle.tracks()[0].width, oracle.tracks()[0].height);
     let duration = oracle.tracks()[0].duration_ns;
     assert!(duration > 0, "fixture declares an mdhd duration");
-    oracle.push(&file);
+    oracle.push_bytes(&file);
     let mut samples: Vec<(u64, bool, Vec<u8>)> = Vec::new();
-    // Copy the sample out first: `ResolvedSample` borrows the reader, and `ticks_to_ns`
-    // needs the reader again.
-    while let Some((ti, pts, sync, bytes)) =
-        oracle.next_sample().map(|s| (s.track_index, s.pts, s.sync, s.bytes.to_vec()))
-    {
-        samples.push((oracle.ticks_to_ns(ti, pts), sync, bytes));
+    while let Some(s) = oracle.next_sample() {
+        samples.push((
+            oracle.ticks_to_ns(s.track_index, s.pts),
+            s.sync,
+            s.payload.data().to_vec(),
+        ));
     }
     assert!(!samples.is_empty(), "fixture yields samples");
 

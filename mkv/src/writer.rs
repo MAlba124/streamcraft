@@ -26,6 +26,10 @@
 //! so a new Cluster is started before a frame would fall outside `±32767` ticks of the
 //! current base (and, opportunistically, on a track-0 keyframe).
 
+use std::collections::VecDeque;
+
+use streamcraft_core::memory::Memory;
+
 use crate::ebml::{self, id};
 
 /// The default Matroska TimestampScale (spec `§ID-tree`; Matroska `basics`): nanoseconds
@@ -147,13 +151,32 @@ struct OpenCluster {
     /// `Timestamp` child, and the origin the SimpleBlock relative timestamps are measured
     /// from.
     base_tick: i64,
-    /// The Cluster's body (Timestamp child + SimpleBlocks), staged here until the Cluster
-    /// closes so its **real size** can be written. Unknown-size (`0xFF`) Clusters are
-    /// RFC 8794 §6.2-legal and libav accepts them, but real players do not — mpv's own
-    /// demuxer rejects every block inside one ("Corrupt file detected") — so the writer
-    /// buffers one Cluster (≈ one GOP) and emits it sized, like every mainstream muxer.
-    /// The *Segment* stays unknown-size (universally accepted; nothing to back-patch).
+    /// The Cluster's staged bytes, held until the Cluster closes so its **real size** can
+    /// be written. Unknown-size (`0xFF`) Clusters are RFC 8794 §6.2-legal and libav
+    /// accepts them, but real players do not — mpv's own demuxer rejects every block
+    /// inside one ("Corrupt file detected") — so the writer stages one Cluster (≈ one
+    /// GOP) and emits it sized, like every mainstream muxer. The *Segment* stays
+    /// unknown-size (universally accepted; nothing to back-patch).
+    ///
+    /// Contiguous mode ([`MatroskaWriter::write_frame`]): the whole body — Timestamp
+    /// child + full SimpleBlocks, headers *and* frame bytes. Scatter mode
+    /// ([`MatroskaWriter::write_frame_scatter`], ZERO-COPY.md Stage 2): only the
+    /// Timestamp child + the ~10-octet SimpleBlock headers; the frame bytes ride
+    /// `pieces` as refcounted [`Memory`] slices, so the staged Cluster costs refcounts,
+    /// not a second copy of one GOP.
     buf: Vec<u8>,
+    /// Scatter-mode frame payloads, each pinned to the `buf` offset it must follow when
+    /// the body is emitted (its SimpleBlock header's end). Empty in contiguous mode.
+    pieces: Vec<(usize, Memory)>,
+}
+
+impl OpenCluster {
+    /// The Cluster's total body size — staged bytes plus every scatter payload. This is
+    /// the **known size** written after the Cluster ID on close (the mpv-load-bearing
+    /// sized-Cluster contract), available without making the body contiguous.
+    fn body_size(&self) -> u64 {
+        self.buf.len() as u64 + self.pieces.iter().map(|(_, m)| m.len() as u64).sum::<u64>()
+    }
 }
 
 /// Multi-track Matroska muxer. Configure with tracks, [`write_header`], then
@@ -370,23 +393,8 @@ impl MatroskaWriter {
         bytes: &[u8],
         keyframe: bool,
     ) -> Result<(), WriteError> {
-        if !self.header_written {
-            return Err(WriteError::HeaderNotWritten);
-        }
-        if !self.tracks.iter().any(|t| t.track_number == track) {
-            return Err(WriteError::UnknownTrack(track));
-        }
-
-        let tick = self.ns_to_ticks(timestamp_ns);
-        let need_new_cluster = match &self.cluster {
-            None => true,
-            Some(c) => {
-                let rel = tick - c.base_tick;
-                rel < REL_TS_MIN || rel > REL_TS_MAX
-                    || (keyframe && track == self.anchor_track && rel != 0)
-            }
-        };
-        if need_new_cluster {
+        let tick = self.frame_tick(track, timestamp_ns)?;
+        if self.need_new_cluster(tick, track, keyframe) {
             self.open_cluster(out, tick);
         }
 
@@ -398,39 +406,160 @@ impl MatroskaWriter {
         Ok(())
     }
 
-    /// Open a new Cluster at `base_tick` (spec `§ID-tree` Cluster, `§sizing`), first
-    /// emitting the previous Cluster (if any) into `out` with its now-known size. The new
-    /// Cluster's body starts with its `Timestamp` child and stages in memory until it
-    /// closes (see [`OpenCluster::buf`] — players reject unknown-size Clusters).
-    fn open_cluster(&mut self, out: &mut Vec<u8>, base_tick: i64) {
-        // Reuse the closed cluster's allocation for the new one's staging buffer.
-        let mut buf = self.close_cluster(out);
-        // Cluster base timestamp, in ticks (non-negative for a forward stream).
-        ebml::write_uint(&mut buf, id::TIMESTAMP, base_tick.max(0) as u64);
-        self.cluster = Some(OpenCluster { base_tick, buf });
+    /// Scatter-mode [`write_frame`](Self::write_frame) (ZERO-COPY.md Stage 2): stages
+    /// only the ~10-octet SimpleBlock header; the frame's bytes ride as the refcounted
+    /// [`Memory`] itself, forwarded when the Cluster closes — no copy into the staging
+    /// buffer, no copy out. Cluster boundaries, sizing and timestamps are byte-identical
+    /// to [`write_frame`]: the mpv-load-bearing **known-size** Cluster is preserved,
+    /// because the size only needs the running header+payload total
+    /// ([`OpenCluster::body_size`]), not a contiguous body.
+    pub fn write_frame_scatter(
+        &mut self,
+        out: &mut MuxOut,
+        track: u64,
+        timestamp_ns: u64,
+        payload: Memory,
+        keyframe: bool,
+    ) -> Result<(), WriteError> {
+        let tick = self.frame_tick(track, timestamp_ns)?;
+        if self.need_new_cluster(tick, track, keyframe) {
+            self.open_cluster_scatter(out, tick);
+        }
+
+        let cluster = self.cluster.as_mut().expect("cluster open");
+        let rel = (tick - cluster.base_tick) as i16; // within the checked window
+        Self::write_simple_block_header(&mut cluster.buf, track, rel, payload.len(), keyframe);
+        cluster.pieces.push((cluster.buf.len(), payload));
+        Ok(())
     }
 
-    /// Emit the staged Cluster (if any) into `out` — ID, its **real** body size, body —
-    /// returning the drained staging buffer for reuse (empty if no Cluster was open).
-    fn close_cluster(&mut self, out: &mut Vec<u8>) -> Vec<u8> {
-        let Some(mut c) = self.cluster.take() else { return Vec::new() };
+    /// [`write_header`](Self::write_header) into a scatter output: the head bytes become
+    /// one queued byte run.
+    pub fn write_header_scatter(&mut self, out: &mut MuxOut) -> Result<(), WriteError> {
+        out.append_bytes_with(|b| self.write_header(b))
+    }
+
+    /// The per-frame preconditions shared by both write modes: header written, track
+    /// known, timestamp quantized to TimestampScale ticks (round-to-nearest).
+    fn frame_tick(&self, track: u64, timestamp_ns: u64) -> Result<i64, WriteError> {
+        if !self.header_written {
+            return Err(WriteError::HeaderNotWritten);
+        }
+        if !self.tracks.iter().any(|t| t.track_number == track) {
+            return Err(WriteError::UnknownTrack(track));
+        }
+        Ok(self.ns_to_ticks(timestamp_ns))
+    }
+
+    /// Whether this frame opens a new Cluster (spec `§simpleblock`): none open yet, the
+    /// tick offset would leave the signed-16-bit window, or a keyframe on the anchor
+    /// (first) track.
+    fn need_new_cluster(&self, tick: i64, track: u64, keyframe: bool) -> bool {
+        match &self.cluster {
+            None => true,
+            Some(c) => {
+                let rel = tick - c.base_tick;
+                rel < REL_TS_MIN || rel > REL_TS_MAX
+                    || (keyframe && track == self.anchor_track && rel != 0)
+            }
+        }
+    }
+
+    /// A fresh [`OpenCluster`] at `base_tick`, reusing the previous cluster's (cleared)
+    /// allocations. Its body starts with the `Timestamp` child.
+    fn opened(base_tick: i64, mut buf: Vec<u8>, pieces: Vec<(usize, Memory)>) -> OpenCluster {
+        // Cluster base timestamp, in ticks (non-negative for a forward stream).
+        ebml::write_uint(&mut buf, id::TIMESTAMP, base_tick.max(0) as u64);
+        OpenCluster { base_tick, buf, pieces }
+    }
+
+    /// Open a new Cluster at `base_tick` (spec `§ID-tree` Cluster, `§sizing`), first
+    /// emitting the previous Cluster (if any) into `out` with its now-known size. The new
+    /// Cluster's body stages in memory until it closes (see [`OpenCluster::buf`] —
+    /// players reject unknown-size Clusters).
+    fn open_cluster(&mut self, out: &mut Vec<u8>, base_tick: i64) {
+        let (buf, pieces) = self.close_cluster(out);
+        self.cluster = Some(Self::opened(base_tick, buf, pieces));
+    }
+
+    /// [`open_cluster`](Self::open_cluster) into a scatter output.
+    fn open_cluster_scatter(&mut self, out: &mut MuxOut, base_tick: i64) {
+        let (buf, pieces) = self.close_cluster_scatter(out);
+        self.cluster = Some(Self::opened(base_tick, buf, pieces));
+    }
+
+    /// Emit the staged Cluster (if any) into `out` — ID, its **real** body size, then the
+    /// body: staged byte runs interleaved with any scatter payloads (copied here, since a
+    /// contiguous caller wants contiguous bytes). Returns the drained staging allocations
+    /// for reuse (empty if no Cluster was open).
+    fn close_cluster(&mut self, out: &mut Vec<u8>) -> (Vec<u8>, Vec<(usize, Memory)>) {
+        let Some(mut c) = self.cluster.take() else { return (Vec::new(), Vec::new()) };
         ebml::write_id(out, id::CLUSTER);
-        ebml::write_size(out, c.buf.len() as u64);
-        out.extend_from_slice(&c.buf);
+        ebml::write_size(out, c.body_size());
+        let mut cur = 0;
+        for (at, mem) in c.pieces.drain(..) {
+            out.extend_from_slice(&c.buf[cur..at]);
+            out.extend_from_slice(mem.data());
+            cur = at;
+        }
+        out.extend_from_slice(&c.buf[cur..]);
         c.buf.clear();
-        c.buf
+        (c.buf, c.pieces)
+    }
+
+    /// Emit the staged Cluster (if any) into a scatter output (ZERO-COPY.md Stage 2):
+    /// the Cluster head + staged header runs are appended as byte runs (tiny — ~10
+    /// octets per block), while each payload [`Memory`] moves out as its own piece — a
+    /// refcount move, the frame bytes are never copied. Returns the drained staging
+    /// allocations for reuse.
+    fn close_cluster_scatter(&mut self, out: &mut MuxOut) -> (Vec<u8>, Vec<(usize, Memory)>) {
+        let Some(mut c) = self.cluster.take() else { return (Vec::new(), Vec::new()) };
+        let body_size = c.body_size();
+        out.append_bytes_with(|b| {
+            ebml::write_id(b, id::CLUSTER);
+            ebml::write_size(b, body_size);
+        });
+        let mut cur = 0;
+        for (at, mem) in c.pieces.drain(..) {
+            if at > cur {
+                out.append_bytes_with(|b| b.extend_from_slice(&c.buf[cur..at]));
+                cur = at;
+            }
+            out.push_payload(mem);
+        }
+        if cur < c.buf.len() {
+            out.append_bytes_with(|b| b.extend_from_slice(&c.buf[cur..]));
+        }
+        c.buf.clear();
+        (c.buf, c.pieces)
     }
 
     /// Serialise one `SimpleBlock` element (spec `§simpleblock`): the `A3` ID, the data
     /// size (the whole block body), then the body — track-number VINT, big-endian signed
     /// 16-bit relative timestamp, flags byte, and the frame bytes verbatim.
     fn write_simple_block(out: &mut Vec<u8>, track: u64, rel_ts: i16, frame: &[u8], keyframe: bool) {
+        Self::write_simple_block_header(out, track, rel_ts, frame.len(), keyframe);
+        // Frame payload, verbatim (zero-transform — spec: A_FLAC frames stored natively).
+        out.extend_from_slice(frame);
+    }
+
+    /// Everything of a `SimpleBlock` **except** the frame bytes (spec `§simpleblock`):
+    /// ID, body size (accounting the frame's length), track-number VINT, big-endian
+    /// signed 16-bit relative timestamp, flags byte — ~10 octets. What scatter mode
+    /// stages per block (ZERO-COPY.md Stage 2).
+    fn write_simple_block_header(
+        out: &mut Vec<u8>,
+        track: u64,
+        rel_ts: i16,
+        frame_len: usize,
+        keyframe: bool,
+    ) {
         ebml::write_id(out, id::SIMPLE_BLOCK);
         // Body length: track VINT (its size-form encodes the number) + 2 (ts) + 1 (flags)
         // + frame. The track number is written with the *size* VINT form (a plain VINT of
         // the value), per the block grammar.
         let track_vint_len = ebml::vint_size_len(track);
-        let body_len = track_vint_len + 2 + 1 + frame.len();
+        let body_len = track_vint_len + 2 + 1 + frame_len;
         ebml::write_size(out, body_len as u64);
 
         // Track number as a VINT (spec `§simpleblock`).
@@ -439,8 +568,6 @@ impl MatroskaWriter {
         out.extend_from_slice(&rel_ts.to_be_bytes());
         // Flags: keyframe bit; lacing bits 0 (no lacing).
         out.push(if keyframe { BLOCK_FLAG_KEYFRAME } else { 0 });
-        // Frame payload, verbatim (zero-transform — spec: A_FLAC frames stored natively).
-        out.extend_from_slice(frame);
     }
 
     /// Finish the stream (spec `§sizing`): emit the final staged Cluster with its real
@@ -449,6 +576,102 @@ impl MatroskaWriter {
     /// single-pass and seek-free.
     pub fn finalize(&mut self, out: &mut Vec<u8>) {
         let _ = self.close_cluster(out);
+    }
+
+    /// [`finalize`](Self::finalize) into a scatter output.
+    pub fn finalize_scatter(&mut self, out: &mut MuxOut) {
+        let _ = self.close_cluster_scatter(out);
+    }
+}
+
+/// Scatter-mode muxer output (ZERO-COPY.md Stage 2): an ordered queue of **byte runs**
+/// (the stream header, Cluster heads, SimpleBlock headers — the only bytes the muxer
+/// itself produces) interleaved with **payload slices** (the refcounted [`Memory`] each
+/// frame arrived in, forwarded without a copy). The consuming element drains pieces in
+/// order — byte runs through pool slots (keeping the backpressure discipline), payloads
+/// pushed as whole buffers — and calls [`reclaim`](Self::reclaim) once drained so the
+/// byte arena's allocation is reused.
+#[derive(Default)]
+pub struct MuxOut {
+    /// The shared byte arena every [`MuxPiece::Bytes`] range indexes into. Append-only
+    /// while any piece is queued; cleared by [`reclaim`](Self::reclaim).
+    bytes: Vec<u8>,
+    /// The emission order.
+    pieces: VecDeque<MuxPiece>,
+}
+
+/// One drainable piece of the muxed stream, in emission order.
+pub enum MuxPiece {
+    /// `MuxOut::header_bytes()[start..end]` — muxer-produced header bytes.
+    Bytes { start: usize, end: usize },
+    /// A frame's payload — forwarded by refcount, never copied.
+    Payload(Memory),
+}
+
+impl MuxOut {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append header bytes by running `f` over the shared arena, queueing the written
+    /// range as a piece (merged into a trailing contiguous byte run, so a Cluster head +
+    /// its first block header drain as one run).
+    fn append_bytes_with<R>(&mut self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        let start = self.bytes.len();
+        let r = f(&mut self.bytes);
+        let end = self.bytes.len();
+        if end > start {
+            if let Some(MuxPiece::Bytes { end: e, .. }) = self.pieces.back_mut() {
+                if *e == start {
+                    *e = end;
+                    return r;
+                }
+            }
+            self.pieces.push_back(MuxPiece::Bytes { start, end });
+        }
+        r
+    }
+
+    /// Queue a payload piece (a refcount move). Empty payloads queue nothing — a
+    /// zero-length frame is fully described by its SimpleBlock header.
+    fn push_payload(&mut self, mem: Memory) {
+        if !mem.is_empty() {
+            self.pieces.push_back(MuxPiece::Payload(mem));
+        }
+    }
+
+    /// The byte arena [`MuxPiece::Bytes`] ranges index into.
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The next piece to drain, if any.
+    pub fn front(&self) -> Option<&MuxPiece> {
+        self.pieces.front()
+    }
+
+    /// Remove and return the next piece.
+    pub fn pop_front(&mut self) -> Option<MuxPiece> {
+        self.pieces.pop_front()
+    }
+
+    /// `true` when nothing is queued.
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    /// Reuse the byte arena's allocation once every piece has drained (no-op while
+    /// pieces still reference it).
+    pub fn reclaim(&mut self) {
+        if self.pieces.is_empty() {
+            self.bytes.clear();
+        }
+    }
+
+    /// Drop everything (a stop/reset).
+    pub fn clear(&mut self) {
+        self.pieces.clear();
+        self.bytes.clear();
     }
 }
 

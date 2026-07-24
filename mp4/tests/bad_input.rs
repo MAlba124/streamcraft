@@ -45,8 +45,10 @@ fn stream_no_panic(head: &[u8], tail: &[u8]) {
     // The reader is fed the WHOLE file from byte 0: head then tail.
     let mut file = head.to_vec();
     file.extend_from_slice(tail);
+    // 1-byte chunks also stress the retained-chunk walk: nearly every multi-byte sample
+    // straddles a chunk boundary, exercising the gather fallback.
     for b in &file {
-        reader.push(std::slice::from_ref(b));
+        reader.push_bytes(std::slice::from_ref(b));
         while reader.next_sample().is_some() {}
     }
 }

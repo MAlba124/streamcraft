@@ -58,7 +58,7 @@ pub mod reader;
 
 pub use codec::{family_for, SampleEntry};
 pub use element::Mp4Demux;
-pub use reader::{Mp4Error, Mp4Reader, ResolvedSample, Sample, Track};
+pub use reader::{Mp4Error, Mp4Reader, ResolvedSample, Sample, SamplePayload, Track};
 
 // Re-export the shared reframer surface so downstream code has one import path.
 pub use sc_mkv::{nal_head_from_config, Reframer, ReframeError};

@@ -153,8 +153,19 @@ fn main() {
     let sink = p.add(FileSink::new(&output));
     p.link((ap.element, &ap.name), (mux, "sink")).expect("demux -> mux");
     p.link((mux, "src"), (sink, "sink")).expect("mux -> sink");
-    // Samples must arrive unsplit (one buffer == one SimpleBlock): give the demuxer
-    // slots comfortably above any H.264 sample (8 MiB × 8).
+    // Pool sizing under zero-copy retention (ZERO-COPY.md Stages 1+2):
+    //
+    // - The *filesrc* pool is the retained-chunk pool now: the demuxer emits refcounted
+    //   slices of the read buffers, and the muxer's open Cluster holds those slices until
+    //   it closes — so the file-byte span of one Cluster (≤ 32.767 s of stream at the ms
+    //   TimestampScale, typically one GOP) must fit in outstanding read slots, or the
+    //   source stalls and the Cluster can never complete (a livelock, not just slowness).
+    //   1 MiB × 96 ≈ 96 MiB comfortably covers a 32 s Cluster at ~20 Mbps; bigger slots
+    //   also make sample-straddles-a-chunk rare (~one sample per MiB pays a gather copy).
+    // - The *demuxer* pool only serves cold paths now (the in-band codec head, straddle
+    //   gathers): slots must still exceed the largest straddled sample so a straddle
+    //   remuxes as one unsplit SimpleBlock (8 MiB × 8; allocated lazily, mostly unused).
+    p.set_element_pool(src, 1 << 20, 96);
     p.set_element_pool(demux, 8 << 20, 8);
 
     let tap = p.tap_handle();

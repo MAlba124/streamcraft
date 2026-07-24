@@ -32,16 +32,18 @@
 //! ## The header, and one frame per input buffer
 //! The **header is emitted lazily on the first frame** (so a stream with no frames
 //! produces no partial file, and the track config is fixed before any block). Each input
-//! buffer is one encoded frame → one `SimpleBlock` (spec `§simpleblock`); its bytes are
-//! pushed downstream chunked to the pool slot, exactly like `OggMux`. **A frame larger
-//! than the upstream's pool slot arrives split and would mux as several blocks** — for
-//! remuxing, size the demuxer's pool to the largest frame
-//! (`Pipeline::set_element_pool`); a frame-preserving emission mode is the documented
-//! follow-up. Timestamps come from the buffer PTS (falling back to a synthesised cadence
-//! when absent). A block is a keyframe unless the buffer is tagged
-//! [`BufferFlags::DELTA`] — untagged means "unknown", and every FLAC frame is
-//! independently decodable, so keyframe is the right default; a demuxed video track
-//! arrives explicitly tagged either way.
+//! buffer is one encoded frame → one `SimpleBlock` (spec `§simpleblock`), staged
+//! **scatter-style** (ZERO-COPY.md Stage 2): only the ~10-octet block header is
+//! buffered; the frame's `Memory` rides the open Cluster as a refcount and leaves as a
+//! whole payload buffer when the Cluster closes — frame bytes are never copied through
+//! this element. Header byte runs still go through pool slots (`try_alloc` + carry —
+//! the backpressure discipline). **A frame larger than the upstream's pool slot arrives
+//! split and would mux as several blocks** — for remuxing, size the demuxer's pool to
+//! the largest frame (`Pipeline::set_element_pool`). Timestamps come from the buffer
+//! PTS (falling back to a synthesised cadence when absent). A block is a keyframe
+//! unless the buffer is tagged [`BufferFlags::DELTA`] — untagged means "unknown", and
+//! every FLAC frame is independently decodable, so keyframe is the right default; a
+//! demuxed video track arrives explicitly tagged either way.
 //!
 //! ## EOS / finalize (spec: Events — Eos)
 //! The Segment and final Cluster are unknown-size streamed masters closed implicitly at end
@@ -51,7 +53,7 @@
 //! element (Cues) has a hook. Any bytes `finalize` were to produce are pushed downstream.
 
 use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::BufferFlags;
+use streamcraft_core::buffer::{Buffer, BufferFlags};
 use streamcraft_core::bus::BusMessage;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
@@ -60,12 +62,13 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::PadId;
+use streamcraft_core::id::{FormatId, PadId};
+use streamcraft_core::memory::Memory;
 use streamcraft_core::time::Timestamp;
 
 use crate::codec::{self, Reframer};
 use crate::reader::{MatroskaReader, Track};
-use crate::writer::{MatroskaWriter, TrackConfig};
+use crate::writer::{MatroskaWriter, MuxOut, MuxPiece, TrackConfig};
 
 /// The one track this single-sink-pad element muxes (spec: single-track element). The
 /// writer is N-track, but the element feeds it exactly this track.
@@ -202,9 +205,19 @@ pub struct MkvMux {
     /// rate (cached so the hot `process` path does not re-derive it, and to avoid a second
     /// borrow of `self` while the writer is borrowed).
     frame_dur_ns: u64,
-    /// Reused byte buffer the writer appends into, so steady-state muxing does not
-    /// reallocate a fresh `Vec` per `process` (mirrors `OggMux::scratch`).
-    scratch: Vec<u8>,
+    /// The scatter output the writer stages into (ZERO-COPY.md Stage 2): tiny header byte
+    /// runs + refcounted payload slices, drained downstream by
+    /// [`drain_out`](Self::drain_out). Doubles as the backpressure carry — while pieces
+    /// are queued (pool dry mid-drain), `process` consumes no input.
+    out: MuxOut,
+    /// Byte offset already emitted of the *front* `Bytes` piece in `out` (a pool-dry
+    /// partial emission resumes here). 0 whenever the front piece is fresh.
+    out_off: usize,
+    /// The `FormatId` a pool-allocated buffer on the src pad would carry (`Ctx` stamps
+    /// its out-format; no public accessor), probed once at `start` so forwarded payload
+    /// buffers match pooled ones. Not load-bearing on the milestone-1 transport
+    /// (`Batch::push` drops the per-row format), but kept faithful.
+    out_fmt: FormatId,
 }
 
 impl MkvMux {
@@ -229,7 +242,9 @@ impl MkvMux {
             header_done: false,
             next_ts_ns: 0,
             frame_dur_ns,
-            scratch: Vec::new(),
+            out: MuxOut::new(),
+            out_off: 0,
+            out_fmt: FormatId(0), // probed at `start`
         }
     }
 
@@ -246,7 +261,9 @@ impl MkvMux {
             header_done: false,
             next_ts_ns: 0,
             frame_dur_ns: 0,
-            scratch: Vec::new(),
+            out: MuxOut::new(),
+            out_off: 0,
+            out_fmt: FormatId(0), // probed at `start`
         }
     }
 
@@ -332,35 +349,97 @@ impl MkvMux {
         }
     }
 
-    /// Push accumulated MKV bytes onto the src pad, chunked to the pool slot size so no
-    /// single copy exceeds a buffer. Clears `bytes` afterwards, retaining its capacity.
-    /// Identical strategy to `OggMux::emit`.
-    fn emit(ctx: &mut Ctx, bytes: &mut Vec<u8>) {
-        let mut off = 0;
-        while off < bytes.len() {
-            let mut buf = ctx.alloc(SRC);
-            let cap = buf.memory.capacity();
-            debug_assert!(cap > 0, "mkvmux: zero-capacity pool slot");
-            let n = cap.min(bytes.len() - off);
-            buf.memory.as_mut_full()[..n].copy_from_slice(&bytes[off..off + n]);
-            buf.memory.set_len(n);
-            ctx.out(SRC).push(buf);
-            off += n;
+    /// Push a payload piece downstream as one whole buffer — a refcount move, no pool
+    /// slot, no copy (ZERO-COPY.md Stage 2). The bytes are the retained input the
+    /// upstream demuxer's pool already accounts for; a slow sink holding them keeps
+    /// those slots outstanding — that *is* the backpressure. MKV byte-stream buffers
+    /// carry no pts/flags (matching the chunked emission this replaces).
+    fn emit_payload(ctx: &mut Ctx, memory: Memory, format: FormatId) {
+        ctx.out(SRC).push(Buffer {
+            memory,
+            pts: Timestamp::NONE,
+            dts: Timestamp::NONE,
+            duration: Timestamp::NONE,
+            flags: BufferFlags::empty(),
+            format,
+            sync: None,
+        });
+    }
+
+    /// Drain staged output pieces downstream, in order — **pool bounded** for the header
+    /// byte runs ([`Ctx::try_alloc`] + the `out_off` cursor carry; returns `false` when
+    /// the pool ran dry, the signal to stop consuming input), refcount-forwarding for
+    /// payload pieces (never blocks). Reclaims the header arena once everything drained.
+    fn drain_out(&mut self, ctx: &mut Ctx) -> bool {
+        loop {
+            match self.out.front() {
+                None => break,
+                Some(&MuxPiece::Bytes { start, end }) => {
+                    let mut at = start + self.out_off;
+                    while at < end {
+                        let Some(mut buf) = ctx.try_alloc(SRC) else {
+                            self.out_off = at - start;
+                            return false; // pool dry — resume here next pass
+                        };
+                        let cap = buf.memory.capacity();
+                        debug_assert!(cap > 0, "mkvmux: zero-capacity pool slot");
+                        let n = cap.min(end - at);
+                        buf.memory.as_mut_full()[..n]
+                            .copy_from_slice(&self.out.header_bytes()[at..at + n]);
+                        buf.memory.set_len(n);
+                        ctx.out(SRC).push(buf);
+                        at += n;
+                    }
+                    self.out_off = 0;
+                    self.out.pop_front();
+                }
+                Some(MuxPiece::Payload(_)) => {
+                    let Some(MuxPiece::Payload(mem)) = self.out.pop_front() else {
+                        unreachable!("front was a payload")
+                    };
+                    Self::emit_payload(ctx, mem, self.out_fmt);
+                }
+            }
         }
-        bytes.clear();
+        self.out.reclaim();
+        true
+    }
+
+    /// The EOS drain: like [`drain_out`](Self::drain_out) but with **exact-size**
+    /// allocations for the byte runs — waiting for a pool slot is no longer an option at
+    /// end of stream (mirrors the demuxers' `flush_exact`).
+    fn drain_out_exact(&mut self, ctx: &mut Ctx) {
+        while let Some(piece) = self.out.pop_front() {
+            match piece {
+                MuxPiece::Bytes { start, end } => {
+                    let at = start + self.out_off;
+                    self.out_off = 0;
+                    if at >= end {
+                        continue;
+                    }
+                    let n = end - at;
+                    let mut buf = ctx.alloc_exact(SRC, n);
+                    buf.memory.as_mut_full()[..n]
+                        .copy_from_slice(&self.out.header_bytes()[at..end]);
+                    buf.memory.set_len(n);
+                    ctx.out(SRC).push(buf);
+                }
+                MuxPiece::Payload(mem) => Self::emit_payload(ctx, mem, self.out_fmt),
+            }
+        }
+        self.out.reclaim();
     }
 
     /// Finalize the stream exactly once (spec `§sizing` — seek-free). Idempotent: the
     /// writer is taken on first call, so later calls (the `event` path then `stop`, or vice
-    /// versa) do nothing. Any bytes finalize produces are pushed downstream.
+    /// versa) do nothing beyond draining any leftover pieces. The final Cluster's pieces
+    /// are pushed downstream with exact-size byte runs (no slot to wait for at EOS).
     fn finish_stream(&mut self, ctx: &mut Ctx) {
         self.done = true;
         if let Some(mut writer) = self.writer.take() {
-            let mut out = std::mem::take(&mut self.scratch);
-            writer.finalize(&mut out);
-            Self::emit(ctx, &mut out);
-            self.scratch = out; // reclaim the allocation
+            writer.finalize_scatter(&mut self.out);
         }
+        self.drain_out_exact(ctx);
     }
 }
 
@@ -369,7 +448,7 @@ impl Element for MkvMux {
         &MUX_DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         // Fixed setup builds its writer here; caps-driven setup builds it when the
         // announcement (and, for flac, the in-band head) arrives.
         if let (Setup::Fixed, Some(track)) = (&self.setup, &self.track) {
@@ -378,11 +457,21 @@ impl Element for MkvMux {
         self.done = false;
         self.header_done = false;
         self.next_ts_ns = 0;
-        self.scratch.clear();
+        self.out.clear();
+        self.out_off = 0;
+        // Probe the out-format a pooled buffer would carry (see the `out_fmt` field): one
+        // throwaway right-sized allocation, recycled on drop — never a steady-state cost.
+        self.out_fmt = ctx.alloc_exact(SRC, 1).format;
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        // Backpressure: resume any parked output pieces first, and consume input only
+        // while emission keeps up (un-popped input stays buffered for the next pass, so
+        // the scheduler's gates absorb a fast demuxer racing a slow sink).
+        if !self.drain_out(ctx) {
+            return Ok(Flow::Ok);
+        }
         while let Some(buf) = inputs.pop() {
             // Stop early if the stream is already finalized: a late buffer after EOS is
             // dropped rather than reopening a closed stream (matches `OggMux`).
@@ -463,24 +552,27 @@ impl Element for MkvMux {
             // untagged norm; a demuxed video track arrives tagged either way).
             let keyframe = !buf.flags.contains(BufferFlags::DELTA);
 
-            let mut out = std::mem::take(&mut self.scratch);
             let writer = self.writer.as_mut().expect("writer present");
 
             // Emit the header lazily, before the first frame — so an empty stream writes
             // nothing, and the track config is fixed before any block. The only error path
             // (BadTracks) cannot occur for our single fixed, validated track.
             if !self.header_done {
-                let _ = writer.write_header(&mut out);
+                let _ = writer.write_header_scatter(&mut self.out);
                 self.header_done = true;
             }
 
-            // One input buffer == one encoded frame == one SimpleBlock. The only error is
-            // an unknown track, impossible for our single fixed track.
-            let _ = writer.write_frame(&mut out, TRACK, ts_ns, buf.memory.data(), keyframe);
+            // One input buffer == one encoded frame == one SimpleBlock (ZERO-COPY.md
+            // Stage 2): the frame's `Memory` moves into the open Cluster as a refcount —
+            // the staged Cluster holds refcounts on the retained input, not byte copies —
+            // and comes back out of `drain_out` as a whole payload buffer when the
+            // Cluster closes. The only error is an unknown track, impossible for our
+            // single fixed track.
+            let _ = writer.write_frame_scatter(&mut self.out, TRACK, ts_ns, buf.memory, keyframe);
 
-            // `buf` recycles here on drop; move the produced bytes downstream.
-            Self::emit(ctx, &mut out);
-            self.scratch = out;
+            if !self.drain_out(ctx) {
+                return Ok(Flow::Ok); // pool dry mid-drain — stop consuming input
+            }
         }
         Ok(Flow::Ok)
     }
@@ -581,7 +673,8 @@ impl Element for MkvMux {
         // Belt-and-braces: guarantee finalize even if `event(Eos)` was not delivered.
         // Idempotent via the `Option` take.
         self.finish_stream(ctx);
-        self.scratch = Vec::new();
+        self.out = MuxOut::new();
+        self.out_off = 0;
     }
 }
 
