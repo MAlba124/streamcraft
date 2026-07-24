@@ -177,6 +177,10 @@ pub struct Pipeline {
     /// `ElementId`; `None` shares the pipeline default pool. See
     /// [`set_element_pool`](Self::set_element_pool).
     pool_overrides: Vec<Option<(usize, u32)>>,
+    /// Per-element inbound-ring capacity overrides (in batches), indexed by
+    /// `ElementId`; `None` uses `queue_cap`. See
+    /// [`set_queue_capacity`](Self::set_queue_capacity).
+    queue_overrides: Vec<Option<usize>>,
     /// Pads instantiated at runtime, per element (spec: dynamic pads). Indexed by
     /// `ElementId`; grown to match `elements` in [`add`](Self::add) and populated by
     /// [`preroll`](Self::preroll). Empty for a static pipeline.
@@ -214,6 +218,7 @@ impl Pipeline {
             base_shared: Arc::new(AtomicU64::new(u64::MAX)),
             dyn_pads: Vec::new(),
             pool_overrides: Vec::new(),
+            queue_overrides: Vec::new(),
         }
     }
 
@@ -296,6 +301,7 @@ impl Pipeline {
         self.elements.push(Some(element));
         self.dyn_pads.push(Vec::new());
         self.pool_overrides.push(None);
+        self.queue_overrides.push(None);
         id
     }
 
@@ -310,6 +316,18 @@ impl Pipeline {
     pub fn set_element_pool(&mut self, el: ElementId, slot_size: usize, slots: u32) {
         if let Some(o) = self.pool_overrides.get_mut(el.0 as usize) {
             *o = Some((slot_size.max(1), slots.max(1)));
+        }
+    }
+
+    /// Deepen (or shrink) the ring feeding **into** `el`, overriding the pipeline
+    /// default capacity in batches (spec: Queues — capacity is the scheduler's, not
+    /// the element's). Applies to every inter-group edge whose consumer is `el`;
+    /// an inlined (intra-group) hop has no ring, so a buffering point must be an
+    /// Active element — this is exactly how the explicit `queue` element gets its
+    /// depth: add it, then size its inbound ring here.
+    pub fn set_queue_capacity(&mut self, el: ElementId, batches: usize) {
+        if let Some(o) = self.queue_overrides.get_mut(el.0 as usize) {
+            *o = Some(batches.max(1));
         }
     }
 
@@ -632,7 +650,13 @@ impl Pipeline {
                      (make the branch point active so it forms its own group)",
                 ));
             }
-            let (p, c) = spsc::<Batch>(self.queue_cap);
+            let cap = self
+                .queue_overrides
+                .get(edge.sink.0 as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(self.queue_cap);
+            let (p, c) = spsc::<Batch>(cap);
             group_downstream[gs].push((PadId(edge.src_pad as u32), p));
             group_upstream[gd].push((PadId(edge.sink_pad as u32), c));
         }
