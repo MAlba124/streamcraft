@@ -74,6 +74,32 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > path is now: MkvDemux → *Dec → sink; remaining for milestone 5: a display sink +
 > pool sizing + MkvDemux V_VP8/V_MPEG4-ISO-AVC track family naming.
 
+> **Update — session 4 (2026-07-24, core roadmap + 3 agents):** landed the serial core
+> list in order, plus three merged agent branches. **(1) Refcounted `Memory`**: views are
+> `(Arc<MemoryInner>, offset, len)` — `Clone`/`slice()` are zero-copy, `as_mut_full` is
+> uniqueness-gated CoW via `pool.acquire_exact`, `take()` leaves an inner-less husk
+> (O(1) batch drain preserved). **(2) Per-element output pools**:
+> `Pipeline::set_element_pool(el, slot_size, slots)` — pool negotiation v1; distinct
+> recycling domains per override. **(3) Latency system v1**: `latency_report()` is a DP
+> over the topo order (per-sink worst path, per-element breakdown, `is_live`); `run()`
+> installs each element's upstream path latency into its `Ctx` and `wait_until` folds it
+> in — sinks render at `base+pts+path_latency` with zero sink code. **(3b) Clock
+> providers**: `Element::provide_clock`, sinks-first selection unless `set_clock` forced
+> one; `ClockWait::polling` (Poll variant) for clocks that advance where no notify
+> exists; `pipewireaudiosink` provides `AudioDeviceClock` (DAC-rendered frames / rate,
+> monotonic across seeks, frozen while paused) — audio-master A/V sync.
+> **(4) `set_queue_capacity(el, batches)`**: per-consumer inbound ring depth (how the
+> `queue` element gets real depth). **(5) Robustness**: unlinked-src-pad output is
+> dropped + counted (drops now real in `CounterSnapshot`; no more dummy drop-sinks);
+> `Ctx::forward_format` (Announcement carries Named *or* resolved Fixed payload) so a
+> pure transport re-announces a `FormatChange` onward — dynamic caps now cross the
+> `queue` end to end. **Merged agents**: threadless single-element `core::harness`
+> (fix_format/push/crank/pull/announced, ~180 lines of per-test scaffolding gone);
+> bounded class-aware bus (critical never dropped, droppable drop-oldest + counter) +
+> `*` wildcard family + the `queue` element itself. Ring agent (fenceless fast path +
+> leaky modes + benches) still in flight — leaky-queue integration follows it.
+> Remaining from the sweep: per-buffer mid-batch FormatChange boundaries.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
