@@ -659,6 +659,7 @@ dependencies = [
  "oxideav-vp9",
  "streamcraft-core",
  "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]
