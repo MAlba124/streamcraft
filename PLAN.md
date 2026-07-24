@@ -142,6 +142,17 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > intern the name) and the muxer writes the Duration float. ffprobe: 5385.36 s;
 > mpv seeks clean. `mkv/examples/check.rs` = full-file structural checker.
 
+> **Update — session 4d (2026-07-24): perf round + observability.** simprof-guided
+> allocation fix: remux **1.22M → 87.7K** calls, 3.51 GB → 459 MB (demux copied every
+> sample twice to break the reader borrow — now split-borrow + emit from the reader's
+> window; the pool now recycles whole `Arc<MemoryInner>`s, `Weak` pool link, disarm on
+> reject). `ZERO-COPY.md` (repo root) = staged plan to true zero-copy; a Fable agent
+> is on Stages 1–2 (demux slices + mux scatter, mp4/mkv only). **Latency tracing**:
+> per-element power-of-2 histograms (process time / ring residency / sink wait
+> overshoot), `Pipeline::set_tracing` / `STREAMCRAFT_TRACE=1`, `TapHandle::latency`,
+> `streamcraft launch --trace` p50/p99/max table. **Colored logs** on TTY stderr
+> (level + stable per-element hue; `NO_COLOR`/`STREAMCRAFT_LOG_COLOR` honored).
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
