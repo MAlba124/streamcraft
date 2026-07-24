@@ -21,3 +21,9 @@ streamcraft-core = { path = "../core" }
 # dependency cycle: sc-flac does not depend on sc-mkv (the container is codec-agnostic),
 # so mkv depending on flac for tests is one-directional (mirrors how flac dev-deps ogg).
 sc-flac = { path = "../flac" }
+# Only for the end-to-end VP8-in-MKV playback test: encode a few frames with oxideav-vp8,
+# mux them into a V_VP8 track, then demux + decode through sc-vp8's Vp8Dec and compare the
+# planes to a direct oxideav reference decode. Same one-directional dev-dep shape (sc-vp8
+# does not depend on sc-mkv), mirroring vp8/tests/vp8dec.rs.
+sc-vp8 = { path = "../vp8" }
+oxideav-vp8 = { version = "0.2", default-features = false }

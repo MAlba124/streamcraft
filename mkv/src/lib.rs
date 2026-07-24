@@ -74,3 +74,40 @@ pub use writer::{
     AudioConfig, MatroskaWriter, TrackConfig, VideoConfig, WriteError, APP_NAME,
     DEFAULT_TIMESTAMP_SCALE,
 };
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based lookup (spec: Plugins — `--list` and
+/// descriptor introspection). Typed `use` + constructor stays the primary path.
+///
+/// **Neither element is constructible by name yet.** Both descriptors carry `make_default:
+/// None`, so [`Registry::parse`](streamcraft_core::registry::Registry::parse) cannot build
+/// them — by design: `MkvMux` needs the track config (CodecID/CodecPrivate/audio params) and
+/// `MkvDemux` needs the stream **header bytes** at construction (see [`MkvDemux::new`]), and
+/// neither has a sensible zero-arg default while codec-init negotiation and autoplug are still
+/// being built. Registration exposes the `mkvmux`/`mkvdemux` descriptors for `--list`/help and
+/// descriptor queries until autoplug lands and can supply those inputs.
+///
+/// The `&'static ElementDesc`s are taken from throwaway instances (a bare `MkvDemux` over an
+/// empty header, a FLAC `MkvMux`) — only `desc()` is called, so the instances are dropped.
+pub fn register(registry: &mut Registry) {
+    registry.register(MkvMux::flac(Vec::new(), 0.0, 0, 0).desc());
+    registry.register(MkvDemux::new(Vec::new()).desc());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `register` exposes both elements under their descriptor names; neither is
+    /// name-constructible (both carry `make_default: None`).
+    #[test]
+    fn register_exposes_both_elements() {
+        let mut reg = Registry::new();
+        register(&mut reg);
+        assert_eq!(reg.names(), vec!["mkvdemux", "mkvmux"], "both descriptors registered");
+        assert!(reg.get("mkvmux").unwrap().make_default.is_none(), "mkvmux not name-constructible");
+        assert!(reg.get("mkvdemux").unwrap().make_default.is_none(), "mkvdemux not name-constructible");
+    }
+}
