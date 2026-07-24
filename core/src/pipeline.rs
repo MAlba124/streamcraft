@@ -1684,26 +1684,31 @@ fn run_group(
 
         // C. Route the tail element's per-pad output to each downstream ring (blocking
         // backpressure). A branching tail (a demuxer) has one ring per src pad; a linear
-        // tail has one; a sink has none, so its (empty) outputs are just cleared.
-        if downstream.is_empty() {
-            ctxs[m - 1].clear_outputs();
-        } else {
-            for (src_pad, down) in &downstream {
-                let mut out = ctxs[m - 1].take_output(*src_pad);
-                if !out.is_inert() {
-                    // Stamp the generation so the consuming group can drop it if a seek
-                    // supersedes it before it is processed (spec: flush/seek).
-                    out.seek_gen = seek_gen;
-                    progressed = true;
-                    if down.push(out).is_err() {
-                        break 'group Ok(()); // this downstream is gone
-                    }
-                    // Queue-fill high-water on the producing element (spec: Taps —
-                    // backpressure shows as the ring sitting at capacity).
-                    counters[m - 1].record_queue_fill(down.len() as u32);
+        // tail has one; a sink has none.
+        for (src_pad, down) in &downstream {
+            let mut out = ctxs[m - 1].take_output(*src_pad);
+            if !out.is_inert() {
+                // Stamp the generation so the consuming group can drop it if a seek
+                // supersedes it before it is processed (spec: flush/seek).
+                out.seek_gen = seek_gen;
+                progressed = true;
+                if down.push(out).is_err() {
+                    break 'group Ok(()); // this downstream is gone
                 }
+                // Queue-fill high-water on the producing element (spec: Taps —
+                // backpressure shows as the ring sitting at capacity).
+                counters[m - 1].record_queue_fill(down.len() as u32);
             }
         }
+        // Whatever is still in the output table has no ring: an *unlinked* src pad
+        // (a demuxer track nobody connected). Policy: discard it here, every pass,
+        // and count it as drops (spec: robustness) — an unlinked track must never
+        // accumulate memory, stall the graph, or require a dummy sink.
+        let (unrouted, _) = ctxs[m - 1].total_output();
+        if unrouted > 0 {
+            counters[m - 1].record_drops(unrouted);
+        }
+        ctxs[m - 1].clear_outputs();
 
         // D. Drive this group's reactor and route completions back to their elements.
         let completions = reactor.run_once();

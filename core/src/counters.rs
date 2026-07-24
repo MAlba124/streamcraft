@@ -47,6 +47,7 @@ pub struct ElementCounters {
     batches_in: AtomicU64,
     batches_out: AtomicU64,
     queue_high_water: AtomicU32,
+    drops: AtomicU64,
 }
 
 impl ElementCounters {
@@ -69,6 +70,13 @@ impl ElementCounters {
         self.queue_high_water.fetch_max(fill, Ordering::Relaxed);
     }
 
+    /// Record buffers this element produced that the scheduler dropped — today,
+    /// output on an unlinked src pad (spec: robustness — an unlinked track is
+    /// discarded by policy, never accumulated); later also leaky-queue drops.
+    pub fn record_drops(&self, buffers: u64) {
+        self.drops.fetch_add(buffers, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
             buffers_in: self.buffers_in.load(Ordering::Relaxed),
@@ -78,7 +86,7 @@ impl ElementCounters {
             batches_in: self.batches_in.load(Ordering::Relaxed),
             batches_out: self.batches_out.load(Ordering::Relaxed),
             queue_high_water: self.queue_high_water.load(Ordering::Relaxed),
-            drops: 0,
+            drops: self.drops.load(Ordering::Relaxed),
         }
     }
 }
