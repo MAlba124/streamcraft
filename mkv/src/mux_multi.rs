@@ -93,6 +93,14 @@ const SRC: PadId = PadId(MAX_TRACKS as u32);
 pub const PRECONFIG_MAX_BYTES: usize = 64 << 20;
 pub const PRECONFIG_MAX_BUFS: usize = 4096;
 
+/// Payload pieces at or below this size are **copied** into the open coalescing slot in
+/// [`MkvMuxN::drain_out`] instead of forwarded as their own refcounted buffer. One
+/// downstream buffer is one sink write submission, so a ~700-octet AAC frame as its own
+/// buffer costs a positioned write *each* — the movie gate measured sys-time-dominated
+/// exactly that way. A page-ish bound keeps every video frame on the zero-copy path
+/// (ZERO-COPY.md Stage 2) while audio/tiny frames batch into full slots.
+const COALESCE_MAX: usize = 4096;
+
 /// Raw `bytes` on the src side: a Matroska byte stream.
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
@@ -324,33 +332,91 @@ impl MkvMuxN {
         });
     }
 
-    /// Drain staged output pieces downstream in order — pool-bounded byte runs
+    /// Drain staged output pieces downstream in order — pool-bounded
     /// ([`Ctx::try_alloc`] + the `out_off` carry; `false` = pool dry, stop consuming
-    /// input), refcount-forwarded payloads (see `MkvMux::drain_out`).
+    /// input). Two piece classes:
+    ///
+    /// - **Large payloads** (> [`COALESCE_MAX`]) forward as refcounts — the video hot
+    ///   path, never copied (ZERO-COPY.md Stage 2).
+    /// - **Byte runs and small payloads** *coalesce*: they pack into one open pool slot
+    ///   until it fills or a large payload must interleave (order is preserved — the
+    ///   open slot flushes first). This is what keeps a muxed audio track from becoming
+    ///   one downstream buffer — and one sink write submission — **per ~700-octet AAC
+    ///   frame**: the movie gate went syscall-bound (sys ≫ user) exactly that way.
+    ///   Copying a sub-4-KiB frame costs far less than its own positioned write, and
+    ///   releases its retained input slot immediately.
     fn drain_out(&mut self, ctx: &mut Ctx) -> bool {
+        // The open coalescing slot, filled to `memory.len()` so far.
+        let mut slot: Option<Buffer> = None;
+        // Flush helper: push the open slot downstream if it holds anything.
+        fn flush(ctx: &mut Ctx, slot: &mut Option<Buffer>) {
+            if let Some(buf) = slot.take() {
+                if !buf.memory.is_empty() {
+                    ctx.out(SRC).push(buf);
+                }
+            }
+        }
         loop {
             match self.out.front() {
                 None => break,
                 Some(&MuxPiece::Bytes { start, end }) => {
                     let mut at = start + self.out_off;
                     while at < end {
-                        let Some(mut buf) = ctx.try_alloc(SRC) else {
-                            self.out_off = at - start;
-                            return false; // pool dry — resume here next pass
-                        };
-                        let cap = buf.memory.capacity();
-                        debug_assert!(cap > 0, "mkvmuxn: zero-capacity pool slot");
-                        let n = cap.min(end - at);
-                        buf.memory.as_mut_full()[..n]
+                        if slot.as_ref().is_some_and(|b| b.memory.len() == b.memory.capacity()) {
+                            flush(ctx, &mut slot);
+                        }
+                        if slot.is_none() {
+                            let Some(buf) = ctx.try_alloc(SRC) else {
+                                self.out_off = at - start;
+                                return false; // pool dry — resume here next pass
+                            };
+                            debug_assert!(buf.memory.capacity() > 0, "zero-capacity slot");
+                            slot = Some(buf);
+                        }
+                        let buf = slot.as_mut().expect("slot open");
+                        let filled = buf.memory.len();
+                        let n = (buf.memory.capacity() - filled).min(end - at);
+                        buf.memory.as_mut_full()[filled..filled + n]
                             .copy_from_slice(&self.out.header_bytes()[at..at + n]);
-                        buf.memory.set_len(n);
-                        ctx.out(SRC).push(buf);
+                        buf.memory.set_len(filled + n);
                         at += n;
                     }
                     self.out_off = 0;
                     self.out.pop_front();
                 }
-                Some(MuxPiece::Payload(_)) => {
+                Some(MuxPiece::Payload(mem)) => {
+                    let len = mem.len();
+                    // Small payload that fits a slot: coalesce by copy (whole-piece —
+                    // never split, so the carry state stays the byte-run cursor only).
+                    let coalesce = len <= COALESCE_MAX
+                        && slot.as_ref().map_or(true, |b| b.memory.capacity() >= len);
+                    if coalesce {
+                        if slot.as_ref().is_some_and(|b| b.memory.capacity() - b.memory.len() < len)
+                        {
+                            flush(ctx, &mut slot);
+                        }
+                        if slot.is_none() {
+                            let Some(buf) = ctx.try_alloc(SRC) else {
+                                flush(ctx, &mut slot);
+                                return false; // piece stays queued; resume next pass
+                            };
+                            slot = Some(buf);
+                        }
+                        let buf = slot.as_mut().expect("slot open");
+                        if buf.memory.capacity() >= len {
+                            let filled = buf.memory.len();
+                            buf.memory.as_mut_full()[filled..filled + len]
+                                .copy_from_slice(mem.data());
+                            buf.memory.set_len(filled + len);
+                            self.out.pop_front();
+                            continue;
+                        }
+                        // A fresh slot smaller than even this small piece (odd pool
+                        // config): fall through to the refcount path.
+                    }
+                    // Large payload: the open slot flushes first (order), then the
+                    // `Memory` moves out as its own buffer — a refcount, no copy.
+                    flush(ctx, &mut slot);
                     let Some(MuxPiece::Payload(mem)) = self.out.pop_front() else {
                         unreachable!("front was a payload")
                     };
@@ -358,6 +424,7 @@ impl MkvMuxN {
                 }
             }
         }
+        flush(ctx, &mut slot);
         self.out.reclaim();
         true
     }
