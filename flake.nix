@@ -27,12 +27,17 @@
           packages = [
             rustToolchain
             # Native tooling. Core is dependency-free; pkg-config + the dev libs
-            # below are for device elements (ALSA, V4L2, …) as they land.
+            # below are for device elements (PipeWire, ALSA, V4L2, …) as they land.
             pkgs.pkg-config
             pkgs.cargo-nextest
             pkgs.cargo-fuzz
             pkgs.mold
+            pkgs.clang # libclang, for the pipewire crate's bindgen
           ];
+
+          # PipeWire (libpipewire-0.3 + libspa), found via pkg-config. Only the
+          # sc-pipewire plugin links it; the core stays dependency-free.
+          buildInputs = [ pkgs.pipewire ];
 
           # Self-contained linking: the stdenv `cc` driver with mold, so the shell
           # doesn't depend on a globally-configured linker. Plain RUSTFLAGS is used
@@ -40,6 +45,9 @@
           # override rustflags set in ~/.cargo/config.toml, but plain RUSTFLAGS does.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "cc";
           RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+
+          # bindgen (pipewire-sys / libspa-sys) needs libclang.
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 

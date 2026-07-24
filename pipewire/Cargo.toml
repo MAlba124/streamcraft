@@ -1,0 +1,19 @@
+[package]
+name = "sc-pipewire"
+description = "PipeWire audio sink plugin for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+# The official PipeWire Rust bindings. This plugin lives outside core precisely so the
+# core stays dependency-free; a device backend is a lot of work for little payoff to
+# reimplement, so we bind libpipewire here (spec: plugins are just crates).
+pipewire = "0.8"
+
+[dev-dependencies]
+# For the `play` example: filesrc ! flacdec ! pipewireaudiosink.
+sc-flac = { path = "../flac" }
+streamcraft-elements = { path = "../elements" }
