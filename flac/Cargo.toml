@@ -18,3 +18,7 @@ streamcraft-core = { path = "../core" }
 # Only for the end-to-end element test (filesrc ! flacenc ! filesink); the library
 # itself depends on core alone.
 streamcraft-elements = { path = "../elements" }
+# Only for the FLAC-in-Ogg de-framer round-trip test (oggmux ! oggdemux ! oggflacdeframe
+# ! flacdec). No dependency cycle: sc-ogg does not depend on sc-flac (the container is
+# codec-agnostic), so flac depending on ogg for tests is one-directional.
+sc-ogg = { path = "../ogg" }

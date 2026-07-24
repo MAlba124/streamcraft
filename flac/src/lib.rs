@@ -16,6 +16,9 @@
 //!   its streamcraft [`Element`](streamcraft_core::element::Element) wrapper.
 //! - [`FlacDecoder`] — decodes what the encoder emits, so round-trip losslessness is
 //!   provable in-crate without any external tool.
+//! - [`OggFlacDeframe`] — the FLAC-in-Ogg de-framer element: reconstructs a native FLAC
+//!   byte stream from an Ogg-mapped one (`filesrc ! oggdemux ! oggflacdeframe ! flacdec`),
+//!   per the xiph "Ogg Mapping for FLAC" (`spec/ogg-flac-mapping.md`).
 //!
 //! ## Encoder scope (correctness first, then speed)
 //! - STREAMINFO metadata block (§8.2); frame + subframe headers (§9.1, §9.2).
@@ -40,12 +43,14 @@ mod decoder;
 mod encoder;
 mod flacdec;
 mod flacenc;
+mod oggflac;
 
 pub use bitstream::{crc16, crc8, BitReader, BitWriter, ReadError};
 pub use decoder::{DecodeError, DecodedFrame, FlacDecoder, StreamDecoder, StreamInfo};
 pub use encoder::{EncodeError, FlacEncoder, SampleFormat};
 pub use flacdec::FlacDec;
 pub use flacenc::FlacEnc;
+pub use oggflac::OggFlacDeframe;
 
 /// Byte offset of the STREAMINFO block body within a stream produced by
 /// [`FlacEncoder::new`] (spec §8.2). A two-pass caller writes the finalised body from
