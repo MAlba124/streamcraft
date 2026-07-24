@@ -133,3 +133,67 @@ pub const XDG_TOPLEVEL_SET_TITLE: u16 = 2;
 pub const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
 /// xdg_toplevel.close() — event 1. The user asked to close the window.
 pub const XDG_TOPLEVEL_CLOSE: u16 = 1;
+
+// --- zwp_linux_dmabuf_v1 (spec: spec/linux-dmabuf-unstable-v1.xml) ---------------------
+//
+// The DMA-BUF import path the GPU sink needs (sc-vk renders into an exported dma-buf and
+// presents it here without any CPU copy). This is *additive*: the shm swapchain above is
+// untouched; a client that never calls these requests behaves exactly as before. Opcodes
+// are the 0-based `<request>`/`<event>` declaration index within each `<interface>`, cited
+// against `linux-dmabuf-unstable-v1.xml` — same convention as the core interfaces above.
+
+/// The linux-dmabuf global's interface name, for `wl_registry.global` matching.
+pub const ZWP_LINUX_DMABUF: &str = "zwp_linux_dmabuf_v1";
+/// The version we bind at. v3 first offers `create_immed` with an explicit modifier (v1/v2
+/// predate modifier support); v4 adds the feedback objects we do not use. We import LINEAR
+/// buffers with an explicit modifier, so v3 is the minimum that works and what we request.
+pub const ZWP_LINUX_DMABUF_VERSION: u32 = 3;
+
+/// zwp_linux_dmabuf_v1.destroy() — request 0.
+pub const ZWP_LINUX_DMABUF_DESTROY: u16 = 0;
+/// zwp_linux_dmabuf_v1.create_params(params_id: new_id<zwp_linux_buffer_params_v1>) —
+/// request 1. Begins a buffer import; planes are then `add`ed to the params object.
+pub const ZWP_LINUX_DMABUF_CREATE_PARAMS: u16 = 1;
+/// zwp_linux_dmabuf_v1.format(format) — event 0. A DRM fourcc the compositor can import
+/// (modifier-unaware; superseded by `modifier` on v3+, but still emitted).
+pub const ZWP_LINUX_DMABUF_FORMAT: u16 = 0;
+/// zwp_linux_dmabuf_v1.modifier(format, modifier_hi, modifier_lo) — event 1. A
+/// (fourcc, DRM format modifier) pair the compositor accepts. We look for our render
+/// format under `DRM_FORMAT_MOD_LINEAR` (modifier 0).
+pub const ZWP_LINUX_DMABUF_MODIFIER: u16 = 1;
+
+// --- zwp_linux_buffer_params_v1 (spec: spec/linux-dmabuf-unstable-v1.xml) --------------
+
+/// zwp_linux_buffer_params_v1.destroy() — request 0.
+pub const ZWP_LINUX_BUFFER_PARAMS_DESTROY: u16 = 0;
+/// zwp_linux_buffer_params_v1.add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo)
+/// — request 1. `fd` rides in the SCM_RIGHTS ancillary data (out of band, no body bytes),
+/// exactly like `wl_shm.create_pool`'s pool fd.
+pub const ZWP_LINUX_BUFFER_PARAMS_ADD: u16 = 1;
+/// zwp_linux_buffer_params_v1.create_immed(buffer_id: new_id<wl_buffer>, width, height,
+/// format, flags) — request 3. Imports the added planes and returns the `wl_buffer`
+/// synchronously; on failure the compositor may raise a protocol error or send `failed`.
+pub const ZWP_LINUX_BUFFER_PARAMS_CREATE_IMMED: u16 = 3;
+/// zwp_linux_buffer_params_v1.created(buffer: new_id<wl_buffer>) — event 0. Answer to the
+/// async `create` request (we use `create_immed`, so this is not the normal path).
+pub const ZWP_LINUX_BUFFER_PARAMS_CREATED: u16 = 0;
+/// zwp_linux_buffer_params_v1.failed() — event 1. The compositor could not import the
+/// dmabuf. We surface it as an [`Error::Resource`] so the caller can fall back.
+///
+/// [`Error::Resource`]: streamcraft_core::error::Error::Resource
+pub const ZWP_LINUX_BUFFER_PARAMS_FAILED: u16 = 1;
+
+/// DRM fourcc `XR24` — 32-bit little-endian `[B, G, R, X]`, the modifier-agnostic twin of
+/// `wl_shm`'s `XRGB8888`. This is the format the GPU renders and imports (spec: Linux DRM
+/// `drm_fourcc.h`, `DRM_FORMAT_XRGB8888` = `fourcc_code('X','R','2','4')`).
+pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b'X', b'R', b'2', b'4');
+
+/// `DRM_FORMAT_MOD_LINEAR` (0): a plain, un-tiled, un-compressed layout — the one modifier
+/// every importer must accept (spec: Linux `drm_fourcc.h`). v1 renders LINEAR only.
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// Build a 32-bit DRM fourcc from four ASCII bytes (`fourcc_code`: `a | b<<8 | c<<16 |
+/// d<<24`), so the format constants read as their character codes (spec: `drm_fourcc.h`).
+const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}

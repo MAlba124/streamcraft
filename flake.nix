@@ -33,6 +33,13 @@
             pkgs.cargo-fuzz
             pkgs.mold
             pkgs.clang # libclang, for the pipewire crate's bindgen
+            # `ash`'s "loaded" feature dlopen()s libvulkan.so.1 at runtime for
+            # the sc-vk renderer; glslang regenerates the checked-in SPIR-V from
+            # the reviewable GLSL sources (vk/shaders/*.glsl → vk/src/shaders.rs).
+            # build.rs never runs a shader compiler — regeneration is a documented
+            # manual step (see vk/REFERENCES.md).
+            pkgs.vulkan-loader
+            pkgs.glslang
           ];
 
           # PipeWire (libpipewire-0.3 + libspa), found via pkg-config. Only the
@@ -50,6 +57,12 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+
+          # So `ash`'s runtime dlopen("libvulkan.so.1") resolves inside the pure
+          # devshell (the loader is not on the default linker search path here).
+          # The loader then discovers the system ICDs via the usual
+          # /run/opengl-driver + /usr/share/vulkan/icd.d manifests.
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
 
           shellHook = ''
             echo "streamcraft devshell — $(rustc --version)"

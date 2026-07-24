@@ -41,6 +41,21 @@ struct SwapBuffer {
     available: bool,
 }
 
+/// One imported dmabuf-backed buffer in the GPU present path (spec: task deliverable 3 —
+/// present through zwp_linux_dmabuf_v1 with `wl_buffer.release`-gated reuse). The `wl_buffer`
+/// wraps a GPU image the renderer exported as a dma-buf fd; we track only the handle and
+/// whether the compositor currently holds it. Reuse is identical to the shm swapchain:
+/// available → the renderer may draw into the underlying image and re-present it.
+struct DmabufBuffer {
+    wl_buffer: u32,
+    /// The caller's opaque slot index (which GPU image this `wl_buffer` wraps), echoed back
+    /// so the renderer knows which image freed.
+    slot: u32,
+    /// `true` while free for us to render into; `false` between `attach`+`commit` and the
+    /// compositor's `wl_buffer.release`.
+    available: bool,
+}
+
 /// The double-buffered `wl_shm` pool + its buffers (spec: task deliverable 2). One memfd
 /// backs `n` XRGB8888 buffers of `width*height`; we draw into a free one, attach it, and
 /// wait for `release` before reusing it.
@@ -76,15 +91,37 @@ pub struct WaylandClient {
     surface: u32,
     xdg_surface: u32,
     xdg_toplevel: u32,
+    /// zwp_linux_dmabuf_v1, bound only if the compositor advertises it (0 = absent). The
+    /// shm path never touches this — dmabuf import is a strictly additive capability.
+    dmabuf: u32,
 
     // Registry discovery: (name, version) for each global we care about, learned from
     // wl_registry.global before we bind.
     compositor_global: Option<(u32, u32)>,
     shm_global: Option<(u32, u32)>,
     wm_base_global: Option<(u32, u32)>,
+    dmabuf_global: Option<(u32, u32)>,
 
     /// wl_shm formats the server advertised (we require XRGB8888).
     shm_formats: Vec<u32>,
+    /// (DRM fourcc, DRM format modifier) pairs the compositor advertised it can import via
+    /// linux-dmabuf (`zwp_linux_dmabuf_v1.modifier`). Empty if dmabuf is absent or the
+    /// compositor only sent the legacy modifier-less `format` events.
+    dmabuf_modifiers: Vec<(u32, u64)>,
+
+    /// Imported dmabuf-backed buffers, keyed by their `wl_buffer` id. Each carries the same
+    /// compositor-holds-it / free-to-reuse flag as an shm [`SwapBuffer`], gated by
+    /// `wl_buffer.release`. The GPU owns the underlying image memory; we only track the
+    /// `wl_buffer` handle and its availability.
+    dmabuf_buffers: Vec<DmabufBuffer>,
+    /// Result of the most recent `create_immed`/`create` params import, learned from a
+    /// `zwp_linux_buffer_params_v1.failed` event (async failure; `create_immed` success is
+    /// silent). `true` means the last import failed.
+    dmabuf_import_failed: bool,
+    /// Object ids of `zwp_linux_buffer_params_v1` objects we created and have not yet
+    /// destroyed, so a late `failed`/`created` event is routed to the dmabuf logic (and not
+    /// mistaken for a `wl_buffer.release`, since opcode 0/1 overlap across interfaces).
+    pending_params: Vec<u32>,
 
     swap: Option<Swapchain>,
 
@@ -125,10 +162,16 @@ impl WaylandClient {
             surface: 0,
             xdg_surface: 0,
             xdg_toplevel: 0,
+            dmabuf: 0,
             compositor_global: None,
             shm_global: None,
             wm_base_global: None,
+            dmabuf_global: None,
             shm_formats: Vec::new(),
+            dmabuf_modifiers: Vec::new(),
+            dmabuf_buffers: Vec::new(),
+            dmabuf_import_failed: false,
+            pending_params: Vec::new(),
             swap: None,
             configured: false,
             pending_configure: None,
@@ -193,7 +236,15 @@ impl WaylandClient {
             .ok_or_else(|| resource("wayland: no xdg_wm_base global"))?;
         self.xdg_wm_base = self.bind(name, op::XDG_WM_BASE, ver.min(op::XDG_WM_BASE_VERSION))?;
 
-        // A second roundtrip so wl_shm.format events (sent right after bind) arrive.
+        // linux-dmabuf is *optional*: bind it only if advertised, so a compositor without it
+        // still gives us a working shm sink. The GPU sink queries `has_dmabuf()` and falls
+        // back to waylandvideosink when it is absent.
+        if let Some((name, ver)) = self.dmabuf_global {
+            self.dmabuf = self.bind(name, op::ZWP_LINUX_DMABUF, ver.min(op::ZWP_LINUX_DMABUF_VERSION))?;
+        }
+
+        // A second roundtrip so wl_shm.format events (and the dmabuf format/modifier
+        // advertisements, sent right after their respective binds) arrive.
         self.roundtrip()?;
         if !self.shm_formats.contains(&op::WL_SHM_FORMAT_XRGB8888) {
             return Err(resource("wayland: compositor does not support XRGB8888 shm"));
@@ -453,6 +504,223 @@ impl WaylandClient {
             .position(|b| b.available)
     }
 
+    // --- linux-dmabuf import + present (GPU path; spec: task deliverable 3) -------------
+    //
+    // This is the additive presenter the sc-vk renderer drives: it renders into an exported
+    // dma-buf (a GPU image), imports each dma-buf fd once as a `wl_buffer` via
+    // zwp_linux_dmabuf_v1, then presents them with the same `wl_buffer.release`-gated reuse
+    // as the shm swapchain. The shm path above is untouched.
+
+    /// Whether the compositor advertised linux-dmabuf and we bound it. The GPU sink checks
+    /// this and falls back to `waylandvideosink` when it is `false`.
+    pub fn has_dmabuf(&self) -> bool {
+        self.dmabuf != 0
+    }
+
+    /// The (DRM fourcc, DRM format modifier) pairs the compositor said it can import. Empty
+    /// if dmabuf is absent. Exposed so the renderer can log/negotiate modifier support.
+    pub fn dmabuf_modifiers(&self) -> &[(u32, u64)] {
+        &self.dmabuf_modifiers
+    }
+
+    /// Whether the compositor can import `format` under `modifier` (an exact membership test
+    /// against the advertised set). v1 imports `DRM_FORMAT_XRGB8888` under
+    /// `DRM_FORMAT_MOD_LINEAR`, so the sink pre-flights that pair before importing.
+    pub fn dmabuf_supports(&self, format: u32, modifier: u64) -> bool {
+        self.dmabuf_modifiers
+            .iter()
+            .any(|&(f, m)| f == format && m == modifier)
+    }
+
+    /// Record an advertised (fourcc, modifier) pair, de-duplicated. `INVALID` modifiers
+    /// (all-ones) mean "implementation-defined"; we ignore those and only keep concrete
+    /// values we can actually request (LINEAR in v1).
+    fn record_dmabuf_modifier(&mut self, format: u32, modifier: u64) {
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+        if modifier == DRM_FORMAT_MOD_INVALID {
+            return;
+        }
+        if !self.dmabuf_modifiers.contains(&(format, modifier)) {
+            self.dmabuf_modifiers.push((format, modifier));
+        }
+    }
+
+    fn is_pending_params(&self, id: u32) -> bool {
+        self.pending_params.contains(&id)
+    }
+
+    fn drop_pending_params(&mut self, id: u32) {
+        self.pending_params.retain(|&p| p != id);
+    }
+
+    /// Import one exported dma-buf plane as a `wl_buffer` and register it under the caller's
+    /// opaque `slot` index (which GPU image it wraps), so a later `wl_buffer.release` tells
+    /// the renderer that image is free to redraw. A single 32-bit XRGB plane is the v1 case;
+    /// `offset`/`stride`/`modifier` come from the Vulkan subresource layout + allocation.
+    ///
+    /// Uses `create_params` → `add` (fd via SCM_RIGHTS) → `create_immed`: the `wl_buffer` is
+    /// live synchronously on success. A `zwp_linux_buffer_params_v1.failed` (async) marks the
+    /// import failed; the caller roundtrips and checks [`take_dmabuf_import_failed`].
+    ///
+    /// The compositor duplicates the fd on receipt; the caller keeps ownership of its own fd.
+    ///
+    /// [`take_dmabuf_import_failed`]: Self::take_dmabuf_import_failed
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_dmabuf(
+        &mut self,
+        slot: u32,
+        width: usize,
+        height: usize,
+        format: u32,
+        modifier: u64,
+        fd: std::os::unix::io::RawFd,
+        offset: u32,
+        stride: u32,
+    ) -> Result<u32, Error> {
+        if self.dmabuf == 0 {
+            return Err(resource("wayland: compositor has no linux-dmabuf support"));
+        }
+
+        // zwp_linux_dmabuf_v1.create_params(new_id params)
+        let params = self.alloc_id();
+        let mut m = MessageBuilder::new(self.dmabuf, op::ZWP_LINUX_DMABUF_CREATE_PARAMS);
+        m.u32(params);
+        self.send(&m)?;
+        self.pending_params.push(params);
+
+        // zwp_linux_buffer_params_v1.add(fd, plane_idx=0, offset, stride, mod_hi, mod_lo).
+        // The fd rides in SCM_RIGHTS ancillary data, exactly like wl_shm.create_pool.
+        let mod_hi = (modifier >> 32) as u32;
+        let mod_lo = (modifier & 0xffff_ffff) as u32;
+        let mut m = MessageBuilder::new(params, op::ZWP_LINUX_BUFFER_PARAMS_ADD);
+        m.fd(fd)
+            .u32(0) // plane_idx
+            .u32(offset)
+            .u32(stride)
+            .u32(mod_hi)
+            .u32(mod_lo);
+        self.send(&m)?;
+
+        // zwp_linux_buffer_params_v1.create_immed(new_id wl_buffer, w, h, format, flags=0).
+        let wl_buffer = self.alloc_id();
+        let mut m = MessageBuilder::new(params, op::ZWP_LINUX_BUFFER_PARAMS_CREATE_IMMED);
+        m.u32(wl_buffer)
+            .i32(width as i32)
+            .i32(height as i32)
+            .u32(format)
+            .u32(0); // flags: no y_invert
+        self.send(&m)?;
+
+        self.dmabuf_buffers.push(DmabufBuffer {
+            wl_buffer,
+            slot,
+            available: true,
+        });
+        Ok(wl_buffer)
+    }
+
+    /// Roundtrip and report whether the most recent import failed (a `params.failed` event),
+    /// clearing the flag. Called after importing all buffers to detect a rejected format.
+    pub fn take_dmabuf_import_failed(&mut self) -> Result<bool, Error> {
+        self.roundtrip()?;
+        // Destroy any params objects that already answered (or that create_immed consumed);
+        // the wl_buffer outlives the params object, so this is always safe post-create.
+        let stale: Vec<u32> = self.pending_params.clone();
+        for p in stale {
+            let m = MessageBuilder::new(p, op::ZWP_LINUX_BUFFER_PARAMS_DESTROY);
+            let _ = self.send(&m);
+            self.drop_pending_params(p);
+        }
+        Ok(std::mem::take(&mut self.dmabuf_import_failed))
+    }
+
+    /// Return the `slot` of a dmabuf buffer the compositor has released (free to redraw),
+    /// pumping events (then a blocking roundtrip backstop) until one frees. Mirrors
+    /// [`acquire_free_buffer`](Self::acquire_free_buffer) for the shm path.
+    fn acquire_free_dmabuf(&mut self) -> Result<u32, Error> {
+        if let Some(s) = self.free_dmabuf_slot() {
+            return Ok(s);
+        }
+        for _ in 0..2 {
+            self.pump()?;
+            if let Some(s) = self.free_dmabuf_slot() {
+                return Ok(s);
+            }
+        }
+        self.roundtrip()?;
+        if let Some(s) = self.free_dmabuf_slot() {
+            return Ok(s);
+        }
+        Err(resource("wayland: no dmabuf buffer released by the compositor"))
+    }
+
+    fn free_dmabuf_slot(&self) -> Option<u32> {
+        self.dmabuf_buffers
+            .iter()
+            .find(|b| b.available)
+            .map(|b| b.slot)
+    }
+
+    /// Acquire a free dmabuf slot for the renderer to draw into, returning its `slot` index.
+    /// The caller renders the frame into that slot's GPU image, then calls
+    /// [`present_dmabuf`](Self::present_dmabuf) with the same slot. Returns `Ok(None)` when
+    /// the window is closing (the caller then treats frames as drops).
+    pub fn acquire_dmabuf_slot(&mut self) -> Result<Option<u32>, Error> {
+        if self.closed {
+            return Ok(None);
+        }
+        if let Some(e) = &self.protocol_error {
+            return Err(resource(format!("wayland: protocol error: {e}")));
+        }
+        Ok(Some(self.acquire_free_dmabuf()?))
+    }
+
+    /// Present the dmabuf buffer registered for `slot` (attach + damage_buffer + commit),
+    /// after the renderer has finished drawing into and syncing it. Marks the slot busy until
+    /// the compositor's `wl_buffer.release`. Returns `Ok(false)` if the window is closing.
+    pub fn present_dmabuf(&mut self, slot: u32, width: usize, height: usize) -> Result<bool, Error> {
+        if self.closed {
+            return Ok(false);
+        }
+        if let Some(e) = &self.protocol_error {
+            return Err(resource(format!("wayland: protocol error: {e}")));
+        }
+        if !self.configured {
+            self.pump()?;
+            self.ack_pending_configure()?;
+        }
+        let wl_buffer = {
+            let b = self
+                .dmabuf_buffers
+                .iter_mut()
+                .find(|b| b.slot == slot)
+                .ok_or_else(|| resource("wayland: present_dmabuf: unknown slot"))?;
+            b.available = false;
+            b.wl_buffer
+        };
+
+        // attach(buffer, 0, 0); damage_buffer(0,0,w,h); commit — identical to the shm path.
+        let mut m = MessageBuilder::new(self.surface, op::WL_SURFACE_ATTACH);
+        m.u32(wl_buffer).i32(0).i32(0);
+        self.send(&m)?;
+        let mut m = MessageBuilder::new(self.surface, op::WL_SURFACE_DAMAGE_BUFFER);
+        m.i32(0).i32(0).i32(width as i32).i32(height as i32);
+        self.send(&m)?;
+        self.commit_surface()?;
+
+        self.pump()?;
+        Ok(!self.closed)
+    }
+
+    /// Destroy all imported dmabuf `wl_buffer`s (e.g. before re-importing at a new size).
+    /// The GPU image memory is the renderer's to free; this only releases the wire objects.
+    pub fn clear_dmabuf_buffers(&mut self) {
+        for b in std::mem::take(&mut self.dmabuf_buffers) {
+            let m = MessageBuilder::new(b.wl_buffer, op::WL_BUFFER_DESTROY);
+            let _ = self.send(&m);
+        }
+    }
+
     // --- event pump --------------------------------------------------------------------
 
     /// True once the compositor asked to close the window.
@@ -576,6 +844,7 @@ impl WaylandClient {
                         op::WL_COMPOSITOR => self.compositor_global = Some((name, version)),
                         op::WL_SHM => self.shm_global = Some((name, version)),
                         op::XDG_WM_BASE => self.wm_base_global = Some((name, version)),
+                        op::ZWP_LINUX_DMABUF => self.dmabuf_global = Some((name, version)),
                         _ => {}
                     }
                 }
@@ -591,6 +860,37 @@ impl WaylandClient {
                     }
                 }
             }
+            _ if self.dmabuf != 0 && h.object == self.dmabuf => match h.opcode {
+                // Legacy modifier-less advertisement: record the fourcc under the LINEAR
+                // modifier, since a format-only advertisement implies LINEAR is importable.
+                op::ZWP_LINUX_DMABUF_FORMAT => {
+                    if let Some(fmt) = r.u32() {
+                        self.record_dmabuf_modifier(fmt, op::DRM_FORMAT_MOD_LINEAR);
+                    }
+                }
+                // (fourcc, modifier) pair — the modifier is a 64-bit value split hi/lo.
+                op::ZWP_LINUX_DMABUF_MODIFIER => {
+                    if let (Some(fmt), Some(hi), Some(lo)) = (r.u32(), r.u32(), r.u32()) {
+                        let modifier = ((hi as u64) << 32) | lo as u64;
+                        self.record_dmabuf_modifier(fmt, modifier);
+                    }
+                }
+                _ => {}
+            },
+            // A zwp_linux_buffer_params_v1 we created is answering create_immed. On success
+            // create_immed is silent (the wl_buffer is live already); only `failed` arrives.
+            _ if self.is_pending_params(h.object) => match h.opcode {
+                op::ZWP_LINUX_BUFFER_PARAMS_FAILED => {
+                    self.dmabuf_import_failed = true;
+                    self.drop_pending_params(h.object);
+                }
+                op::ZWP_LINUX_BUFFER_PARAMS_CREATED => {
+                    // Not our normal path (we use create_immed), but handle it: the buffer
+                    // is already recorded by the caller keyed on the id it allocated.
+                    self.drop_pending_params(h.object);
+                }
+                _ => {}
+            },
             _ if h.object == self.xdg_wm_base => {
                 if h.opcode == op::XDG_WM_BASE_PING {
                     // Answer immediately to prove liveness (spec: xdg_wm_base.ping/pong).
@@ -620,14 +920,22 @@ impl WaylandClient {
                 }
             }
             _ => {
-                // Might be a wl_buffer.release for one of our swap buffers.
-                if let Some(swap) = self.swap.as_mut() {
-                    if h.opcode == op::WL_BUFFER_RELEASE {
+                // Might be a wl_buffer.release for one of our swap buffers (shm) or an
+                // imported dmabuf buffer — the release-gated reuse is identical for both.
+                if h.opcode == op::WL_BUFFER_RELEASE {
+                    if let Some(swap) = self.swap.as_mut() {
                         if let Some(b) =
                             swap.buffers.iter_mut().find(|b| b.wl_buffer == h.object)
                         {
                             b.available = true;
                         }
+                    }
+                    if let Some(b) = self
+                        .dmabuf_buffers
+                        .iter_mut()
+                        .find(|b| b.wl_buffer == h.object)
+                    {
+                        b.available = true;
                     }
                 }
             }
@@ -649,6 +957,9 @@ impl WaylandClient {
             drop(swap.map);
             drop(swap.memfd);
         }
+        // Release any imported dmabuf wl_buffers (the GPU image memory is freed by the
+        // renderer that owns it — this only tears down the wire objects).
+        self.clear_dmabuf_buffers();
         let _ = self.stream.flush();
     }
 }

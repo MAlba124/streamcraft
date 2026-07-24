@@ -8,11 +8,13 @@
 //! * [`wire`] — the wire format: message builder/serialiser + a total (never-panicking)
 //!   event parser (header, args, string/array padding).
 //! * [`protocol`] — interface names, request/event opcodes, enum constants, each cited
-//!   against `wayland/spec/{wayland,xdg-shell}.xml`.
+//!   against `wayland/spec/{wayland,xdg-shell,linux-dmabuf-unstable-v1}.xml`.
 //! * [`sys`] — the one audited `unsafe` module (memfd / mmap / SCM_RIGHTS fd passing).
 //! * [`convert`] — i420 / gray8 → XRGB8888, integer BT.601, one pass into the shm buffer.
 //! * [`client`] — a minimal Wayland client: connect, registry, window, shm swapchain,
-//!   present, event pump.
+//!   present, event pump. Additively, it can also *import and present exported
+//!   DMA-BUFs* via `zwp_linux_dmabuf_v1` (the GPU present path sc-vk drives) — a parallel
+//!   code path alongside the shm swapchain, gated by the same `wl_buffer.release` reuse.
 //! * [`sink`] — the [`WaylandVideoSink`] element (active, clock-paced, QoS, dynamic caps).
 //!
 //! The protocol specs live in the tree (`wayland/spec/`), per project convention.
