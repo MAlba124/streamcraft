@@ -1,0 +1,17 @@
+[package]
+name = "sc-vp9"
+description = "Codec plugin for streamcraft backed by the pure-Rust oxideav-vp9 (adoption pending evaluation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_vp9"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+oxideav-vp9 = { version = "0.0.12", default-features = false }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }

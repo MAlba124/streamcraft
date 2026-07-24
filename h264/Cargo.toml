@@ -1,0 +1,17 @@
+[package]
+name = "sc-h264"
+description = "Codec plugin for streamcraft backed by the pure-Rust oxideav-h264 (adoption pending evaluation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_h264"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+oxideav-h264 = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
