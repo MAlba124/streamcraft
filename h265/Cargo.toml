@@ -1,6 +1,6 @@
 [package]
 name = "sc-h265"
-description = "Codec plugin for streamcraft backed by the pure-Rust oxideav-h265 (adoption pending evaluation)"
+description = "H.265 / HEVC (ITU-T H.265 | ISO/IEC 23008-2) codec plugin for streamcraft, backed by the pure-Rust oxideav-h265"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,11 @@ name = "sc_h265"
 
 [dependencies]
 streamcraft-core = { path = "../core" }
+# A sanctioned plugin-crate dependency (like libpipewire for sc-pipewire): pure
+# Rust, no build.rs, no unsafe, MIT. Unlike sc-vp8 it is NOT zero-dep — at 0.0.9 it
+# pulls oxideav-core (serde_json/thiserror/bytemuck) transitively for its registry
+# glue, which the decode path we call does not touch. See lib.rs for the adoption
+# rationale, the dependency wart, and the planned nativization steps.
 oxideav-h265 = { version = "0.0.9", default-features = false }
 
 [dev-dependencies]
