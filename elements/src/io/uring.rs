@@ -507,13 +507,10 @@ impl Reactor for IoUringReactor {
         );
     }
 
-    fn submit(&mut self, mut subs: Vec<Submission>) {
-        // Steady state `pending` is empty here (submit_pending drains every pass):
-        // adopt the larger allocation instead of copying into a smaller one.
-        if self.pending.is_empty() && self.pending.capacity() < subs.capacity() {
-            std::mem::swap(&mut self.pending, &mut subs);
-        }
-        self.pending.append(&mut subs);
+    fn submit(&mut self, subs: &mut Vec<Submission>) {
+        // Drain, never take: the caller's outbox keeps its capacity for the next
+        // pass; `pending`'s capacity is reactor-owned and survives submit_pending.
+        self.pending.append(subs);
     }
 
     fn cancel(&mut self, op: OpId) {
@@ -526,13 +523,12 @@ impl Reactor for IoUringReactor {
         self.pending.is_empty() && self.in_flight.is_empty()
     }
 
-    fn run_once(&mut self) -> Vec<(ElementId, Completion)> {
-        // One vec per pass (forced fresh by the trait — the scheduler consumes it
-        // by value); submit errors and reaped completions share it.
-        let mut out = Vec::new();
-        self.submit_pending(&mut out);
-        self.reap(&mut out);
-        out
+    fn run_once(&mut self, out: &mut Vec<(ElementId, Completion)>) {
+        // Caller-owned, reused across passes (ZERO-COPY.md stage 4.2); submit
+        // errors and reaped completions share it.
+        out.clear();
+        self.submit_pending(out);
+        self.reap(out);
     }
 }
 

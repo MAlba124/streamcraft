@@ -17,9 +17,10 @@
 //! - [`harness`] — the threadless, mock-clocked single-element test rig (spec: Testing —
 //!   Element harness; it *is* the inline caller)
 
-// `unsafe` is permitted only in `memory` and the SPSC ring (audited, loom+miri
-// covered) once they land. `deny` (not `forbid`) so those modules can locally
-// `#[allow(unsafe_code)]`.
+// `unsafe` is permitted only in the audited modules: `memory` and the SPSC ring
+// (loom+miri covered), plus `io`'s raw-syscall shims (integer-only args, no
+// userspace pointers — see io.rs's justification header). `deny` (not `forbid`)
+// so those modules can locally `#[allow(unsafe_code)]`.
 #![deny(unsafe_code)]
 // Temporary: the skeleton defines the type vocabulary before the modules are wired
 // together. Remove as the build order in streamcraft.md is worked through.

@@ -1574,6 +1574,9 @@ fn run_group(
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_empty();
+    // Reused completions buffer for `run_once` (ZERO-COPY.md stage 4.2): one
+    // allocation for the whole run instead of one per pass.
+    let mut completions_buf: Vec<(ElementId, crate::io::Completion)> = Vec::new();
     // A fan-in (aggregator) head reads several upstream rings; a single-input head reads
     // one. The single-input head's sink pad (the one the ring feeds) is where a
     // FormatChange re-fixates; a fan-in head re-fixates per pad in the feed loop instead.
@@ -1937,7 +1940,7 @@ fn run_group(
             if nbuf > 0 {
                 counters[i].record_out(nbuf, nbytes);
             }
-            reactor.submit(ctxs[i].take_submissions());
+            reactor.submit(ctxs[i].submissions_mut());
             if i + 1 < m {
                 if nbuf > 0 {
                     counters[i + 1].record_in(nbuf, nbytes);
@@ -2001,11 +2004,11 @@ fn run_group(
         ctxs[m - 1].clear_outputs();
 
         // D. Drive this group's reactor and route completions back to their elements.
-        let completions = reactor.run_once();
-        if !completions.is_empty() {
+        reactor.run_once(&mut completions_buf);
+        if !completions_buf.is_empty() {
             progressed = true;
         }
-        for (elem, c) in completions {
+        for (elem, c) in completions_buf.drain(..) {
             if let Some(idx) = ids.iter().position(|e| *e == elem) {
                 ctxs[idx].deliver_completion(c);
             }

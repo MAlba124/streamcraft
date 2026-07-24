@@ -770,8 +770,11 @@ impl Ctx {
         self.pad_eos[i] = true;
     }
 
-    pub(crate) fn take_submissions(&mut self) -> Vec<Submission> {
-        std::mem::take(&mut self.io_out)
+    /// The element's IO outbox, handed to `Reactor::submit` which *drains* it — the
+    /// vec (and its capacity) stays here, so per-pass submission allocates nothing
+    /// (ZERO-COPY.md stage 4.2).
+    pub(crate) fn submissions_mut(&mut self) -> &mut Vec<Submission> {
+        &mut self.io_out
     }
 
     pub(crate) fn deliver_completion(&mut self, c: Completion) {

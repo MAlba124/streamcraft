@@ -104,7 +104,7 @@ fn sync_reactor_hygiene_preserves_data() {
     r.set_file(writer, File::create(&path).expect("create"));
     let expect: Vec<u8> = (0..SLOT * SLOTS).map(|i| (i % 251) as u8).collect();
     for (i, chunk) in expect.chunks(SLOT).enumerate() {
-        r.submit(vec![Submission {
+        r.submit(&mut vec![Submission {
             op: OpId(i as u64),
             element: writer,
             kind: OpKind::Write,
@@ -115,12 +115,20 @@ fn sync_reactor_hygiene_preserves_data() {
         }]);
         // Interleave run_once with submission like the scheduler does.
         if i % 3 == 2 {
-            for (_, c) in r.run_once() {
+            for (_, c) in {
+        let mut completions = Vec::new();
+        r.run_once(&mut completions);
+        completions
+    } {
                 assert!(matches!(c.result, IoResult::Ok(SLOT)), "write completion ok");
             }
         }
     }
-    for (_, c) in r.run_once() {
+    for (_, c) in {
+        let mut completions = Vec::new();
+        r.run_once(&mut completions);
+        completions
+    } {
         assert!(matches!(c.result, IoResult::Ok(SLOT)), "write completion ok");
     }
     assert!(r.is_idle());
@@ -136,7 +144,7 @@ fn sync_reactor_hygiene_preserves_data() {
     r.set_file(reader, File::open(&path).expect("open for read"));
     let mut got = vec![0u8; 0];
     for i in 0..SLOTS {
-        r.submit(vec![Submission {
+        r.submit(&mut vec![Submission {
             op: OpId(1000 + i as u64),
             element: reader,
             kind: OpKind::Read,
@@ -146,7 +154,8 @@ fn sync_reactor_hygiene_preserves_data() {
             user: i as u64,
         }]);
     }
-    let mut completions = r.run_once();
+    let mut completions = Vec::new();
+    r.run_once(&mut completions);
     completions.sort_by_key(|(_, c)| c.user);
     for (_, c) in completions {
         assert!(matches!(c.result, IoResult::Ok(SLOT)), "read completion ok");

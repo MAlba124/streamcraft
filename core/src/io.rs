@@ -432,16 +432,19 @@ pub type ReactorFactory =
 pub trait Reactor {
     /// Register an element's file (called at `start`).
     fn set_file(&mut self, element: ElementId, file: File);
-    /// Enqueue submitted ops.
-    fn submit(&mut self, subs: Vec<Submission>);
+    /// Enqueue submitted ops, draining `subs` — the caller keeps the (now empty)
+    /// vec and its capacity, so per-pass submission costs no allocation
+    /// (ZERO-COPY.md stage 4.2).
+    fn submit(&mut self, subs: &mut Vec<Submission>);
     /// Cancel a pending op by id (flush/seek/shutdown path).
     fn cancel(&mut self, op: OpId);
     /// Whether the reactor is fully idle: nothing queued *and* nothing in flight.
     /// (An async backend may have submitted ops the kernel hasn't completed yet.)
     fn is_idle(&self) -> bool;
-    /// Make progress: execute/reap ops, returning completions tagged with the
-    /// owning element.
-    fn run_once(&mut self) -> Vec<(ElementId, Completion)>;
+    /// Make progress: execute/reap ops, appending completions (tagged with the
+    /// owning element) into the **caller-owned** `out`, which is cleared first —
+    /// the scheduler reuses one buffer across passes (ZERO-COPY.md stage 4.2).
+    fn run_once(&mut self, out: &mut Vec<(ElementId, Completion)>);
 }
 
 /// The default synchronous positioned-IO reactor (dependency-free). Files are
@@ -507,14 +510,10 @@ impl Reactor for SyncReactor {
         );
     }
 
-    fn submit(&mut self, mut subs: Vec<Submission>) {
-        // Steady state `pending` is empty here (run_once drains every pass): adopt
-        // the larger allocation instead of copying into a smaller one, then append
-        // whatever the swap left behind (nothing, in that common case).
-        if self.pending.is_empty() && self.pending.capacity() < subs.capacity() {
-            std::mem::swap(&mut self.pending, &mut subs);
-        }
-        self.pending.append(&mut subs);
+    fn submit(&mut self, subs: &mut Vec<Submission>) {
+        // Drain, never take: the caller's outbox keeps its capacity for the next
+        // pass, and `pending`'s own capacity survives run_once's swap scratch.
+        self.pending.append(subs);
     }
 
     fn cancel(&mut self, op: OpId) {
@@ -527,14 +526,12 @@ impl Reactor for SyncReactor {
         self.pending.is_empty()
     }
 
-    fn run_once(&mut self) -> Vec<(ElementId, Completion)> {
+    fn run_once(&mut self, out: &mut Vec<(ElementId, Completion)>) {
         // Swap `pending` into the drain scratch so its capacity survives the pass
         // (`scratch` is always fully drained below, so this never reorders ops).
         debug_assert!(self.scratch.is_empty());
         std::mem::swap(&mut self.pending, &mut self.scratch);
-        // The returned Vec is forced fresh by the trait (the scheduler consumes it
-        // by value); see ZERO-COPY.md stage 4.2 for the caller-buffer variant.
-        let mut out = Vec::with_capacity(self.scratch.len());
+        out.clear();
         for mut s in self.scratch.drain(..) {
             let result = if self.cancelled.contains(&s.op) {
                 IoResult::Cancelled
@@ -569,6 +566,5 @@ impl Reactor for SyncReactor {
             ));
         }
         self.cancelled.clear();
-        out
     }
 }
