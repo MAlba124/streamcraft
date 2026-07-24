@@ -297,6 +297,9 @@ pub const MAX_FIELDS: usize = 4;
 pub struct LogRecord {
     pub ts: Timestamp,
     pub element: ElementId,
+    /// The element's descriptor name (`""` for framework internals) — a `&'static`
+    /// pointer stamped at emit, formatted only at the drain.
+    pub name: &'static str,
     pub level: Level,
     pub event: &'static str,
     pub nfields: u8,
@@ -409,6 +412,9 @@ pub struct Log {
     sink: LogSink,
     filter: Arc<LevelFilter>,
     element: ElementId,
+    /// The element's descriptor name (`""` for framework internals). A `&'static`
+    /// pointer, so stamping it per record is free and humanization stays at the drain.
+    name: &'static str,
     start: Instant,
 }
 
@@ -418,6 +424,7 @@ impl Log {
             sink,
             filter,
             element: ElementId(0),
+            name: "",
             start: Instant::now(),
         }
     }
@@ -430,10 +437,12 @@ impl Log {
         Log::new(sink, Arc::new(LevelFilter::with_level(level)))
     }
 
-    /// Stamp subsequent records with `element` (the group calls this before running each
-    /// element, since one group thread — hence one sink — serves several elements).
-    pub fn set_element(&mut self, element: ElementId) {
+    /// Stamp subsequent records with `element` and its descriptor `name` (the pipeline
+    /// sets this once per element at run setup; framework-internal `Log`s leave it and
+    /// render as `elem#N`).
+    pub fn set_element(&mut self, element: ElementId, name: &'static str) {
         self.element = element;
+        self.name = name;
     }
 
     pub fn element(&self) -> ElementId {
@@ -476,6 +485,7 @@ impl Loggable for Log {
         self.sink.push(LogRecord {
             ts: self.now(),
             element: self.element,
+            name: self.name,
             level,
             event,
             nfields: n as u8,
@@ -511,12 +521,14 @@ macro_rules! log {
     }};
 }
 
-/// Format a record as one human line: `[    12.000ms] INFO  elem#3 event key=val …`.
+/// Format a record as one human line: `[    12.000ms] INFO  flacdec#3 event key=val …`
+/// (`elem#3` when no element name was stamped — framework internals).
 pub fn format_record(w: &mut impl Write, rec: &LogRecord) -> io::Result<()> {
     let ms = rec.ts.nanos().map(|n| n as f64 / 1e6).unwrap_or(f64::NAN);
+    let name = if rec.name.is_empty() { "elem" } else { rec.name };
     write!(
         w,
-        "[{ms:>10.3}ms] {:<5} elem#{} {}",
+        "[{ms:>10.3}ms] {:<5} {name}#{} {}",
         rec.level.as_str(),
         rec.element.0,
         rec.event
@@ -590,9 +602,10 @@ mod tests {
 
     #[test]
     fn format_line_is_greppable() {
-        let rec = LogRecord {
+        let mut rec = LogRecord {
             ts: Timestamp::from_millis(12),
             element: ElementId(3),
+            name: "flacdec",
             level: Level::Info,
             event: "header_parsed",
             nfields: 2,
@@ -607,10 +620,17 @@ mod tests {
         format_record(&mut buf, &rec).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("INFO"), "{s}");
-        assert!(s.contains("elem#3"), "{s}");
+        assert!(s.contains("flacdec#3"), "{s}");
         assert!(s.contains("header_parsed"), "{s}");
         assert!(s.contains("len=1024"), "{s}");
         assert!(s.contains("codec=flac"), "{s}");
+
+        // Framework internals carry no name and fall back to the bare id.
+        rec.name = "";
+        let mut buf = Vec::new();
+        format_record(&mut buf, &rec).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("elem#3"), "{s}");
     }
 
     #[test]
@@ -634,7 +654,7 @@ mod tests {
         let filter = Arc::new(LevelFilter::with_level(Level::Warn));
         let (sink, drain) = log_channel(64);
         let mut log = Log::new(sink, filter);
-        log.set_element(ElementId(2));
+        log.set_element(ElementId(2), "testsink");
 
         log!(&log, Level::Debug, "below", x = 1); // below threshold → suppressed
         log!(&log, Level::Error, "boom", code = 500u32, retry = true);
@@ -655,7 +675,7 @@ mod tests {
         let filter = Arc::new(LevelFilter::with_level(Level::Trace));
         let (sink, drain) = log_channel(1024);
         let mut log = Log::new(sink, filter);
-        log.set_element(ElementId(7));
+        log.set_element(ElementId(7), "testsrc");
 
         let n = 1000u64;
         let producer = std::thread::spawn(move || {

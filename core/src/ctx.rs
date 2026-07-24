@@ -703,7 +703,7 @@ mod tests {
         let filter = Arc::new(LevelFilter::with_level(Level::Info));
         let (sink, drain) = log_channel(64);
         let mut log = Log::new(sink, filter);
-        log.set_element(ElementId(5));
+        log.set_element(ElementId(5), "testsrc");
 
         let mut ctx = test_ctx(ElementId(5));
         ctx.set_log(log);
@@ -714,6 +714,7 @@ mod tests {
         let rec = drain.try_next().expect("record reached the drain");
         assert_eq!(rec.event, "hello");
         assert_eq!(rec.element, ElementId(5), "stamped with the element id");
+        assert_eq!(rec.name, "testsrc", "stamped with the element name");
         assert_eq!(rec.level, Level::Info);
         assert_eq!(rec.fields().len(), 2);
         assert_eq!(rec.fields()[0].key, "n");
@@ -759,7 +760,7 @@ mod tests {
         let filter = Arc::new(LevelFilter::with_level(Level::Warn));
         let (sink, drain) = log_channel(64);
         let mut log = Log::new(sink, Arc::clone(&filter));
-        log.set_element(ElementId(3));
+        log.set_element(ElementId(3), "testsrc");
 
         let mut ctx = test_ctx(ElementId(3));
         ctx.set_log(log);

@@ -762,7 +762,7 @@ impl Pipeline {
             };
             let (sink, drain) = log_channel(self.log_queue_cap);
             let mut log = Log::new(sink, elem_filter);
-            log.set_element(ElementId(i as u32));
+            log.set_element(ElementId(i as u32), name);
             logs.push(Some(log));
             drains.push(drain);
         }
