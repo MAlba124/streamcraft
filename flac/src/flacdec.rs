@@ -197,11 +197,12 @@ impl Element for FlacDec {
             }
             // Decode the next buffered frame; if the decoder is hungry, feed it one input
             // buffer; when there is neither a frame nor more input, we are done this call.
-            match self.dec.pull() {
-                Ok(Some(frame)) => {
-                    self.announce_if_needed(ctx)?; // first frame → header known
-                    self.pending = frame.samples;
+            // Decode straight into the reused `pending` buffer — no per-frame allocation
+            // (the decoder reuses its own scratch too).
+            match self.dec.pull_into(&mut self.pending) {
+                Ok(Some(())) => {
                     self.pending_pos = 0;
+                    self.announce_if_needed(ctx)?; // first frame → header known
                     if !self.emit_pending(ctx, true)? {
                         return Ok(Flow::Ok); // pool filled mid-frame — carry the rest, yield
                     }
@@ -221,11 +222,10 @@ impl Element for FlacDec {
             // unbounded pool, so the tail is emitted even if we were backpressured here.
             self.emit_pending(ctx, false)?;
             loop {
-                match self.dec.pull() {
-                    Ok(Some(frame)) => {
-                        self.announce_if_needed(ctx)?;
-                        self.pending = frame.samples;
+                match self.dec.pull_into(&mut self.pending) {
+                    Ok(Some(())) => {
                         self.pending_pos = 0;
+                        self.announce_if_needed(ctx)?;
                         self.emit_pending(ctx, false)?;
                     }
                     Ok(None) => break, // no more whole frames (a truncated tail is dropped)

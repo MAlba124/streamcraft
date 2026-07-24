@@ -77,11 +77,12 @@ impl FlacDecoder {
         let info = Self::read_metadata(&mut r)?;
 
         let mut samples: Vec<i64> = Vec::new();
+        let mut scratch = Scratch::default();
         // Frames follow until the input is exhausted (§9). A fixed-block-size stream
         // has no explicit frame count; we stop when fewer than a sync code's worth of
         // bits remain.
         while r.bits_left() >= 16 {
-            Self::read_frame(&mut r, data, &info, &mut samples)?;
+            Self::read_frame(&mut r, data, &info, &mut samples, &mut scratch)?;
             r.align(); // frames are byte-aligned (§9.3 footer padding)
         }
         Ok(Self { info, samples })
@@ -144,6 +145,7 @@ impl FlacDecoder {
         data: &[u8],
         info: &StreamInfo,
         out: &mut Vec<i64>,
+        scratch: &mut Scratch,
     ) -> Result<(), DecodeError> {
         debug_assert!(r.is_byte_aligned());
         let frame_start_byte = (r.bit_pos() / 8) as usize;
@@ -180,12 +182,15 @@ impl FlacDecoder {
             return Err(DecodeError::CrcMismatch);
         }
 
-        // Subframes (§9.2): one per channel. Side channels carry an extra bit (§4.2).
-        let mut planar: Vec<Vec<i64>> = Vec::with_capacity(channels as usize);
+        // Subframes (§9.2): one per channel, decoded into reused per-channel buffers.
+        // Side channels carry an extra bit (§4.2).
+        let Scratch { planar, work } = scratch;
+        while planar.len() < channels as usize {
+            planar.push(Vec::new());
+        }
         for c in 0..channels {
             let extra = decorrelation.extra_bits_for_channel(c);
-            let sub = read_subframe(r, block_size as usize, bit_depth + extra)?;
-            planar.push(sub);
+            read_subframe(r, block_size as usize, bit_depth + extra, &mut planar[c as usize], work)?;
         }
 
         // Frame footer (§9.3): pad to byte boundary, then CRC-16 over the whole frame.
@@ -199,8 +204,9 @@ impl FlacDecoder {
             return Err(DecodeError::CrcMismatch);
         }
 
-        // Undo stereo decorrelation (§4.2), then interleave channel-major.
-        decorrelation.restore(&mut planar);
+        // Undo stereo decorrelation (§4.2), then interleave channel-major, appending to
+        // `out` (which the caller has cleared for one frame, or accumulates across frames).
+        decorrelation.restore(&mut planar[..channels as usize]);
         for i in 0..block_size as usize {
             for c in 0..channels as usize {
                 out.push(planar[c][i]);
@@ -216,17 +222,36 @@ pub struct DecodedFrame {
     pub samples: Vec<i64>,
 }
 
+/// Reusable per-frame working buffers, so steady-state decoding allocates nothing (spec:
+/// Memory — zero steady-state heap traffic). Threaded through the frame/subframe readers;
+/// each is cleared and refilled per frame rather than freshly allocated.
+#[derive(Default)]
+struct Scratch {
+    /// One decoded-sample buffer per channel (reused; grown to the channel count once).
+    planar: Vec<Vec<i64>>,
+    /// Subframe working buffers (residual + LPC coefficients), reused across subframes.
+    work: Work,
+}
+
+#[derive(Default)]
+struct Work {
+    residual: Vec<i64>,
+    coeffs: Vec<i64>,
+}
+
 /// An **incremental** FLAC decoder: push bytes as they arrive, pull decoded frames as they
 /// complete (spec: decoders must not buffer the whole stream — latency #2). Only the
 /// undecoded tail is retained — the consumed prefix is dropped — so memory stays on the
 /// order of one frame regardless of stream length. It reuses [`FlacDecoder`]'s frame and
-/// metadata readers, so the two decoders can never diverge.
+/// metadata readers, so the two decoders can never diverge, and a `Scratch` so steady-state
+/// decoding does no per-frame allocation (via [`pull_into`](StreamDecoder::pull_into)).
 #[derive(Default)]
 pub struct StreamDecoder {
     buf: Vec<u8>,
     /// Decode cursor within `buf`; bytes before it are consumed and periodically dropped.
     pos: usize,
     info: Option<StreamInfo>,
+    scratch: Scratch,
 }
 
 impl StreamDecoder {
@@ -249,34 +274,41 @@ impl StreamDecoder {
     /// STREAMINFO are parsed on the first call(s) with enough bytes; thereafter
     /// [`info`](Self::info) is populated. Malformed input returns `Err`, never a panic.
     pub fn pull(&mut self) -> Result<Option<DecodedFrame>, DecodeError> {
+        let mut samples = Vec::new();
+        match self.pull_into(&mut samples)? {
+            Some(()) => Ok(Some(DecodedFrame { samples })),
+            None => Ok(None),
+        }
+    }
+
+    /// Decode the next fully-buffered frame **into `out`** (cleared first) — the zero-alloc
+    /// hot path. `Ok(None)` when more bytes are needed. Reuses the decoder's `Scratch`, so
+    /// steady-state decoding does no per-frame allocation; only `out` grows, once, to a
+    /// frame's size (a caller that reuses its buffer across calls then allocates nothing).
+    pub fn pull_into(&mut self, out: &mut Vec<i64>) -> Result<Option<()>, DecodeError> {
         if self.info.is_none() && !self.try_header()? {
             return Ok(None);
         }
         let info = self.info.expect("header parsed above");
+        out.clear();
 
         // Attempt one frame from the cursor. `read_frame` runs off the end of a truncated
         // slice as `UnexpectedEof`, which here means "need more" rather than corruption.
-        let outcome = {
+        let used = {
             let slice = &self.buf[self.pos..];
             if slice.len() < 2 {
                 return Ok(None); // not even a frame sync yet
             }
             let mut r = BitReader::new(slice);
-            let mut out = Vec::new();
-            match FlacDecoder::read_frame(&mut r, slice, &info, &mut out) {
-                Ok(()) => Some(((r.bit_pos() / 8) as usize, out)),
-                Err(DecodeError::UnexpectedEof) => None,
+            match FlacDecoder::read_frame(&mut r, slice, &info, out, &mut self.scratch) {
+                Ok(()) => (r.bit_pos() / 8) as usize,
+                Err(DecodeError::UnexpectedEof) => return Ok(None),
                 Err(e) => return Err(e),
             }
         };
-        match outcome {
-            Some((used, samples)) => {
-                self.pos += used;
-                self.compact();
-                Ok(Some(DecodedFrame { samples }))
-            }
-            None => Ok(None),
-        }
+        self.pos += used;
+        self.compact();
+        Ok(Some(()))
     }
 
     /// Parse the `fLaC` marker and metadata chain once enough bytes are buffered. Returns
@@ -374,8 +406,15 @@ impl Decorrelation {
     }
 }
 
-/// Decode one subframe of `block_size` samples at `bps` bit depth (§9.2).
-fn read_subframe(r: &mut BitReader, block_size: usize, bps: u32) -> Result<Vec<i64>, DecodeError> {
+/// Decode one subframe of `block_size` samples at `bps` bit depth into `out` (cleared
+/// first), reusing `work` for the residual / LPC coefficients (§9.2).
+fn read_subframe(
+    r: &mut BitReader,
+    block_size: usize,
+    bps: u32,
+    out: &mut Vec<i64>,
+    work: &mut Work,
+) -> Result<(), DecodeError> {
     // Subframe header (§9.2.1): leading 0 bit, 6 type bits, wasted-bits flag.
     let zero = r.read_bits(1)?;
     if zero != 0 {
@@ -394,19 +433,19 @@ fn read_subframe(r: &mut BitReader, block_size: usize, bps: u32) -> Result<Vec<i
         .filter(|&b| b > 0)
         .ok_or(DecodeError::Corrupt("wasted bits exceed bit depth"))?;
 
-    let mut out = match type_bits {
-        0b000000 => read_constant(r, block_size, effective_bps)?,
-        0b000001 => read_verbatim(r, block_size, effective_bps)?,
+    match type_bits {
+        0b000000 => read_constant(r, block_size, effective_bps, out)?,
+        0b000001 => read_verbatim(r, block_size, effective_bps, out)?,
         v if (0b001000..=0b001100).contains(&v) => {
             let order = v - 0b001000;
-            read_fixed(r, block_size, effective_bps, order)?
+            read_fixed(r, block_size, effective_bps, order, out, work)?;
         }
         v if v >= 0b100000 => {
             let order = v - 0b100000 + 1;
-            read_lpc(r, block_size, effective_bps, order)?
+            read_lpc(r, block_size, effective_bps, order, out, work)?;
         }
         _ => return Err(DecodeError::Reserved("reserved subframe type")),
-    };
+    }
 
     // Undo wasted bits: shift decoded samples left by `wasted` (§9.2.2).
     if wasted > 0 {
@@ -414,22 +453,34 @@ fn read_subframe(r: &mut BitReader, block_size: usize, bps: u32) -> Result<Vec<i
             *s <<= wasted;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// CONSTANT subframe: one sample repeated (§9.2.3).
-fn read_constant(r: &mut BitReader, block_size: usize, bps: u32) -> Result<Vec<i64>, DecodeError> {
+fn read_constant(
+    r: &mut BitReader,
+    block_size: usize,
+    bps: u32,
+    out: &mut Vec<i64>,
+) -> Result<(), DecodeError> {
     let v = r.read_signed(bps)?;
-    Ok(vec![v; block_size])
+    out.clear();
+    out.resize(block_size, v);
+    Ok(())
 }
 
 /// VERBATIM subframe: every sample stored unencoded (§9.2.4).
-fn read_verbatim(r: &mut BitReader, block_size: usize, bps: u32) -> Result<Vec<i64>, DecodeError> {
-    let mut out = Vec::with_capacity(block_size);
+fn read_verbatim(
+    r: &mut BitReader,
+    block_size: usize,
+    bps: u32,
+    out: &mut Vec<i64>,
+) -> Result<(), DecodeError> {
+    out.clear();
     for _ in 0..block_size {
         out.push(r.read_signed(bps)?);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// FIXED-predictor subframe of the given order (§9.2.5): warm-up samples, then the
@@ -439,14 +490,16 @@ fn read_fixed(
     block_size: usize,
     bps: u32,
     order: u32,
-) -> Result<Vec<i64>, DecodeError> {
-    let mut out = Vec::with_capacity(block_size);
+    out: &mut Vec<i64>,
+    work: &mut Work,
+) -> Result<(), DecodeError> {
+    out.clear();
     for _ in 0..order as usize {
         out.push(r.read_signed(bps)?); // unencoded warm-up (§9.2.5 Table 21)
     }
-    let residual = read_residual(r, block_size, order)?;
-    reconstruct_fixed(&mut out, &residual, order, block_size);
-    Ok(out)
+    read_residual(r, block_size, order, &mut work.residual)?;
+    reconstruct_fixed(out, &work.residual, order, block_size);
+    Ok(())
 }
 
 /// LPC subframe (§9.2.6). The encoder never emits LPC, but decoding it keeps the
@@ -456,11 +509,13 @@ fn read_lpc(
     block_size: usize,
     bps: u32,
     order: u32,
-) -> Result<Vec<i64>, DecodeError> {
+    out: &mut Vec<i64>,
+    work: &mut Work,
+) -> Result<(), DecodeError> {
     if order == 0 || order > 32 {
         return Err(DecodeError::Reserved("LPC order out of range"));
     }
-    let mut out = Vec::with_capacity(block_size);
+    out.clear();
     for _ in 0..order as usize {
         out.push(r.read_signed(bps)?);
     }
@@ -472,28 +527,33 @@ fn read_lpc(
     if shift < 0 {
         return Err(DecodeError::Reserved("LPC shift must not be negative"));
     }
-    let mut coeffs = Vec::with_capacity(order as usize);
+    work.coeffs.clear();
     for _ in 0..order {
-        coeffs.push(r.read_signed(precision)?);
+        work.coeffs.push(r.read_signed(precision)?);
     }
-    let residual = read_residual(r, block_size, order)?;
+    read_residual(r, block_size, order, &mut work.residual)?;
     for i in order as usize..block_size {
         let mut pred: i64 = 0;
         for j in 0..order as usize {
-            pred += coeffs[j] * out[i - 1 - j];
+            pred += work.coeffs[j] * out[i - 1 - j];
         }
         pred >>= shift;
-        out.push(pred + residual[i]);
+        out.push(pred + work.residual[i]);
     }
     // `out` already has warm-up + reconstructed; residual indices align by position.
     // (The loop above pushed the reconstructed samples; warm-up was pushed earlier.)
     debug_assert_eq!(out.len(), block_size);
-    Ok(out)
+    Ok(())
 }
 
-/// Read a coded residual into a full-length vector (indices `0..order` are unused
-/// placeholders; residual proper starts at `order`) (§9.2.7).
-fn read_residual(r: &mut BitReader, block_size: usize, order: u32) -> Result<Vec<i64>, DecodeError> {
+/// Read a coded residual into `residual` (cleared, resized to `block_size`; indices
+/// `0..order` are unused placeholders; residual proper starts at `order`) (§9.2.7).
+fn read_residual(
+    r: &mut BitReader,
+    block_size: usize,
+    order: u32,
+    residual: &mut Vec<i64>,
+) -> Result<(), DecodeError> {
     let method = r.read_bits(2)?;
     let param_bits = match method {
         0b00 => 4,
@@ -510,7 +570,8 @@ fn read_residual(r: &mut BitReader, block_size: usize, order: u32) -> Result<Vec
         return Err(DecodeError::Corrupt("partition smaller than predictor order"));
     }
 
-    let mut residual = vec![0i64; block_size];
+    residual.clear();
+    residual.resize(block_size, 0);
     let escape = (1u64 << param_bits) - 1; // 0b1111 or 0b11111 (§9.2.7)
     let mut idx = order as usize;
     for p in 0..parts {
@@ -534,7 +595,7 @@ fn read_residual(r: &mut BitReader, block_size: usize, order: u32) -> Result<Vec
             }
         }
     }
-    Ok(residual)
+    Ok(())
 }
 
 /// Run the FIXED predictor forward to reconstruct samples from residuals (§9.2.5).
