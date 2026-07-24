@@ -60,12 +60,16 @@ pub struct Sample {
     pub offset: u64,
     /// Sample size in bytes.
     pub size: u32,
-    /// Decode timestamp in **media-timescale ticks** (running sum of `stts` deltas).
-    pub dts: u64,
-    /// Presentation timestamp in **media-timescale ticks** (`dts + ctts offset`, edit-list
-    /// shift applied). Kept as `i128` while computed; clamped to `u64` here (a negative
-    /// presentation time after the shift is clamped to 0 — the sample presents at start).
-    pub pts: u64,
+    /// Decode timestamp in **media-timescale ticks** — the running `stts` sum minus the
+    /// edit-list leading media-time shift. **Signed**, because an edit list that trims a
+    /// track's composition lead pushes the first sample's DTS negative (the standard
+    /// ffmpeg / oxideav convention: the leading `media_time` is subtracted from *both* DTS
+    /// and CTS so the first *presented* sample lands at pts 0).
+    pub dts: i64,
+    /// Presentation (composition) timestamp in **media-timescale ticks**: `dts_raw + ctts
+    /// offset - edit_shift`. Signed for the same reason; the ns conversion clamps a negative
+    /// presentation time to 0 (the sample presents at stream start).
+    pub pts: i64,
     /// True if this is a sync (random-access / key) sample (`stss`, or every sample when
     /// `stss` is absent — §8.6.2).
     pub sync: bool,
@@ -255,11 +259,12 @@ impl Mp4Reader {
         })
     }
 
-    /// Convert a media-timescale tick count for `track_index` to nanoseconds (i128-safe:
-    /// `ticks * 1e9` can exceed u64 for long files at high timescales). A zero timescale
-    /// (malformed `mdhd`) yields the raw tick value so the pipeline still gets a monotone
-    /// timeline rather than a divide-by-zero.
-    pub fn ticks_to_ns(&self, track_index: usize, ticks: u64) -> u64 {
+    /// Convert a (possibly negative) media-timescale tick count for `track_index` to
+    /// **non-negative** nanoseconds (i128-safe: `ticks * 1e9` can exceed u64 for long files
+    /// at high timescales). A negative presentation time (from an edit-list trim) clamps to 0
+    /// — the sample presents at stream start. A zero timescale (malformed `mdhd`) passes the
+    /// tick value through (clamped ≥ 0) rather than dividing by zero.
+    pub fn ticks_to_ns(&self, track_index: usize, ticks: i64) -> u64 {
         let ts = self.tracks.get(track_index).map(|t| t.timescale).unwrap_or(0);
         ticks_to_ns(ticks, ts)
     }
@@ -270,19 +275,21 @@ impl Mp4Reader {
 /// [`push`](Mp4Reader::push)).
 pub struct ResolvedSample<'a> {
     pub track_index: usize,
-    /// Presentation timestamp in media-timescale ticks (use [`Mp4Reader::ticks_to_ns`]).
-    pub pts: u64,
-    /// Decode timestamp in media-timescale ticks.
-    pub dts: u64,
+    /// Presentation timestamp in media-timescale ticks (signed; use [`Mp4Reader::ticks_to_ns`]
+    /// which clamps to non-negative nanoseconds).
+    pub pts: i64,
+    /// Decode timestamp in media-timescale ticks (signed — may be negative after an edit trim).
+    pub dts: i64,
     pub sync: bool,
     pub bytes: &'a [u8],
 }
 
-/// Convert `ticks` at `timescale` ticks/second to nanoseconds via i128 so the intermediate
-/// `ticks * 1_000_000_000` never overflows (spec: i128-safe pts). Timescale 0 → passthrough.
-fn ticks_to_ns(ticks: u64, timescale: u32) -> u64 {
+/// Convert `ticks` (signed) at `timescale` ticks/second to **non-negative** nanoseconds via
+/// i128 so the intermediate `ticks * 1_000_000_000` never overflows (spec: i128-safe pts).
+/// Timescale 0 → passthrough. A negative result clamps to 0.
+fn ticks_to_ns(ticks: i64, timescale: u32) -> u64 {
     if timescale == 0 {
-        return ticks;
+        return ticks.max(0) as u64;
     }
     let ns = (ticks as i128 * 1_000_000_000i128) / timescale as i128;
     ns.clamp(0, u64::MAX as i128) as u64
@@ -396,9 +403,15 @@ fn resolve_track(trak_body: &[u8], track_index: usize) -> Result<Option<(Track, 
     Ok(Some((track, samples)))
 }
 
-/// The single-entry edit-list media-time shift, in this track's media ticks. Returns the
-/// `media_time` of a lone edit-list entry with a non-negative media time; `0` for an absent,
-/// empty (`media_time == -1`), or multi-entry list (documented unsupported — NOTES.md).
+/// The edit-list **leading media-time shift**, in this track's media ticks (§8.6.6). Returns
+/// the `media_time` of the first edit-list entry that is **not** an empty edit (`media_time
+/// != -1`) — the standard trim-the-composition-lead convention (ffmpeg / oxideav's
+/// `elst_leading_media_time`): that value is subtracted from both DTS and CTS so the first
+/// *presented* sample lands at pts 0. `0` for an absent list or an all-empty list.
+///
+/// The rest of an edit list — multiple segments, dwell/gap semantics, rate changes — is
+/// **documented unsupported** (NOTES.md): only this single leading shift is honoured, which
+/// is the common case (a lone non-empty entry, or an empty edit followed by one non-empty).
 fn edit_list_shift(trak_body: &[u8]) -> Result<i64, Mp4Error> {
     let Some(edts) = boxes::find_child(trak_body, boxes::boxtype::EDTS)? else {
         return Ok(0);
@@ -407,10 +420,11 @@ fn edit_list_shift(trak_body: &[u8]) -> Result<i64, Mp4Error> {
         return Ok(0);
     };
     let entries = boxes::parse_elst(elst.body(edts.body(trak_body)))?;
-    match entries.as_slice() {
-        [only] if only.media_time >= 0 => Ok(only.media_time),
-        _ => Ok(0), // empty edit, multi-entry, or gap — unsupported: no shift
-    }
+    Ok(entries
+        .iter()
+        .find(|e| e.media_time != -1)
+        .map(|e| e.media_time)
+        .unwrap_or(0))
 }
 
 /// Fold the `stbl` tables into a flat per-sample list (spec: §8.6.1.2/§8.6.1.3/§8.7.3/
@@ -487,7 +501,8 @@ fn build_samples(
 
     let mut out = Vec::with_capacity(sample_count);
     let mut sample_no = 0usize; // 0-based across the whole track
-    let mut dts: u64 = 0;
+    // The raw decode time (running `stts` sum) before the edit-list shift, in ticks.
+    let mut dts_raw: u64 = 0;
 
     for (chunk_idx, &chunk_off) in chunk_offsets.iter().enumerate() {
         let spc = samples_per_chunk[chunk_idx];
@@ -504,9 +519,14 @@ fn build_samples(
             ))?;
             let ctts_off = ctts_iter.next_offset();
 
-            // pts = dts + ctts offset - edit-list media-time shift, i128-safe, clamped ≥ 0.
-            let pts_i = dts as i128 + ctts_off as i128 - media_time_shift as i128;
-            let pts = pts_i.clamp(0, u64::MAX as i128) as u64;
+            // The edit-list leading media-time is subtracted from BOTH decode and composition
+            // time (the ffmpeg / oxideav convention), so the first presented sample lands at
+            // pts 0. All i128-safe, then narrowed to i64 (well within range for real files):
+            //   dts = dts_raw - shift ; pts = dts_raw + ctts_off - shift.
+            let dts_i = dts_raw as i128 - media_time_shift as i128;
+            let pts_i = dts_raw as i128 + ctts_off as i128 - media_time_shift as i128;
+            let dts = dts_i.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            let pts = pts_i.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
             let sync = sync_lookup.is_sync(sample_no);
 
@@ -519,7 +539,7 @@ fn build_samples(
                 sync,
             });
 
-            dts = dts.checked_add(delta as u64).ok_or(Mp4Error::Inconsistent(
+            dts_raw = dts_raw.checked_add(delta as u64).ok_or(Mp4Error::Inconsistent(
                 "cumulative dts overflow",
             ))?;
             offset = offset
@@ -651,10 +671,13 @@ mod tests {
         assert_eq!(ticks_to_ns(0, 48_000), 0);
         assert_eq!(ticks_to_ns(48_000, 48_000), 1_000_000_000);
         // 90 kHz clock, ~2^40 ticks — the intermediate exceeds u64 but i128 holds it.
-        let big = 1u64 << 40;
+        let big = 1i64 << 40;
         let want = (big as i128 * 1_000_000_000 / 90_000) as u64;
         assert_eq!(ticks_to_ns(big, 90_000), want);
         assert_eq!(ticks_to_ns(1234, 0), 1234, "timescale 0 → passthrough");
+        // A negative tick (edit-list trim) clamps to 0 nanoseconds.
+        assert_eq!(ticks_to_ns(-9000, 90_000), 0, "negative presentation time → 0");
+        assert_eq!(ticks_to_ns(-5, 0), 0, "timescale 0 + negative → 0");
     }
 
     /// Build a two-chunk, single-run sample table and check offsets/dts/pts fold correctly.
@@ -678,7 +701,9 @@ mod tests {
         assert!(out.iter().all(|s| s.sync));
     }
 
-    /// A ctts shifts pts above dts; an edit-list shift subtracts from pts (clamped ≥ 0).
+    /// A ctts shifts pts relative to dts; the edit-list leading media-time is subtracted from
+    /// BOTH dts and pts (the ffmpeg / oxideav convention), so the first presented sample lands
+    /// at pts 0 while its dts goes negative. Signed throughout.
     #[test]
     fn build_samples_applies_ctts_and_edit_shift() {
         let sizes = SampleSizes::Constant { sample_size: 5, sample_count: 3 };
@@ -689,12 +714,12 @@ mod tests {
         let chunk_offsets = [100u64];
         // Edit shift of 200 media ticks (trim the composition lead so presentation starts at 0).
         let out = build_samples(0, 3, &sizes, &stts, &ctts, &stsc, &chunk_offsets, None, 200, 1).unwrap();
-        // sample 0: dts 0, ctts +200, shift -200 → pts 0.
-        assert_eq!((out[0].dts, out[0].pts), (0, 0));
-        // sample 1: dts 100, ctts 0, shift -200 → -100 clamped to 0.
-        assert_eq!((out[1].dts, out[1].pts), (100, 0));
-        // sample 2: dts 200, ctts 0, shift -200 → 0.
-        assert_eq!((out[2].dts, out[2].pts), (200, 0));
+        // sample 0: dts_raw 0 → dts -200; pts 0+200-200 = 0.
+        assert_eq!((out[0].dts, out[0].pts), (-200, 0));
+        // sample 1: dts_raw 100 → dts -100; pts 100+0-200 = -100.
+        assert_eq!((out[1].dts, out[1].pts), (-100, -100));
+        // sample 2: dts_raw 200 → dts 0; pts 200+0-200 = 0.
+        assert_eq!((out[2].dts, out[2].pts), (0, 0));
     }
 
     /// A chunk map whose sample total disagrees with stsz is rejected (not sliced out of range).
