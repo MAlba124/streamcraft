@@ -117,6 +117,11 @@ pub struct Ctx {
     bus: BusSender,
     element: ElementId,
     out_format: FormatId,
+    /// Recycled output-batch shells (spec: Batching — zero-alloc transport): empty
+    /// `Batch`es whose column capacity survived a trip downstream, returned by the
+    /// consumer over the link's shell ring. [`take_output`](Self::take_output) reuses
+    /// one instead of allocating fresh columns. Bounded (see `recycle_shell`).
+    spare_shells: Vec<Batch>,
     /// The format negotiated on each of this element's pads, indexed by local pad
     /// index (`PadId.0` == index into `desc().pads`). `None` for an unlinked pad.
     /// Filled once, at link time, by the pipeline — read cheaply in `start()` /
@@ -197,6 +202,7 @@ impl Ctx {
     ) -> Self {
         Self {
             input: Batch::new(out_format),
+            spare_shells: Vec::new(),
             outs: Vec::new(),
             primary_out: 0,
             single_src: None,
@@ -655,10 +661,31 @@ impl Ctx {
         self.out_slot(pad)
     }
 
-    /// Take (replace with empty) the output batch for a src pad, to route it downstream.
+    /// Take (replace with empty) the output batch for a src pad, to route it
+    /// downstream. The replacement comes from the spare-shell stack when the consumer
+    /// has returned one (column capacity intact — the steady-state zero-alloc path);
+    /// only a link whose shells haven't circulated yet allocates.
     pub(crate) fn take_output(&mut self, pad: PadId) -> Batch {
         let fmt = self.out_format;
-        std::mem::replace(self.out_slot(pad), Batch::new(fmt))
+        let replacement = match self.spare_shells.pop() {
+            Some(mut shell) => {
+                shell.format = fmt;
+                shell
+            }
+            None => Batch::new(fmt),
+        };
+        std::mem::replace(self.out_slot(pad), replacement)
+    }
+
+    /// Return an empty shell for [`take_output`](Self::take_output) to reuse
+    /// (scheduler hook — shells arrive over the link's shell ring). Cleared here;
+    /// capped so a burst can't hoard column memory.
+    pub(crate) fn recycle_shell(&mut self, mut shell: Batch) {
+        const MAX_SPARES: usize = 8;
+        if self.spare_shells.len() < MAX_SPARES {
+            shell.clear();
+            self.spare_shells.push(shell);
+        }
     }
 
     /// Total buffers and used bytes across all src pads (for counters).

@@ -833,9 +833,9 @@ impl Pipeline {
         // (fan-out — a demuxer's src pads), each tagged with the tail's src pad; and
         // several upstream rings (fan-in — a muxer's sink pads), each tagged with the
         // head's sink pad so the aggregator reads each pad independently.
-        let mut group_downstream: Vec<Vec<(PadId, Producer<Batch>)>> =
+        let mut group_downstream: Vec<Vec<(PadId, Producer<Batch>, Consumer<Batch>)>> =
             (0..ng).map(|_| Vec::new()).collect();
-        let mut group_upstream: Vec<Vec<(PadId, Consumer<Batch>)>> =
+        let mut group_upstream: Vec<Vec<(PadId, Consumer<Batch>, Producer<Batch>)>> =
             (0..ng).map(|_| Vec::new()).collect();
         for edge in &self.edges {
             let gs = group_of[edge.src.0 as usize];
@@ -856,8 +856,14 @@ impl Pipeline {
                 .flatten()
                 .unwrap_or(self.queue_cap);
             let (p, c) = spsc::<Batch>(cap);
-            group_downstream[gs].push((PadId(edge.src_pad as u32), p));
-            group_upstream[gd].push((PadId(edge.sink_pad as u32), c));
+            // The shell return ring (spec: Batching — zero-alloc transport): the
+            // consumer sends drained batch shells back so the producer's
+            // `take_output` reuses their column capacity instead of allocating.
+            // Non-blocking on both ends; an empty/full shell ring just means an
+            // alloc/drop — correctness never depends on it.
+            let (shell_tx, shell_rx) = spsc::<Batch>(cap);
+            group_downstream[gs].push((PadId(edge.src_pad as u32), p, shell_rx));
+            group_upstream[gd].push((PadId(edge.sink_pad as u32), c, shell_tx));
         }
 
         // Per-element counters — created at `add()` and stable across runs, so a
@@ -1548,8 +1554,8 @@ fn run_group(
     ids: Vec<ElementId>,
     formats: Vec<Vec<Option<FixedFormat>>>,
     logs: Vec<Option<Log>>,
-    upstream: Vec<(PadId, Consumer<Batch>)>,
-    downstream: Vec<(PadId, Producer<Batch>)>,
+    upstream: Vec<(PadId, Consumer<Batch>, Producer<Batch>)>,
+    downstream: Vec<(PadId, Producer<Batch>, Consumer<Batch>)>,
     factory: ReactorFactory,
     pools: Vec<Pool>,
     bus: BusSender,
@@ -1725,7 +1731,7 @@ fn run_group(
             // stop waiting for it). An efficient multi-ring park is a follow-up; the
             // yield-on-no-progress net at the loop's end covers the idle case for now.
             let mut all_closed = true;
-            for (pad, cons) in &upstream {
+            for (pad, cons, shell_tx) in &upstream {
                 while let Some(mut batch) = cons.try_pop() {
                     if batch.seek_gen < seek_gen {
                         continue; // stale pre-seek data (buffers recycle on drop)
@@ -1736,6 +1742,10 @@ fn run_group(
                     }
                     let events = batch.take_events();
                     ctxs[0].append_input_on(*pad, &mut batch);
+                    // Return the drained shell for the producer's take_output to reuse
+                    // (columns keep their capacity; drop is the harmless fallback).
+                    batch.clear();
+                    let _ = shell_tx.try_push(batch);
                     if let Err(e) =
                         deliver_events(&mut *elements[0], &mut ctxs[0], Some(*pad), events, &vocabulary)
                     {
@@ -1752,7 +1762,7 @@ fn run_group(
             if all_closed {
                 upstream_closed = true;
             }
-        } else if let Some((_pad, up)) = upstream.first() {
+        } else if let Some((_pad, up, shell_tx)) = upstream.first() {
             let closed = up.is_closed();
             let head_idle =
                 ctxs[0].input_is_empty() && ctxs[0].inbox_empty() && reactor.is_idle();
@@ -1766,6 +1776,8 @@ fn run_group(
                         }
                         let events = batch.take_events();
                         ctxs[0].input_append(&mut batch);
+                        batch.clear();
+                        let _ = shell_tx.try_push(batch);
                         if let Err(e) = deliver_events(
                             &mut *elements[0],
                             &mut ctxs[0],
@@ -1797,6 +1809,8 @@ fn run_group(
                     }
                     let events = batch.take_events();
                     ctxs[0].input_append(&mut batch);
+                    batch.clear();
+                    let _ = shell_tx.try_push(batch);
                     if let Err(e) = deliver_events(
                         &mut *elements[0],
                         &mut ctxs[0],
@@ -1949,8 +1963,14 @@ fn run_group(
 
         // C. Route the tail element's per-pad output to each downstream ring (blocking
         // backpressure). A branching tail (a demuxer) has one ring per src pad; a linear
-        // tail has one; a sink has none.
-        for (src_pad, down) in &downstream {
+        // tail has one; a sink has none. First reclaim any shells the consumer returned,
+        // so `take_output` below reuses their column capacity (zero-alloc steady state).
+        for (_, _, shell_rx) in &downstream {
+            while let Some(shell) = shell_rx.try_pop() {
+                ctxs[m - 1].recycle_shell(shell);
+            }
+        }
+        for (src_pad, down, _) in &downstream {
             let mut out = ctxs[m - 1].take_output(*src_pad);
             if !out.is_inert() {
                 // Stamp the generation so the consuming group can drop it if a seek
