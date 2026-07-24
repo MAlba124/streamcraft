@@ -218,6 +218,23 @@ Three loose ends from Stage-0 dynamic caps (see `memory/runtime-caps-gap.md`):
    the full input format by name off the negotiated caps (`learn_from_sink`); no
    `with_input` needed. (`audioresample` landed alongside.)
 
+> **Update — session 3d (2026-07-24): MILESTONE 5 SHIPPED.** `play_mkv` plays a
+> VP8-in-MKV file in a real window (`filesrc ! mkvdemux ! vp8dec ! waylandvideosink`,
+> clock-paced, clean EOS), and `streamcraft launch videotestsrc frames=60 !
+> waylandvideosink` opens a window from a one-liner. Landed: **sc-wayland** (hand-written
+> wire-protocol client + shm sink; BT.601 §-cited per the new **algorithm-citation rule**
+> — every algorithm cites its standard/paper, clean-room, see memory), the **streamcraft
+> CLI** (launch/dot/inspect/list; switches-first + unquoted pipeline; `registry::describe`
+> cards), **parallel-forest transcode** proven (6×60s FLACs in 0.8s, one pipeline,
+> ~12 threads; inline-gate livelock fix + `set_pool`), **sc-mp3 wired** (84–102 dB vs
+> ffmpeg), **sc-opus REJECTED** (published 0.0.13 fails the official RFC 6716 vectors —
+> silence/noise; the desired decoder exists only at unpublished git HEAD; turnkey
+> re-vet recipe in `opus/src/lib.rs`). **Decision: containers are hand-written**
+> (like sc-mkv/sc-ogg) — the oxideav-mp4 adoption was stopped; agents in flight:
+> hand-written `Mp4Demux` (oxideav-mp4 demoted to dev-oracle; muxer is a follow-up
+> task) and **sc-vk** (clean-room Vulkan renderer: render into exported DMA-BUFs,
+> present via sc-wayland's `zwp_linux_dmabuf_v1`; `ash` only; cited algorithms).
+
 ## Stage 5 — Registry + parse-launch · MED
 
 `use` + typed construction stays primary; add the opt-in `Registry` (`register`/`get`/
