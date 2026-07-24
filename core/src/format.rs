@@ -439,6 +439,67 @@ impl Vocabulary {
         }
         Some(fixed)
     }
+
+    /// Does this static offer *admit* the concrete `format`? Runtime re-validation of a
+    /// dynamic-caps announcement against a peer's declared offer (spec: Formats — an
+    /// announced format must still satisfy the downstream, or it is a loud negotiation
+    /// failure, never a silent install). The family must match, and for every field the
+    /// offer constrains *and* the format fixes, the constraint must accept the value. A
+    /// field the offer constrains but the announcement leaves unset is **not** a
+    /// conflict — the peer would fixate it, exactly as at link time. Read-only: resolves
+    /// names against the frozen tables, interning nothing.
+    pub fn offer_admits(&self, offer: &OfferDesc, format: &FixedFormat) -> bool {
+        match self.family_id(offer.family) {
+            Some(fam) if fam == format.family => {}
+            _ => return false,
+        }
+        for fd in offer.fields {
+            if let Some(field) = self.field_id(fd.field) {
+                if let Some(v) = format.get(field) {
+                    if !self.constraint_admits(&fd.allowed, v) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether *any* of a pad's alternative offers admits `format` (declaration order is
+    /// preference, but for validation any match suffices). An empty offer list admits
+    /// nothing, mirroring [`negotiate`].
+    pub fn offers_admit(&self, offers: &[OfferDesc], format: &FixedFormat) -> bool {
+        offers.iter().any(|o| self.offer_admits(o, format))
+    }
+
+    /// Resolve a string-keyed [`ValueDesc`] read-only (`None` if a categorical name was
+    /// never interned in this graph).
+    fn desc_value(&self, vd: &ValueDesc) -> Option<Value> {
+        Some(match *vd {
+            ValueDesc::Int(n) => Value::Int(n),
+            ValueDesc::Rat(n, d) => Value::Rat(n, d),
+            ValueDesc::Id(s) => Value::Id(self.value_id(s)?),
+        })
+    }
+
+    /// Read-only counterpart of [`Constraint::accepts`] over the string-keyed
+    /// [`ConstraintDesc`], resolving categorical names against the frozen tables. An
+    /// unresolvable name means the constraint can match no interned value.
+    fn constraint_admits(&self, c: &ConstraintDesc, v: Value) -> bool {
+        match c {
+            ConstraintDesc::Any => true,
+            ConstraintDesc::Eq(x) => self.desc_value(x) == Some(v),
+            ConstraintDesc::Set(xs) => xs.iter().any(|x| self.desc_value(x) == Some(v)),
+            ConstraintDesc::Range { min, max, step } => {
+                match (self.desc_value(min), self.desc_value(max), self.desc_value(step)) {
+                    (Some(min), Some(max), Some(step)) => {
+                        Constraint::Range { min, max, step }.accepts(v)
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -772,5 +833,121 @@ mod tests {
             let got = negotiate(&src, &sink).map(|f| f.family.0);
             assert_eq!(got, *want, "case {i}: src={sa:?} sink={sb:?}");
         }
+    }
+
+    // --- runtime re-validation (dynamic caps): Vocabulary::offer_admits ---
+
+    fn vocab_with(families: &[&str], fields: &[&str], values: &[&str]) -> Vocabulary {
+        let (mut formats, mut flds, mut vals) =
+            (Interner::new(), Interner::new(), Interner::new());
+        for f in families {
+            formats.intern(f);
+        }
+        for f in fields {
+            flds.intern(f);
+        }
+        for v in values {
+            vals.intern(v);
+        }
+        Vocabulary { formats, fields: flds, values: vals }
+    }
+
+    #[test]
+    fn offer_admits_family_and_value_conflict() {
+        let vocab = vocab_with(&["audio/raw", "video/raw"], &["rate"], &[]);
+        let fam = vocab.family_id("audio/raw").unwrap();
+        let rate = vocab.field_id("rate").unwrap();
+        let mut f = FixedFormat::new(fam);
+        f.set(rate, Value::Int(48000));
+
+        // rate Eq 44100 rejects the announced 48000 — the loud-error case.
+        static STRICT: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Eq(ValueDesc::Int(44100)),
+            preferred: None,
+        }];
+        assert!(!vocab.offer_admits(&OfferDesc { family: "audio/raw", fields: &STRICT }, &f));
+
+        // rate Set{44100,48000} admits it.
+        static SET: [ValueDesc; 2] = [ValueDesc::Int(44100), ValueDesc::Int(48000)];
+        static OK: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Set(&SET),
+            preferred: None,
+        }];
+        assert!(vocab.offer_admits(&OfferDesc { family: "audio/raw", fields: &OK }, &f));
+
+        // Family mismatch is a conflict; an unconstrained same-family offer admits.
+        assert!(!vocab.offer_admits(&OfferDesc::any("video/raw"), &f));
+        assert!(vocab.offer_admits(&OfferDesc::any("audio/raw"), &f));
+    }
+
+    #[test]
+    fn offer_admits_unset_field_is_not_a_conflict() {
+        // The offer constrains a field the announcement never fixed — the peer fixates
+        // it (as at link time), so this must NOT be rejected.
+        let vocab = vocab_with(&["audio/raw"], &["rate", "channels"], &[]);
+        let fam = vocab.family_id("audio/raw").unwrap();
+        let rate = vocab.field_id("rate").unwrap();
+        let mut f = FixedFormat::new(fam);
+        f.set(rate, Value::Int(44100)); // channels deliberately unset
+
+        static CH: [FieldDesc; 1] = [FieldDesc {
+            field: "channels",
+            allowed: ConstraintDesc::Eq(ValueDesc::Int(2)),
+            preferred: None,
+        }];
+        assert!(vocab.offer_admits(&OfferDesc { family: "audio/raw", fields: &CH }, &f));
+    }
+
+    #[test]
+    fn offer_admits_categorical_value() {
+        let vocab = vocab_with(&["audio/raw"], &["sample"], &["s16", "s24"]);
+        let fam = vocab.family_id("audio/raw").unwrap();
+        let sample = vocab.field_id("sample").unwrap();
+        let s16 = vocab.value_id("s16").unwrap();
+        let mut f = FixedFormat::new(fam);
+        f.set(sample, Value::Id(s16));
+
+        static OKV: [ValueDesc; 1] = [ValueDesc::Id("s16")];
+        static OKF: [FieldDesc; 1] = [FieldDesc {
+            field: "sample",
+            allowed: ConstraintDesc::Set(&OKV),
+            preferred: None,
+        }];
+        assert!(vocab.offer_admits(&OfferDesc { family: "audio/raw", fields: &OKF }, &f));
+
+        static BADF: [FieldDesc; 1] = [FieldDesc {
+            field: "sample",
+            allowed: ConstraintDesc::Eq(ValueDesc::Id("s24")),
+            preferred: None,
+        }];
+        assert!(!vocab.offer_admits(&OfferDesc { family: "audio/raw", fields: &BADF }, &f));
+    }
+
+    #[test]
+    fn offers_admit_needs_one_match_and_empty_admits_nothing() {
+        let vocab = vocab_with(&["audio/raw"], &["rate"], &[]);
+        let fam = vocab.family_id("audio/raw").unwrap();
+        let rate = vocab.field_id("rate").unwrap();
+        let mut f = FixedFormat::new(fam);
+        f.set(rate, Value::Int(48000));
+
+        static A: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Eq(ValueDesc::Int(44100)),
+            preferred: None,
+        }];
+        static B: [FieldDesc; 1] = [FieldDesc {
+            field: "rate",
+            allowed: ConstraintDesc::Eq(ValueDesc::Int(48000)),
+            preferred: None,
+        }];
+        let alts = [
+            OfferDesc { family: "audio/raw", fields: &A },
+            OfferDesc { family: "audio/raw", fields: &B },
+        ];
+        assert!(vocab.offers_admit(&alts, &f), "second alternative admits it");
+        assert!(!vocab.offers_admit(&[], &f), "no offers admit nothing");
     }
 }

@@ -781,10 +781,40 @@ fn deliver_events(
     ctx: &mut Ctx,
     sink_pad: Option<PadId>,
     events: Vec<Event>,
+    vocabulary: &Vocabulary,
 ) -> Result<(), Error> {
     for ev in events {
         if let Event::FormatChange(f) = &ev {
             if let Some(pad) = sink_pad {
+                // Re-validate the announced format against this pad's declared offers
+                // before installing it (spec: Formats — dynamic caps: an incompatible
+                // runtime format is a loud negotiation failure, never a silent install).
+                // Only offers in the *announced family* gate this: if the peer speaks
+                // that family but none of its offers admits the concrete values, that is
+                // fatal — the target case, a decoder announcing (say) a rate the sink
+                // cannot take. If the peer offers no such family at all (e.g. an
+                // `audio/raw` refinement riding a `bytes` bridge to a byte sink), there
+                // is nothing for this peer to re-fixate: install it and let a caps-reading
+                // peer act while a caps-ignoring one ignores it. Underspecified fields are
+                // never a conflict — the peer would fixate them, as at link time.
+                let offers = elem.desc().pads[pad.0 as usize].offers;
+                let family_offered = offers
+                    .iter()
+                    .any(|o| vocabulary.family_id(o.family) == Some(f.family));
+                if family_offered && !vocabulary.offers_admit(offers, f) {
+                    let element = ctx.element();
+                    let err = Error::Element {
+                        element,
+                        message: format!(
+                            "runtime format announcement not accepted by '{}' pad '{}' \
+                             — dynamic-caps re-validation failed",
+                            elem.desc().name,
+                            elem.desc().pads[pad.0 as usize].name,
+                        ),
+                    };
+                    ctx.post(BusMessage::Error { element, error: err.clone() });
+                    return Err(err);
+                }
                 ctx.set_negotiated_one(pad, f.clone());
             }
         }
@@ -893,9 +923,13 @@ fn run_group(
                         counters[0].record_in(batch.len() as u64, batch.total_bytes());
                         let events = batch.take_events();
                         ctxs[0].input_append(&mut batch);
-                        if let Err(e) =
-                            deliver_events(&mut *elements[0], &mut ctxs[0], head_sink_pad, events)
-                        {
+                        if let Err(e) = deliver_events(
+                            &mut *elements[0],
+                            &mut ctxs[0],
+                            head_sink_pad,
+                            events,
+                            &vocabulary,
+                        ) {
                             break 'group Err(e);
                         }
                         progressed = true;
@@ -907,9 +941,13 @@ fn run_group(
                     counters[0].record_in(batch.len() as u64, batch.total_bytes());
                     let events = batch.take_events();
                     ctxs[0].input_append(&mut batch);
-                    if let Err(e) =
-                        deliver_events(&mut *elements[0], &mut ctxs[0], head_sink_pad, events)
-                    {
+                    if let Err(e) = deliver_events(
+                        &mut *elements[0],
+                        &mut ctxs[0],
+                        head_sink_pad,
+                        events,
+                        &vocabulary,
+                    ) {
                         break 'group Err(e);
                     }
                     progressed = true;
