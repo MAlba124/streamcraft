@@ -580,6 +580,7 @@ dependencies = [
  "oxideav-av1",
  "streamcraft-core",
  "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]
