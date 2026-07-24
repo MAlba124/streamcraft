@@ -751,6 +751,7 @@ dependencies = [
 name = "sc-mp3"
 version = "0.1.0"
 dependencies = [
+ "oxideav-core",
  "oxideav-mp3",
  "streamcraft-core",
  "streamcraft-elements",
