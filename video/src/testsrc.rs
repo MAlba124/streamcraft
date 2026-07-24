@@ -13,11 +13,11 @@
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::ValueDesc;
+use streamcraft_core::format::{Constraint, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::{Rational, Timestamp};
 
@@ -26,6 +26,7 @@ use crate::format::{
     RAW_ANY_OFFER,
 };
 use crate::geometry::frame_size;
+use crate::props::{read_dims, read_u64, DEFAULT_FORMAT};
 
 const SRC: PadId = PadId(0);
 
@@ -37,10 +38,26 @@ static PADS: [PadDesc; 1] = [PadDesc {
     validate: None,
 }];
 
+/// The construction parameters, for the parse path (spec: Plugins —
+/// `parse("videotestsrc width=320 height=240 pixfmt=i420 fps=30/1 frames=90 seed=1 ! …")`).
+/// Until a demuxer feeds the format through caps, `videotestsrc` needs these out of band;
+/// the parse layer supplies them as props (the typed [`VideoTestSrc::new`] is the other
+/// path). All structural (`live: false`): the source is built in `start()`. `width` /
+/// `height` / `frames` / `seed` are ints, `pixfmt` an interned format name, `fps` a
+/// rational (`30/1`).
+static PROPS: [PropDesc; 6] = [
+    PropDesc { name: "width", allowed: Constraint::Any, live: false },
+    PropDesc { name: "height", allowed: Constraint::Any, live: false },
+    PropDesc { name: "pixfmt", allowed: Constraint::Any, live: false },
+    PropDesc { name: "fps", allowed: Constraint::Any, live: false },
+    PropDesc { name: "frames", allowed: Constraint::Any, live: false },
+    PropDesc { name: "seed", allowed: Constraint::Any, live: false },
+];
+
 static DESC: ElementDesc = ElementDesc {
     name: "videotestsrc",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     sched: SchedHint::Active,
     inputs: InputPolicy::None,
     latency: LatencyDesc {
@@ -49,7 +66,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default parameters (320x240 I420 @ 30 fps, 90 frames); override via the props.
+    make_default: Some(|| Box::new(VideoTestSrc::new(DEFAULT_FORMAT, 0, 90))),
 };
 
 /// The deterministic byte a [`VideoTestSrc`] writes at flat frame offset `pos` of frame
@@ -150,7 +168,13 @@ impl Element for VideoTestSrc {
         &DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // Parsed props override the constructor parameters (spec: Plugins). `width` /
+        // `height` / `pixfmt` / `fps` refine the format; `frames` / `seed` the schedule.
+        self.format = read_dims(ctx, self.format);
+        self.count = read_u64(ctx, "frames", self.count);
+        self.seed = read_u64(ctx, "seed", self.seed);
+        self.frame_bytes = frame_size(self.format.pixfmt, self.format.width, self.format.height);
         self.produced = 0;
         self.announced = false;
         Ok(())

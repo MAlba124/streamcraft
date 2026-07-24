@@ -55,7 +55,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // The stats handle is discarded for the parse path (see `VideoCkSink::new_element`).
+    make_default: Some(|| Box::new(VideoCkSink::new_element())),
 };
 
 /// One rendered frame: the PTS it carried, an FNV-1a checksum of its bytes, and the
@@ -136,6 +137,14 @@ impl VideoCkSink {
         });
         let stats = VideoCkSinkStats(Arc::clone(&shared));
         (Self { shared }, stats)
+    }
+
+    /// The sink alone, discarding the stats handle — for the registry `make_default`,
+    /// which cannot hand a handle back through the parse path (spec: Plugins). A launch
+    /// run inspects results via the pipeline's counters/taps or its EOS exit, not the
+    /// [`VideoCkSinkStats`] a typed caller would keep.
+    pub fn new_element() -> Self {
+        Self::new().0
     }
 }
 

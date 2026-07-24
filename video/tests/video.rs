@@ -313,3 +313,61 @@ fn incompatible_pixfmt_fails_negotiation_at_link() {
         "error should explain the empty pixfmt intersection, got: {msg}"
     );
 }
+
+// --- 5. Parse-path props override the constructor defaults (spec: Plugins) -----------
+//
+// The registry builds `VideoTestSrc` with default construction parameters and refines
+// them from props in `start()`. This exercises the same refinement path through
+// `Pipeline::set` / `set_str`: construct with placeholder dims/seed/frames, override every
+// knob via props, then prove the sink rendered the *overridden* format — the checksums
+// only match the overridden `(seed, dims)`, and the count only matches `frames`.
+
+#[test]
+fn videotestsrc_props_override_constructor_defaults() {
+    use streamcraft_core::format::Value;
+
+    // Placeholder construction values — every one is overridden below.
+    let ctor = VideoFormat::new(320, 240, PixelFormat::Rgb24, Rational::new(25, 1));
+    // The overrides the props install.
+    let want = VideoFormat::new(8, 8, PixelFormat::Gray8, Rational::new(30, 1));
+    let want_seed = 0xC0FF_EEu64;
+    let want_frames = 7u64;
+
+    let clock = MockClock::new();
+    let (sink, stats) = VideoCkSink::new();
+    let mut p = Pipeline::new();
+    let src = p.add(VideoTestSrc::new(ctor, 1, 1)); // ctor seed=1, frames=1
+    let snk = p.add(sink);
+    p.link((src, "src"), (snk, "sink")).expect("link");
+
+    // Override each construction parameter through the property mailbox.
+    p.set(src, "width", Value::Int(want.width as i64)).expect("width");
+    p.set(src, "height", Value::Int(want.height as i64)).expect("height");
+    p.set_str(src, "pixfmt", want.pixfmt.caps_name()).expect("pixfmt");
+    p.set(src, "fps", Value::Rat(want.fps.num, want.fps.den)).expect("fps");
+    p.set(src, "frames", Value::Int(want_frames as i64)).expect("frames");
+    p.set(src, "seed", Value::Int(want_seed as i64)).expect("seed");
+
+    p.set_clock(Arc::new(clock.clone()));
+    let run = std::thread::spawn(move || p.run());
+    let step = Timestamp::from_millis(200);
+    while !run.is_finished() {
+        clock.advance(step);
+        std::thread::yield_now();
+    }
+    run.join().expect("joined").expect("run ok");
+
+    let renders = stats.renders();
+    // `frames` override took effect: exactly `want_frames` frames, not the ctor's 1.
+    assert_eq!(renders.len() as u64, want_frames, "frames prop overrode the constructor");
+
+    // The overridden `(seed, dims, fps)` reproduce every rendered frame exactly.
+    let frame_bytes = frame_size(want.pixfmt, want.width, want.height);
+    for (i, r) in renders.iter().enumerate() {
+        assert_eq!(r.pts, frame_pts(want.fps, i as u64), "frame {i} on the overridden fps grid");
+        let expect: Vec<u8> = (0..frame_bytes)
+            .map(|pos| frame_pattern_byte(want_seed, i as u64, pos))
+            .collect();
+        assert_eq!(r.checksum, checksum(&expect), "frame {i} matches the overridden format");
+    }
+}
