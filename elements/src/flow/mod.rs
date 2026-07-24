@@ -1,7 +1,11 @@
 //! Flow elements — the thread-group boundaries and inline transforms
-//! (spec: Scheduling). `queue`, `tee`, and `funnel` will live here; for now a
-//! `passthrough` exercises the passive-inline group path.
+//! (spec: Scheduling). `tee` and `funnel` will live here too; today a `passthrough`
+//! exercises the passive-inline group path and [`Queue`] is the explicit thread-
+//! decoupling boundary (spec: Scheduling — "wherever the user drops an explicit `queue`
+//! element").
 
 mod passthrough;
+mod queue;
 
 pub use passthrough::PassThrough;
+pub use queue::Queue;

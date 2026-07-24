@@ -342,6 +342,12 @@ pub fn describe_desc(desc: &ElementDesc) -> String {
         let validate = if pad.validate.is_some() { ", validate-hook" } else { "" };
         let _ = writeln!(s, "    {} ({dir}{dynamic}{validate})", pad.name);
         for offer in pad.offers {
+            // A wildcard pad adopts the peer's family (spec: Formats — family-agnostic
+            // elements like `queue`/`tee`). Render it distinctly from a concrete `any()`.
+            if offer.is_wildcard() {
+                let _ = writeln!(s, "      * (any family)");
+                continue;
+            }
             if offer.fields.is_empty() {
                 let _ = writeln!(s, "      {} (any)", offer.family);
                 continue;
