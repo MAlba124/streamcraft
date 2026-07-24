@@ -1,0 +1,21 @@
+[package]
+name = "sc-wayland"
+description = "Hand-written Wayland shm video sink for streamcraft (zero deps beyond libc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_wayland"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+streamcraft-video = { path = "../video" }
+# The one allowed dependency: raw syscall bindings for SCM_RIGHTS fd passing,
+# memfd_create, and mmap — std exposes none of these on stable. The Wayland wire
+# protocol itself is hand-written over std's UnixStream.
+libc = "0.2"
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
