@@ -106,25 +106,34 @@ impl FlacDec {
         Self::default()
     }
 
-    /// Serialise one decoded sample as `bytes` little-endian bytes (two's-complement — the
-    /// low bytes of the sign-extended `i64` are the correct LE PCM for that width).
-    fn write_sample(out: &mut Vec<u8>, s: i64, bytes: usize) {
-        out.extend_from_slice(&s.to_le_bytes()[..bytes]);
-    }
-
-    /// Push PCM `bytes` on the src pad, chunked to the pool slot size.
-    fn emit(ctx: &mut Ctx, bytes: &[u8]) -> Result<(), Error> {
-        let mut off = 0;
-        while off < bytes.len() {
-            let mut buf = ctx.alloc(PadId(1));
-            let cap = buf.memory.capacity();
-            debug_assert!(cap > 0, "flacdec: zero-capacity pool slot");
-            let n = cap.min(bytes.len() - off);
-            buf.memory.as_mut_full()[..n].copy_from_slice(&bytes[off..off + n]);
-            buf.memory.set_len(n);
-            ctx.out(PadId(1)).push(buf);
-            off += n;
+    /// Serialise a decoded frame's samples as interleaved little-endian PCM **directly
+    /// into pool output buffers** — no per-frame intermediate allocation (spec: Memory —
+    /// zero steady-state heap traffic). Each sample is `bytes` wide (the low bytes of the
+    /// sign-extended two's-complement `i64` are the correct LE PCM for that width); a
+    /// buffer is flushed and a fresh one taken whenever the next whole sample would not
+    /// fit, so a sample never straddles a buffer boundary.
+    fn emit_frame(ctx: &mut Ctx, samples: &[i64], bytes: usize) -> Result<(), Error> {
+        if samples.is_empty() {
+            return Ok(());
         }
+        let mut buf = ctx.alloc(PadId(1));
+        let cap = buf.memory.capacity();
+        debug_assert!(bytes > 0 && cap >= bytes, "flacdec: pool slot too small for a sample");
+        let mut n = 0; // bytes written into the current buffer
+        for &s in samples {
+            if n + bytes > cap {
+                buf.memory.set_len(n);
+                ctx.out(PadId(1)).push(buf);
+                buf = ctx.alloc(PadId(1));
+                n = 0;
+            }
+            buf.memory.as_mut_full()[n..n + bytes].copy_from_slice(&s.to_le_bytes()[..bytes]);
+            n += bytes;
+        }
+        // The final buffer always holds at least one sample here (empty frames returned
+        // early, and a flush is always followed by a write).
+        buf.memory.set_len(n);
+        ctx.out(PadId(1)).push(buf);
         Ok(())
     }
 }
@@ -172,11 +181,7 @@ impl Element for FlacDec {
                     self.announced = true;
                 }
 
-                let mut pcm = Vec::with_capacity(frame.samples.len() * self.bytes_per_sample);
-                for &s in &frame.samples {
-                    Self::write_sample(&mut pcm, s, self.bytes_per_sample);
-                }
-                Self::emit(ctx, &pcm)?;
+                Self::emit_frame(ctx, &frame.samples, self.bytes_per_sample)?;
             }
         }
         Ok(Flow::Ok)
