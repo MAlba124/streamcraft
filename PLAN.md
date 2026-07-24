@@ -235,6 +235,28 @@ Three loose ends from Stage-0 dynamic caps (see `memory/runtime-caps-gap.md`):
 > task) and **sc-vk** (clean-room Vulkan renderer: render into exported DMA-BUFs,
 > present via sc-wayland's `zwp_linux_dmabuf_v1`; `ash` only; cited algorithms).
 
+> **Update — session 3e (2026-07-24): real-file playback + the GPU renderer.**
+> `play_file` plays a real **1080p HEVC BluRay MKV** (4 tracks: HEVC→h265dec, AAC/PGS
+> to drop-sinks) in a window, bounded at ~1.2 GiB RSS — after fixing the OOM family
+> it exposed: MkvDemux unbounded `ctx.alloc` → **try_alloc + pending carry +
+> consume-only-while-emitting**; `Pool::acquire_exact`/`Ctx::alloc_exact`
+> (right-sized heap fallback, never a 4 MiB slot per 15 KB sample); ring-fed group
+> heads now cap their input backlog at INLINE_INPUT_CAP (closed-and-drained guard).
+> Video decoders went **Active** (a decode is ms, not the inline ns budget; also
+> keeps a branching demuxer a legal group tail). **sc-vk landed, built in-session**
+> (agents kept OOMing the box — policy now: max ONE background agent): compute-only
+> Vulkan → exported LINEAR dma-bufs → presented by sc-wayland's hand-written client
+> via `zwp_linux_dmabuf_v1` (salvaged+reviewed from the dead agent's worktree);
+> BT.601 §-cited GLSL + committed SPIR-V; byte-exact vs the CPU path on a Quadro
+> P620; `vkvideosink` registered, `play_file --vk`. **sc-mp3 salvaged + merged**
+> (agent finished, OOM'd before committing). **sc-opus REJECTED** on official
+> RFC 6716 vectors (0.0.13 emits noise/silence; recipe in opus/src/lib.rs).
+> Test heavy pipelines under `systemd-run --scope -p MemoryMax=3G`. Workspace 90
+> binaries green. In flight: hand-written Mp4Demux (containers stay hand-written —
+> user decision; oxideav-mp4 is dev-oracle only). Follow-ups: per-link pools, h26x
+> pts reorder exactness, Opus re-vet on next upstream publish, explicit-sync +
+> scaling/HDR ladder for sc-vk.
+
 ## Stage 5 — Registry + parse-launch · MED
 
 `use` + typed construction stays primary; add the opt-in `Registry` (`register`/`get`/
