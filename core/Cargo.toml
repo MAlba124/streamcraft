@@ -9,6 +9,12 @@ repository.workspace = true
 [lib]
 name = "streamcraft_core"
 
+# Hand-rolled SPSC-ring microbench (spec: Performance doctrine — no criterion, core
+# stays dep-free). `harness = false` → the bench's own `main` is the harness.
+[[bench]]
+name = "ring_hop"
+harness = false
+
 # No dependencies. Ever. (streamcraft.md: Crate layout)
 [dependencies]
 
