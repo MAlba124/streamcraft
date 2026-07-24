@@ -20,6 +20,7 @@ members = [
     "mp3",
     "mp4",
     "wayland",
+    "vk",
     "launch",
 ]
 

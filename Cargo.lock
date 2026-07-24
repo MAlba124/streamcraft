@@ -39,6 +39,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.69.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -789,6 +798,17 @@ dependencies = [
  "sc-flac",
  "streamcraft-core",
  "streamcraft-elements",
+]
+
+[[package]]
+name = "sc-vk"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "sc-wayland",
+ "streamcraft-core",
+ "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]
