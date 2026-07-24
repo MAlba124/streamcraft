@@ -270,6 +270,11 @@ impl Arena {
     /// Carve `size` bytes aligned to `align` (a power of two) and return a fresh mutable
     /// region; its contents are unspecified (reused memory). A pointer bump on the
     /// steady-state path; a chunk allocation only when the current chunks are exhausted.
+    // `&self -> &mut [u8]` is the defining shape of a bump arena (cf. `bumpalo::Bump::alloc`):
+    // each call carves a *disjoint* region, so handing out `&mut` from a shared borrow is
+    // sound. `clippy::mut_from_ref` can't see that invariant, so allow it here (the module's
+    // unsafe is audited); the borrow checker still enforces one region borrow at a time.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self, size: usize, align: usize) -> &mut [u8] {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         loop {

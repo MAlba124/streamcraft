@@ -26,6 +26,12 @@ pub struct Batch {
     /// buffers through the same queues). A `FormatChange` here is how a decoder announces
     /// a runtime format to its peer (spec: Formats — dynamic caps). Usually empty.
     pub events: Vec<Event>,
+    /// The seek generation this span was produced under (spec: flush/seek). The scheduler
+    /// stamps it on each batch crossing a ring and drops any batch whose generation is
+    /// older than the current one on the consuming side — so a seek can discard the data
+    /// already queued past the point of no return without racing the producer that is
+    /// concurrently pushing fresh, post-seek data. `0` until the first seek.
+    pub seek_gen: u64,
 }
 
 impl Batch {
@@ -38,6 +44,7 @@ impl Batch {
             flags: Vec::new(),
             metas: Vec::new(),
             events: Vec::new(),
+            seek_gen: 0,
         }
     }
 

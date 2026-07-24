@@ -17,7 +17,7 @@ use crate::batch::{Batch, Inputs};
 use crate::bus::{Bus, BusMessage, BusSender, State};
 use crate::clock::{Clock, InstantClock};
 use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, SeekState};
 use crate::element::{Direction, Element, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::event::Event;
@@ -91,6 +91,27 @@ impl StopHandle {
     }
 }
 
+/// A handle to seek this pipeline from another thread while `run()` is blocking (spec:
+/// flush/seek). Publishing a target makes the source resume reading at `to_byte`, discards
+/// the data already in flight (out-of-band, so it is responsive rather than playing out the
+/// queue first), and resets the reported play position to `to_frame`. Cloneable and cheap.
+#[derive(Clone)]
+pub struct SeekHandle(Arc<SeekState>);
+
+impl SeekHandle {
+    /// Request a seek: resume the source at byte offset `to_byte`, and reset the reported
+    /// play position to PCM frame `to_frame`. The targets are published before the
+    /// generation bump, so any observer that sees the new generation also sees the targets.
+    /// Mapping a wall-clock time to a byte offset is the caller's job (a byte source has no
+    /// notion of time); for FLAC without a seektable that is a proportional estimate the
+    /// decoder then re-syncs from.
+    pub fn seek(&self, to_byte: u64, to_frame: u64) {
+        self.0.to_byte.store(to_byte, Ordering::Release);
+        self.0.to_frame.store(to_frame, Ordering::Release);
+        self.0.gen.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub struct Pipeline {
     elements: Vec<Option<Box<dyn Element>>>,
     edges: Vec<Edge>,
@@ -101,6 +122,9 @@ pub struct Pipeline {
     fields: Interner,
     values: Interner,
     stop: Arc<AtomicBool>,
+    /// Shared seek request (spec: flush/seek). Bumped by a [`SeekHandle`]; observed by every
+    /// group thread (to flush) and by the source/sink elements (to re-seek / reset position).
+    seek: Arc<SeekState>,
     bus_sender: BusSender,
     bus: Bus,
     slot_size: usize,
@@ -141,6 +165,7 @@ impl Pipeline {
             fields: Interner::new(),
             values: Interner::new(),
             stop: Arc::new(AtomicBool::new(false)),
+            seek: Arc::new(SeekState::default()),
             bus_sender: tx,
             bus: rx,
             slot_size: 128 * 1024,
@@ -179,6 +204,12 @@ impl Pipeline {
     /// while `run()` is blocking.
     pub fn stop_handle(&self) -> StopHandle {
         StopHandle(Arc::clone(&self.stop))
+    }
+
+    /// A handle to seek this pipeline from another thread while `run()` is blocking
+    /// (spec: flush/seek). See [`SeekHandle`].
+    pub fn seek_handle(&self) -> SeekHandle {
+        SeekHandle(Arc::clone(&self.seek))
     }
 
     /// Programmatically enable logging up to `level`, formatting records to stderr on a
@@ -507,6 +538,7 @@ impl Pipeline {
             (0..total).map(|_| Arc::new(ElementCounters::default())).collect();
         self.counters = counters.clone();
         let stop = Arc::clone(&self.stop);
+        let seek = Arc::clone(&self.seek);
 
         // Formats fixed at link time, resolved per element so each group can install
         // them on its elements' `Ctx`s (spec: elements read their fixed format from
@@ -582,12 +614,13 @@ impl Pipeline {
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
+            let seek = Arc::clone(&seek);
             let vocabulary = Arc::clone(&vocabulary);
             let clock = Arc::clone(&clock);
             handles.push(std::thread::spawn(move || {
                 run_group(
                     elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
-                    bus, credits, group_counters, stop, vocabulary, clock, base_time,
+                    bus, credits, group_counters, stop, seek, vocabulary, clock, base_time,
                     group_pad_infos,
                 )
             }));
@@ -1050,6 +1083,7 @@ fn run_group(
     credits: u32,
     counters: Vec<Arc<ElementCounters>>,
     stop: Arc<AtomicBool>,
+    seek: Arc<SeekState>,
     vocabulary: Arc<Vocabulary>,
     clock: Arc<dyn Clock>,
     base_time: Timestamp,
@@ -1102,6 +1136,11 @@ fn run_group(
     for ctx in ctxs.iter_mut() {
         ctx.set_clock(Arc::clone(&clock), base_time);
     }
+    // Install the shared seek request so a source resolves its byte target and a sink its
+    // frame target when the scheduler delivers `FlushStart` (spec: flush/seek).
+    for ctx in ctxs.iter_mut() {
+        ctx.set_seek(Arc::clone(&seek));
+    }
 
     // Start each element; hand any file it registered to this group's reactor.
     for i in 0..m {
@@ -1114,6 +1153,9 @@ fn run_group(
     let mut source_eos = false;
     let mut upstream_closed = false;
     let mut eos_next = 0usize;
+    // The seek generation this group has flushed up to. A `SeekHandle::seek` bumps the
+    // shared generation; observing the change here drives the out-of-band flush.
+    let mut seek_gen = seek.gen.load(Ordering::Acquire);
 
     let result: Result<(), Error> = 'group: loop {
         // Cooperative cancellation: break, then stop + drop downstream, which closes
@@ -1121,6 +1163,31 @@ fn run_group(
         if stop.load(Ordering::Acquire) {
             break Ok(());
         }
+
+        // Flush/seek (spec: flush/seek). A bumped generation, observed out-of-band here
+        // rather than carried in-band behind the queued data, means: reset each element's
+        // stream state (a source re-seeks, a decoder re-syncs, a sink drops its device
+        // buffer and re-bases its position — all via `FlushStart`) and discard everything
+        // staged inside this group. Data already handed to the downstream ring is dropped
+        // on the consuming side by the generation stamp below, so this never races the
+        // producer that is concurrently pushing fresh post-seek data.
+        let cur_gen = seek.gen.load(Ordering::Acquire);
+        if cur_gen != seek_gen {
+            for i in 0..m {
+                if let Err(e) = elements[i].event(&mut ctxs[i], &Event::FlushStart) {
+                    break 'group Err(e);
+                }
+            }
+            for c in ctxs.iter_mut() {
+                c.discard_buffers();
+            }
+            // A seek revives a stream that may already have ended: forget prior EOS.
+            source_eos = false;
+            upstream_closed = false;
+            eos_next = 0;
+            seek_gen = cur_gen;
+        }
+
         let mut progressed = false;
 
         // A. Feed the head from upstream.
@@ -1132,6 +1199,9 @@ fn run_group(
             let mut all_closed = true;
             for (pad, cons) in &upstream {
                 while let Some(mut batch) = cons.try_pop() {
+                    if batch.seek_gen < seek_gen {
+                        continue; // stale pre-seek data (buffers recycle on drop)
+                    }
                     counters[0].record_in(batch.len() as u64, batch.total_bytes());
                     let events = batch.take_events();
                     ctxs[0].append_input_on(*pad, &mut batch);
@@ -1158,7 +1228,7 @@ fn run_group(
             if !closed && head_idle {
                 // Nothing to do but wait for input — block (no busy spin).
                 match up.pop() {
-                    Some(mut batch) => {
+                    Some(mut batch) if batch.seek_gen >= seek_gen => {
                         counters[0].record_in(batch.len() as u64, batch.total_bytes());
                         let events = batch.take_events();
                         ctxs[0].input_append(&mut batch);
@@ -1173,10 +1243,14 @@ fn run_group(
                         }
                         progressed = true;
                     }
+                    Some(_) => {} // stale pre-seek data: drop (buffers recycle)
                     None => upstream_closed = true,
                 }
             } else {
                 while let Some(mut batch) = up.try_pop() {
+                    if batch.seek_gen < seek_gen {
+                        continue; // stale pre-seek data (buffers recycle on drop)
+                    }
                     counters[0].record_in(batch.len() as u64, batch.total_bytes());
                     let events = batch.take_events();
                     ctxs[0].input_append(&mut batch);
@@ -1253,8 +1327,11 @@ fn run_group(
             ctxs[m - 1].clear_outputs();
         } else {
             for (src_pad, down) in &downstream {
-                let out = ctxs[m - 1].take_output(*src_pad);
+                let mut out = ctxs[m - 1].take_output(*src_pad);
                 if !out.is_inert() {
+                    // Stamp the generation so the consuming group can drop it if a seek
+                    // supersedes it before it is processed (spec: flush/seek).
+                    out.seek_gen = seek_gen;
                     progressed = true;
                     if down.push(out).is_err() {
                         break 'group Ok(()); // this downstream is gone

@@ -54,6 +54,9 @@ pub struct FileSrc {
     eof: bool,
     in_flight: u32,
     seq: u64,
+    /// Reads submitted before a seek carry a `user` (their `seq`) below this floor; their
+    /// completions land at the *old* offset, so they are discarded (spec: flush/seek).
+    valid_from: u64,
 }
 
 impl FileSrc {
@@ -66,6 +69,7 @@ impl FileSrc {
             eof: false,
             in_flight: 0,
             seq: 0,
+            valid_from: 0,
         }
     }
 }
@@ -98,6 +102,9 @@ impl Element for FileSrc {
                 None => break,
             };
             self.in_flight -= 1;
+            if c.user < self.valid_from {
+                continue; // read submitted before a seek: wrong offset, discard (buf recycles)
+            }
             match c.result {
                 IoResult::Ok(0) => self.eof = true, // c.buf recycles on drop
                 IoResult::Ok(n) => {
@@ -132,7 +139,18 @@ impl Element for FileSrc {
         }
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::FlushStart) {
+            // Seek (spec: flush/seek): resume reading at the requested byte offset. Reads
+            // already in flight will complete at the old offset — mark them stale via the
+            // `seq` floor so their completions are discarded. `submit_read` takes the
+            // offset explicitly, so the fd's cursor is irrelevant; nothing else to reset.
+            if let Some(t) = ctx.seek_target() {
+                self.offset = t.to_byte;
+                self.eof = false;
+                self.valid_from = self.seq;
+            }
+        }
         Ok(())
     }
 

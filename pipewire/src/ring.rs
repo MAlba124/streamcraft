@@ -45,6 +45,16 @@ struct Inner {
     head: CachePadded<AtomicUsize>,
     /// Producer-owned position (monotonic; masked for indexing).
     tail: CachePadded<AtomicUsize>,
+    /// Flush (spec: flush/seek). The producer bumps `flush_gen` and publishes the tail it
+    /// held at flush time in `flush_to`; the RT consumer, seeing a new generation, jumps
+    /// `head` forward to `flush_to`, dropping the buffered pre-seek PCM while preserving any
+    /// post-seek bytes the producer has pushed since (index ≥ `flush_to`). Only the consumer
+    /// writes `head`, so this stays SPSC-safe — the producer never touches the consumer's
+    /// index. `seen_flush_gen` is the consumer's private record of the last generation it
+    /// acted on (it alone writes it), read on the pull fast path — one relaxed load.
+    flush_gen: AtomicUsize,
+    flush_to: AtomicUsize,
+    seen_flush_gen: CachePadded<AtomicUsize>,
     /// Either end went away (sink shutdown / PW loop exited); unblocks the parked producer.
     closed: AtomicBool,
     /// Parking gate for the producer's blocking path. The RT consumer never touches this.
@@ -89,6 +99,9 @@ pub fn spsc(capacity: usize) -> (Producer, Consumer) {
         mask: cap - 1,
         head: CachePadded(AtomicUsize::new(0)),
         tail: CachePadded(AtomicUsize::new(0)),
+        flush_gen: AtomicUsize::new(0),
+        flush_to: AtomicUsize::new(0),
+        seen_flush_gen: CachePadded(AtomicUsize::new(0)),
         closed: AtomicBool::new(false),
         gate: Mutex::new(()),
         cvar: Condvar::new(),
@@ -153,6 +166,17 @@ impl Producer {
         }
     }
 
+    /// Discard the currently-buffered PCM on a seek (spec: flush/seek). Publishes the current
+    /// tail as the flush point and bumps the flush generation; the RT consumer drops
+    /// everything up to that point on its next `pull`. Bytes pushed *after* this call (the
+    /// post-seek PCM) are preserved. Wait-free and safe to interleave with the RT consumer:
+    /// the producer only writes its own `flush_to`/`flush_gen`, never the consumer's `head`.
+    pub fn flush(&self) {
+        let tail = self.inner.tail.0.load(Ordering::Relaxed); // we own tail
+        self.inner.flush_to.store(tail, Ordering::Release);
+        self.inner.flush_gen.fetch_add(1, Ordering::Release);
+    }
+
     /// End-of-stream: block until the consumer has played out every buffered byte (or the sink
     /// closes). After this returns, the ring is empty and the stream is complete. "Signalling
     /// EOS" is exactly this wait — the producer stops pushing and blocks until drained, which
@@ -177,6 +201,21 @@ impl Consumer {
     /// allocation-free** — safe to call from the PipeWire RT thread: two index loads, up to
     /// two `memcpy`s, one Release store, no mutex.
     pub fn pull(&self, out: &mut [u8]) {
+        // Flush check (spec: flush/seek): if the producer bumped the flush generation, jump
+        // `head` to the published flush point, dropping the buffered pre-seek PCM. Guard with
+        // a wrap-safe distance test so we never move `head` backward (if we have already
+        // consumed past the flush point, there is nothing stale to drop). One relaxed load on
+        // the fast path when no flush is pending — no fence, no lock; stays RT-safe.
+        let g = self.inner.flush_gen.load(Ordering::Acquire);
+        if g != self.inner.seen_flush_gen.0.load(Ordering::Relaxed) {
+            let ft = self.inner.flush_to.load(Ordering::Acquire);
+            let head = self.inner.head.0.load(Ordering::Relaxed);
+            if ft.wrapping_sub(head) <= self.inner.cap {
+                self.inner.head.0.store(ft, Ordering::Release);
+            }
+            self.inner.seen_flush_gen.0.store(g, Ordering::Relaxed);
+        }
+
         let head = self.inner.head.0.load(Ordering::Relaxed); // we own head
         let tail = self.inner.tail.0.load(Ordering::Acquire); // peer's publish
         let avail = tail.wrapping_sub(head);
@@ -283,6 +322,46 @@ mod tests {
         let mut out = [0xAAu8; 8];
         c.pull(&mut out);
         assert_eq!(out, [0u8; 8], "empty ring → pure silence, no read");
+    }
+
+    #[test]
+    fn flush_drops_buffered_and_preserves_post_flush() {
+        // Seek: the pre-flush PCM is discarded, but bytes pushed after the flush (the
+        // post-seek audio) survive and play — the flush point is the tail at flush time.
+        let (p, c) = spsc(64);
+        p.push(&[1, 2, 3, 4]); // pre-flush (stale after a seek)
+        p.flush();
+        p.push(&[5, 6, 7, 8]); // post-flush (the new position's audio)
+        let mut out = [0u8; 4];
+        c.pull(&mut out);
+        assert_eq!(out, [5, 6, 7, 8], "pre-flush dropped, post-flush kept");
+    }
+
+    #[test]
+    fn flush_then_empty_pulls_silence() {
+        // Flush with nothing pushed after → the ring is empty → pure silence, no stale bytes.
+        let (p, c) = spsc(64);
+        p.push(&[1, 2, 3, 4]);
+        p.flush();
+        let mut out = [0x77u8; 4];
+        c.pull(&mut out);
+        assert_eq!(out, [0, 0, 0, 0], "flushed ring is empty → silence");
+    }
+
+    #[test]
+    fn flush_after_partial_consume_drops_only_the_rest() {
+        // The consumer has already played some pre-flush bytes; the flush drops just the
+        // remaining buffered ones, never rewinding over what was consumed.
+        let (p, c) = spsc(64);
+        p.push(&[1, 2, 3, 4, 5, 6]);
+        let mut out = [0u8; 2];
+        c.pull(&mut out); // consume [1,2]
+        assert_eq!(out, [1, 2]);
+        p.flush(); // drop the buffered [3,4,5,6]
+        p.push(&[7, 8]);
+        let mut out2 = [0u8; 2];
+        c.pull(&mut out2);
+        assert_eq!(out2, [7, 8], "only post-flush bytes remain");
     }
 
     #[test]

@@ -217,6 +217,16 @@ impl Element for FlacDec {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::FlushStart) {
+            // Seek (spec: flush/seek): drop the buffered bytes and the pending carry, and
+            // arrange to re-sync to the next frame boundary on the bytes that arrive after
+            // the source's byte-seek. STREAMINFO (and thus the announced format) is kept —
+            // the header lives only at the file start, so a mid-stream seek carries none.
+            self.dec.seek_reset();
+            self.pending.clear();
+            self.pending_pos = 0;
+            return Ok(());
+        }
         if matches!(event, Event::Eos) {
             // End of stream: flush the carry and every remaining buffered frame through the
             // unbounded pool, so the tail is emitted even if we were backpressured here.

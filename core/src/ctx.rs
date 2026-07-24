@@ -6,6 +6,7 @@
 //! then drains the `out` batch and the IO `outbox` (submissions) afterwards.
 
 use std::fs::File;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::batch::{Batch, OutBatch};
@@ -43,6 +44,30 @@ pub(crate) struct AddedPad {
     pub(crate) name: String,
     pub(crate) offers: &'static [OfferDesc],
     pub(crate) pad: PadId,
+}
+
+/// Shared app→pipeline seek request (spec: Events, queries, and the bus — flush/seek). The
+/// app publishes a target through a `SeekHandle`; the scheduler and the source/sink elements
+/// each observe `gen` advancing and perform a coordinated flush. `to_byte` drives the source
+/// (where to resume reading), `to_frame` resets the sink's play position. All fields are
+/// relaxed/acquire atomics — reads sit on the flush path, never the per-buffer hot path.
+#[derive(Default)]
+pub struct SeekState {
+    /// Bumped once per seek; every observer compares it to its own last-seen value.
+    pub(crate) gen: AtomicU64,
+    pub(crate) to_byte: AtomicU64,
+    pub(crate) to_frame: AtomicU64,
+}
+
+/// A resolved seek target, read by an element from [`Ctx::seek_target`] when it handles
+/// [`Event::FlushStart`](crate::event::Event::FlushStart).
+#[derive(Clone, Copy, Debug)]
+pub struct SeekTarget {
+    /// Byte offset in the source byte stream to resume reading from.
+    pub to_byte: u64,
+    /// PCM frame (interchannel sample) index the target corresponds to — the play position
+    /// a sink resets its counter to.
+    pub to_frame: u64,
 }
 
 pub struct Ctx {
@@ -115,6 +140,11 @@ pub struct Ctx {
     /// reads `NONE` and `wait_until` returns at once (no pacing).
     clock: Option<Arc<dyn Clock>>,
     base_time: Timestamp,
+    /// Shared seek request, installed at run setup (spec: flush/seek). A source reads the
+    /// byte target and a sink the frame target from [`seek_target`](Self::seek_target) when
+    /// the scheduler delivers `FlushStart`. `None` outside a run / for a pipeline that is
+    /// never seeked — no cost on the hot path.
+    seek: Option<Arc<SeekState>>,
     /// Per-`process()` scratch bump allocator (spec: Memory). Reset by the scheduler after
     /// each `process()`, so temporaries carved here impose no steady-state heap traffic.
     scratch: Arena,
@@ -152,6 +182,7 @@ impl Ctx {
             vocabulary: None,
             clock: None,
             base_time: Timestamp::ZERO,
+            seek: None,
             scratch: Arena::default(),
         }
     }
@@ -230,6 +261,36 @@ impl Ctx {
     pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base_time: Timestamp) {
         self.clock = Some(clock);
         self.base_time = base_time;
+    }
+
+    /// Install the shared seek request (pipeline → element at run setup). See
+    /// [`seek_target`](Self::seek_target).
+    pub(crate) fn set_seek(&mut self, seek: Arc<SeekState>) {
+        self.seek = Some(seek);
+    }
+
+    /// The current seek generation (spec: flush/seek), bumped once per seek. An element that
+    /// blocks for a long time inside `process()` (e.g. a sink pushing a big batch to a device
+    /// that drains in real time) samples this and bails out when it changes, so the scheduler
+    /// can run the flush promptly instead of after the whole batch has played. `0` until the
+    /// first seek / when no seek state is installed.
+    pub fn seek_gen(&self) -> u64 {
+        self.seek.as_ref().map_or(0, |s| s.gen.load(Ordering::Acquire))
+    }
+
+    /// The current seek target, if any seek has been requested (spec: flush/seek). A source
+    /// element reads `to_byte` (where to resume reading) and a sink reads `to_frame` (the
+    /// play position to reset to) when the scheduler delivers
+    /// [`Event::FlushStart`](crate::event::Event::FlushStart). `None` until the first seek.
+    pub fn seek_target(&self) -> Option<SeekTarget> {
+        let s = self.seek.as_ref()?;
+        if s.gen.load(Ordering::Acquire) == 0 {
+            return None; // no seek has ever been requested
+        }
+        Some(SeekTarget {
+            to_byte: s.to_byte.load(Ordering::Acquire),
+            to_frame: s.to_frame.load(Ordering::Acquire),
+        })
     }
 
     /// Resolve a format-field name to its interned id, for reading a negotiated
@@ -512,6 +573,24 @@ impl Ctx {
 
     pub(crate) fn take_registration(&mut self) -> Option<File> {
         self.registration.take()
+    }
+
+    /// Drop every buffer staged in this `Ctx` — pending input, each src pad's output, any
+    /// fan-in per-pad inputs, and queued IO completions/submissions — recycling them to the
+    /// pool (spec: flush/seek). The scheduler calls this on each element of a group when a
+    /// flush begins, so no pre-seek data lingers inside an element between passes. In-flight
+    /// reactor reads are not here (the reactor owns them); a source drops their stale
+    /// completions itself once they land.
+    pub(crate) fn discard_buffers(&mut self) {
+        self.input.clear();
+        for o in &mut self.outs {
+            o.clear();
+        }
+        for i in &mut self.ins {
+            i.clear();
+        }
+        self.io_in.clear();
+        self.io_out.clear();
     }
 }
 

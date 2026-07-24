@@ -252,6 +252,9 @@ pub struct StreamDecoder {
     pos: usize,
     info: Option<StreamInfo>,
     scratch: Scratch,
+    /// After a byte-domain seek the buffer starts mid-frame; [`pull_into`](Self::pull_into)
+    /// then scans for the next frame boundary before decoding (spec: flush/seek — resync).
+    resync: bool,
 }
 
 impl StreamDecoder {
@@ -267,6 +270,18 @@ impl StreamDecoder {
     /// Append freshly-received bytes to the decode buffer.
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Reset for a byte-domain seek (spec: flush/seek): drop all buffered bytes and arrange
+    /// to re-sync to the next frame boundary on the bytes pushed next. The already-parsed
+    /// [`StreamInfo`](Self::info) is **kept** — the `fLaC` header appears only once, at the
+    /// start of the file, so bytes landed on after a mid-stream seek carry none — as is the
+    /// reusable scratch. After this, [`pull_into`](Self::pull_into) scans byte-aligned
+    /// positions for one where a whole frame decodes with both CRCs intact before resuming.
+    pub fn seek_reset(&mut self) {
+        self.buf.clear();
+        self.pos = 0;
+        self.resync = true;
     }
 
     /// Decode the next fully-buffered frame, or `Ok(None)` when more bytes are needed
@@ -291,6 +306,45 @@ impl StreamDecoder {
         }
         let info = self.info.expect("header parsed above");
         out.clear();
+
+        // Post-seek: the buffer starts mid-frame. Scan byte-aligned positions for one where a
+        // whole frame decodes with both its header CRC-8 and frame CRC-16 intact — that dual
+        // check makes a false positive vanishingly unlikely, so a single good frame is enough
+        // to declare resync. A candidate that runs off the end is "need more", not a failure.
+        if self.resync {
+            loop {
+                let step = {
+                    let slice = &self.buf[self.pos..];
+                    if slice.len() < 2 {
+                        return Ok(None); // not enough bytes to even test a sync
+                    }
+                    // A frame starts 0xFF then 0xF8/0xF9 (15-bit sync + the blocking-strategy
+                    // bit): a cheap pre-filter before the full CRC-validated decode attempt.
+                    if slice[0] == 0xFF && slice[1] & 0xFE == 0xF8 {
+                        let mut r = BitReader::new(slice);
+                        match FlacDecoder::read_frame(&mut r, slice, &info, out, &mut self.scratch) {
+                            Ok(()) => Some((r.bit_pos() / 8) as usize),
+                            Err(DecodeError::UnexpectedEof) => return Ok(None), // candidate truncated
+                            Err(_) => None, // false sync — advance one byte and keep scanning
+                        }
+                    } else {
+                        None
+                    }
+                };
+                match step {
+                    Some(used) => {
+                        self.resync = false;
+                        self.pos += used;
+                        self.compact();
+                        return Ok(Some(()));
+                    }
+                    None => {
+                        out.clear(); // discard any partial decode from a failed candidate
+                        self.pos += 1;
+                    }
+                }
+            }
+        }
 
         // Attempt one frame from the cursor. `read_frame` runs off the end of a truncated
         // slice as `UnexpectedEof`, which here means "need more" rather than corruption.
@@ -727,6 +781,58 @@ mod tests {
             let folded = ((n << 1) ^ (n >> 63)) as u64;
             assert_eq!(unzigzag(folded), n, "n={n}");
         }
+    }
+
+    #[test]
+    fn resync_after_seek_decodes_the_tail() {
+        use crate::encoder::{FlacEncoder, SampleFormat};
+        // A deterministic multi-frame stereo stream: 10 frames × 512 interchannel samples.
+        const FRAMES: usize = 10;
+        const BLOCK: usize = 512;
+        let (mut enc, header) =
+            FlacEncoder::new_streaming(44100, 2, SampleFormat::S16, BLOCK as u32).unwrap();
+        let mut stream = header;
+        for f in 0..FRAMES {
+            let mut pcm = Vec::with_capacity(BLOCK * 2 * 2);
+            for i in 0..BLOCK {
+                let n = (f * BLOCK + i) as f64;
+                let l = (8000.0 * (n * 0.03).sin()) as i16;
+                let r = (6000.0 * (n * 0.047).cos()) as i16;
+                pcm.extend_from_slice(&l.to_le_bytes());
+                pcm.extend_from_slice(&r.to_le_bytes());
+            }
+            enc.encode_interleaved(&pcm, &mut stream).unwrap();
+        }
+
+        // Baseline: decode the whole stream in one shot.
+        let baseline = FlacDecoder::decode(&stream).expect("baseline decode").samples;
+        assert_eq!(baseline.len(), FRAMES * BLOCK * 2);
+
+        // Populate the incremental decoder's STREAMINFO, then simulate a byte-domain seek:
+        // reset and feed from a mid-stream offset (almost certainly landing mid-frame).
+        let mut dec = StreamDecoder::new();
+        dec.push(&stream);
+        dec.pull().expect("first frame decodes").expect("a frame is present");
+        assert!(dec.info().is_some(), "header parsed");
+
+        dec.seek_reset();
+        let off = stream.len() / 2;
+        dec.push(&stream[off..]);
+
+        let mut got = Vec::new();
+        while let Some(frame) = dec.pull().expect("resync decode never errors") {
+            got.extend_from_slice(&frame.samples);
+        }
+
+        // Resync located a real frame boundary (both CRCs intact) and decoded cleanly to EOF,
+        // so the samples are exactly a suffix of the baseline, aligned to a frame boundary.
+        assert!(!got.is_empty(), "resynced and decoded at least one frame past the seek");
+        assert_eq!(got.len() % (BLOCK * 2), 0, "resync landed on a frame boundary");
+        assert_eq!(
+            got,
+            baseline[baseline.len() - got.len()..],
+            "resynced tail is bit-exact with the baseline from that boundary"
+        );
     }
 
     #[test]

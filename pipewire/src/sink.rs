@@ -373,9 +373,24 @@ impl Element for PipeWireAudioSink {
                 None => return Ok(Flow::Ok), // wait for the format before touching the device
             }
         }
+        // A single pooled buffer can be ~0.7 s of audio while the device ring holds ~0.5 s, so
+        // `push` blocks for most of a buffer's playback. Push in small slices and bail the
+        // moment a seek is requested (the generation changes), so the scheduler can run the
+        // flush promptly rather than after the whole batch has drained (spec: flush/seek).
+        // The partial data already pushed is dropped by the sink's `FlushStart` handler.
+        const SLICE: usize = 8 * 1024; // ~46 ms at 44.1 kHz stereo s16 — well under the ring
+        let start_gen = ctx.seek_gen();
         while let Some(buf) = inputs.pop() {
-            if let Some(producer) = &self.producer {
-                producer.push(buf.memory.data()); // blocks when full → backpressure
+            let Some(producer) = &self.producer else { break };
+            let data = buf.memory.data();
+            let mut off = 0;
+            while off < data.len() {
+                if ctx.seek_gen() != start_gen {
+                    return Ok(Flow::Ok); // a seek arrived: stop pushing; the loop top flushes
+                }
+                let end = (off + SLICE).min(data.len());
+                producer.push(&data[off..end]); // blocks when full → backpressure
+                off = end;
             }
         }
         Ok(Flow::Ok)
@@ -384,6 +399,17 @@ impl Element for PipeWireAudioSink {
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             Event::FormatChange(f) => self.configure(ctx, f)?,
+            // Seek (spec: flush/seek): drop the ~0.5 s of PCM buffered in the device ring so
+            // the new position's audio plays immediately instead of after the stale tail, and
+            // re-base the play-position counter to the seek target's frame.
+            Event::FlushStart => {
+                if let Some(producer) = &self.producer {
+                    producer.flush();
+                }
+                if let Some(t) = ctx.seek_target() {
+                    self.playback.frames.store(t.to_frame, Ordering::Relaxed);
+                }
+            }
             // The pipeline delivers EOS at end-of-stream: play out the buffered audio.
             Event::Eos => {
                 if let Some(producer) = &self.producer {
