@@ -11,12 +11,16 @@
 pub mod convert;
 pub mod convert_element;
 pub mod format;
+pub mod resample;
+pub mod resample_element;
 pub mod wav;
 
 pub use convert::{
     convert_interleaved, convert_interleaved_vec, converted_len, remap_channels,
 };
 pub use convert_element::AudioConvert;
+pub use resample::{gcd, output_len, ChannelResampler, PolyphaseFilter};
+pub use resample_element::AudioResample;
 pub use format::{
     AudioFormat, AudioFrameRef, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE,
     RAW_ANY_OFFER,
