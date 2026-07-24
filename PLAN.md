@@ -131,6 +131,16 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > two-thread), leaky DropNewest, loom models, ring_hop bench — fenceless-as-specced
 > proven unsound (Dekker lost-wakeup), the SeqCst wake fence stays. Remaining for
 > remux: audio (multi-track fan-in MkvMux + A_AAC/esds), av1C, `Language` tags.
+> **Post-playback fixes (same day):** (1) mpv rejected every cluster — unknown-size
+> (`0xFF`) Clusters are RFC-legal but ecosystem-hostile (libav accepts, mpv's own
+> demuxer doesn't); the writer now stages one cluster (~a GOP) and emits it sized;
+> Segment stays unknown-size. **Standing rule saved to memory: muxer output must
+> pass headless mpv AND ffprobe — they disagree in practice; our own reader is
+> never the only gate.** (2) No `Info\Duration` → players treat the output as a
+> live stream; a remux knows the duration before the lazy header, so the demuxer
+> announces a `duration` field (passthrough mode only — decode pipelines don't
+> intern the name) and the muxer writes the Duration float. ffprobe: 5385.36 s;
+> mpv seeks clean. `mkv/examples/check.rs` = full-file structural checker.
 
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
