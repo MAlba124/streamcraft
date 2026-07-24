@@ -84,6 +84,9 @@ pub struct Track {
     pub track_id: u32,
     /// Media timescale (ticks/second) from `mdhd` — the unit `dts`/`pts` are counted in.
     pub timescale: u32,
+    /// Track duration in nanoseconds, from `mdhd` duration/timescale (§8.4.2) — what a
+    /// remuxing consumer declares as the container duration. 0 when `mdhd` omitted it.
+    pub duration_ns: u64,
     /// The parsed first sample entry: codec four-CC, announce family, dims/rate/channels,
     /// the Annex B parameter-set head, and the per-sample [`Reframer`].
     pub entry: SampleEntry,
@@ -396,6 +399,7 @@ fn resolve_track(trak_body: &[u8], track_index: usize) -> Result<Option<(Track, 
     let track = Track {
         track_id,
         timescale: mdhd.timescale,
+        duration_ns: ticks_to_ns(mdhd.duration as i64, mdhd.timescale),
         entry,
         width,
         height,

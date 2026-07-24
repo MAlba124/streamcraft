@@ -163,6 +163,8 @@ fn h264_mp4_remuxes_to_conformant_mkv() {
     let record = oracle.tracks()[0].entry.config_record.clone();
     assert!(!record.is_empty(), "fixture has an avcC record");
     let (width, height) = (oracle.tracks()[0].width, oracle.tracks()[0].height);
+    let duration = oracle.tracks()[0].duration_ns;
+    assert!(duration > 0, "fixture declares an mdhd duration");
     oracle.push(&file);
     let mut samples: Vec<(u64, bool, Vec<u8>)> = Vec::new();
     // Copy the sample out first: `ResolvedSample` borrows the reader, and `ticks_to_ns`
@@ -197,6 +199,12 @@ fn h264_mp4_remuxes_to_conformant_mkv() {
     assert_eq!(t.codec_id, "V_MPEG4/ISO/AVC");
     assert_eq!(t.codec_private, record, "CodecPrivate is the avcC record, verbatim");
     assert_eq!((t.pixel_width, t.pixel_height), (width, height), "announced dims");
+    let want_dur = duration;
+    let got_dur = r.duration_ns().expect("remux declares Info\\Duration — not a live stream");
+    assert!(
+        got_dur.abs_diff(want_dur) <= sc_mkv::DEFAULT_TIMESTAMP_SCALE,
+        "duration {got_dur} ns ≈ mdhd duration {want_dur} ns (within one ms tick)"
+    );
 
     let mut frames = Vec::new();
     while let Some(f) = r.next_frame() {

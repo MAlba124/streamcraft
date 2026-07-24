@@ -170,6 +170,11 @@ pub struct MatroskaWriter {
     /// The track number treated as the "keyframe anchor" for opening Clusters: the first
     /// configured track. A keyframe on it opens a fresh Cluster (typical Matroska cadence).
     anchor_track: u64,
+    /// Presentation duration in ns, written as `Info\Duration` when known **before**
+    /// [`write_header`] (a remux knows it from the source's tables; the header is written
+    /// lazily at the first frame, so no back-patching is ever needed). Without it, players
+    /// treat the unknown-size Segment as a live stream with no duration or seek bar.
+    duration_ns: Option<u64>,
 }
 
 impl MatroskaWriter {
@@ -190,6 +195,16 @@ impl MatroskaWriter {
             header_written: false,
             cluster: None,
             anchor_track,
+            duration_ns: None,
+        }
+    }
+
+    /// Declare the presentation duration (ns), to be written as `Info\Duration`. Must be
+    /// called before [`write_header`] (which the muxer element defers to the first frame);
+    /// later calls are ignored — the Info master is already emitted.
+    pub fn set_duration_ns(&mut self, ns: u64) {
+        if !self.header_written {
+            self.duration_ns = Some(ns);
         }
     }
 
@@ -261,6 +276,11 @@ impl MatroskaWriter {
         let size_at = ebml::reserve_size(out);
         let body_start = out.len();
         ebml::write_uint(out, id::TIMESTAMP_SCALE, self.timestamp_scale);
+        // Duration is a float in TimestampScale ticks (RFC 9559 §5.1.2); without it a
+        // player treats the unknown-size Segment as a live, duration-less stream.
+        if let Some(ns) = self.duration_ns {
+            ebml::write_f64(out, id::DURATION, ns as f64 / self.timestamp_scale.max(1) as f64);
+        }
         ebml::write_string(out, id::MUXING_APP, APP_NAME);
         ebml::write_string(out, id::WRITING_APP, APP_NAME);
         let len = (out.len() - body_start) as u64;

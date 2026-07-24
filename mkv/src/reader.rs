@@ -114,6 +114,8 @@ pub struct MatroskaReader {
     tracks: Vec<Track>,
     /// True once the whole Tracks master has been parsed — discovery is complete.
     tracks_ready: bool,
+    /// Presentation duration in ns (`Info\Duration` × TimestampScale), when declared.
+    duration_ns: Option<u64>,
     /// The current Cluster's base timestamp in ticks (Cluster\Timestamp). `0` before the
     /// first Cluster.
     cluster_base_tick: i64,
@@ -139,6 +141,7 @@ impl MatroskaReader {
             timestamp_scale: DEFAULT_TIMESTAMP_SCALE,
             tracks: Vec::new(),
             tracks_ready: false,
+            duration_ns: None,
             cluster_base_tick: 0,
             pending: VecDeque::new(),
         }
@@ -147,6 +150,12 @@ impl MatroskaReader {
     /// The TimestampScale in ns/tick this stream declared (or the default until Info is read).
     pub fn timestamp_scale(&self) -> u64 {
         self.timestamp_scale
+    }
+
+    /// The presentation duration in ns, when the stream declared `Info\Duration`
+    /// (RFC 9559 §5.1.2). `None` for duration-less (live-style) streams.
+    pub fn duration_ns(&self) -> Option<u64> {
+        self.duration_ns
     }
 
     /// The tracks discovered so far (complete once [`tracks_ready`](Self::tracks_ready)).
@@ -263,10 +272,13 @@ impl MatroskaReader {
         // parse once per stream, so they slice a borrow locally with no `self` mutation until
         // after — captured here as owned indices.
         if id == id::INFO {
-            let scale = parse_info(&self.buf[ds..de])?;
+            let (scale, duration_ticks) = parse_info(&self.buf[ds..de])?;
             if let Some(scale) = scale {
                 self.timestamp_scale = scale;
             }
+            // Duration is declared in ticks; convert with the (possibly just-updated) scale.
+            self.duration_ns =
+                duration_ticks.map(|t| (t * self.timestamp_scale as f64).round() as u64);
         } else if id == id::TRACKS {
             let tracks = parse_tracks(&self.buf[ds..de])?;
             self.tracks.extend(tracks);
@@ -294,12 +306,14 @@ impl MatroskaReader {
 // holding both a `&self.buf` slice and a `&mut self.pending`. Split-borrow via free functions
 // keeps the parse zero-copy on the hot block path (no intermediate copy of the block bytes).
 
-/// Parse the Segment `Info` master for TimestampScale (spec `§ID-tree`). Returns the scale in
-/// ns/tick if present and nonzero (a zero scale would divide by zero — the default is kept);
-/// other children (MuxingApp, WritingApp, Duration, …) are skipped.
-fn parse_info(data: &[u8]) -> Result<Option<u64>, ReadError> {
+/// Parse the Segment `Info` master (spec `§ID-tree`): TimestampScale in ns/tick if present
+/// and nonzero (a zero scale would divide by zero — the default is kept), and `Duration` in
+/// **ticks** (RFC 9559 §5.1.2: a 4- or 8-octet float) if present. Other children
+/// (MuxingApp, WritingApp, …) are skipped.
+fn parse_info(data: &[u8]) -> Result<(Option<u64>, Option<f64>), ReadError> {
     let mut at = 0;
     let mut scale = None;
+    let mut duration_ticks = None;
     while at < data.len() {
         let h = ebml::read_element_header(data, at)?;
         let end = h.data_end()?.ok_or(ReadError::Malformed("unknown-size child in Info"))?;
@@ -311,10 +325,15 @@ fn parse_info(data: &[u8]) -> Result<Option<u64>, ReadError> {
             if v != 0 {
                 scale = Some(v);
             }
+        } else if h.id == id::DURATION {
+            let v = read_float(&data[h.data_start..end])?;
+            if v.is_finite() && v > 0.0 {
+                duration_ticks = Some(v);
+            }
         }
         at = end;
     }
-    Ok(scale)
+    Ok((scale, duration_ticks))
 }
 
 /// Parse the `Tracks` master into one [`Track`] per `TrackEntry` (spec `§ID-tree`).

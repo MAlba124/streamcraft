@@ -28,6 +28,9 @@ pub mod id {
     pub const SEGMENT: &[u8] = &[0x18, 0x53, 0x80, 0x67];
     pub const INFO: &[u8] = &[0x15, 0x49, 0xA9, 0x66];
     pub const TIMESTAMP_SCALE: &[u8] = &[0x2A, 0xD7, 0xB1];
+/// `Info\Duration` (RFC 9559 §5.1.2): a float, in TimestampScale ticks. Without it a
+/// player treats an unknown-size Segment as a live/duration-less stream.
+pub const DURATION: &[u8] = &[0x44, 0x89];
     pub const MUXING_APP: &[u8] = &[0x4D, 0x80];
     pub const WRITING_APP: &[u8] = &[0x57, 0x41];
 

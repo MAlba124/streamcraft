@@ -119,8 +119,12 @@ struct PadTrack {
 /// The runtime format params a src pad announces once, on its first sample.
 #[derive(Clone, Copy)]
 enum Announce {
-    /// A video track: coded/presentation dims (0,0 → announce the bare family).
-    Video { width: u32, height: u32 },
+    /// A video track: coded/presentation dims (0,0 → announce the bare family), plus the
+    /// mdhd track duration in ns — announced **only in passthrough mode** (0 elsewhere):
+    /// a remuxing consumer declares its offer field and writes `Info\Duration` from it,
+    /// while decode pipelines never intern a "duration" field name, and an announcement
+    /// with any un-interned name is dropped whole by `build_fixed`.
+    Video { width: u32, height: u32, duration_ns: u64 },
     /// An audio track: sample rate + channels (0 → bare family).
     Audio { rate: u32, channels: u32 },
     /// No declared params — a bare family announcement.
@@ -419,12 +423,21 @@ impl Mp4Demux {
     /// caps-ignoring decoder still links on the family offer.
     fn announce(ctx: &mut Ctx, pad: PadId, family: &'static str, announce: Announce) {
         match announce {
-            Announce::Video { width, height } if width != 0 && height != 0 => {
-                ctx.announce_format(
-                    pad,
-                    family,
-                    &[("width", ValueDesc::Int(width as i64)), ("height", ValueDesc::Int(height as i64))],
-                );
+            Announce::Video { width, height, duration_ns } if width != 0 && height != 0 => {
+                let dims = [
+                    ("width", ValueDesc::Int(width as i64)),
+                    ("height", ValueDesc::Int(height as i64)),
+                ];
+                if duration_ns != 0 {
+                    // Passthrough/remux only (see `Announce::Video`): the muxer writes
+                    // `Info\Duration` from this, so the output is not a duration-less
+                    // "live" stream.
+                    let mut fields = dims.to_vec();
+                    fields.push(("duration", ValueDesc::Int(duration_ns as i64)));
+                    ctx.announce_format(pad, family, &fields);
+                } else {
+                    ctx.announce_format(pad, family, &dims);
+                }
             }
             Announce::Audio { rate, channels } if rate != 0 || channels != 0 => {
                 ctx.announce_format(
@@ -452,7 +465,11 @@ impl Element for Mp4Demux {
             let (family, codec_head, reframer) =
                 Self::track_wiring(track, self.passthrough).map_err(Error::Todo)?;
             let announce = if codec::is_video_family(track.family()) {
-                Announce::Video { width: track.width, height: track.height }
+                Announce::Video {
+                    width: track.width,
+                    height: track.height,
+                    duration_ns: if self.passthrough { track.duration_ns } else { 0 },
+                }
             } else if family == "opus" || track.entry.sample_rate != 0 || track.entry.channels != 0 {
                 Announce::Audio { rate: track.entry.sample_rate, channels: track.entry.channels }
             } else {

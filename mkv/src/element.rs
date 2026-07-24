@@ -97,9 +97,13 @@ static MUX_AUDIO_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: "channels", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "sample", allowed: ConstraintDesc::Set(&MUX_SAMPLE_VALUES), preferred: None },
 ];
-static MUX_VIDEO_FIELDS: [FieldDesc; 2] = [
+static MUX_VIDEO_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: "width", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "height", allowed: ConstraintDesc::Any, preferred: None },
+    // Optional presentation duration (ns) — a remuxing demuxer knows it from the source's
+    // tables and this muxer writes it as `Info\Duration`, so the output has a duration and
+    // a seek bar instead of reading as a live stream.
+    FieldDesc { field: "duration", allowed: ConstraintDesc::Any, preferred: None },
 ];
 static MUX_SINK_OFFERS: [OfferDesc; 6] = [
     OfferDesc { family: "flac", fields: &MUX_AUDIO_FIELDS },
@@ -165,7 +169,7 @@ enum Setup {
     /// buffer** is the raw `avcC`/`hvcC` record (the demuxer emits it as one leading
     /// buffer — it is a few hundred octets, far below any pool slot), taken verbatim as
     /// `CodecPrivate` (RFC 9559 §12); every later buffer is one length-prefixed sample.
-    NalHead { codec_id: &'static str, width: u32, height: u32 },
+    NalHead { codec_id: &'static str, width: u32, height: u32, duration_ns: Option<u64> },
 }
 
 /// Muxes a single track into Matroska: one encoded frame **per input buffer** on the sink
@@ -253,11 +257,16 @@ impl MkvMux {
     }
 
     /// Install `track` and build the writer — the moment a caps-driven muxer becomes
-    /// equivalent to a constructed one.
-    fn configure(&mut self, mut track: TrackConfig) {
+    /// equivalent to a constructed one. `duration_ns` (when the announcement carried it)
+    /// becomes `Info\Duration`, written with the lazy header.
+    fn configure(&mut self, mut track: TrackConfig, duration_ns: Option<u64>) {
         track.track_number = TRACK;
         self.frame_dur_ns = Self::frame_duration_ns(&track);
-        self.writer = Some(MatroskaWriter::new(vec![track.clone()]));
+        let mut writer = MatroskaWriter::new(vec![track.clone()]);
+        if let Some(ns) = duration_ns {
+            writer.set_duration_ns(ns);
+        }
+        self.writer = Some(writer);
         self.track = Some(track);
         self.setup = Setup::Fixed;
     }
@@ -399,12 +408,15 @@ impl Element for MkvMux {
                                 }
                                 let head = std::mem::take(head);
                                 let (rate, channels, bits) = Self::flac_streaminfo_params(&head)?;
-                                self.configure(TrackConfig::flac(TRACK, head, rate, channels, bits));
+                                self.configure(
+                                    TrackConfig::flac(TRACK, head, rate, channels, bits),
+                                    None,
+                                );
                                 continue; // the head is CodecPrivate, never a block
                             }
                         }
                     }
-                    Setup::NalHead { codec_id, width, height } => {
+                    Setup::NalHead { codec_id, width, height, duration_ns } => {
                         // First buffer = the raw config record, verbatim (RFC 9559 §12:
                         // CodecPrivate *is* the AVC/HEVCDecoderConfigurationRecord).
                         // configurationVersion is 1 for both records — a cheap guard
@@ -416,8 +428,8 @@ impl Element for MkvMux {
                                  (configurationVersion != 1)",
                             ));
                         }
-                        let (codec_id, w, h) = (*codec_id, *width, *height);
-                        self.configure(TrackConfig::video(TRACK, codec_id, head, w, h));
+                        let (codec_id, w, h, dur) = (*codec_id, *width, *height, *duration_ns);
+                        self.configure(TrackConfig::video(TRACK, codec_id, head, w, h), dur);
                         continue; // the record is CodecPrivate, never a block
                     }
                     Setup::AwaitCaps => {
@@ -493,6 +505,14 @@ impl Element for MkvMux {
                                 _ => None,
                             })
                     };
+                    // Optional announced presentation duration (ns) → `Info\Duration`.
+                    let duration_ns = ctx
+                        .field_id("duration")
+                        .and_then(|id| f.get(id))
+                        .and_then(|v| match v {
+                            Value::Int(n) if n > 0 => Some(n as u64),
+                            _ => None,
+                        });
                     match family.as_str() {
                         // The CodecPrivate is the in-band native head; absorb it first.
                         "flac" => self.setup = Setup::FlacHead(Vec::new()),
@@ -503,7 +523,10 @@ impl Element for MkvMux {
                                 ));
                             };
                             let id = if family == "vp8" { "V_VP8" } else { "V_VP9" };
-                            self.configure(TrackConfig::video(TRACK, id, Vec::new(), w, h));
+                            self.configure(
+                                TrackConfig::video(TRACK, id, Vec::new(), w, h),
+                                duration_ns,
+                            );
                         }
                         // Passthrough NAL remux: the CodecPrivate arrives as the first
                         // buffer (the raw record); defer writer creation until then.
@@ -518,7 +541,12 @@ impl Element for MkvMux {
                             } else {
                                 "V_MPEGH/ISO/HEVC"
                             };
-                            self.setup = Setup::NalHead { codec_id, width: w, height: h };
+                            self.setup = Setup::NalHead {
+                                codec_id,
+                                width: w,
+                                height: h,
+                                duration_ns,
+                            };
                         }
                         // Families we cannot mux *conformantly* yet — loud, with the reason
                         // (see the module docs): av1 needs an av1C CodecPrivate; the Annex B
