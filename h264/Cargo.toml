@@ -1,6 +1,6 @@
 [package]
 name = "sc-h264"
-description = "Codec plugin for streamcraft backed by the pure-Rust oxideav-h264 (adoption pending evaluation)"
+description = "H.264 / AVC (ITU-T H.264 | ISO/IEC 14496-10) codec plugin for streamcraft, backed by the pure-Rust oxideav-h264"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,16 @@ name = "sc_h264"
 
 [dependencies]
 streamcraft-core = { path = "../core" }
+# The one sanctioned kind of dependency for a plugin crate (like libpipewire for
+# sc-pipewire): pure Rust, no build.rs, zero unsafe, MIT. See lib.rs for the
+# adoption rationale, the wire-or-reject evidence, and the dependency situation —
+# unlike sc-vp8, oxideav-h264 0.1.7 pulls oxideav-core + thiserror + serde_json
+# mandatorily (the decoder is consumed via oxideav-core's Decoder trait).
 oxideav-h264 = { version = "0.1", default-features = false }
+# Consumed types (Packet / Frame / VideoFrame / Decoder trait / CodecId). Pinned
+# to the same 0.1.x line oxideav-h264 resolves so no duplicate copy is linked.
+oxideav-core = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
+streamcraft-video = { path = "../video" }

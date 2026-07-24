@@ -595,9 +595,11 @@ dependencies = [
 name = "sc-h264"
 version = "0.1.0"
 dependencies = [
+ "oxideav-core",
  "oxideav-h264",
  "streamcraft-core",
  "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]
