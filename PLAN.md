@@ -305,8 +305,31 @@ one-liners and debugging.
   known soft spots — a fenceless fast-path variant of the SPSC ring (the SeqCst Dekker
   fence dominates the ~51 ns/item hop) and a deeper-queue / batched-submission io_uring
   reactor.
-- **TLS/https for `sc-http`**: the reason `sc-http` is an isolated plugin (needs a TLS
-  library — the one sanctioned dependency, like `sc-pipewire`).
+- **TLS/https for `sc-http`** — *decided (2026-07-24): rustls.* The sanctioned dependency
+  for this plugin (like libpipewire for `sc-pipewire`); core stays at zero deps.
+  - **Why rustls**: pure Rust, audited (Cure53/ISRG), and — decisive here — a **sans-IO
+    core**: `ClientConnection` never owns the socket (`read_tls`/`write_tls` +
+    `reader()`/`writer()` pump buffers), so it drops into today's blocking-`TcpStream`
+    `HttpSrc` *and* stays compatible with the io_uring reactor later, where
+    stream-owning TLS APIs (native-tls/openssl — C bindings anyway) get awkward.
+  - **Crypto provider** (the real decision; rustls 0.23 makes it pluggable): use
+    **`rustls-graviola`** — Rust with formally-verified constant-time cores (s2n-bignum
+    ports), from the rustls maintainer, x86-64/aarch64 only (fine for our targets), **no
+    C compiler in the tree** (the default `aws-lc-rs` compiles C via cmake — audit/FIPS
+    pedigree, but a real risk with this repo's worked-around clang toolchain; `ring` has
+    maintenance concerns; `rustls-rustcrypto` is unaudited). The `CryptoProvider`
+    boundary makes this low-regret — swappable to `aws-lc-rs` later without touching
+    element code.
+  - **Roots**: `rustls-native-certs` (system trust store), optional bundled
+    `webpki-roots` fallback feature.
+  - **Integration**: `enum Transport { Plain(TcpStream), Tls(StreamOwned<ClientConnection,
+    TcpStream>) }` implementing `Read` — the header/chunked/Content-Length paths in
+    `http/src/httpsrc.rs` are untouched (blocking reads are fine; `HttpSrc` is Active).
+    Pin ALPN to `http/1.1` (refuse h2); enable session resumption (free win for
+    reconnect-on-seek via `Range`). Everything behind an **`https` cargo feature** so the
+    plain-HTTP build keeps its current footprint. Client-only, TLS 1.2+1.3.
+  - **Verify at adoption time** (not from memory): exact provider crate names/versions
+    and graviola's current maturity — check the rustls provider docs when wiring.
 - **Spec** (`streamcraft.md`): write the **dynamic-caps two-layer** section and an
   **audio-sink / clocking** section (work *around* the user's WIP blocks).
 
