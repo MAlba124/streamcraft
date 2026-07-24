@@ -10,4 +10,4 @@
 mod ring;
 mod sink;
 
-pub use sink::PipeWireAudioSink;
+pub use sink::{AudioControl, PipeWireAudioSink};

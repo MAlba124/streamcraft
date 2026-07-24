@@ -13,6 +13,8 @@
 //! announces (spec: dynamic caps). On EOS the pipeline delivers `Event::Eos`, and the sink
 //! drains the ring (plays out) before returning.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use pipewire as pw;
@@ -127,7 +129,10 @@ fn run_pw(
     channels: u32,
     fmt: Fmt,
     stride: usize,
+    pb: Arc<Playback>,
 ) -> Result<(), pw::Error> {
+    // Silence byte for this format: 0 for signed/float PCM, 0x80 for unsigned U8.
+    let silence: u8 = if matches!(fmt, Fmt::U8) { 0x80 } else { 0 };
     pw::init();
     let mainloop = pw::main_loop::MainLoop::new(None)?;
     let context = pw::context::Context::new(&mainloop)?;
@@ -154,7 +159,14 @@ fn run_pw(
                 if let Some(data) = datas.get_mut(0) {
                     let size = if let Some(slice) = data.data() {
                         let n = (slice.len() / stride) * stride; // whole frames only
-                        consumer.pull(&mut slice[..n]);
+                        if pb.paused.load(Ordering::Relaxed) {
+                            // Paused: render silence and hold the ring (audio preserved),
+                            // don't advance the play position; upstream backpressures.
+                            slice[..n].fill(silence);
+                        } else {
+                            consumer.pull(&mut slice[..n]);
+                            pb.frames.fetch_add((n / stride) as u64, Ordering::Relaxed);
+                        }
                         n
                     } else {
                         0
@@ -209,6 +221,50 @@ fn run_pw(
 
 // --- the element -----------------------------------------------------------------------
 
+/// Shared playback state between the element and the device's real-time callback: the pause
+/// latch, the rendered-frame count (for the play position), and the sample rate. Relaxed
+/// atomics — the RT callback only ever does a load and an add, no lock, no allocation.
+#[derive(Default)]
+struct Playback {
+    paused: AtomicBool,
+    frames: AtomicU64, // whole interchannel frames the device has rendered
+    rate: AtomicU32,   // sample rate, published once at configure
+}
+
+/// A cloneable handle to control and observe playback (spec: Clocking — pause). Obtain it
+/// from [`PipeWireAudioSink::control`] before adding the sink to the pipeline. Pausing makes
+/// the device render silence and hold its buffer — no audio is lost and the whole pipeline
+/// backpressures to a stop; resuming continues from exactly where it left off.
+#[derive(Clone)]
+pub struct AudioControl {
+    pb: Arc<Playback>,
+}
+
+impl AudioControl {
+    pub fn pause(&self) {
+        self.pb.paused.store(true, Ordering::Relaxed);
+    }
+    pub fn resume(&self) {
+        self.pb.paused.store(false, Ordering::Relaxed);
+    }
+    /// Flip paused↔playing; returns the new state (`true` = now paused).
+    pub fn toggle(&self) -> bool {
+        !self.pb.paused.fetch_xor(true, Ordering::Relaxed)
+    }
+    pub fn is_paused(&self) -> bool {
+        self.pb.paused.load(Ordering::Relaxed)
+    }
+    /// Seconds of audio the device has rendered so far — the play position.
+    pub fn position_secs(&self) -> f64 {
+        let rate = self.pb.rate.load(Ordering::Relaxed);
+        if rate == 0 {
+            0.0
+        } else {
+            self.pb.frames.load(Ordering::Relaxed) as f64 / rate as f64
+        }
+    }
+}
+
 /// Plays interleaved PCM through PipeWire. Construct with [`PipeWireAudioSink::new`].
 #[derive(Default)]
 pub struct PipeWireAudioSink {
@@ -218,11 +274,21 @@ pub struct PipeWireAudioSink {
     quit: Option<pw::channel::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     started: bool,
+    /// Pause latch + play-position counter, shared with the RT callback and the app's
+    /// [`AudioControl`] handle.
+    playback: Arc<Playback>,
 }
 
 impl PipeWireAudioSink {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A handle to pause/resume and read the play position. Call before
+    /// `pipeline.add(sink)` (the pipeline takes ownership of the sink); the handle keeps
+    /// working for the pipeline's lifetime.
+    pub fn control(&self) -> AudioControl {
+        AudioControl { pb: Arc::clone(&self.playback) }
     }
 
     /// Configure the device from the negotiated `audio/raw` format and spawn the PipeWire
@@ -259,13 +325,15 @@ impl PipeWireAudioSink {
         let cap = stride * (rate as usize / 2).max(4096);
         let (producer, consumer) = ring::spsc(cap);
 
+        self.playback.rate.store(rate, Ordering::Relaxed);
         let (tx, rx) = pw::channel::channel::<()>();
+        let pb = Arc::clone(&self.playback);
         let handle = std::thread::Builder::new()
             .name("sc-pipewire".into())
             .spawn(move || {
                 // `consumer` is moved onto the PW thread and pulled from its RT callback; on
                 // any early exit it drops here, closing the ring so a parked producer wakes.
-                if let Err(e) = run_pw(consumer, rx, rate, channels, fmt, stride) {
+                if let Err(e) = run_pw(consumer, rx, rate, channels, fmt, stride, pb) {
                     eprintln!("pipewireaudiosink: PipeWire error: {e}");
                 }
             })
