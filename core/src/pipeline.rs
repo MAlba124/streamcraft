@@ -1251,6 +1251,21 @@ fn run_group(
         }
     }
 
+    // Each member's (single) sink pad, for intra-group in-band event delivery — a
+    // FormatChange from a co-grouped upstream installs the announced format there
+    // (spec: Formats — dynamic caps; events are delivered before the buffers they
+    // precede even when the hop is an inline function call, not a ring).
+    let member_sink_pads: Vec<Option<PadId>> = elements
+        .iter()
+        .map(|e| {
+            e.desc()
+                .pads
+                .iter()
+                .position(|p| p.direction == Direction::Sink)
+                .map(|i| PadId(i as u32))
+        })
+        .collect();
+
     // Start each element; hand any file it registered to this group's reactor.
     for i in 0..m {
         elements[i].start(&mut ctxs[i])?;
@@ -1408,6 +1423,25 @@ fn run_group(
                 elements[0].process(&mut ctxs[0], Inputs::empty())
             } else {
                 let mut input = ctxs[i].take_input();
+                // In-band events from a co-grouped upstream ride the inline-appended
+                // batch (a ring-fed head's events were already delivered at feed
+                // time and never reach here). Deliver them now, before the buffers
+                // they precede — this is what lets a passive consumer see a passive
+                // producer's FormatChange (spec: Formats — dynamic caps).
+                let events = input.take_events();
+                if !events.is_empty() {
+                    if let Err(e) = deliver_events(
+                        &mut *elements[i],
+                        &mut ctxs[i],
+                        member_sink_pads[i],
+                        events,
+                        &vocabulary,
+                    ) {
+                        ctxs[i].set_input(input);
+                        fatal = Some(e);
+                        break;
+                    }
+                }
                 let f = elements[i].process(&mut ctxs[i], Inputs::owned(&mut input));
                 ctxs[i].set_input(input);
                 f
