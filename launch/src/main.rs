@@ -1,29 +1,31 @@
-//! `scraft-launch` — a gst-launch-style runner for streamcraft (spec: Plugins —
-//! "a gst-launch equivalent is cheap once the registry exists and invaluable for
-//! debugging and bug reports").
+//! `streamcraft` — the CLI: `launch` (gst-launch), `inspect` (gst-inspect), `dot`
+//! (spec: Plugins — "a gst-launch equivalent is cheap once the registry exists and
+//! invaluable for debugging and bug reports").
 //!
 //! It aggregates every in-tree plugin crate's `register(&mut Registry)` into one
-//! registry, parses a launch string into a [`Pipeline`], and drives it to EOS.
+//! registry; `launch` parses a pipeline into a [`Pipeline`] and drives it to EOS.
 //!
 //! ```text
-//! scraft-launch "filesrc path=in.wav ! wavparse ! flacenc ! filesink path=out.flac"
-//! scraft-launch "videotestsrc frames=90 ! videocksink"
-//! scraft-launch --pool 4194304x16 "videotestsrc width=1280 height=720 frames=30 ! videocksink"
-//! scraft-launch --dump-dot "testsrc total=65536 ! testsink"
-//! scraft-launch --counters   "testsrc total=65536 ! testsink"
-//! scraft-launch --log info    "filesrc path=x ! filesink path=y"
+//! streamcraft launch filesrc path=in.wav ! wavparse ! flacenc ! filesink path=out.flac
+//! streamcraft launch --counters testsrc total=65536 ! testsink
+//! streamcraft launch --pool 4194304x16 videotestsrc width=1280 height=720 frames=30 ! videocksink
+//! streamcraft dot testsrc total=65536 ! testsink
+//! streamcraft inspect flacenc
+//! streamcraft inspect            # list every registered element
 //! ```
 //!
-//! Flags (before the launch string):
-//! * `--dump-dot`      — print the pipeline as Graphviz `dot` and exit (no run).
+//! Switches come **first**; everything after the first non-switch argument is the
+//! pipeline, taken verbatim and joined with spaces — no quoting needed (the
+//! gst-launch contract; interactive shells with `!` history expansion may still
+//! prefer quotes).
+//!
+//! `launch` switches:
 //! * `--counters`      — after the run, print each element's `CounterSnapshot`.
 //! * `--log LEVEL`     — enable stderr logging up to LEVEL (error/warn/info/debug/trace).
 //! * `--no-progress`   — suppress the live progress line (auto-off when stderr isn't a tty).
 //! * `--pool SIZExN`   — size the buffer pool: `SIZE` bytes per slot, `N` slots (e.g.
 //!   `4194304x16`). A raw-video frame must fit one slot, so big frames need this raised
 //!   from the default. Parsed leniently (`x` or `*`, whitespace-tolerant).
-//! * `--list`          — list every registered element name and exit.
-//! * `-h`/`--help`     — usage.
 //!
 //! ## Progress
 //! While running, a single in-place stderr line shows running time, bytes produced
@@ -70,6 +72,7 @@ fn build_registry() -> Registry {
     r
 }
 
+#[cfg_attr(test, derive(Debug))]
 struct Options {
     launch: String,
     dump_dot: bool,
@@ -80,51 +83,85 @@ struct Options {
     pool: Option<(usize, u32)>,
 }
 
-/// Parse argv (already skipping the program name) into [`Options`], or a message to
-/// print (help/list/usage error). Total: never panics on bad flags.
-fn parse_args(args: Vec<String>) -> Result<Options, String> {
-    let mut launch: Option<String> = None;
-    let mut dump_dot = false;
-    let mut counters = false;
-    let mut log = None;
-    let mut no_progress = false;
-    let mut pool = None;
+/// A parsed invocation: run/dot a pipeline, or inspect (one element, or list all).
+#[cfg_attr(test, derive(Debug))]
+enum Cmd {
+    Pipeline(Options),
+    Inspect(Option<String>),
+}
+
+/// Parse argv (already skipping the program name) into a [`Cmd`], or a message to
+/// print (help/usage error). Total: never panics on bad input.
+///
+/// Contract (the gst-launch shape): a subcommand first, then that subcommand's
+/// switches, then — for `launch`/`dot` — *everything else verbatim* as the pipeline,
+/// joined with single spaces. Nothing after the first non-switch word is interpreted
+/// as a switch, so `volume=-3`-style words can never collide with flags.
+fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
     let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--dump-dot" => dump_dot = true,
-            "--counters" => counters = true,
-            "--no-progress" => no_progress = true,
-            "--log" => {
-                let lvl = it.next().ok_or_else(|| "--log needs a LEVEL argument".to_string())?;
-                log = Some(
-                    Level::from_name(&lvl)
-                        .ok_or_else(|| format!("unknown log level '{lvl}' (error/warn/info/debug/trace)"))?,
-                );
-            }
-            "--pool" => {
-                let spec = it.next().ok_or_else(|| "--pool needs a SIZExSLOTS argument".to_string())?;
-                pool = Some(parse_pool(&spec)?);
-            }
-            "-h" | "--help" => return Err(usage()),
-            "--list" => return Err(list_elements()),
-            other if other.starts_with('-') && other != "-" => {
-                return Err(format!("unknown flag '{other}'\n\n{}", usage()));
-            }
-            // The first non-flag positional is the launch string.
-            _ => {
-                if launch.is_some() {
-                    return Err(format!(
-                        "unexpected extra argument '{arg}' — quote the whole launch string\n\n{}",
-                        usage()
-                    ));
+    let sub = it.next().ok_or_else(usage)?;
+    match sub.as_str() {
+        "launch" | "dot" => {
+            let dump_dot = sub == "dot";
+            let mut counters = false;
+            let mut log = None;
+            let mut no_progress = false;
+            let mut pool = None;
+            let mut words: Vec<String> = Vec::new();
+            while let Some(arg) = it.next() {
+                if !words.is_empty() {
+                    words.push(arg);
+                    continue;
                 }
-                launch = Some(arg);
+                match arg.as_str() {
+                    "--counters" => counters = true,
+                    "--no-progress" => no_progress = true,
+                    "--log" => {
+                        // Switch values still come from the iterator; we are before
+                        // the pipeline, so this cannot swallow a pipeline word.
+                        let lvl = take_value(&mut it, "--log LEVEL")?;
+                        log = Some(Level::from_name(&lvl).ok_or_else(|| {
+                            format!("unknown log level '{lvl}' (error/warn/info/debug/trace)")
+                        })?);
+                    }
+                    "--pool" => {
+                        let spec = take_value(&mut it, "--pool SIZExSLOTS")?;
+                        pool = Some(parse_pool(&spec)?);
+                    }
+                    "-h" | "--help" => return Err(usage()),
+                    other if other.starts_with('-') && other != "-" => {
+                        return Err(format!("unknown switch '{other}'\n\n{}", usage()));
+                    }
+                    _ => words.push(arg), // first pipeline word — verbatim from here on
+                }
             }
+            if words.is_empty() {
+                return Err(format!("missing pipeline\n\n{}", usage()));
+            }
+            Ok(Cmd::Pipeline(Options {
+                launch: words.join(" "),
+                dump_dot,
+                counters,
+                log,
+                no_progress,
+                pool,
+            }))
         }
+        "inspect" => {
+            let name = it.next();
+            if let Some(extra) = it.next() {
+                return Err(format!("inspect takes at most one element name (got '{extra}')\n\n{}", usage()));
+            }
+            Ok(Cmd::Inspect(name))
+        }
+        "list" => Ok(Cmd::Inspect(None)),
+        "help" | "-h" | "--help" => Err(usage()),
+        other => Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
-    let launch = launch.ok_or_else(|| format!("missing launch string\n\n{}", usage()))?;
-    Ok(Options { launch, dump_dot, counters, log, no_progress, pool })
+}
+
+fn take_value(it: &mut impl Iterator<Item = String>, what: &str) -> Result<String, String> {
+    it.next().ok_or_else(|| format!("{what}: missing value"))
 }
 
 /// Parse a `--pool` spec — `SLOT_SIZExSLOTS` (`4194304x16`) — into `(slot_size, slots)`.
@@ -151,20 +188,28 @@ fn parse_pool(spec: &str) -> Result<(usize, u32), String> {
 }
 
 fn usage() -> String {
-    "usage: scraft-launch [--dump-dot] [--counters] [--log LEVEL] [--no-progress] [--pool SIZExSLOTS] \"elem prop=val ! elem ! …\"\n\
+    "usage: streamcraft <command> …\n\
      \n\
-     flags:\n\
-     \x20 --dump-dot        print the pipeline as Graphviz dot and exit\n\
+     commands:\n\
+     \x20 launch [switches] ELEM prop=val ! ELEM ! …   run a pipeline to EOS\n\
+     \x20 dot    [switches] ELEM ! …                   print the pipeline as Graphviz dot\n\
+     \x20 inspect [NAME]                               describe an element / list all\n\
+     \x20 list                                         list registered element names\n\
+     \x20 help                                         this message\n\
+     \n\
+     switches come first; everything after the first non-switch word is the pipeline\n\
+     (no quoting needed).\n\
+     \n\
+     launch switches:\n\
      \x20 --counters        print each element's counters after the run\n\
      \x20 --log LEVEL       log to stderr up to LEVEL (error/warn/info/debug/trace)\n\
      \x20 --no-progress     suppress the live progress line (auto-off when not a tty)\n\
      \x20 --pool SIZExSLOTS size the buffer pool: SIZE bytes/slot, SLOTS slots (e.g. 4194304x16);\n\
-     \x20                   a raw-video frame must fit one slot, so big frames need this raised\n\
-     \x20 --list            list registered element names and exit\n\
-     \x20 -h, --help        this message"
+     \x20                   a raw-video frame must fit one slot, so big frames need this raised"
         .to_string()
 }
 
+/// `inspect` with no name / `list`: every registered element, one per line.
 fn list_elements() -> String {
     let r = build_registry();
     let mut s = String::from("registered elements:\n");
@@ -178,12 +223,28 @@ fn list_elements() -> String {
 
 fn main() -> ExitCode {
     let opts = match parse_args(std::env::args().skip(1).collect()) {
-        Ok(o) => o,
+        Ok(Cmd::Pipeline(o)) => o,
+        Ok(Cmd::Inspect(Some(name))) => {
+            return match build_registry().describe(&name) {
+                Some(card) => {
+                    print!("{card}");
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("no element '{name}' — 'streamcraft inspect' lists them all");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Ok(Cmd::Inspect(None)) => {
+            print!("{}", list_elements());
+            return ExitCode::SUCCESS;
+        }
         Err(msg) => {
-            // Help/list is not an error; a usage problem is. Both print to stderr; the
+            // Help is not an error; a usage problem is. Both print to stderr; the
             // exit code distinguishes them.
             eprintln!("{msg}");
-            return if msg.starts_with("usage:") || msg.starts_with("registered elements:") {
+            return if msg.starts_with("usage:") {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -350,7 +411,67 @@ fn print_counters(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraf
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_size, parse_pool};
+    use super::{fmt_size, parse_args, parse_pool, Cmd};
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn launch_joins_unquoted_pipeline_words_after_switches() {
+        let Ok(Cmd::Pipeline(o)) = parse_args(argv(&[
+            "launch", "--counters", "--pool", "1024x4", "testsrc", "total=65536", "!", "testsink",
+        ])) else {
+            panic!("expected a pipeline command");
+        };
+        assert_eq!(o.launch, "testsrc total=65536 ! testsink");
+        assert!(o.counters && !o.dump_dot);
+        assert_eq!(o.pool, Some((1024, 4)));
+    }
+
+    #[test]
+    fn switch_looking_words_after_the_pipeline_starts_stay_pipeline() {
+        // Nothing after the first non-switch word is interpreted — the gst contract.
+        let Ok(Cmd::Pipeline(o)) =
+            parse_args(argv(&["launch", "testsrc", "--counters", "!", "testsink"]))
+        else {
+            panic!("expected a pipeline command");
+        };
+        assert_eq!(o.launch, "testsrc --counters ! testsink");
+        assert!(!o.counters, "--counters inside the pipeline is data, not a switch");
+    }
+
+    #[test]
+    fn dot_is_launch_without_running() {
+        let Ok(Cmd::Pipeline(o)) = parse_args(argv(&["dot", "testsrc", "!", "testsink"])) else {
+            panic!("expected a pipeline command");
+        };
+        assert!(o.dump_dot);
+        assert_eq!(o.launch, "testsrc ! testsink");
+    }
+
+    #[test]
+    fn inspect_routes_name_and_bare_list() {
+        assert!(matches!(
+            parse_args(argv(&["inspect", "flacenc"])),
+            Ok(Cmd::Inspect(Some(n))) if n == "flacenc"
+        ));
+        assert!(matches!(parse_args(argv(&["inspect"])), Ok(Cmd::Inspect(None))));
+        assert!(matches!(parse_args(argv(&["list"])), Ok(Cmd::Inspect(None))));
+        assert!(parse_args(argv(&["inspect", "a", "b"])).is_err());
+    }
+
+    #[test]
+    fn bad_invocations_error_without_panicking() {
+        assert!(parse_args(argv(&[])).is_err());
+        assert!(parse_args(argv(&["frobnicate"])).is_err());
+        assert!(parse_args(argv(&["launch"])).is_err(), "missing pipeline");
+        assert!(parse_args(argv(&["launch", "--pool"])).is_err(), "missing switch value");
+        assert!(parse_args(argv(&["launch", "--nope", "a", "!", "b"])).is_err());
+        // help is a usage message, flagged via the Err channel but starts with usage:
+        let msg = parse_args(argv(&["help"])).unwrap_err();
+        assert!(msg.starts_with("usage:"));
+    }
 
     #[test]
     fn fmt_size_picks_binary_units() {

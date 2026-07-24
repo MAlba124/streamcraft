@@ -1,13 +1,13 @@
 [package]
-name = "scraft-launch"
-description = "gst-launch-style parse-launch runner for streamcraft (spec: Plugins)"
+name = "streamcraft-cli"
+description = "The streamcraft command: launch (gst-launch), inspect (gst-inspect), dot (spec: Plugins)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "scraft-launch"
+name = "streamcraft"
 path = "src/main.rs"
 
 [dependencies]
