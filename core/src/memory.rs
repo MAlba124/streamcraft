@@ -91,6 +91,32 @@ impl Pool {
         })
     }
 
+    /// Acquire a buffer of at least `n` usable bytes: a pooled slot when `n` fits and
+    /// one is free, otherwise an **exactly-`n`** heap allocation. The right-sized
+    /// fallback is the point (spec: Memory — pool negotiation is future work): with
+    /// one pipeline-wide slot size, a cold/tail path emitting a 15 KB demuxed sample
+    /// must not pay a multi-MiB slot per buffer — that turned a movie transcode into
+    /// gigabytes. Odd-sized boxes recycle to nothing (`recycle` keeps only slot-sized
+    /// ones), and every heap fallback still shows in `PoolStats::slot_allocations`.
+    /// Hot paths should prefer `try_acquire` + backpressure; this is for bounded
+    /// flushes (an EOS drain) where yielding is not an option.
+    pub fn acquire_exact(&self, n: usize) -> Memory {
+        if n <= self.inner.slot_size {
+            if let Some(m) = self.try_acquire() {
+                return m;
+            }
+        }
+        self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
+        self.inner.acquires.fetch_add(1, Ordering::Relaxed);
+        let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.high_water.fetch_max(now, Ordering::Relaxed);
+        Memory {
+            buf: Some(vec![0u8; n.max(1)].into_boxed_slice()),
+            len: 0,
+            pool: Arc::clone(&self.inner),
+        }
+    }
+
     /// Take a slot from the free-list, or heap-allocate one on a miss.
     pub fn acquire(&self) -> Memory {
         let recycled = self.inner.free.lock().unwrap().pop();

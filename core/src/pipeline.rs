@@ -1388,7 +1388,13 @@ fn run_group(
                     None => upstream_closed = true,
                 }
             } else {
-                while let Some(mut batch) = up.try_pop() {
+                // Backlog cap (the ring-fed twin of the inline gate): stop popping while
+                // the head still holds INLINE_INPUT_CAP unconsumed buffers, so a slow
+                // head (a video decoder) is bounded by its ring + this cap instead of
+                // accumulating its whole upstream's output — every buffered buffer pins
+                // a pool slot, and unbounded backlogs are how a movie eats gigabytes.
+                while ctxs[0].input_len() < INLINE_INPUT_CAP {
+                    let Some(mut batch) = up.try_pop() else { break };
                     if batch.seek_gen < seek_gen {
                         continue; // stale pre-seek data (buffers recycle on drop)
                     }
@@ -1406,7 +1412,7 @@ fn run_group(
                     }
                     progressed = true;
                 }
-                if closed {
+                if closed && up.is_empty() {
                     upstream_closed = true;
                 }
             }

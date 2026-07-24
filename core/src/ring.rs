@@ -285,6 +285,20 @@ impl<T> Consumer<T> {
         self.inner.closed.load(Ordering::Acquire)
     }
 
+    /// Items currently queued, from the consumer's side. Momentary (the producer may
+    /// be pushing concurrently); used by the scheduler to distinguish "closed and
+    /// drained" from "closed with a tail still queued" when its backlog cap left
+    /// items behind.
+    pub fn len(&self) -> usize {
+        let head = self.inner.head.0.load(Ordering::Relaxed);
+        let tail = self.inner.tail.0.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Blocking pop. Blocks while empty; `None` once the producer is gone *and* the
     /// ring has drained.
     pub fn pop(&self) -> Option<T> {

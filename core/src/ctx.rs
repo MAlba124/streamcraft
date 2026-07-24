@@ -335,6 +335,15 @@ impl Ctx {
         Some(self.buffer(memory))
     }
 
+    /// Allocate a buffer of at least `n` usable bytes: a pooled slot when one is free
+    /// and large enough, else an exactly-`n` heap allocation (never a slot-sized
+    /// over-allocation — see [`Pool::acquire_exact`]). For bounded cold paths (an EOS
+    /// flush emitting the tail of a stream); steady-state producers use
+    /// [`try_alloc`](Self::try_alloc) + backpressure instead.
+    pub fn alloc_exact(&mut self, _pad: PadId, n: usize) -> Buffer {
+        self.buffer(self.pool.acquire_exact(n))
+    }
+
     fn buffer(&self, memory: crate::memory::Memory) -> Buffer {
         Buffer {
             memory,
