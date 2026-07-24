@@ -151,12 +151,40 @@ fn main() {
         p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
     }
 
-    println!("playing {path} — close the window or Ctrl-C…");
+    println!("playing {path} — 'p'⏎ pause/resume, 'q'⏎ quit (or close the window / Ctrl-C)…");
     if let Some(secs) = max_secs {
         let stop = p.stop_handle();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
             stop.stop();
+        });
+    }
+    // Transport control from stdin (spec: Clocking — pause is a clock op): running
+    // time freezes, the audio sink holds its hardware, video holds its frame; resume
+    // continues exactly where it left off. Line-based — no raw-mode termios, no deps.
+    {
+        let pause = p.pause_handle();
+        let stop = p.stop_handle();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if std::io::BufRead::read_line(&mut stdin.lock(), &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                match line.trim() {
+                    "p" => {
+                        let paused = pause.toggle();
+                        println!("{}", if paused { "⏸ paused" } else { "▶ playing" });
+                    }
+                    "q" => {
+                        stop.stop();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         });
     }
     let result = p.run();
