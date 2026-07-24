@@ -68,4 +68,7 @@ pub mod writer;
 
 pub use element::{MkvDemux, MkvMux};
 pub use reader::{Frame, MatroskaReader, Track};
-pub use writer::{AudioConfig, MatroskaWriter, TrackConfig, WriteError, APP_NAME, DEFAULT_TIMESTAMP_SCALE};
+pub use writer::{
+    AudioConfig, MatroskaWriter, TrackConfig, VideoConfig, WriteError, APP_NAME,
+    DEFAULT_TIMESTAMP_SCALE,
+};

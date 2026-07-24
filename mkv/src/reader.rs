@@ -53,6 +53,12 @@ pub struct Track {
     pub channels: u32,
     /// `Audio\BitDepth` (bits per sample), or `0` if absent.
     pub bit_depth: u32,
+    /// `Video\PixelWidth` in pixels (RFC 9559 §5.1.4.1.28.6), or `0` if the entry carried no
+    /// Video master. A downstream video decoder re-announces authoritative dimensions from the
+    /// bitstream; this is the container's declared size, used to seed the pad announcement.
+    pub pixel_width: u32,
+    /// `Video\PixelHeight` in pixels (RFC 9559 §5.1.4.1.28.7), or `0` if absent.
+    pub pixel_height: u32,
 }
 
 /// One decoded frame ready to route to a track's src pad (spec `§simpleblock`, RFC 9559
@@ -330,7 +336,7 @@ fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, ReadError> {
 }
 
 /// Parse one `TrackEntry` master (spec `§ID-tree`) into a [`Track`]. Descends the nested
-/// `Audio` master for the audio params.
+/// `Audio` master for the audio params and the `Video` master for pixel dimensions.
 fn parse_track_entry(data: &[u8]) -> Result<Track, ReadError> {
     let mut track = Track {
         track_number: 0,
@@ -339,6 +345,8 @@ fn parse_track_entry(data: &[u8]) -> Result<Track, ReadError> {
         sampling_frequency: 0.0,
         channels: 0,
         bit_depth: 0,
+        pixel_width: 0,
+        pixel_height: 0,
     };
     let mut at = 0;
     while at < data.len() {
@@ -356,6 +364,8 @@ fn parse_track_entry(data: &[u8]) -> Result<Track, ReadError> {
             track.codec_private = body.to_vec();
         } else if h.id == id::AUDIO {
             parse_audio(body, &mut track)?;
+        } else if h.id == id::VIDEO {
+            parse_video(body, &mut track)?;
         }
         at = end;
     }
@@ -384,6 +394,28 @@ fn parse_audio(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
             track.channels = read_uint(body) as u32;
         } else if h.id == id::BIT_DEPTH {
             track.bit_depth = read_uint(body) as u32;
+        }
+        at = end;
+    }
+    Ok(())
+}
+
+/// Parse the nested `Video` master (RFC 9559 §5.1.4.1.28) into the track's pixel dimensions.
+/// PixelWidth/PixelHeight are EBML uints (RFC 8794 §7.1); other children (crop, colour, …)
+/// are skipped — a video decoder re-announces authoritative dims from the bitstream.
+fn parse_video(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
+    let mut at = 0;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at)?;
+        let end = h.data_end()?.ok_or(ReadError::Malformed("unknown-size child in Video"))?;
+        if end > data.len() {
+            return Err(ReadError::Malformed("Video child runs past its master"));
+        }
+        let body = &data[h.data_start..end];
+        if h.id == id::PIXEL_WIDTH {
+            track.pixel_width = read_uint(body) as u32;
+        } else if h.id == id::PIXEL_HEIGHT {
+            track.pixel_height = read_uint(body) as u32;
         }
         at = end;
     }
