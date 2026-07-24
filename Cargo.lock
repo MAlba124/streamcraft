@@ -761,7 +761,10 @@ dependencies = [
 name = "sc-mp4"
 version = "0.1.0"
 dependencies = [
+ "oxideav-core",
  "oxideav-mp4",
+ "sc-h264",
+ "sc-mkv",
  "streamcraft-core",
  "streamcraft-elements",
 ]
@@ -947,6 +950,7 @@ dependencies = [
  "sc-h265",
  "sc-mkv",
  "sc-mp3",
+ "sc-mp4",
  "sc-ogg",
  "sc-vk",
  "sc-vp8",

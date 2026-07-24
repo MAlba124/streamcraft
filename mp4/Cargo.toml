@@ -1,6 +1,6 @@
 [package]
 name = "sc-mp4"
-description = "Plugin for streamcraft backed by the pure-Rust oxideav-mp4 (adoption pending evaluation)"
+description = "Hand-written, dependency-free ISO-BMFF (ISO/IEC 14496-12) MP4 container demuxer plugin for streamcraft"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,27 @@ repository.workspace = true
 name = "sc_mp4"
 
 [dependencies]
+# Hand-written container — the whole point is zero container dependencies. Only the
+# framework's core vocabulary (buffers, batches, the element contract) is pulled in for
+# the element wrapper; the box parser and the sample-table resolver are core-independent.
 streamcraft-core = { path = "../core" }
-oxideav-mp4 = { version = "0.0.9", default-features = false }
+# The avcC/hvcC → Annex B reframers are shared with sc-mkv: the exact same ISO/IEC
+# 14496-15 configuration records ride an MKV `CodecPrivate` and an MP4 `avc1`/`hvc1`
+# sample entry, so we reuse `sc-mkv`'s tested `nal_head_from_config` + `Reframer` instead
+# of copying (see mp4/NOTES.md, "Reframer reuse"). No cycle: sc-mkv does not depend on
+# sc-mp4. This is the sole non-core dependency and it is a container-support crate, not a
+# container library — the MP4 box grammar itself is 100% hand-written here.
+sc-mkv = { path = "../mkv" }
 
 [dev-dependencies]
+# Cross-validation ORACLE ONLY (the container rule: MP4 is hand-written; oxideav-mp4 is
+# never a production dep — see mp4/NOTES.md). Our sample enumeration (count / offset /
+# size / pts / dts / keyframe) is asserted against oxideav-mp4's demuxer over the same
+# committed fixture, so a table-resolution bug is caught against an independent reader.
+oxideav-mp4 = { version = "0.0.9", default-features = false }
+oxideav-core = "0.1"
+# End-to-end decode integration: demux the H.264 fixture and decode it through sc-h264 in
+# a real pipeline (mirrors mkv/tests/vp8_playback.rs).
+sc-h264 = { path = "../h264" }
+# The pipeline harness (ByteSrc/recording sink shapes) for the end-to-end demux tests.
 streamcraft-elements = { path = "../elements" }
