@@ -89,8 +89,8 @@ pub use codec::{family_for, nal_head_from_config, Reframer, ReframeError};
 pub use element::{MkvDemux, MkvMux};
 pub use reader::{Frame, MatroskaReader, Track};
 pub use writer::{
-    AudioConfig, MatroskaWriter, TrackConfig, VideoConfig, WriteError, APP_NAME,
-    DEFAULT_TIMESTAMP_SCALE,
+    AudioConfig, MatroskaWriter, MuxOut, MuxPiece, TrackConfig, VideoConfig, WriteError,
+    APP_NAME, DEFAULT_TIMESTAMP_SCALE,
 };
 
 use streamcraft_core::element::Element;
