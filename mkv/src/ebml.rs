@@ -49,6 +49,14 @@ pub mod id {
     pub const CLUSTER: &[u8] = &[0x1F, 0x43, 0xB6, 0x75];
     pub const TIMESTAMP: &[u8] = &[0xE7];
     pub const SIMPLE_BLOCK: &[u8] = &[0xA3];
+
+    // BlockGroup + Block — the demuxer reads these; the muxer emits only SimpleBlock, but a
+    // conforming Matroska file may store frames in a BlockGroup wrapping a plain Block (RFC
+    // 9559 §5.1.3.5). The demuxer accepts both forms.
+    pub const BLOCK_GROUP: &[u8] = &[0xA0];
+    pub const BLOCK: &[u8] = &[0xA1];
+    pub const BLOCK_DURATION: &[u8] = &[0x9B];
+    pub const REFERENCE_BLOCK: &[u8] = &[0xFB];
 }
 
 /// The fixed width, in octets, of a back-patched size (spec `§sizing`). An 8-octet size
@@ -201,6 +209,123 @@ pub fn write_binary(out: &mut Vec<u8>, element_id: &[u8], value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+// =====================================================================================
+// Reading — the parse side (spec: `spec/MATROSKA.md`; RFC 8794 §4–§6)
+//
+// The demuxer (`crate::element::MkvDemux`) parses untrusted input, so every reader here is
+// **fallible and bounds-checked** — a truncated or malformed stream returns a
+// [`ReadError`], never panics or slices out of range (spec: "a crash on bad input is a
+// P0"). The readers operate on a borrowed `&[u8]` slice with a caller-held cursor; buffering
+// bytes across input boundaries is the demuxer's job (it accumulates a `Vec<u8>` and re-runs
+// the parser once more bytes arrive), so these primitives only ever see a contiguous window.
+// =====================================================================================
+
+/// A parse failure. The demuxer maps this to a `streamcraft` [`Error`](streamcraft_core::error::Error);
+/// [`Incomplete`](ReadError::Incomplete) is special — it means "need more bytes", not
+/// "corrupt", so the demuxer buffers and retries rather than erroring out.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReadError {
+    /// The window ends before the value is complete — the demuxer needs to buffer more input
+    /// and retry (NOT a corruption; RFC 8794 elements can straddle a read boundary).
+    Incomplete,
+    /// A VINT's first octet is `0x00`, which would encode a width > 8 (RFC 8794 §4.4: the
+    /// maximum VINT width is 8 octets).
+    VintTooLong,
+    /// A structural violation: a size or field that cannot be valid (e.g. a child claiming to
+    /// run past its parent, a leaf whose declared length overflows `usize`).
+    Malformed(&'static str),
+}
+
+/// Read one VINT starting at `data[at]`, returning `(value, len, all_ones)` and *not*
+/// advancing any cursor (RFC 8794 §4). `all_ones` flags the reserved value whose VINT_DATA is
+/// entirely `1` bits — the unknown-size marker for a data size (§6.2). Bounds-checked: a
+/// window too short for the marker-indicated width is [`Incomplete`](ReadError::Incomplete).
+///
+/// This is the shared decoder behind both [`read_id`] (which keeps the marker bits) and
+/// [`read_size`] (which strips them): a size's *value* is the VINT_DATA, whereas an ID *is*
+/// the whole VINT octets — see [`read_id`].
+pub fn read_vint(data: &[u8], at: usize) -> Result<(u64, usize, bool), ReadError> {
+    let first = *data.get(at).ok_or(ReadError::Incomplete)?;
+    if first == 0x00 {
+        return Err(ReadError::VintTooLong); // width would exceed 8 octets (RFC 8794 §4.4)
+    }
+    let len = first.leading_zeros() as usize + 1; // marker is the first 1 bit
+    if at + len > data.len() {
+        return Err(ReadError::Incomplete);
+    }
+    // Data bits of the first octet: clear the marker. `0xFF >> len` in u16 avoids the u8
+    // overflow at len == 8 (the mask is then 0 — an 8-octet VINT has no data in octet 0).
+    let mask = (0xFFu16 >> len) as u64;
+    let mut value = (first as u64) & mask;
+    let mut all_ones = value == mask;
+    for &b in &data[at + 1..at + len] {
+        value = (value << 8) | b as u64;
+        all_ones &= b == 0xFF;
+    }
+    Ok((value, len, all_ones))
+}
+
+/// Read an Element **ID** at `data[at]` as its raw on-the-wire octets (spec `§ID-tree`; RFC
+/// 8794 §5). Unlike a size, a Matroska ID *includes* its VINT length-descriptor bits, so the
+/// bytes are returned verbatim to compare against the [`id`] constants. Returns `(id_bytes,
+/// len)`. Bounds-checked.
+pub fn read_id(data: &[u8], at: usize) -> Result<(&[u8], usize), ReadError> {
+    let (_v, len, _ao) = read_vint(data, at)?;
+    Ok((&data[at..at + len], len))
+}
+
+/// Read an Element **Data Size** at `data[at]` (RFC 8794 §6.1), returning `(size, len)` where
+/// `size` is `None` for the unknown-size marker (all VINT_DATA bits `1`, §6.2) and
+/// `Some(octets)` otherwise. Bounds-checked.
+pub fn read_size(data: &[u8], at: usize) -> Result<(Option<u64>, usize), ReadError> {
+    let (value, len, all_ones) = read_vint(data, at)?;
+    Ok((if all_ones { None } else { Some(value) }, len))
+}
+
+/// One parsed element header: its ID (raw bytes), the byte offset where its *data* begins,
+/// and the data length (`None` = unknown-size streamed master, §6.2). Returned by
+/// [`read_element_header`].
+#[derive(Clone, Copy, Debug)]
+pub struct ElementHeader<'a> {
+    /// The element's ID as its raw on-the-wire octets (compare against [`id`] constants).
+    pub id: &'a [u8],
+    /// Byte offset (in the same slice) where the element's data starts — i.e. just past the
+    /// ID and size VINTs.
+    pub data_start: usize,
+    /// Data length in octets, or `None` for an unknown-size master (Segment/Cluster).
+    pub size: Option<u64>,
+}
+
+impl ElementHeader<'_> {
+    /// Byte offset just past this element's data — where the next sibling begins — for a
+    /// definite-size element. `None` for an unknown-size master (its end is implicit). Errors
+    /// [`Malformed`](ReadError::Malformed) if the length overflows a `usize` offset.
+    pub fn data_end(&self) -> Result<Option<usize>, ReadError> {
+        match self.size {
+            None => Ok(None),
+            Some(sz) => {
+                let end = (self.data_start as u64)
+                    .checked_add(sz)
+                    .ok_or(ReadError::Malformed("element size overflows the address space"))?;
+                Ok(Some(end as usize))
+            }
+        }
+    }
+}
+
+/// Read one element header (ID + size) at `data[at]`, returning the parsed header (the data
+/// is *not* read — the caller descends into a master or skips a leaf). Bounds-checked:
+/// [`Incomplete`](ReadError::Incomplete) when the window is too short for the ID+size.
+pub fn read_element_header(data: &[u8], at: usize) -> Result<ElementHeader<'_>, ReadError> {
+    let (id, id_len) = read_id(data, at)?;
+    let (size, size_len) = read_size(data, at + id_len)?;
+    Ok(ElementHeader {
+        id,
+        data_start: at + id_len + size_len,
+        size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +469,67 @@ mod tests {
         let mut out = Vec::new();
         write_binary(&mut out, id::CODEC_PRIVATE, &[0xDE, 0xAD]);
         assert_eq!(out, vec![0x63, 0xA2, 0x82, 0xDE, 0xAD]);
+    }
+
+    // --- Reader primitives (RFC 8794 §4–§6) ---
+
+    /// Every size the writer emits reads back to the same value at the same width — the
+    /// reader is the exact inverse of `write_size` (RFC 8794 §6.1).
+    #[test]
+    fn read_size_inverts_write_size() {
+        for &v in &[0u64, 1, 126, 127, 128, 0x3FFF, 100_000, 1_000_000, MAX_VINT_DATA] {
+            let mut buf = Vec::new();
+            write_size(&mut buf, v);
+            let (got, len) = read_size(&buf, 0).expect("read");
+            assert_eq!(got, Some(v), "value round-trip for {v}");
+            assert_eq!(len, buf.len(), "width round-trip for {v}");
+        }
+    }
+
+    /// The `0xFF` unknown-size marker reads as `None` (streamed master, §6.2); an ID reads
+    /// back as its verbatim octets (§5).
+    #[test]
+    fn read_unknown_size_and_id() {
+        let (size, len) = read_size(&[0xFF], 0).expect("read");
+        assert_eq!((size, len), (None, 1), "0xFF is the unknown-size marker");
+
+        let (id, len) = read_id(id::EBML, 0).expect("read id");
+        assert_eq!(id, id::EBML, "ID octets returned verbatim");
+        assert_eq!(len, 4);
+    }
+
+    /// A window too short for the marker-indicated width is `Incomplete` (need more bytes),
+    /// distinct from a corrupt `0x00` first octet which is `VintTooLong` — the demuxer
+    /// buffers on the former and errors on the latter.
+    #[test]
+    fn read_vint_incomplete_vs_too_long() {
+        // A 4-octet VINT (marker 0x1A) with only 2 octets present → Incomplete.
+        assert_eq!(read_vint(&[0x1A, 0x45], 0), Err(ReadError::Incomplete));
+        // Empty window → Incomplete.
+        assert_eq!(read_vint(&[], 0), Err(ReadError::Incomplete));
+        // First octet 0x00 would mean width > 8 → VintTooLong.
+        assert_eq!(read_vint(&[0x00, 0x01], 0), Err(ReadError::VintTooLong));
+    }
+
+    /// `read_element_header` parses ID + size and points `data_start`/`data_end` at the right
+    /// offsets; an unknown-size master reports `size == None` and `data_end == None`.
+    #[test]
+    fn read_element_header_offsets() {
+        // A definite-size uint element: TIMESTAMP_SCALE = 1_000_000 (from write_uint_bytes).
+        let mut buf = Vec::new();
+        write_uint(&mut buf, id::TIMESTAMP_SCALE, 1_000_000);
+        let h = read_element_header(&buf, 0).expect("header");
+        assert_eq!(h.id, id::TIMESTAMP_SCALE);
+        assert_eq!(h.size, Some(3), "value 0x0F4240 is 3 octets");
+        assert_eq!(h.data_end().unwrap(), Some(buf.len()));
+
+        // An open Segment: ID then 0xFF → unknown size.
+        let mut seg = Vec::new();
+        write_id(&mut seg, id::SEGMENT);
+        write_unknown_size(&mut seg);
+        let h = read_element_header(&seg, 0).expect("header");
+        assert_eq!(h.id, id::SEGMENT);
+        assert_eq!(h.size, None, "unknown-size streamed master");
+        assert_eq!(h.data_end().unwrap(), None);
     }
 }
