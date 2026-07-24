@@ -1560,23 +1560,28 @@ fn deliver_events(
                 // is nothing for this peer to re-fixate: install it and let a caps-reading
                 // peer act while a caps-ignoring one ignores it. Underspecified fields are
                 // never a conflict — the peer would fixate them, as at link time.
-                let offers = elem.desc().pads[pad.0 as usize].offers;
-                let family_offered = offers
-                    .iter()
-                    .any(|o| vocabulary.family_id(o.family) == Some(f.family));
-                if family_offered && !vocabulary.offers_admit(offers, f) {
-                    let element = ctx.element();
-                    let err = Error::Element {
-                        element,
-                        message: format!(
-                            "runtime format announcement not accepted by '{}' pad '{}' \
-                             — dynamic-caps re-validation failed",
-                            elem.desc().name,
-                            elem.desc().pads[pad.0 as usize].name,
-                        ),
-                    };
-                    ctx.post(BusMessage::Error { element, error: err.clone() });
-                    return Err(err);
+                // A runtime-added (dynamic) pad has no entry in the static descriptor —
+                // indexing would panic (found by the multi-track mux agent). Its offer
+                // menu isn't reachable here yet (`Ctx::pad_offers` is the follow-up), so
+                // a dynamic pad installs tolerantly, like a family the peer never offered.
+                if let Some(pad_desc) = elem.desc().pads.get(pad.0 as usize) {
+                    let offers = pad_desc.offers;
+                    let family_offered = offers
+                        .iter()
+                        .any(|o| vocabulary.family_id(o.family) == Some(f.family));
+                    if family_offered && !vocabulary.offers_admit(offers, f) {
+                        let element = ctx.element();
+                        let err = Error::Element {
+                            element,
+                            message: format!(
+                                "runtime format announcement not accepted by '{}' pad '{}' \
+                                 — dynamic-caps re-validation failed",
+                                elem.desc().name, pad_desc.name,
+                            ),
+                        };
+                        ctx.post(BusMessage::Error { element, error: err.clone() });
+                        return Err(err);
+                    }
                 }
                 ctx.set_negotiated_one(pad, f.clone());
             }
