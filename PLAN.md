@@ -153,6 +153,25 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > `streamcraft launch --trace` p50/p99/max table. **Colored logs** on TTY stderr
 > (level + stable per-element hue; `NO_COLOR`/`STREAMCRAFT_LOG_COLOR` honored).
 
+> **Update — session 4e (2026-07-24): pause transport + zero-copy merged.** Playback
+> pause landed spec-conformant ("pause is a clock op, not a state"): `PauseHandle`
+> {pause,resume,toggle} freezes running time; resume re-bases the now-**shared**
+> base cell (Ctx derives every deadline from it per call); groups gate at the pass
+> top with `Event::Paused`/`Resumed` (pipewireaudiosink holds hardware via its
+> silence latch — device clock freezes ⇒ zero re-base shift, InstantClock shifts by
+> the pause interval — both correct); a sink whose wait expires mid-pause blocks
+> and re-derives after resume — provably nothing renders while paused;
+> `start_paused` = preroll-and-hold; stop unsticks a paused pipeline. Known gap: a
+> head blocked in a ring pop learns of pause by data starvation, not the event.
+> **Zero-copy agent merged** (ZERO-COPY.md stages 1+2): Mp4Reader retains input
+> `Memory` chunks, samples resolve to `Memory::slice`; MatroskaWriter scatter
+> clusters (size still known at close — no 0xFF regression). Movie remux:
+> **~140→1438 MiB/s**; allocation calls now dominated by Stage-4 transport churn
+> (Submission vecs + Batch columns, amplified by small buffers) — next core work,
+> with an IO-hygiene agent (fadvise/sync_file_range + reactor vec reuse) in
+> flight. Agent-requested core APIs worth adding: `Ctx::out_format()`,
+> `Ctx::pad_linked(pad)` (unlocks skipping unlinked-track resolution).
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
