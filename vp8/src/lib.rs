@@ -27,3 +27,15 @@
 pub mod vp8dec;
 
 pub use vp8dec::Vp8Dec;
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! vp8dec ! …")`). Typed `use` + constructor stays primary; this powers
+/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// throwaway default instance; [`Vp8Dec`] is config-free (dimensions come from the
+/// keyframe header, announced at runtime).
+pub fn register(registry: &mut Registry) {
+    registry.register(Vp8Dec::new().desc());
+}

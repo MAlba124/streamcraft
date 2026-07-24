@@ -84,7 +84,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default-constructs trivially: dimensions come from the keyframe header, not props.
+    make_default: Some(|| Box::new(Vp8Dec::new())),
 };
 
 /// A decoded frame waiting for a pool slot — the backpressure carry, bounded to

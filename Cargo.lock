@@ -703,11 +703,17 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 name = "scraft-launch"
 version = "0.1.0"
 dependencies = [
+ "sc-av1",
  "sc-flac",
+ "sc-h264",
+ "sc-h265",
  "sc-ogg",
+ "sc-vp8",
+ "sc-vp9",
  "streamcraft-audio",
  "streamcraft-core",
  "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]

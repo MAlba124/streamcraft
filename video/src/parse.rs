@@ -13,11 +13,11 @@
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
-    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
-use streamcraft_core::format::{OfferDesc, ValueDesc};
+use streamcraft_core::format::{Constraint, OfferDesc, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::{Rational, Timestamp};
 
@@ -26,6 +26,7 @@ use crate::format::{
     RAW_ANY_OFFER,
 };
 use crate::geometry::frame_size;
+use crate::props::{read_dims, DEFAULT_FORMAT};
 use crate::testsrc::frame_pts;
 
 const SINK: PadId = PadId(0);
@@ -54,10 +55,22 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+/// The frame format, for the parse path (spec: Plugins —
+/// `parse("filesrc … ! rawvideoparse width=320 height=240 pixfmt=i420 fps=30/1 ! …")`).
+/// A raw byte stream carries no format, so `rawvideoparse` needs these out of band; the
+/// parse layer supplies them as props (the typed [`RawVideoParse::new`] is the other
+/// path). All structural (`live: false`): the frame stride is fixed in `start()`.
+static PROPS: [PropDesc; 4] = [
+    PropDesc { name: "width", allowed: Constraint::Any, live: false },
+    PropDesc { name: "height", allowed: Constraint::Any, live: false },
+    PropDesc { name: "pixfmt", allowed: Constraint::Any, live: false },
+    PropDesc { name: "fps", allowed: Constraint::Any, live: false },
+];
+
 static DESC: ElementDesc = ElementDesc {
     name: "rawvideoparse",
     pads: &PADS,
-    props: &[],
+    props: &PROPS,
     // Passive: a pure transform that inlines into the upstream group (spec: Scheduling).
     sched: SchedHint::Passive,
     inputs: InputPolicy::Single,
@@ -67,7 +80,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default frame format (320x240 I420 @ 30 fps); override via the props at parse time.
+    make_default: Some(|| Box::new(RawVideoParse::new(DEFAULT_FORMAT))),
 };
 
 /// Chunks a raw-video byte stream into frame-sized buffers of a fixed format.
@@ -187,7 +201,10 @@ impl Element for RawVideoParse {
         &DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        // Parsed props override the constructor format (spec: Plugins).
+        self.format = read_dims(ctx, self.format);
+        self.frame_bytes = frame_size(self.format.pixfmt, self.format.width, self.format.height);
         self.carry.clear();
         self.frames_out = 0;
         self.announced = false;

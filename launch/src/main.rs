@@ -7,18 +7,23 @@
 //!
 //! ```text
 //! scraft-launch "filesrc path=in.wav ! wavparse ! flacenc ! filesink path=out.flac"
+//! scraft-launch "videotestsrc frames=90 ! videocksink"
+//! scraft-launch --pool 4194304x16 "videotestsrc width=1280 height=720 frames=30 ! videocksink"
 //! scraft-launch --dump-dot "testsrc total=65536 ! testsink"
 //! scraft-launch --counters   "testsrc total=65536 ! testsink"
 //! scraft-launch --log info    "filesrc path=x ! filesink path=y"
 //! ```
 //!
 //! Flags (before the launch string):
-//! * `--dump-dot`    — print the pipeline as Graphviz `dot` and exit (no run).
-//! * `--counters`    — after the run, print each element's `CounterSnapshot`.
-//! * `--log LEVEL`   — enable stderr logging up to LEVEL (error/warn/info/debug/trace).
-//! * `--no-progress` — suppress the live progress line (auto-off when stderr isn't a tty).
-//! * `--list`        — list every registered element name and exit.
-//! * `-h`/`--help`   — usage.
+//! * `--dump-dot`      — print the pipeline as Graphviz `dot` and exit (no run).
+//! * `--counters`      — after the run, print each element's `CounterSnapshot`.
+//! * `--log LEVEL`     — enable stderr logging up to LEVEL (error/warn/info/debug/trace).
+//! * `--no-progress`   — suppress the live progress line (auto-off when stderr isn't a tty).
+//! * `--pool SIZExN`   — size the buffer pool: `SIZE` bytes per slot, `N` slots (e.g.
+//!   `4194304x16`). A raw-video frame must fit one slot, so big frames need this raised
+//!   from the default. Parsed leniently (`x` or `*`, whitespace-tolerant).
+//! * `--list`          — list every registered element name and exit.
+//! * `-h`/`--help`     — usage.
 //!
 //! ## Progress
 //! While running, a single in-place stderr line shows running time, bytes produced
@@ -56,6 +61,12 @@ fn build_registry() -> Registry {
     streamcraft_audio::register(&mut r);
     sc_flac::register(&mut r);
     sc_ogg::register(&mut r);
+    streamcraft_video::register(&mut r);
+    sc_vp8::register(&mut r);
+    sc_vp9::register(&mut r);
+    sc_av1::register(&mut r);
+    sc_h264::register(&mut r);
+    sc_h265::register(&mut r);
     r
 }
 
@@ -65,6 +76,8 @@ struct Options {
     counters: bool,
     log: Option<Level>,
     no_progress: bool,
+    /// `(slot_size_bytes, slots)` from `--pool`, or `None` to keep the pipeline default.
+    pool: Option<(usize, u32)>,
 }
 
 /// Parse argv (already skipping the program name) into [`Options`], or a message to
@@ -75,6 +88,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut counters = false;
     let mut log = None;
     let mut no_progress = false;
+    let mut pool = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -87,6 +101,10 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     Level::from_name(&lvl)
                         .ok_or_else(|| format!("unknown log level '{lvl}' (error/warn/info/debug/trace)"))?,
                 );
+            }
+            "--pool" => {
+                let spec = it.next().ok_or_else(|| "--pool needs a SIZExSLOTS argument".to_string())?;
+                pool = Some(parse_pool(&spec)?);
             }
             "-h" | "--help" => return Err(usage()),
             "--list" => return Err(list_elements()),
@@ -106,19 +124,44 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         }
     }
     let launch = launch.ok_or_else(|| format!("missing launch string\n\n{}", usage()))?;
-    Ok(Options { launch, dump_dot, counters, log, no_progress })
+    Ok(Options { launch, dump_dot, counters, log, no_progress, pool })
+}
+
+/// Parse a `--pool` spec — `SLOT_SIZExSLOTS` (`4194304x16`) — into `(slot_size, slots)`.
+/// Lenient: the separator is `x`, `X`, or `*`, surrounding whitespace is trimmed, and
+/// both sides must be positive integers. Total — a malformed spec is a named `Err`,
+/// never a panic (the parse layer's fuzz-friendly contract). `SLOTS` is clamped to
+/// `u32`; an out-of-range slot count is an error rather than a silent wrap.
+fn parse_pool(spec: &str) -> Result<(usize, u32), String> {
+    let sep = spec
+        .find(['x', 'X', '*'])
+        .ok_or_else(|| format!("--pool '{spec}' must be SIZExSLOTS (e.g. 4194304x16)"))?;
+    let size_s = spec[..sep].trim();
+    let slots_s = spec[sep + 1..].trim();
+    let slot_size: usize = size_s
+        .parse()
+        .map_err(|_| format!("--pool slot size '{size_s}' is not a non-negative integer"))?;
+    let slots: u32 = slots_s
+        .parse()
+        .map_err(|_| format!("--pool slot count '{slots_s}' is not a u32"))?;
+    if slot_size == 0 || slots == 0 {
+        return Err(format!("--pool '{spec}' — both slot size and slot count must be > 0"));
+    }
+    Ok((slot_size, slots))
 }
 
 fn usage() -> String {
-    "usage: scraft-launch [--dump-dot] [--counters] [--log LEVEL] [--no-progress] \"elem prop=val ! elem ! …\"\n\
+    "usage: scraft-launch [--dump-dot] [--counters] [--log LEVEL] [--no-progress] [--pool SIZExSLOTS] \"elem prop=val ! elem ! …\"\n\
      \n\
      flags:\n\
-     \x20 --dump-dot     print the pipeline as Graphviz dot and exit\n\
-     \x20 --counters     print each element's counters after the run\n\
-     \x20 --log LEVEL    log to stderr up to LEVEL (error/warn/info/debug/trace)\n\
-     \x20 --no-progress  suppress the live progress line (auto-off when not a tty)\n\
-     \x20 --list         list registered element names and exit\n\
-     \x20 -h, --help     this message"
+     \x20 --dump-dot        print the pipeline as Graphviz dot and exit\n\
+     \x20 --counters        print each element's counters after the run\n\
+     \x20 --log LEVEL       log to stderr up to LEVEL (error/warn/info/debug/trace)\n\
+     \x20 --no-progress     suppress the live progress line (auto-off when not a tty)\n\
+     \x20 --pool SIZExSLOTS size the buffer pool: SIZE bytes/slot, SLOTS slots (e.g. 4194304x16);\n\
+     \x20                   a raw-video frame must fit one slot, so big frames need this raised\n\
+     \x20 --list            list registered element names and exit\n\
+     \x20 -h, --help        this message"
         .to_string()
 }
 
@@ -152,6 +195,11 @@ fn main() -> ExitCode {
     let mut pipeline = Pipeline::new();
     if let Some(level) = opts.log {
         pipeline.log_to_stderr(level);
+    }
+    if let Some((slot_size, slots)) = opts.pool {
+        // A raw-video frame must fit one pool slot; large frames need this raised from
+        // the default (spec: Formats — pool sizing).
+        pipeline.set_pool(slot_size, slots);
     }
 
     let ids = match registry.parse(&mut pipeline, &opts.launch) {
@@ -302,7 +350,7 @@ fn print_counters(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraf
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_size;
+    use super::{fmt_size, parse_pool};
 
     #[test]
     fn fmt_size_picks_binary_units() {
@@ -312,5 +360,27 @@ mod tests {
         assert_eq!(fmt_size(1536), "1.5 KiB");
         assert_eq!(fmt_size(12 * 1024 * 1024), "12.0 MiB");
         assert_eq!(fmt_size(5 * 1024 * 1024 * 1024), "5.0 GiB");
+    }
+
+    #[test]
+    fn parse_pool_accepts_lenient_specs() {
+        // The documented form, plus the tolerated separators and surrounding whitespace.
+        assert_eq!(parse_pool("4194304x16"), Ok((4_194_304, 16)));
+        assert_eq!(parse_pool("1024X4"), Ok((1024, 4)));
+        assert_eq!(parse_pool("2048*8"), Ok((2048, 8)));
+        assert_eq!(parse_pool("  65536 x 32 "), Ok((65_536, 32)));
+    }
+
+    #[test]
+    fn parse_pool_rejects_bad_specs_without_panicking() {
+        // The contract is "Err, never panic" (the parse layer's fuzz-friendly rule).
+        let bad = [
+            "", "x", "16", "4194304", "x16", "16x", "axb", "-1x4", "4x-1", "0x16",
+            "16x0", "16x16x16", "16.5x4", "999999999999999999999999x4",
+            "16x999999999999999999999999", "  ", "*", "16 16",
+        ];
+        for s in bad {
+            assert!(parse_pool(s).is_err(), "{s:?} should be a clean Err");
+        }
     }
 }

@@ -67,3 +67,15 @@ pub mod superframe;
 pub mod vp9dec;
 
 pub use vp9dec::Vp9Dec;
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! vp9dec ! …")`). Typed `use` + constructor stays primary; this powers
+/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// throwaway default instance; [`Vp9Dec`] is config-free (dimensions come from the
+/// frame header, announced at runtime).
+pub fn register(registry: &mut Registry) {
+    registry.register(Vp9Dec::new().desc());
+}

@@ -84,3 +84,15 @@
 pub mod av1dec;
 
 pub use av1dec::Av1Dec;
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! av1dec ! …")`). Typed `use` + constructor stays primary; this powers
+/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// throwaway default instance; [`Av1Dec`] is config-free (dimensions come from the
+/// sequence header, announced at runtime).
+pub fn register(registry: &mut Registry) {
+    registry.register(Av1Dec::new().desc());
+}
