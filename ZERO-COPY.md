@@ -121,6 +121,20 @@ to a refcount bump + drop, which is fine — but the principled fix is the per-p
 sample resolution entirely inside the demuxer. Ties into `SELECT_STREAMS`; don't
 build it just for this.
 
+## Status (updated as stages land)
+
+- **Stages 1+2: DONE** (zero-copy agent, merged) — payload flows as `Memory` slices
+  end to end; movie remux ~140 → **1438 MiB/s**.
+- **Stage 3 (hygiene half): DONE** (IO agent, merged) — fadvise/sync_file_range
+  streaming hygiene; memcapped stall gone, dirty plateau 8–63 MiB. `writev` gather
+  remains (the next lever for the residual below).
+- **Stage 4: DONE** — shell return rings (4.1) + caller-owned reactor vecs (4.2,
+  trait changed as proposed). Movie: 314.9K → **87.1K allocation calls**, 397 →
+  306 MB allocated. Residual: `Batch::push` column growth in the mux's per-pass
+  batches — bounded, amortized; shrinks further with writev-style batching, not
+  with more recycling.
+- **Stage 5: open** (`Ctx::pad_linked` gate — see PLAN, stream-selection design).
+
 ## Order and payoff
 
 | Stage | Effort | Removes | Blocked by |
