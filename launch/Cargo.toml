@@ -28,5 +28,6 @@ sc-av1 = { path = "../av1" }
 sc-h264 = { path = "../h264" }
 sc-h265 = { path = "../h265" }
 sc-mkv = { path = "../mkv" }
+sc-mp3 = { path = "../mp3" }
 # The shm display sink (hand-written Wayland client — no native library).
 sc-wayland = { path = "../wayland" }
