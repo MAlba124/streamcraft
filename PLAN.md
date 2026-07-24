@@ -188,6 +188,19 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > out_format. **In flight**: multi-track audio remux agent (aac/esds +
 > MkvMux::multi fan-in — merge on completion).
 
+> **Update — session 4g (overnight 2026-07-25, morning wrap):** **THE MOVIE REMUXES
+> WITH AUDIO.** Multi-track agent merged: mp4 `esds`→AudioSpecificConfig ('aac'
+> family, A_AAC CodecPrivate), `MkvMux::multi(n)` fan-in (per-pad caps setup,
+> pts-ordered merge, video-anchor clusters, small-run coalescing). Movie → 2-track
+> h264+aac MKV, 1544.9 MiB, ffprobe/mpv clean incl. tail seeks, memcapped no stall.
+> Honest note from its A/B: today's throughput is disk-bound parity (~205-257
+> MiB/s); the earlier 1438 figure was a fully-cached pre-hygiene run.
+> deliver_events dynamic-pad OOB panic guarded (tolerant install). **Core
+> follow-ups queued from agent findings**: `Ctx::pad_offers` + event-pad-id (drop
+> the static sink_0..7 fallback and give dynamic pads real re-validation), fan-in
+> idle park (~374K sched_yield/movie), writev gather in FileSink, single-track
+> MkvMux aac offer, av1C, the one-batch EOS-race note in MkvMuxN.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
