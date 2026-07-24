@@ -1221,6 +1221,9 @@ fn run_group(
                     break;
                 }
             }
+            // Scratch lives only for the duration of `process()`; reclaim it now the call
+            // has returned (its regions are dropped) so the next call reuses the memory.
+            ctxs[i].reset_scratch();
             // Dynamic caps: if the element announced a runtime output format, attach a
             // FormatChange to its output batch so the peer re-fixates (spec: Formats).
             if let Some(ann) = ctxs[i].take_announcement() {

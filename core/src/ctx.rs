@@ -115,6 +115,9 @@ pub struct Ctx {
     /// reads `NONE` and `wait_until` returns at once (no pacing).
     clock: Option<Arc<dyn Clock>>,
     base_time: Timestamp,
+    /// Per-`process()` scratch bump allocator (spec: Memory). Reset by the scheduler after
+    /// each `process()`, so temporaries carved here impose no steady-state heap traffic.
+    scratch: Arena,
 }
 
 impl Ctx {
@@ -149,6 +152,7 @@ impl Ctx {
             vocabulary: None,
             clock: None,
             base_time: Timestamp::ZERO,
+            scratch: Arena::default(),
         }
     }
 
@@ -324,9 +328,19 @@ impl Ctx {
         }
     }
 
-    /// Bump allocator, reset after each `process()` call (spec: Memory).
-    pub fn scratch(&mut self) -> &mut Arena {
-        todo!("spec: Memory — scratch arenas")
+    /// A per-`process()` bump allocator for temporary scratch space (spec: Memory). Carve
+    /// regions with `ctx.scratch().alloc_bytes(n)`; they are reused (the scheduler resets
+    /// the arena after each `process()`), so scratch imposes no steady-state heap traffic.
+    /// The regions borrow the `Ctx`, so finish with them before other `&mut ctx` calls
+    /// (e.g. `ctx.out(pad)`) — typically build a temporary here, then copy the result into
+    /// an output buffer.
+    pub fn scratch(&self) -> &Arena {
+        &self.scratch
+    }
+
+    /// Reset the scratch arena (scheduler hook, run after each `process()`).
+    pub(crate) fn reset_scratch(&mut self) {
+        self.scratch.reset();
     }
 
     // --- Scheduler hooks (crate-internal) ---
