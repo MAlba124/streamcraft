@@ -991,22 +991,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn socket_path_prefers_absolute_wayland_display() {
-        // Absolute path is used verbatim.
-        // (We mutate process env under a serial guard-free test; these vars are process-wide
-        // but the assertions read the resolved path immediately.)
+    fn socket_path_resolution() {
+        // ONE test, not two: `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` are process-wide, and
+        // cargo runs a binary's tests on parallel threads — two tests mutating the
+        // same env vars raced (an intermittent workspace-run failure). Sequential
+        // assertions in a single body cannot.
         std::env::set_var("WAYLAND_DISPLAY", "/tmp/sc-abs.sock");
         let p = socket_path().unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/sc-abs.sock"));
-        std::env::remove_var("WAYLAND_DISPLAY");
-    }
+        assert_eq!(p, PathBuf::from("/tmp/sc-abs.sock"), "absolute display used verbatim");
 
-    #[test]
-    fn socket_path_joins_runtime_dir_for_relative_name() {
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-1");
         let p = socket_path().unwrap();
-        assert_eq!(p, PathBuf::from("/run/user/1000/wayland-1"));
+        assert_eq!(
+            p,
+            PathBuf::from("/run/user/1000/wayland-1"),
+            "relative display joins the runtime dir"
+        );
         std::env::remove_var("WAYLAND_DISPLAY");
         std::env::remove_var("XDG_RUNTIME_DIR");
     }
