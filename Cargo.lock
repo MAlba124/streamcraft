@@ -950,6 +950,7 @@ dependencies = [
  "sc-h265",
  "sc-mkv",
  "sc-mp3",
+ "sc-mp4",
  "sc-ogg",
  "sc-vk",
  "sc-vp8",
