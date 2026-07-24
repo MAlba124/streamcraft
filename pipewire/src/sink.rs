@@ -38,6 +38,11 @@ use crate::ring::{self, Consumer, Producer};
 // --- audio/raw sink offer (broad; the concrete format arrives via dynamic caps) --------
 
 const FAMILY: &str = "audio/raw";
+/// Requested device buffer in frames (via `SPA_PARAM_Buffers`, with `NODE_LATENCY` as the
+/// matching hint). Bounds how soon the device pulls audio after a seek/flush — the perceptible
+/// seek latency. ~1024 frames (~23 ms at 44.1 kHz) makes seeking feel instant; the sink's byte
+/// ring is the real jitter buffer, so a small device buffer does not risk underruns.
+const QUANTUM: u32 = 1024;
 static SAMPLE_VALUES: [ValueDesc; 5] = [
     ValueDesc::Id("u8"),
     ValueDesc::Id("s16"),
@@ -138,15 +143,16 @@ fn run_pw(
     let context = pw::context::Context::new(&mainloop)?;
     let core = context.connect(None)?;
 
-    let stream = pw::stream::Stream::new(
-        &core,
-        "streamcraft",
-        pw::properties::properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_ROLE => "Music",
-            *pw::keys::MEDIA_CATEGORY => "Playback",
-        },
-    )?;
+    // Advertise our desired latency (~`QUANTUM` frames). The buffer size that actually bounds
+    // the post-seek device latency is requested via `SPA_PARAM_Buffers` at `connect` below;
+    // this is the matching hint.
+    let props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::NODE_LATENCY => format!("{QUANTUM}/{rate}").as_str(),
+    };
+    let stream = pw::stream::Stream::new(&core, "streamcraft", props)?;
 
     // The RT process callback: pull PCM from the ring to fill the device buffer. This runs
     // on PipeWire's real-time thread, so `Consumer::pull` is wait-free and allocation-free —
@@ -154,6 +160,11 @@ fn run_pw(
     let _listener = stream
         .add_local_listener_with_user_data(())
         .process(move |stream, ()| {
+            if pb.flush_stream.swap(false, Ordering::Relaxed) {
+                // Seek: drop buffers already committed past our ring (the rate-converter's, when
+                // the device rate differs from the stream's), so the new position is heard now.
+                let _ = stream.flush(false);
+            }
             if let Some(mut buffer) = stream.dequeue_buffer() {
                 let datas = buffer.datas_mut();
                 if let Some(data) = datas.get_mut(0) {
@@ -196,7 +207,36 @@ fn run_pw(
     .unwrap()
     .0
     .into_inner();
-    let mut params = [Pod::from_bytes(&values).unwrap()];
+
+    // Request a small device buffer (spec: latency #2; responsive seeking). When the device
+    // rate differs from the stream's, PipeWire otherwise sizes our buffer for its rate
+    // converter — here ~278 ms — which is how long after a seek the device waits to pull the
+    // new position's audio. Asking for `QUANTUM` frames bounds that; the ring is the real
+    // jitter buffer. `size`/`stride` are bytes.
+    let prop = |key: u32, v: i32| pw::spa::pod::Property {
+        key,
+        flags: pw::spa::pod::PropertyFlags::empty(),
+        value: pw::spa::pod::Value::Int(v),
+    };
+    let buf_bytes = (QUANTUM as usize * stride) as i32;
+    let buffers: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
+            type_: spa_sys::SPA_TYPE_OBJECT_ParamBuffers,
+            id: spa_sys::SPA_PARAM_Buffers,
+            properties: vec![
+                prop(spa_sys::SPA_PARAM_BUFFERS_buffers as u32, 2),
+                prop(spa_sys::SPA_PARAM_BUFFERS_blocks as u32, 1),
+                prop(spa_sys::SPA_PARAM_BUFFERS_size as u32, buf_bytes),
+                prop(spa_sys::SPA_PARAM_BUFFERS_stride as u32, stride as i32),
+            ],
+        }),
+    )
+    .unwrap()
+    .0
+    .into_inner();
+    let mut params =
+        [Pod::from_bytes(&values).unwrap(), Pod::from_bytes(&buffers).unwrap()];
 
     stream.connect(
         spa::utils::Direction::Output,
@@ -229,6 +269,10 @@ struct Playback {
     paused: AtomicBool,
     frames: AtomicU64, // whole interchannel frames the device has rendered
     rate: AtomicU32,   // sample rate, published once at configure
+    /// Set on seek; the RT callback flushes the PipeWire stream (drops the buffers already
+    /// committed downstream — notably the rate-converter's, when the device rate differs from
+    /// the stream's) so the new position is audible promptly instead of after that buffer.
+    flush_stream: AtomicBool,
 }
 
 /// A cloneable handle to control and observe playback (spec: Clocking — pause). Obtain it
@@ -411,6 +455,7 @@ impl Element for PipeWireAudioSink {
                 if let Some(t) = ctx.seek_target() {
                     self.playback.frames.store(t.to_frame, Ordering::Relaxed);
                 }
+                self.playback.flush_stream.store(true, Ordering::Relaxed);
             }
             // The pipeline delivers EOS at end-of-stream: play out the buffered audio.
             Event::Eos => {
