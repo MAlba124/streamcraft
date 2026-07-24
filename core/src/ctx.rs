@@ -161,6 +161,10 @@ pub struct Ctx {
     /// `base_time + running + path_latency` — so a sink automatically compensates
     /// what its upstream needs. Zero unless the graph declares latencies.
     path_latency: Timestamp,
+    /// Latency tracing (spec: Debuggability): this element's histograms + the live
+    /// gate, installed at run setup so [`wait_until`](Self::wait_until) can record how
+    /// far past its deadline a sink wait actually returned. `None` outside a run.
+    trace: Option<(Arc<crate::counters::ElementCounters>, Arc<std::sync::atomic::AtomicBool>)>,
     /// Shared seek request, installed at run setup (spec: flush/seek). A source reads the
     /// byte target and a sink the frame target from [`seek_target`](Self::seek_target) when
     /// the scheduler delivers `FlushStart`. `None` outside a run / for a pipeline that is
@@ -213,6 +217,7 @@ impl Ctx {
             scratch: Arena::default(),
             props: None,
             path_latency: Timestamp::ZERO,
+            trace: None,
         }
     }
 
@@ -313,6 +318,16 @@ impl Ctx {
     /// run setup; spec: Latency — computed per path from declared latencies).
     pub(crate) fn set_path_latency(&mut self, latency: Timestamp) {
         self.path_latency = latency;
+    }
+
+    /// Install the latency-tracing gate + histograms (pipeline → element at run setup;
+    /// spec: Debuggability).
+    pub(crate) fn set_trace(
+        &mut self,
+        counters: Arc<crate::counters::ElementCounters>,
+        gate: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.trace = Some((counters, gate));
     }
 
     /// This element's upstream path latency — what [`wait_until`](Self::wait_until)
@@ -454,11 +469,25 @@ impl Ctx {
     /// "infinitely late": only an interrupt ends the wait.
     pub fn wait_until(&self, running: Timestamp) -> WaitOutcome {
         match &self.clock {
-            Some(c) => c.new_wait().wait_until(
-                self.base_time
+            Some(c) => {
+                let deadline = self
+                    .base_time
                     .saturating_add(running)
-                    .saturating_add(self.path_latency),
-            ),
+                    .saturating_add(self.path_latency);
+                let outcome = c.new_wait().wait_until(deadline);
+                // Latency tracing (spec: Debuggability): how far past the deadline the
+                // wait actually returned — scheduling jitter as the sink experiences
+                // it, in the pipeline clock's domain (deterministic under MockClock).
+                if outcome == WaitOutcome::Reached && running.is_some() {
+                    if let Some((counters, gate)) = &self.trace {
+                        if gate.load(std::sync::atomic::Ordering::Relaxed) {
+                            let late = c.now().saturating_sub(deadline);
+                            counters.wait_lateness_ns.record(late.nanos().unwrap_or(0));
+                        }
+                    }
+                }
+                outcome
+            }
             None => WaitOutcome::Reached,
         }
     }

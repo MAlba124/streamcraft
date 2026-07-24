@@ -173,6 +173,13 @@ pub struct Pipeline {
     /// (`u64::MAX` before the first run), shared into [`TapHandle`]s so observers can
     /// window counter deltas over running time (spec: Taps — bitrate is Δbytes/Δt).
     base_shared: Arc<AtomicU64>,
+    /// Latency tracing gate (spec: Debuggability): while set, the scheduler times
+    /// `process()` calls, stamps ring pushes for residency measurement, and sinks
+    /// record wait overshoot — into the per-element histograms a [`TapHandle`]
+    /// reads. Off (the default, unless `STREAMCRAFT_TRACE=1`) the streaming path
+    /// pays one relaxed load per call. Toggle via [`set_tracing`](Self::set_tracing),
+    /// live — it is read per pass.
+    tracing: Arc<AtomicBool>,
     /// Per-element output-pool overrides (`(slot_size, slots)`), indexed by
     /// `ElementId`; `None` shares the pipeline default pool. See
     /// [`set_element_pool`](Self::set_element_pool).
@@ -216,10 +223,22 @@ impl Pipeline {
             clock: Arc::new(InstantClock::new()),
             clock_explicit: false,
             base_shared: Arc::new(AtomicU64::new(u64::MAX)),
+            tracing: Arc::new(AtomicBool::new(
+                std::env::var_os("STREAMCRAFT_TRACE").is_some_and(|v| v != "0"),
+            )),
             dyn_pads: Vec::new(),
             pool_overrides: Vec::new(),
             queue_overrides: Vec::new(),
         }
+    }
+
+    /// Enable/disable latency tracing (spec: Debuggability): per-element histograms of
+    /// `process()` time, ring residency, and sink wait overshoot, read via
+    /// [`TapHandle::latency`](crate::counters::TapHandle::latency). Also enabled by
+    /// `STREAMCRAFT_TRACE=1`. Live — takes effect on the next scheduler pass; the cost
+    /// while on is two monotonic clock reads per batch.
+    pub fn set_tracing(&mut self, on: bool) {
+        self.tracing.store(on, Ordering::Release);
     }
 
     /// Install a per-thread-group reactor factory (e.g. io_uring). Each group thread
@@ -750,6 +769,7 @@ impl Pipeline {
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
+            let tracing = Arc::clone(&self.tracing);
             let seek = Arc::clone(&seek);
             let vocabulary = Arc::clone(&vocabulary);
             let clock = Arc::clone(&clock);
@@ -758,7 +778,7 @@ impl Pipeline {
                     elems, ids, group_formats, group_logs, upstream, downstream, factory,
                     group_pools, bus, credits, group_counters, group_props, stop, seek,
                     vocabulary, clock,
-                    base_time, group_pad_infos, group_latencies,
+                    base_time, group_pad_infos, group_latencies, tracing,
                 )
             }));
         }
@@ -1244,6 +1264,7 @@ impl LogDrainThread {
 
     fn run(drains: Vec<LogDrain>) {
         use std::io::Write;
+        let styled = crate::log::stderr_colors_enabled();
         let stderr = std::io::stderr();
         // Idle backoff: park a beat when a whole sweep found nothing, so the thread
         // costs no CPU while streaming is quiet, yet stays responsive under load.
@@ -1256,7 +1277,7 @@ impl LogDrainThread {
                 for d in &drains {
                     let mut drained_this = false;
                     while let Some(rec) = d.try_next() {
-                        let _ = crate::log::format_record(&mut lock, &rec);
+                        let _ = crate::log::format_record_styled(&mut lock, &rec, styled);
                         progressed = true;
                         drained_this = true;
                     }
@@ -1360,6 +1381,7 @@ fn run_group(
     base_time: Timestamp,
     pad_infos: Vec<(usize, Vec<usize>)>,
     path_latencies: Vec<Timestamp>,
+    tracing: Arc<AtomicBool>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_empty();
@@ -1416,6 +1438,11 @@ fn run_group(
     // frame target when the scheduler delivers `FlushStart` (spec: flush/seek).
     for ctx in ctxs.iter_mut() {
         ctx.set_seek(Arc::clone(&seek));
+    }
+    // Install the tracing gate + this element's histograms so `ctx.wait_until` can record
+    // sink wait overshoot while tracing is on (spec: Debuggability).
+    for (ctx, c) in ctxs.iter_mut().zip(&counters) {
+        ctx.set_trace(Arc::clone(c), Arc::clone(&tracing));
     }
     // Install each element's property mailbox — only where props are declared, so the
     // no-props majority keeps the zero-cost `None` path (spec: Dynamic element properties).
@@ -1502,6 +1529,9 @@ fn run_group(
                         continue; // stale pre-seek data (buffers recycle on drop)
                     }
                     counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    if let Some(t) = batch.pushed_at.take() {
+                        counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
+                    }
                     let events = batch.take_events();
                     ctxs[0].append_input_on(*pad, &mut batch);
                     if let Err(e) =
@@ -1529,6 +1559,9 @@ fn run_group(
                 match up.pop() {
                     Some(mut batch) if batch.seek_gen >= seek_gen => {
                         counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                        if let Some(t) = batch.pushed_at.take() {
+                            counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
+                        }
                         let events = batch.take_events();
                         ctxs[0].input_append(&mut batch);
                         if let Err(e) = deliver_events(
@@ -1557,6 +1590,9 @@ fn run_group(
                         continue; // stale pre-seek data (buffers recycle on drop)
                     }
                     counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    if let Some(t) = batch.pushed_at.take() {
+                        counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
+                    }
                     let events = batch.take_events();
                     ctxs[0].input_append(&mut batch);
                     if let Err(e) = deliver_events(
@@ -1611,6 +1647,10 @@ fn run_group(
             if fatal.is_some() {
                 break;
             }
+            // Latency tracing (spec: Debuggability): time `process()` only while the
+            // flag is on — the untraced hot path pays one relaxed load per call.
+            let trace_t0 =
+                if tracing.load(Ordering::Relaxed) { Some(std::time::Instant::now()) } else { None };
             let flow = if i == 0 && (is_source || fan_in) {
                 // A source has no input; a fan-in head reads its pads via
                 // `ctx.take_input_on(pad)`, so both get an empty `Inputs` here.
@@ -1640,6 +1680,9 @@ fn run_group(
                 ctxs[i].set_input(input);
                 f
             };
+            if let Some(t0) = trace_t0 {
+                counters[i].process_ns.record(t0.elapsed().as_nanos() as u64);
+            }
             match flow {
                 Ok(fl) => {
                     if i == 0 && is_source && matches!(fl, Flow::Eos) {
@@ -1711,6 +1754,11 @@ fn run_group(
                 // Stamp the generation so the consuming group can drop it if a seek
                 // supersedes it before it is processed (spec: flush/seek).
                 out.seek_gen = seek_gen;
+                // Latency tracing: stamp the push instant so the consumer's pop measures
+                // ring residency (spec: Debuggability).
+                if tracing.load(Ordering::Relaxed) {
+                    out.pushed_at = Some(std::time::Instant::now());
+                }
                 progressed = true;
                 if down.push(out).is_err() {
                     break 'group Ok(()); // this downstream is gone

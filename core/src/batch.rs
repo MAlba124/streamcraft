@@ -41,6 +41,11 @@ pub struct Batch {
     /// already queued past the point of no return without racing the producer that is
     /// concurrently pushing fresh, post-seek data. `0` until the first seek.
     pub seek_gen: u64,
+    /// When latency tracing is on (spec: Debuggability), the wall-clock instant the
+    /// scheduler pushed this batch onto an inter-group ring — measured against the pop
+    /// on the consuming side for ring residency. `None` when tracing is off (the
+    /// untraced hot path never reads a clock for it).
+    pub(crate) pushed_at: Option<std::time::Instant>,
 }
 
 impl Batch {
@@ -55,6 +60,7 @@ impl Batch {
             head: 0,
             events: Vec::new(),
             seek_gen: 0,
+            pushed_at: None,
         }
     }
 
@@ -75,6 +81,7 @@ impl Batch {
     pub fn clear(&mut self) {
         self.reset_columns();
         self.events.clear();
+        self.pushed_at = None;
     }
 
     /// Clear the data columns (not the events), resetting the drain cursor.

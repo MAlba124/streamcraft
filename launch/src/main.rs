@@ -82,6 +82,9 @@ struct Options {
     launch: String,
     dump_dot: bool,
     counters: bool,
+    /// `--trace`: enable latency tracing and print per-element histograms after the
+    /// run (p50/p90/p99/max of process time, ring residency, sink wait overshoot).
+    trace: bool,
     log: Option<Level>,
     no_progress: bool,
     /// `(slot_size_bytes, slots)` from `--pool`, or `None` to keep the pipeline default.
@@ -109,6 +112,7 @@ fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
         "launch" | "dot" => {
             let dump_dot = sub == "dot";
             let mut counters = false;
+            let mut trace = false;
             let mut log = None;
             let mut no_progress = false;
             let mut pool = None;
@@ -120,6 +124,7 @@ fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
                 }
                 match arg.as_str() {
                     "--counters" => counters = true,
+                    "--trace" => trace = true,
                     "--no-progress" => no_progress = true,
                     "--log" => {
                         // Switch values still come from the iterator; we are before
@@ -147,6 +152,7 @@ fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
                 launch: words.join(" "),
                 dump_dot,
                 counters,
+                trace,
                 log,
                 no_progress,
                 pool,
@@ -207,6 +213,7 @@ fn usage() -> String {
      \n\
      launch switches:\n\
      \x20 --counters        print each element's counters after the run\n\
+\x20 --trace           latency tracing: per-element p50/p99/max after the run\n\
      \x20 --log LEVEL       log to stderr up to LEVEL (error/warn/info/debug/trace)\n\
      \x20 --no-progress     suppress the live progress line (auto-off when not a tty)\n\
      \x20 --pool SIZExSLOTS size the buffer pool: SIZE bytes/slot, SLOTS slots (e.g. 4194304x16);\n\
@@ -281,6 +288,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if opts.trace {
+        pipeline.set_tracing(true);
+    }
+
     // Take the stats tap before the run so it reads the counters live/after (spec: Taps).
     let tap = pipeline.tap_handle();
 
@@ -297,6 +308,9 @@ fn main() -> ExitCode {
 
     if opts.counters {
         print_counters(&tap, &ids);
+    }
+    if opts.trace {
+        print_latency(&tap, &ids);
     }
 
     match result {
@@ -411,6 +425,42 @@ fn print_counters(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraf
             ),
             None => println!("  e{}: (no counters)", id.0),
         }
+    }
+}
+
+/// `--trace`: per-element latency table (spec: Debuggability). Quantiles are computed
+/// here, on the observer's side, from the histograms the scheduler filled — the tap
+/// model: the pipeline keeps counts, the observer does arithmetic.
+fn print_latency(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraft_core::id::ElementId]) {
+    let fmt = |ns: u64| -> String {
+        if ns >= 1_000_000_000 {
+            format!("{:.2}s", ns as f64 / 1e9)
+        } else if ns >= 1_000_000 {
+            format!("{:.1}ms", ns as f64 / 1e6)
+        } else if ns >= 1_000 {
+            format!("{:.1}µs", ns as f64 / 1e3)
+        } else {
+            format!("{ns}ns")
+        }
+    };
+    println!("latency (p50/p99/max over the whole run):");
+    for &id in ids {
+        let Some((process, queue, wait)) = tap.latency(id) else { continue };
+        let name = tap.element_name(id).unwrap_or("?");
+        let mut line = format!("  {name}#{}:", id.0);
+        for (label, h) in [("process", process), ("queue", queue), ("wait_late", wait)] {
+            if h.count == 0 {
+                continue;
+            }
+            line.push_str(&format!(
+                " {label} {}/{}/{} (n={})",
+                fmt(h.quantile_ns(0.5)),
+                fmt(h.quantile_ns(0.99)),
+                fmt(h.max_ns),
+                h.count
+            ));
+        }
+        println!("{line}");
     }
 }
 

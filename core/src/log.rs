@@ -372,13 +372,16 @@ impl LogDrain {
         Ok(n)
     }
 
-    /// Run this drain to completion, formatting each record to stderr. Intended for a
-    /// dedicated low-priority thread (see [`LogDrain::spawn_stderr`]).
+    /// Run this drain to completion, formatting each record to stderr — with ANSI
+    /// colors when stderr is a terminal (see [`format_record_styled`]; `NO_COLOR` and
+    /// `STREAMCRAFT_LOG_COLOR=always|never` override). Intended for a dedicated
+    /// low-priority thread (see [`LogDrain::spawn_stderr`]).
     pub fn run_to_stderr(self) {
+        let styled = stderr_colors_enabled();
         let stderr = io::stderr();
         while let Some(rec) = self.rx.pop() {
             let mut lock = stderr.lock();
-            let _ = format_record(&mut lock, &rec);
+            let _ = format_record_styled(&mut lock, &rec, styled);
         }
     }
 
@@ -522,19 +525,91 @@ macro_rules! log {
 }
 
 /// Format a record as one human line: `[    12.000ms] INFO  flacdec#3 event key=val …`
-/// (`elem#3` when no element name was stamped — framework internals).
+/// (`elem#3` when no element name was stamped — framework internals). Plain, no ANSI —
+/// the machine/file/test-safe form; the stderr drain uses
+/// [`format_record_styled`] when the terminal supports it.
 pub fn format_record(w: &mut impl Write, rec: &LogRecord) -> io::Result<()> {
+    format_record_styled(w, rec, false)
+}
+
+/// ANSI reset.
+const SGR_RESET: &str = "\x1b[0m";
+/// Dim — timestamps and field keys (context, not content).
+const SGR_DIM: &str = "\x1b[2m";
+
+/// The level's SGR: severity at a glance (error red jumps out of a scroll).
+fn level_sgr(level: Level) -> &'static str {
+    match level {
+        Level::Error => "\x1b[1;31m", // bold red
+        Level::Warn => "\x1b[33m",    // yellow
+        Level::Info => "\x1b[32m",    // green
+        Level::Debug => "\x1b[36m",   // cyan
+        Level::Trace => "\x1b[2m",    // dim
+    }
+}
+
+/// A stable per-element hue, so one element's lines group visually in interleaved
+/// multi-group output. The palette avoids the level colors (no red/yellow/green).
+fn element_sgr(id: ElementId) -> &'static str {
+    const PALETTE: [&str; 6] = [
+        "\x1b[94m", // bright blue
+        "\x1b[95m", // bright magenta
+        "\x1b[96m", // bright cyan
+        "\x1b[34m", // blue
+        "\x1b[35m", // magenta
+        "\x1b[36m", // cyan
+    ];
+    PALETTE[id.0 as usize % PALETTE.len()]
+}
+
+/// Whether the stderr drain should emit ANSI colors: `STREAMCRAFT_LOG_COLOR`
+/// (`always`/`never`) wins, then the `NO_COLOR` convention (https://no-color.org),
+/// then "is stderr actually a terminal" — so piping to a file stays clean bytes.
+/// Public so every stderr drain (the pipeline's multi-channel one included) applies
+/// one policy.
+pub fn stderr_colors_enabled() -> bool {
+    match std::env::var("STREAMCRAFT_LOG_COLOR").as_deref() {
+        Ok("always") => return true,
+        Ok("never") => return false,
+        _ => {}
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    use std::io::IsTerminal;
+    io::stderr().is_terminal()
+}
+
+/// [`format_record`] with optional ANSI styling: dim timestamp, level-colored level,
+/// per-element hue on `name#id`, dim field keys. Styling is a drain-side concern —
+/// the hot path only ever moves POD records.
+pub fn format_record_styled(w: &mut impl Write, rec: &LogRecord, styled: bool) -> io::Result<()> {
     let ms = rec.ts.nanos().map(|n| n as f64 / 1e6).unwrap_or(f64::NAN);
     let name = if rec.name.is_empty() { "elem" } else { rec.name };
-    write!(
-        w,
-        "[{ms:>10.3}ms] {:<5} {name}#{} {}",
-        rec.level.as_str(),
-        rec.element.0,
-        rec.event
-    )?;
-    for f in rec.fields() {
-        write!(w, " {}={}", f.key, f.val)?;
+    if styled {
+        write!(
+            w,
+            "{SGR_DIM}[{ms:>10.3}ms]{SGR_RESET} {}{:<5}{SGR_RESET} {}{name}#{}{SGR_RESET} {}",
+            level_sgr(rec.level),
+            rec.level.as_str(),
+            element_sgr(rec.element),
+            rec.element.0,
+            rec.event
+        )?;
+        for f in rec.fields() {
+            write!(w, " {SGR_DIM}{}={SGR_RESET}{}", f.key, f.val)?;
+        }
+    } else {
+        write!(
+            w,
+            "[{ms:>10.3}ms] {:<5} {name}#{} {}",
+            rec.level.as_str(),
+            rec.element.0,
+            rec.event
+        )?;
+        for f in rec.fields() {
+            write!(w, " {}={}", f.key, f.val)?;
+        }
     }
     writeln!(w)
 }

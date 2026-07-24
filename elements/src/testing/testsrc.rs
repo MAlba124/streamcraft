@@ -52,6 +52,9 @@ static DESC: ElementDesc = ElementDesc {
 pub struct TestSrc {
     total: u64,
     produced: u64,
+    /// The scheduler may call `process()` again after `Flow::Eos` (it drives to
+    /// quiescence); log the completion transition once, not per call.
+    eos_logged: bool,
 }
 
 impl TestSrc {
@@ -60,6 +63,7 @@ impl TestSrc {
         Self {
             total: total_bytes,
             produced: 0,
+            eos_logged: false,
         }
     }
 }
@@ -78,12 +82,16 @@ impl Element for TestSrc {
             }
         }
         log!(&*ctx, Level::Debug, "start", total = self.total);
+        self.eos_logged = false;
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
         if self.produced >= self.total {
-            log!(&*ctx, Level::Info, "eos", produced = self.produced);
+            if !self.eos_logged {
+                self.eos_logged = true;
+                log!(&*ctx, Level::Info, "eos", produced = self.produced);
+            }
             return Ok(Flow::Eos);
         }
         let mut buf = match ctx.try_alloc(PadId(0)) {

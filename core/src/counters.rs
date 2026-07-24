@@ -34,10 +34,91 @@ pub struct CounterSnapshot {
     // TODO(step 7): latency histograms.
 }
 
+/// A lock-free power-of-two latency histogram (spec: Debuggability — latency
+/// instrumentation). Bucket `i` counts durations in `[2^i, 2^(i+1))` ns — 32
+/// buckets cover 1 ns to ~4.3 s at a constant ~2× resolution (the top bucket
+/// absorbs anything longer), which is what perf debugging needs (is it 10 µs or
+/// 10 ms?). Recording is one `leading_zeros` + four relaxed `fetch_*`s.
+#[derive(Default)]
+pub struct LatencyHistogram {
+    buckets: [AtomicU64; Self::BUCKETS],
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+
+impl LatencyHistogram {
+    pub const BUCKETS: usize = 32;
+
+    /// Record one duration. Zero-duration records land in bucket 0.
+    pub fn record(&self, ns: u64) {
+        let bucket = (63 - (ns | 1).leading_zeros() as usize).min(Self::BUCKETS - 1);
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> LatencySnapshot {
+        let mut buckets = [0u64; Self::BUCKETS];
+        for (b, a) in buckets.iter_mut().zip(&self.buckets) {
+            *b = a.load(Ordering::Relaxed);
+        }
+        LatencySnapshot {
+            buckets,
+            count: self.count.load(Ordering::Relaxed),
+            sum_ns: self.sum_ns.load(Ordering::Relaxed),
+            max_ns: self.max_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// An observer-side copy of a [`LatencyHistogram`], with quantile arithmetic (the
+/// observer's policy, per the tap model — the pipeline only keeps counts).
+#[derive(Clone, Copy, Debug)]
+pub struct LatencySnapshot {
+    pub buckets: [u64; LatencyHistogram::BUCKETS],
+    pub count: u64,
+    pub sum_ns: u64,
+    pub max_ns: u64,
+}
+
+impl LatencySnapshot {
+    pub fn mean_ns(&self) -> u64 {
+        if self.count == 0 { 0 } else { self.sum_ns / self.count }
+    }
+
+    /// The quantile `q` in `[0,1]`, estimated at bucket resolution (the geometric
+    /// midpoint of the bucket holding the q-th sample — ~±41% by construction,
+    /// which is the granularity that matters for "µs or ms?" questions).
+    pub fn quantile_ns(&self, q: f64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = ((self.count as f64) * q.clamp(0.0, 1.0)).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (i, &c) in self.buckets.iter().enumerate() {
+            seen += c;
+            if seen >= target {
+                // Geometric midpoint of [2^i, 2^(i+1)): 2^i * sqrt(2) — clamped to the
+                // observed max so an estimate never reads above a real sample.
+                return (((1u128 << i) as f64 * std::f64::consts::SQRT_2) as u64)
+                    .min(self.max_ns);
+            }
+        }
+        self.max_ns
+    }
+}
+
 /// Live per-element counters, incremented by the scheduler as batches cross the
 /// element's boundaries. One shared instance per element, created at `add()` and
 /// stable across runs (cumulative), so a [`TapHandle`] taken before `run()` reads
 /// them while streaming. Read via [`snapshot`](Self::snapshot).
+///
+/// The three latency histograms (spec: Debuggability — latency instrumentation)
+/// fill only while [`Pipeline::set_tracing`](crate::pipeline::Pipeline::set_tracing)
+/// (or `STREAMCRAFT_TRACE=1`) is on — the timestamp reads they need are the cost
+/// the flag gates; the histograms themselves are always allocated (≈1.3 KB/element).
 #[derive(Default)]
 pub struct ElementCounters {
     buffers_in: AtomicU64,
@@ -48,6 +129,14 @@ pub struct ElementCounters {
     batches_out: AtomicU64,
     queue_high_water: AtomicU32,
     drops: AtomicU64,
+    /// Wall time spent inside this element's `process()` per call.
+    pub process_ns: LatencyHistogram,
+    /// Ring residency: wall time a batch waited between the producer's push and this
+    /// (consuming) element's pop — the backpressure/queueing signal.
+    pub queue_ns: LatencyHistogram,
+    /// Sink wait overshoot: how far past its deadline `ctx.wait_until` actually
+    /// returned (running-time domain) — scheduling jitter as the sink experiences it.
+    pub wait_lateness_ns: LatencyHistogram,
 }
 
 impl ElementCounters {
@@ -135,6 +224,18 @@ impl TapHandle {
     /// A snapshot of one element's cumulative counters. `None` for an unknown id.
     pub fn snapshot(&self, el: ElementId) -> Option<CounterSnapshot> {
         self.entries.get(el.0 as usize).map(|(_, c)| c.snapshot())
+    }
+
+    /// Snapshots of one element's latency histograms — `(process, queue_wait,
+    /// sink_wait_lateness)` (spec: Debuggability). All-zero unless tracing is on
+    /// (`Pipeline::set_tracing` / `STREAMCRAFT_TRACE=1`). `None` for an unknown id.
+    pub fn latency(
+        &self,
+        el: ElementId,
+    ) -> Option<(LatencySnapshot, LatencySnapshot, LatencySnapshot)> {
+        self.entries.get(el.0 as usize).map(|(_, c)| {
+            (c.process_ns.snapshot(), c.queue_ns.snapshot(), c.wait_lateness_ns.snapshot())
+        })
     }
 
     /// Running time on the pipeline clock — the denominator for rate windows.
