@@ -168,6 +168,10 @@ pub struct Pipeline {
     /// (`u64::MAX` before the first run), shared into [`TapHandle`]s so observers can
     /// window counter deltas over running time (spec: Taps — bitrate is Δbytes/Δt).
     base_shared: Arc<AtomicU64>,
+    /// Per-element output-pool overrides (`(slot_size, slots)`), indexed by
+    /// `ElementId`; `None` shares the pipeline default pool. See
+    /// [`set_element_pool`](Self::set_element_pool).
+    pool_overrides: Vec<Option<(usize, u32)>>,
     /// Pads instantiated at runtime, per element (spec: dynamic pads). Indexed by
     /// `ElementId`; grown to match `elements` in [`add`](Self::add) and populated by
     /// [`preroll`](Self::preroll). Empty for a static pipeline.
@@ -203,6 +207,7 @@ impl Pipeline {
             clock: Arc::new(InstantClock::new()),
             base_shared: Arc::new(AtomicU64::new(u64::MAX)),
             dyn_pads: Vec::new(),
+            pool_overrides: Vec::new(),
         }
     }
 
@@ -281,7 +286,22 @@ impl Pipeline {
         self.counters.push(Arc::new(ElementCounters::default()));
         self.elements.push(Some(element));
         self.dyn_pads.push(Vec::new());
+        self.pool_overrides.push(None);
         id
+    }
+
+    /// Give one element its **own** output pool, overriding the pipeline default
+    /// (spec: Formats — "pool negotiation is decoupled"; this is its explicit v1).
+    /// One pipeline-wide slot size cannot serve a demuxer's ~16 KB samples and a
+    /// decoder's multi-MB frames at once — that mismatch has cost real gigabytes.
+    /// Elements without an override share the default pool ([`set_pool`](Self::set_pool)).
+    /// Automatic sizing from the negotiated format is the follow-up; core stays
+    /// format-agnostic, so it will arrive as element-declared requirements, not core
+    /// interpreting families.
+    pub fn set_element_pool(&mut self, el: ElementId, slot_size: usize, slots: u32) {
+        if let Some(o) = self.pool_overrides.get_mut(el.0 as usize) {
+            *o = Some((slot_size.max(1), slots.max(1)));
+        }
     }
 
     /// Link a src pad to a sink pad, negotiating their formats (spec: Formats — the
@@ -539,7 +559,22 @@ impl Pipeline {
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
         let total = self.elements.len();
+        // The default pool plus per-element overrides (spec: pool negotiation,
+        // explicit v1 — see set_element_pool). Elements without an override share
+        // the default; each override is its own recycling domain, so a demuxer's
+        // small samples and a decoder's frames stop competing for one slot size.
         let pool = Pool::bounded(self.slot_size, self.pool_slots as u32);
+        let mut distinct_pools: Vec<Pool> = vec![pool.clone()]; // for the run report
+        let pools: Vec<Pool> = (0..total)
+            .map(|i| match self.pool_overrides.get(i).copied().flatten() {
+                Some((slot, slots)) => {
+                    let p = Pool::bounded(slot, slots);
+                    distinct_pools.push(p.clone());
+                    p
+                }
+                None => pool.clone(),
+            })
+            .collect();
         let credits = self.credits;
         let factory: ReactorFactory = self
             .reactor_factory
@@ -658,7 +693,8 @@ impl Pipeline {
             let downstream = std::mem::take(&mut group_downstream[gi]);
             let group_pad_infos: Vec<(usize, Vec<usize>)> =
                 ids.iter().map(|id| pad_infos[id.0 as usize].clone()).collect();
-            let pool = pool.clone();
+            let group_pools: Vec<Pool> =
+                ids.iter().map(|id| pools[id.0 as usize].clone()).collect();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
@@ -667,8 +703,9 @@ impl Pipeline {
             let clock = Arc::clone(&clock);
             handles.push(std::thread::spawn(move || {
                 run_group(
-                    elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
-                    bus, credits, group_counters, group_props, stop, seek, vocabulary, clock,
+                    elems, ids, group_formats, group_logs, upstream, downstream, factory,
+                    group_pools, bus, credits, group_counters, group_props, stop, seek,
+                    vocabulary, clock,
                     base_time, group_pad_infos,
                 )
             }));
@@ -699,12 +736,16 @@ impl Pipeline {
             let _ = drain.join();
         }
 
-        let s = pool.stats();
-        self.last_report = Some(RunReport {
-            pool_slot_allocations: s.slot_allocations,
-            pool_high_water: s.high_water,
-            buffers: s.acquires,
-        });
+        // Aggregate over the default pool and every per-element override (each is
+        // its own recycling domain; high-water sums as a worst-case footprint).
+        let mut report = RunReport::default();
+        for p in &distinct_pools {
+            let s = p.stats();
+            report.pool_slot_allocations += s.slot_allocations;
+            report.pool_high_water += s.high_water;
+            report.buffers += s.acquires;
+        }
+        self.last_report = Some(report);
 
         match first_err {
             None => {
@@ -1195,7 +1236,7 @@ fn run_group(
     upstream: Vec<(PadId, Consumer<Batch>)>,
     downstream: Vec<(PadId, Producer<Batch>)>,
     factory: ReactorFactory,
-    pool: Pool,
+    pools: Vec<Pool>,
     bus: BusSender,
     credits: u32,
     counters: Vec<Arc<ElementCounters>>,
@@ -1222,7 +1263,8 @@ fn run_group(
         factory().map_err(|e| Error::Resource(format!("reactor init: {e}")))?;
     let mut ctxs: Vec<Ctx> = ids
         .iter()
-        .map(|id| Ctx::new(pool.clone(), bus.clone(), *id, BYTES, credits))
+        .zip(&pools)
+        .map(|(id, pool)| Ctx::new(pool.clone(), bus.clone(), *id, BYTES, credits))
         .collect();
     // Size each Ctx's per-pad output table and record its primary (first) src pad, so
     // `ctx.out(pad)` routes per pad and the scheduler can pull each src pad's output for
