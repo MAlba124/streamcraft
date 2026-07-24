@@ -46,7 +46,9 @@
 
 pub mod ebml;
 pub mod element;
+pub mod reader;
 pub mod writer;
 
-pub use element::MkvMux;
+pub use element::{MkvDemux, MkvMux};
+pub use reader::{Frame, MatroskaReader, Track};
 pub use writer::{AudioConfig, MatroskaWriter, TrackConfig, WriteError, APP_NAME, DEFAULT_TIMESTAMP_SCALE};
