@@ -176,6 +176,12 @@ pub struct Ctx {
     /// The pause transport (spec: Clocking — pause is a clock op), installed at run
     /// setup; `None` outside a run.
     pause: Option<Arc<crate::pipeline::PauseShared>>,
+    /// Which of this element's src pads have a linked edge (indexed by local pad),
+    /// installed at run setup. Lets a demuxer skip resolving samples for tracks
+    /// nobody consumes (ZERO-COPY.md stage 5-lite). Empty outside a run — then
+    /// [`pad_linked`](Self::pad_linked) reports `true` (fail open: emit; the
+    /// scheduler's unlinked-drop policy is the backstop).
+    linked_src_pads: Vec<bool>,
     /// Shared seek request, installed at run setup (spec: flush/seek). A source reads the
     /// byte target and a sink the frame target from [`seek_target`](Self::seek_target) when
     /// the scheduler delivers `FlushStart`. `None` outside a run / for a pipeline that is
@@ -231,6 +237,7 @@ impl Ctx {
             path_latency: Timestamp::ZERO,
             trace: None,
             pause: None,
+            linked_src_pads: Vec::new(),
         }
     }
 
@@ -325,6 +332,25 @@ impl Ctx {
     pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base: Arc<std::sync::atomic::AtomicU64>) {
         self.clock = Some(clock);
         self.base = base;
+    }
+
+    /// Install the linked-src-pad map (pipeline -> element at run setup).
+    pub(crate) fn set_linked_pads(&mut self, linked: Vec<bool>) {
+        self.linked_src_pads = linked;
+    }
+
+    /// Whether `pad` (a src pad) has a linked downstream edge. A demuxer may skip
+    /// producing for unlinked pads entirely — cheaper than the scheduler's
+    /// drop-and-count backstop, which still applies to whatever is emitted anyway.
+    /// Outside a run (empty map) this reports `true` — fail open.
+    pub fn pad_linked(&self, pad: PadId) -> bool {
+        self.linked_src_pads.get(pad.0 as usize).copied().unwrap_or(true)
+    }
+
+    /// This element's negotiated output `FormatId` (what pool-allocated buffers are
+    /// stamped with) — for elements constructing `Buffer`s around sliced `Memory`.
+    pub fn out_format(&self) -> FormatId {
+        self.out_format
     }
 
     /// Install the pause transport (pipeline -> element at run setup; spec: Clocking

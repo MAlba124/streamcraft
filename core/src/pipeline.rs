@@ -921,6 +921,22 @@ impl Pipeline {
         // declared latencies, installed into each Ctx so sink waits compensate it.
         let (path_latency, _) = self.compute_in_latency();
 
+        // Per-element linked-src-pad map (for Ctx::pad_linked — a demuxer skips
+        // producing for tracks nobody consumes; ZERO-COPY.md stage 5-lite).
+        let mut linked_pads: Vec<Vec<bool>> = pad_infos
+            .iter()
+            .map(|(npads, _)| vec![false; *npads])
+            .collect();
+        for e in &self.edges {
+            let (el, pad) = (e.src.0 as usize, e.src_pad);
+            if let Some(v) = linked_pads.get_mut(el) {
+                if pad >= v.len() {
+                    v.resize(pad + 1, false);
+                }
+                v[pad] = true;
+            }
+        }
+
         // Spawn a thread per group.
         let mut handles: Vec<JoinHandle<Result<(), Error>>> = Vec::with_capacity(ng);
         for (gi, ids) in groups.into_iter().enumerate() {
@@ -952,6 +968,8 @@ impl Pipeline {
                 ids.iter().map(|id| pools[id.0 as usize].clone()).collect();
             let group_latencies: Vec<Timestamp> =
                 ids.iter().map(|id| path_latency[id.0 as usize]).collect();
+            let group_linked: Vec<Vec<bool>> =
+                ids.iter().map(|id| linked_pads[id.0 as usize].clone()).collect();
             let bus = self.bus_sender.clone();
             let factory = Arc::clone(&factory);
             let stop = Arc::clone(&stop);
@@ -966,7 +984,7 @@ impl Pipeline {
                     elems, ids, group_formats, group_logs, upstream, downstream, factory,
                     group_pools, bus, credits, group_counters, group_props, stop, seek,
                     vocabulary, clock,
-                    base, group_pad_infos, group_latencies, tracing, pause,
+                    base, group_pad_infos, group_latencies, tracing, pause, group_linked,
                 )
             }));
         }
@@ -1571,6 +1589,7 @@ fn run_group(
     path_latencies: Vec<Timestamp>,
     tracing: Arc<AtomicBool>,
     pause: Arc<PauseShared>,
+    linked_pads: Vec<Vec<bool>>,
 ) -> Result<(), Error> {
     let m = elements.len();
     let is_source = upstream.is_empty();
@@ -1623,10 +1642,11 @@ fn run_group(
     // `ctx.wait_until()` (spec: Clocking), each element's computed upstream path
     // latency (spec: Latency — enforced at sinks), and the pause transport so an
     // expired wait blocks instead of rendering while paused.
-    for (ctx, lat) in ctxs.iter_mut().zip(path_latencies) {
+    for ((ctx, lat), linked) in ctxs.iter_mut().zip(path_latencies).zip(linked_pads) {
         ctx.set_clock(Arc::clone(&clock), Arc::clone(&base));
         ctx.set_path_latency(lat);
         ctx.set_pause(Arc::clone(&pause));
+        ctx.set_linked_pads(linked);
     }
     // Install the shared seek request so a source resolves its byte target and a sink its
     // frame target when the scheduler delivers `FlushStart` (spec: flush/seek).

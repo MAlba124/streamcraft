@@ -214,6 +214,7 @@ fn usage() -> String {
      launch switches:\n\
      \x20 --counters        print each element's counters after the run\n\
 \x20 --trace           latency tracing: per-element p50/p99/max after the run\n\
+\x20 (interactive)     while running on a tty: 'p'⏎ pause/resume, 'q'⏎ stop\n\
      \x20 --log LEVEL       log to stderr up to LEVEL (error/warn/info/debug/trace)\n\
      \x20 --no-progress     suppress the live progress line (auto-off when not a tty)\n\
      \x20 --pool SIZExSLOTS size the buffer pool: SIZE bytes/slot, SLOTS slots (e.g. 4194304x16);\n\
@@ -299,6 +300,41 @@ fn main() -> ExitCode {
     // thread. Zero cost on the streaming path; tty-gated so piped output stays clean.
     let progress = (!opts.no_progress && std::io::stderr().is_terminal())
         .then(|| Progress::spawn(tap.clone(), ids.first().copied(), ids.last().copied()));
+
+    // Transport control from stdin while running (tty only — a piped stdin must not
+    // be consumed): `p⏎` pause/resume (spec: Clocking — pause is a clock op), `q⏎`
+    // stop. Line-based on purpose: no raw-mode termios, no dependencies. The reader
+    // thread parks on stdin and is not joined — it dies with the process.
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        let pause = pipeline.pause_handle();
+        let stop = pipeline.stop_handle();
+        std::thread::Builder::new()
+            .name("scl-stdin".into())
+            .spawn(move || {
+                let stdin = std::io::stdin();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if stdin.read_line(&mut line).unwrap_or(0) == 0 {
+                        return; // stdin closed
+                    }
+                    match line.trim() {
+                        "p" => {
+                            let paused = pause.toggle();
+                            eprintln!("\r{}", if paused { "⏸ paused ('p'⏎ resumes)" } else { "▶ playing" });
+                        }
+                        "q" => {
+                            eprintln!("\rstopping…");
+                            stop.stop();
+                            return;
+                        }
+                        "" => {}
+                        other => eprintln!("\r'{other}'? — 'p'⏎ pause/resume, 'q'⏎ stop"),
+                    }
+                }
+            })
+            .expect("spawn stdin control thread");
+    }
 
     let result = pipeline.run();
 
