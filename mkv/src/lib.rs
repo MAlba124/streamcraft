@@ -36,6 +36,10 @@
 //!   constructor-supplied (a mid-pipeline element gets no input during preroll, and the
 //!   scheduler freezes topology after preroll), so [`MkvDemux::new`] takes the stream head and
 //!   parses it in `preroll` to add the pads; the full stream then streams through `process`.
+//! - [`codec`] — the CodecID → announce-family map ([`family_for`]) and the [`Reframer`] that
+//!   turns an AVC/HEVC configuration record + length-prefixed Blocks into an Annex B stream for
+//!   the H.264/H.265 decoders (spec: video codec mappings). Bounds-checked, golden-vector
+//!   tested.
 //!
 //! ## `A_FLAC` (spec: A_FLAC mapping)
 //! The container is codec-agnostic: `CodecID`, `CodecPrivate` (FLAC `fLaC` + STREAMINFO), and
@@ -47,11 +51,24 @@
 //! announces family `flac` (rate/channels/sample) via dynamic caps, `bytes` for unknown codec
 //! ids.
 //!
+//! ## Video (spec: video codec mappings; RFC 9559 §12)
+//! A video track sets `TrackType = 1` with a `Video` master (PixelWidth/PixelHeight). WebM
+//! codecs (`V_VP8`/`V_VP9`/`V_AV1`) store frames raw — one Block per frame, pts already
+//! computed — so the demuxer forwards them verbatim and names the pad `vp8`/`vp9`/`av1`. The
+//! ISO-BMFF NAL codecs (`V_MPEG4/ISO/AVC` → `h264/annexb`, `V_MPEGH/ISO/HEVC` → `h265/annexb`)
+//! carry length-prefixed NALs plus an avcC/hvcC CodecPrivate; the demuxer reframes them to
+//! Annex B (parameter-set head + one start-code access unit per buffer) via [`codec`]. The
+//! writer emits a video track with [`TrackConfig::video`]/[`TrackConfig::vp8`]; a dedicated
+//! video mux **element** is a naming-only follow-up (see "Not yet").
+//!
 //! ## Not yet
 //! - **Multi-track *mux* element**: the writer is N-track, but [`MkvMux`] exposes one sink
 //!   pad. Multi-track wants one dynamic sink pad per input plus fan-in on the core side (a
 //!   documented follow-up, mirroring `sc-ogg`'s single-stream `OggMux`). The **demux** side
 //!   is already multi-track (one dynamic src pad per discovered track).
+//! - **Video *mux* element**: the writer muxes a `V_VP8` (etc.) track today
+//!   ([`TrackConfig::video`]), but [`MkvMux`] is FLAC-oriented. A `V_VP8` mux element is a
+//!   naming-only wrapper over the same writer — deferred with the multi-track element above.
 //! - **Codec-init via caps**: audio params + `CodecPrivate` are constructor arguments for
 //!   now. Carrying codec-init-data through a negotiated `FixedFormat` config blob is the
 //!   clean future path (see [`element`] docs).
