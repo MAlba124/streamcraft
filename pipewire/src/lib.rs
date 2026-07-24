@@ -7,6 +7,7 @@
 //! PipeWire, configuring itself from the runtime `audio/raw` format a decoder announces
 //! (spec: Formats — dynamic caps) and pacing the graph by backpressure.
 
+mod ring;
 mod sink;
 
 pub use sink::PipeWireAudioSink;
