@@ -11,7 +11,8 @@
 //! - [`event`], [`bus`] — the two communication channels (spec: Events, queries, and the bus)
 //! - [`pipeline`] — topology owner and public API (spec: The pipeline API)
 //! - [`io`] — the reactor submit/complete contract (spec: IO)
-//! - [`log`], [`counters`] — observability (spec: Debuggability)
+//! - [`log`], [`counters`] — observability (spec: Debuggability, Taps)
+//! - [`props`] — dynamic element properties (spec: Dynamic element properties)
 
 // `unsafe` is permitted only in `memory` and the SPSC ring (audited, loom+miri
 // covered) once they land. `deny` (not `forbid`) so those modules can locally
@@ -36,6 +37,7 @@ pub mod io;
 pub mod log;
 pub mod memory;
 pub mod pipeline;
+pub mod props;
 pub mod ring;
 pub mod sched;
 pub mod time;

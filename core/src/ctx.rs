@@ -14,11 +14,12 @@ use crate::buffer::{Buffer, BufferFlags};
 use crate::bus::{BusMessage, BusSender};
 use crate::clock::{Clock, WaitOutcome};
 use crate::element::Direction;
-use crate::format::{FixedFormat, OfferDesc, ValueDesc, Vocabulary};
+use crate::format::{FixedFormat, OfferDesc, Value, ValueDesc, Vocabulary};
 use crate::id::{ElementId, FieldId, FormatId, PadId, ValueId};
 use crate::io::{Completion, Io, Submission};
 use crate::log::{Field, Level, Log, Loggable};
 use crate::memory::{Arena, Pool};
+use crate::props::PropTable;
 use crate::time::Timestamp;
 
 /// A runtime format announcement queued by an element via [`Ctx::announce_format`]. The
@@ -148,6 +149,12 @@ pub struct Ctx {
     /// Per-`process()` scratch bump allocator (spec: Memory). Reset by the scheduler after
     /// each `process()`, so temporaries carved here impose no steady-state heap traffic.
     scratch: Arena,
+    /// This element's property mailbox + its `desc().props` table (spec: Dynamic element
+    /// properties), installed at run setup. The app validates and parks sets in the
+    /// table; the scheduler polls the dirty mask at batch boundaries (one relaxed load
+    /// when idle) and the element pull-reads via [`prop`](Self::prop). `None` outside a
+    /// run / for elements declaring no props — zero cost.
+    props: Option<(&'static [crate::element::PropDesc], Arc<PropTable>)>,
 }
 
 impl Ctx {
@@ -184,6 +191,7 @@ impl Ctx {
             base_time: Timestamp::ZERO,
             seek: None,
             scratch: Arena::default(),
+            props: None,
         }
     }
 
@@ -387,6 +395,44 @@ impl Ctx {
             Some(c) => c.new_wait().wait_until(self.base_time.saturating_add(running)),
             None => WaitOutcome::Reached,
         }
+    }
+
+    /// The current value of one of this element's declared properties, by name (spec:
+    /// Dynamic element properties). `None` while never set — fall back to the
+    /// constructor value — and for a name not in `desc().props`. A lock-free seqlock
+    /// read plus a short name scan: cheap enough to call once per batch for a
+    /// continuous knob (volume, threshold); elements that prefer notification handle
+    /// [`Event::PropChanged`](crate::event::Event::PropChanged) instead.
+    pub fn prop(&self, name: &str) -> Option<Value> {
+        let (descs, table) = self.props.as_ref()?;
+        let idx = descs.iter().position(|p| p.name == name)?;
+        table.get(idx)
+    }
+
+    /// Install the property mailbox (pipeline → element at run setup).
+    pub(crate) fn set_props(
+        &mut self,
+        descs: &'static [crate::element::PropDesc],
+        table: Arc<PropTable>,
+    ) {
+        self.props = Some((descs, table));
+    }
+
+    /// Poll the property dirty mask (scheduler hook, once per pass at the batch
+    /// boundary). One relaxed load when nothing changed.
+    pub(crate) fn poll_prop_changes(&self) -> u64 {
+        match &self.props {
+            Some((_, table)) => table.take_dirty(),
+            None => 0,
+        }
+    }
+
+    /// Resolve a dirty-bit index to `(name, current value)` for delivering
+    /// [`Event::PropChanged`](crate::event::Event::PropChanged) (scheduler hook).
+    pub(crate) fn prop_entry(&self, idx: usize) -> Option<(&'static str, Value)> {
+        let (descs, table) = self.props.as_ref()?;
+        let name = descs.get(idx)?.name;
+        Some((name, table.get(idx)?))
     }
 
     /// A per-`process()` bump allocator for temporary scratch space (spec: Memory). Carve

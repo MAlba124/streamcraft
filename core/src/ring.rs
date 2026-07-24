@@ -243,6 +243,20 @@ impl<T> Producer<T> {
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
+
+    /// Items currently queued, from the producer's side. Momentary — the consumer
+    /// may be draining concurrently, so this can overestimate; used for queue-fill
+    /// observability (spec: Taps — backpressure is the queue high-water), never for
+    /// flow-control decisions.
+    pub fn len(&self) -> usize {
+        let tail = self.inner.tail.0.load(Ordering::Relaxed);
+        let head = self.inner.head.0.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl<T> Consumer<T> {

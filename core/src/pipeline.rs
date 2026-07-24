@@ -9,16 +9,16 @@
 //! all-active chain (e.g. `filesrc ! filesink`) this yields one thread per element
 //! with a ring between them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::batch::{Batch, Inputs};
 use crate::bus::{Bus, BusMessage, BusSender, State};
 use crate::clock::{Clock, InstantClock};
-use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport};
+use crate::counters::{CounterSnapshot, ElementCounters, LatencyReport, TapHandle};
 use crate::ctx::{Ctx, SeekState};
-use crate::element::{Direction, Element, Flow, SchedHint, Template};
+use crate::element::{Direction, Element, ElementDesc, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::event::Event;
 use crate::format::{negotiate, FieldConstraint, FixedFormat, OfferDesc, Value, Vocabulary};
@@ -26,6 +26,7 @@ use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, PadId, 
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::log::{log_channel, Level, LevelFilter, Log, LogDrain};
 use crate::memory::Pool;
+use crate::props::{validate_and_set, PropHandle, PropTable};
 use crate::ring::{spsc, Consumer, Producer};
 use crate::time::Timestamp;
 
@@ -114,6 +115,14 @@ impl SeekHandle {
 
 pub struct Pipeline {
     elements: Vec<Option<Box<dyn Element>>>,
+    /// Each element's `&'static` descriptor, captured at [`add`](Self::add). Outlives
+    /// the element being moved into its group thread at `run()`, so name lookups,
+    /// property validation, and handles keep working while streaming.
+    descs: Vec<&'static ElementDesc>,
+    /// Per-element property mailboxes (spec: Dynamic element properties), created at
+    /// [`add`](Self::add) and shared with the element's `Ctx` (reader) and any
+    /// [`PropHandle`] (writers).
+    props: Vec<Arc<PropTable>>,
     edges: Vec<Edge>,
     // The three interning domains (spec: Formats — one interner per domain). Offers
     // declared as `&'static str` on pads are lowered through these at link time, so
@@ -149,6 +158,10 @@ pub struct Pipeline {
     /// samples `base_time = clock.now()` at start, then every element shares this one
     /// timeline via `ctx.now()` / `ctx.wait_until()`.
     clock: Arc<dyn Clock>,
+    /// Raw ns of the running-time base sampled by the current/last [`run`](Self::run)
+    /// (`u64::MAX` before the first run), shared into [`TapHandle`]s so observers can
+    /// window counter deltas over running time (spec: Taps — bitrate is Δbytes/Δt).
+    base_shared: Arc<AtomicU64>,
     /// Pads instantiated at runtime, per element (spec: dynamic pads). Indexed by
     /// `ElementId`; grown to match `elements` in [`add`](Self::add) and populated by
     /// [`preroll`](Self::preroll). Empty for a static pipeline.
@@ -160,6 +173,8 @@ impl Pipeline {
         let (tx, rx) = Bus::channel();
         Self {
             elements: Vec::new(),
+            descs: Vec::new(),
+            props: Vec::new(),
             edges: Vec::new(),
             formats: Interner::new(),
             fields: Interner::new(),
@@ -180,6 +195,7 @@ impl Pipeline {
             log_level: None,
             log_queue_cap: 1024,
             clock: Arc::new(InstantClock::new()),
+            base_shared: Arc::new(AtomicU64::new(u64::MAX)),
             dyn_pads: Vec::new(),
         }
     }
@@ -232,6 +248,13 @@ impl Pipeline {
     /// Elements arrive already constructed: `pipeline.add(FileSrc::new(path))`.
     pub fn add(&mut self, element: impl Element + 'static) -> ElementId {
         let id = ElementId(self.elements.len() as u32);
+        let desc = element.desc();
+        self.descs.push(desc);
+        // The property mailbox and counters are created here — not per run — so
+        // handles taken before `run()` observe the streaming run (spec: Dynamic
+        // element properties; Taps). Counters are cumulative across runs.
+        self.props.push(Arc::new(PropTable::new(desc.props.len())));
+        self.counters.push(Arc::new(ElementCounters::default()));
         self.elements.push(Some(Box::new(element)));
         self.dyn_pads.push(Vec::new());
         id
@@ -345,12 +368,10 @@ impl Pipeline {
         }
     }
 
-    /// An element's descriptor name, for link diagnostics.
+    /// An element's descriptor name, for link diagnostics. Reads the captured desc,
+    /// so it works even while the element itself is off in its group thread.
     fn name_of(&self, el: ElementId) -> &'static str {
-        self.elements
-            .get(el.0 as usize)
-            .and_then(|o| o.as_ref())
-            .map_or("?", |e| e.desc().name)
+        self.descs.get(el.0 as usize).map_or("?", |d| d.name)
     }
 
     /// The family names of a set of lowered offers, resolved back to strings for a
@@ -488,6 +509,8 @@ impl Pipeline {
         // shared into every group so all elements share one timeline.
         let clock = Arc::clone(&self.clock);
         let base_time = clock.now();
+        // Publish the base so TapHandles can window counter deltas over running time.
+        self.base_shared.store(base_time.0, Ordering::Release);
         let order = self.topo_order()?;
         let groups = self.compute_groups(&order)?;
         let ng = groups.len();
@@ -533,10 +556,9 @@ impl Pipeline {
             group_upstream[gd].push((PadId(edge.sink_pad as u32), c));
         }
 
-        // Per-element counters, shared with the app via `counters()` after run.
-        let counters: Vec<Arc<ElementCounters>> =
-            (0..total).map(|_| Arc::new(ElementCounters::default())).collect();
-        self.counters = counters.clone();
+        // Per-element counters — created at `add()` and stable across runs, so a
+        // TapHandle taken before this run reads them live (spec: Taps).
+        let counters = self.counters.clone();
         let stop = Arc::clone(&self.stop);
         let seek = Arc::clone(&self.seek);
 
@@ -597,6 +619,8 @@ impl Pipeline {
             }
             let group_counters: Vec<Arc<ElementCounters>> =
                 ids.iter().map(|id| Arc::clone(&counters[id.0 as usize])).collect();
+            let group_props: Vec<Arc<PropTable>> =
+                ids.iter().map(|id| Arc::clone(&self.props[id.0 as usize])).collect();
             let group_formats: Vec<Vec<Option<FixedFormat>>> = ids
                 .iter()
                 .map(|id| std::mem::take(&mut negotiated[id.0 as usize]))
@@ -620,8 +644,8 @@ impl Pipeline {
             handles.push(std::thread::spawn(move || {
                 run_group(
                     elems, ids, group_formats, group_logs, upstream, downstream, factory, pool,
-                    bus, credits, group_counters, stop, seek, vocabulary, clock, base_time,
-                    group_pad_infos,
+                    bus, credits, group_counters, group_props, stop, seek, vocabulary, clock,
+                    base_time, group_pad_infos,
                 )
             }));
         }
@@ -885,8 +909,46 @@ impl Pipeline {
         todo!("spec: Scheduling — step() mode")
     }
 
-    pub fn set(&mut self, _el: ElementId, _prop: &str, _v: Value) -> Result<(), Error> {
-        todo!("spec: Runtime configuration — live vs. structural props")
+    /// Set an element property (spec: Dynamic element properties). The value is
+    /// validated *here*, against the constraint the element declared in
+    /// `desc().props` — an unknown name or out-of-range value fails loudly at the
+    /// call site, reusing the format algebra's closed check. The element observes
+    /// the new value in `start()` (next run) or, while streaming, at its next batch
+    /// boundary via [`Event::PropChanged`] / [`Ctx::prop`](crate::ctx::Ctx::prop).
+    /// Since `run()` blocks this thread, mid-run sets go through a
+    /// [`prop_handle`](Self::prop_handle) instead (live properties only).
+    pub fn set(&mut self, el: ElementId, prop: &str, v: Value) -> Result<(), Error> {
+        let desc = self.descs.get(el.0 as usize).ok_or(Error::Todo("set: unknown element"))?;
+        validate_and_set(el, desc, &self.props[el.0 as usize], prop, v, false)
+    }
+
+    /// A cloneable handle to set **live** properties from another thread while
+    /// `run()` is blocking (spec: Dynamic element properties). Snapshots the
+    /// elements present now — take it after the topology is built.
+    pub fn prop_handle(&self) -> PropHandle {
+        PropHandle::new(
+            self.descs
+                .iter()
+                .zip(&self.props)
+                .map(|(d, t)| (*d, Arc::clone(t)))
+                .collect(),
+        )
+    }
+
+    /// A cloneable stats tap: read any element's counters and the pipeline's
+    /// running time from any thread, at zero streaming-path cost (spec: Taps —
+    /// a tap is a pull of data the pipeline already keeps). Take it after the
+    /// topology is built and the clock (if custom) is installed.
+    pub fn tap_handle(&self) -> TapHandle {
+        TapHandle::new(
+            self.descs
+                .iter()
+                .zip(&self.counters)
+                .map(|(d, c)| (d.name, Arc::clone(c)))
+                .collect(),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.base_shared),
+        )
     }
 
     pub fn set_latency_budget(&mut self, _budget: Timestamp) {
@@ -1082,6 +1144,7 @@ fn run_group(
     bus: BusSender,
     credits: u32,
     counters: Vec<Arc<ElementCounters>>,
+    props: Vec<Arc<PropTable>>,
     stop: Arc<AtomicBool>,
     seek: Arc<SeekState>,
     vocabulary: Arc<Vocabulary>,
@@ -1140,6 +1203,14 @@ fn run_group(
     // frame target when the scheduler delivers `FlushStart` (spec: flush/seek).
     for ctx in ctxs.iter_mut() {
         ctx.set_seek(Arc::clone(&seek));
+    }
+    // Install each element's property mailbox — only where props are declared, so the
+    // no-props majority keeps the zero-cost `None` path (spec: Dynamic element properties).
+    for i in 0..m {
+        let descs = elements[i].desc().props;
+        if !descs.is_empty() {
+            ctxs[i].set_props(descs, Arc::clone(&props[i]));
+        }
     }
 
     // Start each element; hand any file it registered to this group's reactor.
@@ -1274,6 +1345,25 @@ fn run_group(
         // B. Run the group's elements inline (head active, passive tail).
         let mut fatal = None;
         for i in 0..m {
+            // Live property sets land here, at the batch boundary — a set issued
+            // while batch N was in flight takes effect no earlier than N+1 (spec:
+            // Dynamic element properties). Idle cost: one relaxed load.
+            let mut dirty = ctxs[i].poll_prop_changes();
+            while dirty != 0 {
+                let bit = dirty.trailing_zeros() as usize;
+                dirty &= dirty - 1;
+                if let Some((name, value)) = ctxs[i].prop_entry(bit) {
+                    if let Err(e) =
+                        elements[i].event(&mut ctxs[i], &Event::PropChanged { name, value })
+                    {
+                        fatal = Some(e);
+                        break;
+                    }
+                }
+            }
+            if fatal.is_some() {
+                break;
+            }
             let flow = if i == 0 && (is_source || fan_in) {
                 // A source has no input; a fan-in head reads its pads via
                 // `ctx.take_input_on(pad)`, so both get an empty `Inputs` here.
@@ -1308,10 +1398,16 @@ fn run_group(
                 }
             }
             let (nbuf, nbytes) = ctxs[i].total_output();
-            counters[i].record_out(nbuf, nbytes);
+            // Only touch the counters when something was produced: an idle pass pays
+            // no atomics, and `batches_*` counts real batches, not scheduler passes.
+            if nbuf > 0 {
+                counters[i].record_out(nbuf, nbytes);
+            }
             reactor.submit(ctxs[i].take_submissions());
             if i + 1 < m {
-                counters[i + 1].record_in(nbuf, nbytes);
+                if nbuf > 0 {
+                    counters[i + 1].record_in(nbuf, nbytes);
+                }
                 let (left, right) = ctxs.split_at_mut(i + 1);
                 right[0].input_append(left[i].output_mut());
             }
@@ -1336,6 +1432,9 @@ fn run_group(
                     if down.push(out).is_err() {
                         break 'group Ok(()); // this downstream is gone
                     }
+                    // Queue-fill high-water on the producing element (spec: Taps —
+                    // backpressure shows as the ring sitting at capacity).
+                    counters[m - 1].record_queue_fill(down.len() as u32);
                 }
             }
         }
