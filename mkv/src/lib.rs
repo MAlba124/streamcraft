@@ -61,11 +61,13 @@
 
 #![deny(unsafe_code)]
 
+pub mod codec;
 pub mod ebml;
 pub mod element;
 pub mod reader;
 pub mod writer;
 
+pub use codec::{family_for, nal_head_from_config, Reframer, ReframeError};
 pub use element::{MkvDemux, MkvMux};
 pub use reader::{Frame, MatroskaReader, Track};
 pub use writer::{
