@@ -49,12 +49,30 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > RFC-annotated — rubric + nativization debt in `vp8/src/lib.rs`): `Vp8Dec` with
 > dynamic-caps announce, per-buffer warn-drop-resync error scope, invisible-frame
 > handling. Log records now carry the element **name** (`flacdec#3`). Workspace ~350
-> tests green across 67 binaries. **In flight**: four adoption agents for
-> `oxideav-{h264,av1,vp9,h265}` into the pre-created `h264/ h265/ av1/ vp9/` stubs
-> (note: those four pull `oxideav-core`+serde_json mandatorily, unlike vp8 — flagged
-> for upstream). Open follow-ups: `decode_frame_into` upstream (kill the per-frame
-> plane copy), official `vp80-*` conformance vectors in CI, `MkvDemux` V_VP8 family
-> naming alignment with `vp8dec` ("vp8"), display video sink backend decision.
+> tests green across 67 binaries. Open follow-ups: `decode_frame_into` upstream
+> (kill the per-frame plane copy), official `vp80-*` conformance vectors in CI,
+> `MkvDemux` V_VP8 family naming alignment with `vp8dec` ("vp8"), display video
+> sink backend decision.
+
+> **Update — session 3c (2026-07-24): all five OxideAV video decoders wired.** Four
+> parallel agents vetted-then-adopted, all WIRE verdicts, judged by source/tests
+> (every crates.io blurb was stale, in both directions): **sc-h264** (0.1.7 is a
+> *full* I/P/B CAVLC+CABAC decoder + encoder despite an "empty" blurb; `h264/annexb`
+> in, i420 out, DPB display-order via a feed-order pts FIFO — B-frame pts caveat
+> documented); **sc-h265** (0.0.9 is production-complete HEVC — Main/Main10, inter,
+> SAO, byte-exact vs ffmpeg; `h265/annexb` in, i420 out, honest pts reorder window);
+> **sc-av1** (0.1.16 decodes byte-exact vs dav1d; one temporal unit per buffer,
+> i420/gray8 out, multi-frame TU carry); **sc-vp9** (0.0.12 is **intra-only** — the
+> one real subset; element splits superframes itself; git HEAD has inter+encoder but
+> is unpublished — re-evaluate on next release). Non-i420 outputs (10/12-bit,
+> 4:2:2/4:4:4) decode upstream but are refused per-buffer until the video vocab +
+> pool sizing grow. Shared adoption debt, per-crate lib.rs: mandatory `oxideav-core`
+> (serde_json tail — only their *registry glue*, dead code on our paths; upstream
+> feature-gate PR like vp8 0.2.x did), decode-into-pool (one plane copy/frame),
+> conformance suites in CI, 128 KiB pool slot caps frames ~320×256 (needs a
+> pipeline pool-size API). Workspace **71 test binaries green**. Video milestone
+> path is now: MkvDemux → *Dec → sink; remaining for milestone 5: a display sink +
+> pool sizing + MkvDemux V_VP8/V_MPEG4-ISO-AVC track family naming.
 
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
