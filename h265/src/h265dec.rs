@@ -105,7 +105,12 @@ static DESC: ElementDesc = ElementDesc {
     name: "h265dec",
     pads: &PADS,
     props: &[],
-    sched: SchedHint::Passive,
+    // Active: a video decode is far beyond the inline passive budget (spec:
+    // Scheduling — the Passive contract is enforced, and a frame decode is
+    // milliseconds, not nanoseconds). Its own thread group pipelines decode
+    // against demux and display, and a branching demuxer upstream stays a legal
+    // group tail (its consumers are all group heads).
+    sched: SchedHint::Active,
     inputs: InputPolicy::Single,
     latency: LatencyDesc {
         min: Timestamp::ZERO,
