@@ -36,6 +36,8 @@ pub const DEFAULT_TIMESTAMP_SCALE: u64 = 1_000_000;
 /// The muxer's identity, written into `MuxingApp`/`WritingApp` (spec `§ID-tree`).
 pub const APP_NAME: &str = "sc-mkv";
 
+/// TrackType for video (spec `§ID-tree`; RFC 9559 §5.1.4.1.3 Table 2: 1 video, 2 audio).
+const TRACK_TYPE_VIDEO: u64 = 1;
 /// TrackType for audio (spec `§ID-tree`; Matroska `basics`: 1 video, 2 audio).
 const TRACK_TYPE_AUDIO: u64 = 2;
 
@@ -60,18 +62,34 @@ pub struct AudioConfig {
     pub bit_depth: u32,
 }
 
-/// One track to mux (spec `§ID-tree` TrackEntry). The writer holds a `Vec` of these.
+/// Video parameters for a track's `Video` element (RFC 9559 §5.1.4.1.28). Present only on a
+/// video track; its presence is what makes [`MatroskaWriter`] emit a `Video` master and set
+/// TrackType = video (1) instead of audio (2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoConfig {
+    /// `PixelWidth` (RFC 9559 §5.1.4.1.28.6) — encoded frame width in pixels. MUST be nonzero.
+    pub pixel_width: u32,
+    /// `PixelHeight` (RFC 9559 §5.1.4.1.28.7) — encoded frame height in pixels. MUST be nonzero.
+    pub pixel_height: u32,
+}
+
+/// One track to mux (spec `§ID-tree` TrackEntry). The writer holds a `Vec` of these. A track
+/// is audio unless it carries a [`VideoConfig`] (`video: Some`), in which case it is a video
+/// track and the `audio` params are ignored.
 #[derive(Clone, Debug)]
 pub struct TrackConfig {
     /// `TrackNumber` (1-based, must be nonzero and unique). Also used as `TrackUID`.
     pub track_number: u64,
-    /// `CodecID`, e.g. `"A_FLAC"` (spec: A_FLAC mapping).
+    /// `CodecID`, e.g. `"A_FLAC"` (audio) or `"V_VP8"` (video; RFC 9559 §12 codec mappings).
     pub codec_id: String,
-    /// `CodecPrivate` — codec init data, e.g. FLAC `fLaC` + STREAMINFO (spec: A_FLAC
-    /// mapping). Empty means the element is omitted.
+    /// `CodecPrivate` — codec init data, e.g. FLAC `fLaC` + STREAMINFO, or an
+    /// AVCDecoderConfigurationRecord for `V_MPEG4/ISO/AVC`. Empty means the element is omitted
+    /// (WebM video — VP8/VP9/AV1 — stores frames raw with no CodecPrivate).
     pub codec_private: Vec<u8>,
-    /// Audio parameters.
+    /// Audio parameters. Ignored (and typically zero) when `video` is `Some`.
     pub audio: AudioConfig,
+    /// Video parameters when this is a video track, else `None` (an audio track).
+    pub video: Option<VideoConfig>,
 }
 
 impl TrackConfig {
@@ -83,7 +101,29 @@ impl TrackConfig {
             codec_id: "A_FLAC".to_string(),
             codec_private,
             audio: AudioConfig { sampling_frequency, channels, bit_depth },
+            video: None,
         }
+    }
+
+    /// A video track from its number, `CodecID`, optional `CodecPrivate`, and pixel dimensions
+    /// (RFC 9559 §5.1.4.1.28). WebM codecs (`V_VP8`/`V_VP9`/`V_AV1`) store frames raw with an
+    /// empty CodecPrivate; `V_MPEG4/ISO/AVC` / `V_MPEGH/ISO/HEVC` carry their configuration
+    /// record here. Sets TrackType = video (1) and writes a `Video` master, no `Audio`.
+    pub fn video(track_number: u64, codec_id: &str, codec_private: Vec<u8>, pixel_width: u32, pixel_height: u32) -> Self {
+        Self {
+            track_number,
+            codec_id: codec_id.to_string(),
+            codec_private,
+            audio: AudioConfig { sampling_frequency: 0.0, channels: 0, bit_depth: 0 },
+            video: Some(VideoConfig { pixel_width, pixel_height }),
+        }
+    }
+
+    /// A `V_VP8` (WebM) video track — pre-encoded VP8 frames, no CodecPrivate, given only its
+    /// pixel dimensions. Convenience for the common WebM case (spec: RFC 9559 §12 codec
+    /// mappings).
+    pub fn vp8(track_number: u64, pixel_width: u32, pixel_height: u32) -> Self {
+        Self::video(track_number, "V_VP8", Vec::new(), pixel_width, pixel_height)
     }
 }
 
@@ -233,15 +273,17 @@ impl MatroskaWriter {
         ebml::patch_size(out, size_at, len);
     }
 
-    /// One `TrackEntry` (spec `§ID-tree`), back-patched, with a nested `Audio` master.
+    /// One `TrackEntry` (spec `§ID-tree`), back-patched, with a nested `Audio` *or* `Video`
+    /// master depending on whether the track carries a [`VideoConfig`].
     fn write_track_entry(out: &mut Vec<u8>, track: &TrackConfig) {
         ebml::write_id(out, id::TRACK_ENTRY);
         let size_at = ebml::reserve_size(out);
         let body_start = out.len();
 
+        let track_type = if track.video.is_some() { TRACK_TYPE_VIDEO } else { TRACK_TYPE_AUDIO };
         ebml::write_uint(out, id::TRACK_NUMBER, track.track_number);
         ebml::write_uint(out, id::TRACK_UID, track.track_number); // stable nonzero UID
-        ebml::write_uint(out, id::TRACK_TYPE, TRACK_TYPE_AUDIO);
+        ebml::write_uint(out, id::TRACK_TYPE, track_type);
         // Lacing off: the muxer emits exactly one frame per SimpleBlock (spec `§simpleblock`).
         ebml::write_uint(out, id::FLAG_LACING, 0);
         ebml::write_string(out, id::CODEC_ID, &track.codec_id);
@@ -249,20 +291,39 @@ impl MatroskaWriter {
             ebml::write_binary(out, id::CODEC_PRIVATE, &track.codec_private);
         }
 
-        // Nested Audio master, itself back-patched.
-        ebml::write_id(out, id::AUDIO);
-        let audio_size_at = ebml::reserve_size(out);
-        let audio_start = out.len();
-        ebml::write_f64(out, id::SAMPLING_FREQUENCY, track.audio.sampling_frequency);
-        ebml::write_uint(out, id::CHANNELS, track.audio.channels as u64);
-        if track.audio.bit_depth != 0 {
-            ebml::write_uint(out, id::BIT_DEPTH, track.audio.bit_depth as u64);
+        match &track.video {
+            Some(video) => Self::write_video(out, video),
+            None => Self::write_audio(out, &track.audio),
         }
-        let audio_len = (out.len() - audio_start) as u64;
-        ebml::patch_size(out, audio_size_at, audio_len);
 
         let len = (out.len() - body_start) as u64;
         ebml::patch_size(out, size_at, len);
+    }
+
+    /// The nested `Audio` master (spec `§ID-tree`), itself back-patched.
+    fn write_audio(out: &mut Vec<u8>, audio: &AudioConfig) {
+        ebml::write_id(out, id::AUDIO);
+        let audio_size_at = ebml::reserve_size(out);
+        let audio_start = out.len();
+        ebml::write_f64(out, id::SAMPLING_FREQUENCY, audio.sampling_frequency);
+        ebml::write_uint(out, id::CHANNELS, audio.channels as u64);
+        if audio.bit_depth != 0 {
+            ebml::write_uint(out, id::BIT_DEPTH, audio.bit_depth as u64);
+        }
+        let audio_len = (out.len() - audio_start) as u64;
+        ebml::patch_size(out, audio_size_at, audio_len);
+    }
+
+    /// The nested `Video` master (RFC 9559 §5.1.4.1.28), back-patched — PixelWidth and
+    /// PixelHeight, the minimum a demuxer needs to seed a video track's format announcement.
+    fn write_video(out: &mut Vec<u8>, video: &VideoConfig) {
+        ebml::write_id(out, id::VIDEO);
+        let video_size_at = ebml::reserve_size(out);
+        let video_start = out.len();
+        ebml::write_uint(out, id::PIXEL_WIDTH, video.pixel_width as u64);
+        ebml::write_uint(out, id::PIXEL_HEIGHT, video.pixel_height as u64);
+        let video_len = (out.len() - video_start) as u64;
+        ebml::patch_size(out, video_size_at, video_len);
     }
 
     /// Append one encoded frame as a `SimpleBlock` (spec `§simpleblock`), opening a new

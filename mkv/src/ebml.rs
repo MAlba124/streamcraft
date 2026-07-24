@@ -45,6 +45,13 @@ pub mod id {
     pub const CHANNELS: &[u8] = &[0x9F];
     pub const BIT_DEPTH: &[u8] = &[0x62, 0x64];
 
+    // Video master (RFC 9559 §5.1.4.1.28) — the video counterpart of the Audio master. The
+    // demuxer reads PixelWidth/PixelHeight to seed a video track's pad announcement; the
+    // writer emits them for a video (V_VP8, …) track.
+    pub const VIDEO: &[u8] = &[0xE0];
+    pub const PIXEL_WIDTH: &[u8] = &[0xB0];
+    pub const PIXEL_HEIGHT: &[u8] = &[0xBA];
+
     // Cluster.
     pub const CLUSTER: &[u8] = &[0x1F, 0x43, 0xB6, 0x75];
     pub const TIMESTAMP: &[u8] = &[0xE7];

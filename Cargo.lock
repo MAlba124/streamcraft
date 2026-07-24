@@ -633,7 +633,9 @@ dependencies = [
 name = "sc-mkv"
 version = "0.1.0"
 dependencies = [
+ "oxideav-vp8",
  "sc-flac",
+ "sc-vp8",
  "streamcraft-core",
 ]
 

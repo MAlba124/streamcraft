@@ -94,14 +94,17 @@ what the muxer writes.
         AE      TrackEntry                 [m]   (one per configured track)
           D7    TrackNumber                uint (1-based)
           73C5  TrackUID                   uint (== TrackNumber; a stable nonzero id)
-          83    TrackType                  uint (1=video, 2=audio → 2)
-          86    CodecID                    str  ("A_FLAC")
-          63A2  CodecPrivate               bin  (fLaC + STREAMINFO; see A_FLAC below)
+          83    TrackType                  uint (1=video, 2=audio)
+          86    CodecID                    str  ("A_FLAC" / "V_VP8" / …)
+          63A2  CodecPrivate               bin  (fLaC+STREAMINFO, or avcC/hvcC; see below)
           9C    FlagLacing                 uint (0 — muxer emits one frame per block)
-          E1    Audio                      [m]
+          E1    Audio                      [m]  (audio tracks)
             B5  SamplingFrequency          f32/f64 (Hz)
             9F  Channels                   uint
             6264 BitDepth                  uint (bits/sample)
+          E0    Video                      [m]  (video tracks — instead of Audio)
+            B0  PixelWidth                 uint (encoded frame width)
+            BA  PixelHeight                uint (encoded frame height)
       1F43B675  Cluster                    [m]  (unknown-size, streamed — one per window)
         E7      Timestamp                  uint (cluster base, in TimestampScale ticks)
         A3      SimpleBlock                bin  (track VINT + s16 rel-ts + flags + frame)
@@ -144,6 +147,38 @@ would overflow (and, for a track-0 keyframe, opportunistically). With the defaul
 The muxer is codec-agnostic beyond this table: `CodecID`, `CodecPrivate`, and the frame
 bytes are all supplied by the caller/element, so the same writer muxes any
 frame-per-block codec by changing the strings.
+
+---
+
+## Video codec mappings (RFC 9559 §12; Matroska codec registry)  {#video-codecs}
+
+A video track sets `TrackType = 1` and carries a `Video` master (PixelWidth/PixelHeight)
+instead of `Audio`. Two families, distinguished by how a Block's payload relates to the
+codec's elementary stream:
+
+- **WebM raw** — `V_VP8`, `V_VP9`, `V_AV1`. One Block is exactly one codec frame / temporal
+  unit; there is **no CodecPrivate** (VP8/VP9 store no out-of-band config; AV1 optionally
+  does but WebM commonly omits it). The demuxer forwards Block bytes **verbatim** and just
+  names the pad family (`vp8`/`vp9`/`av1`) so a decoder links. pts is the Block timestamp.
+
+- **ISO-BMFF NAL** — `V_MPEG4/ISO/AVC` (H.264) and `V_MPEGH/ISO/HEVC` (H.265). A Block holds
+  **length-prefixed NAL units** (each NAL preceded by a big-endian length whose size, 1–4
+  octets, is `lengthSizeMinusOne + 1` from the config record), and the parameter sets live in
+  the CodecPrivate as an `AVCDecoderConfigurationRecord` / `HEVCDecoderConfigurationRecord`
+  (ISO/IEC 14496-15). Our H.264/H.265 decoders consume **Annex B** (`00 00 00 01` start-code)
+  streams, so the demuxer reframes (`codec.rs`): the parameter sets (SPS/PPS, VPS/SPS/PPS)
+  become an Annex B head emitted once before the first frame, and each Block's length-prefixed
+  NALs become start-code NALs, one access unit per output buffer. A malformed record/block
+  warns-and-drops (untrusted input; never panics).
+
+The `CodecID → announce family` map (`codec::family_for`) matches each decoder's sink offer:
+`V_VP8→vp8`, `V_VP9→vp9`, `V_AV1→av1`, `V_MPEG4/ISO/AVC→h264/annexb`,
+`V_MPEGH/ISO/HEVC→h265/annexb`, `A_FLAC→flac`, else `bytes`. The demux src pad also announces
+`width`/`height` from the Video element (the decoder re-announces authoritative dims anyway).
+
+The writer emits a video track with `TrackConfig::video`/`TrackConfig::vp8`; today's single-
+sink-pad `MkvMux` element is FLAC-oriented, so a dedicated V_VP8 mux **element** is a
+naming-only follow-up over the same N-track writer (see `lib.rs`, "Not yet").
 
 ---
 

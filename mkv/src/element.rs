@@ -41,6 +41,7 @@
 
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::buffer::BufferFlags;
+use streamcraft_core::bus::BusMessage;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
@@ -51,6 +52,7 @@ use streamcraft_core::format::{OfferDesc, ValueDesc};
 use streamcraft_core::id::PadId;
 use streamcraft_core::time::Timestamp;
 
+use crate::codec::{self, Reframer};
 use crate::reader::{MatroskaReader, Track};
 use crate::writer::{MatroskaWriter, TrackConfig};
 
@@ -305,11 +307,21 @@ const FAMILY_FLAC: &str = "flac";
 /// dynamic caps — "bytes fallback for unknown codec ids").
 const FAMILY_BYTES: &str = "bytes";
 
-/// Both announce families a demux src pad may carry, so the pad's offer menu contains the
+/// Every announce family a demux src pad may carry, so the pad's offer menu contains the
 /// family it will announce (a pad can only announce a family it already offered — the
-/// vocabulary is interned from these offers at link time). `flac` for A_FLAC, `bytes` for
-/// everything else; both are unconstrained byte families.
-static DEMUX_SRC_OFFERS: [OfferDesc; 2] = [OfferDesc::any(FAMILY_FLAC), OfferDesc::any(FAMILY_BYTES)];
+/// vocabulary is interned from these offers at link time). The video families match the
+/// codec decoders' sink offers so `mkvdemux.src_track<N> ! vp8dec.sink` (etc.) negotiates
+/// (spec: RFC 9559 §12 codec mappings; [`codec::family_for`]). All are unconstrained byte
+/// families — the concrete `width`/`height` ride the runtime announcement, not the offer.
+static DEMUX_SRC_OFFERS: [OfferDesc; 7] = [
+    OfferDesc::any(FAMILY_FLAC),
+    OfferDesc::any(FAMILY_BYTES),
+    OfferDesc::any("vp8"),
+    OfferDesc::any("vp9"),
+    OfferDesc::any("av1"),
+    OfferDesc::any("h264/annexb"),
+    OfferDesc::any("h265/annexb"),
+];
 
 static DEMUX_PADS: [PadDesc; 1] = [PadDesc {
     name: "sink",
@@ -342,14 +354,20 @@ struct PadTrack {
     track_number: u64,
     /// The runtime src pad this track's frames go out on ([`Ctx::add_pad`]).
     pad: PadId,
-    /// The announce family for the pad: `flac` for A_FLAC, else `bytes`.
+    /// The announce family for the pad ([`codec::family_for`]): `flac`, `vp8`/`vp9`/`av1`,
+    /// `h264/annexb`/`h265/annexb`, or `bytes` for an unknown codec id.
     family: &'static str,
-    /// The native codec head to emit *before* the first frame — for A_FLAC this is the
+    /// The native codec head to emit *before* the first frame. For A_FLAC this is the
     /// CodecPrivate (`fLaC` + STREAMINFO), reconstructing a native FLAC byte stream a
-    /// downstream `flacdec` decodes (spec: A_FLAC mapping). Empty for a raw `bytes` track.
+    /// downstream `flacdec` decodes (spec: A_FLAC mapping). For H.264/H.265 it is the
+    /// parameter sets from the config record as an Annex B head (SPS/PPS, VPS/SPS/PPS). Empty
+    /// for a raw `bytes` / WebM (VP8/VP9/AV1) track — those frames are self-contained.
     codec_head: Vec<u8>,
-    /// The audio params, for a `flac`-family announcement (rate/channels/sample) mirroring
-    /// what `flacdec` would announce from STREAMINFO.
+    /// How each Block's payload is reframed to the bytes emitted downstream: passthrough for
+    /// FLAC / WebM / raw bytes; length-prefixed-NAL → Annex B for H.264/H.265.
+    reframer: Reframer,
+    /// The track params (audio rate/channels/sample, or video pixel dims) so the runtime
+    /// announcement carries the concrete format a caps-aware consumer sees.
     track: Track,
     /// False until the codec head + the format announcement have been emitted on this pad.
     started: bool,
@@ -413,15 +431,30 @@ impl MkvDemux {
             .map(|pt| pt.pad)
     }
 
-    /// Reconstruct the codec head to emit before a track's first frame (spec: A_FLAC
-    /// mapping). For A_FLAC the CodecPrivate *is* the native FLAC head (`fLaC` + STREAMINFO),
-    /// so it is forwarded verbatim; a downstream `flacdec` then sees exactly a native `.flac`
-    /// stream. Any other codec has no reconstruction — its frames are raw `bytes`.
-    fn codec_head_for(track: &Track) -> Vec<u8> {
-        if track.codec_id == CODEC_A_FLAC {
-            track.codec_private.clone()
-        } else {
-            Vec::new()
+    /// The stream-start head + the per-frame [`Reframer`] for a track (spec: A_FLAC mapping;
+    /// RFC 9559 §12 codec mappings). Three shapes:
+    /// - **A_FLAC**: the CodecPrivate *is* the native FLAC head (`fLaC` + STREAMINFO), forwarded
+    ///   verbatim so a downstream `flacdec` sees exactly a native `.flac` stream; passthrough
+    ///   frames.
+    /// - **H.264 / H.265** (`V_MPEG4/ISO/AVC` / `V_MPEGH/ISO/HEVC`): the CodecPrivate is an
+    ///   AVC/HEVC configuration record — the head is its parameter sets as an Annex B stream
+    ///   (SPS/PPS, VPS/SPS/PPS), and each Block is reframed from length-prefixed NALs to Annex
+    ///   B. A **malformed** record degrades to an empty head + passthrough (never panics): the
+    ///   pad still links, the decoder simply gets no parameter sets until an in-band one arrives.
+    /// - **Everything else** (WebM VP8/VP9/AV1, unknown `bytes`): no head, passthrough frames.
+    fn head_and_reframer(track: &Track) -> (Vec<u8>, Reframer) {
+        match track.codec_id.as_str() {
+            CODEC_A_FLAC => (track.codec_private.clone(), Reframer::Passthrough),
+            "V_MPEG4/ISO/AVC" | "V_MPEGH/ISO/HEVC" => {
+                let is_hevc = track.codec_id == "V_MPEGH/ISO/HEVC";
+                match codec::nal_head_from_config(&track.codec_private, is_hevc) {
+                    Ok((head, length_size)) => (head, Reframer::Nal { length_size }),
+                    // Untrusted CodecPrivate: a broken record must not kill the demuxer. Fall
+                    // back to a bare pad and let the decoder resync at an in-band keyframe.
+                    Err(_) => (Vec::new(), Reframer::Passthrough),
+                }
+            }
+            _ => (Vec::new(), Reframer::Passthrough),
         }
     }
 
@@ -450,11 +483,33 @@ impl MkvDemux {
     /// On a track's first frame the native codec head is emitted first and the pad's runtime
     /// format is announced (spec: dynamic caps). A frame for a track that was not discovered
     /// (absent from the header the demux was constructed with) is dropped — its pad does not
-    /// exist, so there is nowhere to route it.
+    /// exist, so there is nowhere to route it. A Block that fails to reframe (a malformed
+    /// length-prefixed NAL access unit for H.264/H.265) is **warned-and-dropped**, not fatal —
+    /// the demuxer keeps parsing (spec: untrusted input; per-buffer error scope).
     fn drain(&mut self, ctx: &mut Ctx) {
         while let Some(frame) = self.reader.next_frame() {
             let Some(idx) = self.pad_tracks.iter().position(|pt| pt.track_number == frame.track_number) else {
                 continue; // undiscovered track — no pad to route to
+            };
+            // Reframe the Block payload to the downstream bytes (before touching pool memory)
+            // so a malformed access unit is dropped without ever emitting the codec head/format
+            // for a track that would then carry nothing (announce happens only on a good frame).
+            let out_bytes = match self.pad_tracks[idx].reframer.reframe_block(&frame.data) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let element = ctx.element();
+                    ctx.post(BusMessage::Warning {
+                        element,
+                        error: Error::Element {
+                            element,
+                            message: format!(
+                                "mkvdemux: dropping malformed frame on track {}: {e:?}",
+                                frame.track_number
+                            ),
+                        },
+                    });
+                    continue;
+                }
             };
             // First frame on this pad: emit the native codec head and announce the format.
             if !self.pad_tracks[idx].started {
@@ -467,14 +522,20 @@ impl MkvDemux {
                 Self::emit(ctx, pad, Some(frame.pts_ns), &head);
             }
             let pad = self.pad_tracks[idx].pad;
-            Self::emit(ctx, pad, Some(frame.pts_ns), &frame.data);
+            Self::emit(ctx, pad, Some(frame.pts_ns), &out_bytes);
         }
     }
 
     /// Announce a src pad's runtime format (spec: dynamic caps; follows `OggDemux`/`flacdec`).
-    /// For a `flac` track the audio params (rate/channels/sample) ride the announcement so a
-    /// caps-aware consumer sees the concrete format; for a `bytes` track it is a bare family
-    /// announcement. Either rides a `bytes` bridge to a byte-reading peer (`flacdec`).
+    /// The concrete params ride the announcement so a caps-aware consumer sees the format:
+    /// - `flac` → audio rate/channels/sample (mirroring what `flacdec` announces);
+    /// - a **video** family (`vp8`/`vp9`/`av1`/`h264/annexb`/`h265/annexb`) → the container's
+    ///   `width`/`height` from the Video element, when present (the decoder re-announces
+    ///   authoritative dims from the bitstream — this just seeds negotiation);
+    /// - `bytes` (or a video track with no declared dims) → a bare family announcement.
+    ///
+    /// Every family rides a byte bridge to a byte-reading peer, so a caps-ignoring decoder still
+    /// links on the `bytes`/family offer.
     fn announce(ctx: &mut Ctx, pad: PadId, family: &'static str, track: &Track) {
         if family == FAMILY_FLAC {
             ctx.announce_format(
@@ -486,10 +547,25 @@ impl MkvDemux {
                     ("sample", ValueDesc::Id(sample_name(track.bit_depth))),
                 ],
             );
+        } else if is_video_family(family) && track.pixel_width != 0 && track.pixel_height != 0 {
+            ctx.announce_format(
+                pad,
+                family,
+                &[
+                    ("width", ValueDesc::Int(track.pixel_width as i64)),
+                    ("height", ValueDesc::Int(track.pixel_height as i64)),
+                ],
+            );
         } else {
-            ctx.announce_format(pad, FAMILY_BYTES, &[]);
+            ctx.announce_format(pad, family, &[]);
         }
     }
+}
+
+/// Whether a family names a video codec the demuxer routes (spec: RFC 9559 §12 codec
+/// mappings). Used to decide whether a `width`/`height` announcement is meaningful.
+fn is_video_family(family: &str) -> bool {
+    matches!(family, "vp8" | "vp9" | "av1" | "h264/annexb" | "h265/annexb")
 }
 
 /// Map a bit depth to the `sample` categorical name `flacdec` uses (spec: dynamic caps). An
@@ -525,14 +601,16 @@ impl Element for MkvDemux {
             ));
         }
         for track in probe.tracks() {
-            let family = if track.codec_id == CODEC_A_FLAC { FAMILY_FLAC } else { FAMILY_BYTES };
+            let family = codec::family_for(&track.codec_id);
+            let (codec_head, reframer) = Self::head_and_reframer(track);
             let name = format!("src_track{}", track.track_number);
             let pad = ctx.add_pad(Direction::Src, &name, &DEMUX_SRC_OFFERS);
             self.pad_tracks.push(PadTrack {
                 track_number: track.track_number,
                 pad,
                 family,
-                codec_head: Self::codec_head_for(track),
+                codec_head,
+                reframer,
                 track: track.clone(),
                 started: false,
             });
@@ -545,7 +623,9 @@ impl Element for MkvDemux {
         self.reader = MatroskaReader::new();
         for pt in &mut self.pad_tracks {
             pt.started = false;
-            pt.codec_head = Self::codec_head_for(&pt.track);
+            let (head, reframer) = Self::head_and_reframer(&pt.track);
+            pt.codec_head = head;
+            pt.reframer = reframer;
         }
         self.scratch.clear();
         Ok(())

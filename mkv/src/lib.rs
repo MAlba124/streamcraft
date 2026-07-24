@@ -36,6 +36,10 @@
 //!   constructor-supplied (a mid-pipeline element gets no input during preroll, and the
 //!   scheduler freezes topology after preroll), so [`MkvDemux::new`] takes the stream head and
 //!   parses it in `preroll` to add the pads; the full stream then streams through `process`.
+//! - [`codec`] — the CodecID → announce-family map ([`family_for`]) and the [`Reframer`] that
+//!   turns an AVC/HEVC configuration record + length-prefixed Blocks into an Annex B stream for
+//!   the H.264/H.265 decoders (spec: video codec mappings). Bounds-checked, golden-vector
+//!   tested.
 //!
 //! ## `A_FLAC` (spec: A_FLAC mapping)
 //! The container is codec-agnostic: `CodecID`, `CodecPrivate` (FLAC `fLaC` + STREAMINFO), and
@@ -47,11 +51,24 @@
 //! announces family `flac` (rate/channels/sample) via dynamic caps, `bytes` for unknown codec
 //! ids.
 //!
+//! ## Video (spec: video codec mappings; RFC 9559 §12)
+//! A video track sets `TrackType = 1` with a `Video` master (PixelWidth/PixelHeight). WebM
+//! codecs (`V_VP8`/`V_VP9`/`V_AV1`) store frames raw — one Block per frame, pts already
+//! computed — so the demuxer forwards them verbatim and names the pad `vp8`/`vp9`/`av1`. The
+//! ISO-BMFF NAL codecs (`V_MPEG4/ISO/AVC` → `h264/annexb`, `V_MPEGH/ISO/HEVC` → `h265/annexb`)
+//! carry length-prefixed NALs plus an avcC/hvcC CodecPrivate; the demuxer reframes them to
+//! Annex B (parameter-set head + one start-code access unit per buffer) via [`codec`]. The
+//! writer emits a video track with [`TrackConfig::video`]/[`TrackConfig::vp8`]; a dedicated
+//! video mux **element** is a naming-only follow-up (see "Not yet").
+//!
 //! ## Not yet
 //! - **Multi-track *mux* element**: the writer is N-track, but [`MkvMux`] exposes one sink
 //!   pad. Multi-track wants one dynamic sink pad per input plus fan-in on the core side (a
 //!   documented follow-up, mirroring `sc-ogg`'s single-stream `OggMux`). The **demux** side
 //!   is already multi-track (one dynamic src pad per discovered track).
+//! - **Video *mux* element**: the writer muxes a `V_VP8` (etc.) track today
+//!   ([`TrackConfig::video`]), but [`MkvMux`] is FLAC-oriented. A `V_VP8` mux element is a
+//!   naming-only wrapper over the same writer — deferred with the multi-track element above.
 //! - **Codec-init via caps**: audio params + `CodecPrivate` are constructor arguments for
 //!   now. Carrying codec-init-data through a negotiated `FixedFormat` config blob is the
 //!   clean future path (see [`element`] docs).
@@ -61,11 +78,53 @@
 
 #![deny(unsafe_code)]
 
+pub mod codec;
 pub mod ebml;
 pub mod element;
 pub mod reader;
 pub mod writer;
 
+pub use codec::{family_for, nal_head_from_config, Reframer, ReframeError};
 pub use element::{MkvDemux, MkvMux};
 pub use reader::{Frame, MatroskaReader, Track};
-pub use writer::{AudioConfig, MatroskaWriter, TrackConfig, WriteError, APP_NAME, DEFAULT_TIMESTAMP_SCALE};
+pub use writer::{
+    AudioConfig, MatroskaWriter, TrackConfig, VideoConfig, WriteError, APP_NAME,
+    DEFAULT_TIMESTAMP_SCALE,
+};
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based lookup (spec: Plugins — `--list` and
+/// descriptor introspection). Typed `use` + constructor stays the primary path.
+///
+/// **Neither element is constructible by name yet.** Both descriptors carry `make_default:
+/// None`, so [`Registry::parse`](streamcraft_core::registry::Registry::parse) cannot build
+/// them — by design: `MkvMux` needs the track config (CodecID/CodecPrivate/audio params) and
+/// `MkvDemux` needs the stream **header bytes** at construction (see [`MkvDemux::new`]), and
+/// neither has a sensible zero-arg default while codec-init negotiation and autoplug are still
+/// being built. Registration exposes the `mkvmux`/`mkvdemux` descriptors for `--list`/help and
+/// descriptor queries until autoplug lands and can supply those inputs.
+///
+/// The `&'static ElementDesc`s are taken from throwaway instances (a bare `MkvDemux` over an
+/// empty header, a FLAC `MkvMux`) — only `desc()` is called, so the instances are dropped.
+pub fn register(registry: &mut Registry) {
+    registry.register(MkvMux::flac(Vec::new(), 0.0, 0, 0).desc());
+    registry.register(MkvDemux::new(Vec::new()).desc());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `register` exposes both elements under their descriptor names; neither is
+    /// name-constructible (both carry `make_default: None`).
+    #[test]
+    fn register_exposes_both_elements() {
+        let mut reg = Registry::new();
+        register(&mut reg);
+        assert_eq!(reg.names(), vec!["mkvdemux", "mkvmux"], "both descriptors registered");
+        assert!(reg.get("mkvmux").unwrap().make_default.is_none(), "mkvmux not name-constructible");
+        assert!(reg.get("mkvdemux").unwrap().make_default.is_none(), "mkvdemux not name-constructible");
+    }
+}
