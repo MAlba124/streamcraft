@@ -71,3 +71,15 @@
 pub mod h265dec;
 
 pub use h265dec::H265Dec;
+
+use streamcraft_core::element::Element;
+use streamcraft_core::registry::Registry;
+
+/// Register this crate's elements for name-based construction (spec: Plugins —
+/// `parse("… ! h265dec ! …")`). Typed `use` + constructor stays primary; this powers
+/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// throwaway default instance; [`H265Dec`] is config-free (dimensions come from the
+/// SPS, announced at runtime).
+pub fn register(registry: &mut Registry) {
+    registry.register(H265Dec::new().desc());
+}

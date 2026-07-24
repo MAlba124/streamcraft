@@ -133,7 +133,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default-constructs trivially: dimensions come from the frame header, not props.
+    make_default: Some(|| Box::new(Vp9Dec::new())),
 };
 
 /// The categorical `video/raw` `pixfmt` id for a decoded frame's geometry + depth.

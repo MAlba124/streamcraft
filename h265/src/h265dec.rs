@@ -113,7 +113,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default-constructs trivially: dimensions come from the SPS, not props.
+    make_default: Some(|| Box::new(H265Dec::new())),
 };
 
 /// A decoded frame in output order, waiting for a pool slot — the backpressure

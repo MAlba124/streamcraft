@@ -95,7 +95,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
-    make_default: None,
+    // Default-constructs trivially: dimensions come from the sequence header, not props.
+    make_default: Some(|| Box::new(Av1Dec::new())),
 };
 
 /// The `video/raw` pixel format a decoded [`SpecFrame`] maps onto, and the total
