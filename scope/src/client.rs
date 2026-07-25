@@ -82,6 +82,9 @@ pub struct Model {
     pub cur: Option<CounterSample>,
     pub prev: Option<CounterSample>,
     pub feed: VecDeque<FeedLine>,
+    /// Presentation duration, from the `DurationChanged` bus message, the sticky
+    /// `Info` poll, or a negotiated `duration` format field (remux pipelines).
+    pub duration_ns: Option<u64>,
     pub bus_dropped: u64,
     pub logs_dropped: u64,
     /// Set by the reader on a topology-mutation bus message; consumed by `poll`.
@@ -173,6 +176,15 @@ impl Client {
             self.last_counters = Instant::now();
             let s = self.next_seq();
             let _ = send(&mut self.writer, kind::GET_COUNTERS, s, &[]);
+            // Sticky facts a late attach missed on the bus; stop once known.
+            let need_info = {
+                let m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+                m.duration_ns.is_none()
+            };
+            if need_info {
+                let s = self.next_seq();
+                let _ = send(&mut self.writer, kind::GET_INFO, s, &[]);
+            }
         }
         let want_topo = {
             let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,8 +233,16 @@ fn reader_loop(mut stream: UnixStream, model: Arc<Mutex<Model>>) {
             }
             kind::TOPOLOGY => {
                 if let Some(t) = decode_topology(&frame.payload, &strings) {
+                    if t.duration_ns.is_some() {
+                        m.duration_ns = t.duration_ns;
+                    }
                     m.topo = Some(t);
                     m.topo_gen += 1;
+                }
+            }
+            kind::INFO => {
+                if let Some(Some(ns)) = wire::decode_info(&frame.payload) {
+                    m.duration_ns = Some(ns);
                 }
             }
             kind::COUNTERS => {
@@ -233,6 +253,10 @@ fn reader_loop(mut stream: UnixStream, model: Arc<Mutex<Model>>) {
             }
             kind::BUS_MSG => {
                 if let Some(row) = wire::BusMsgRow::decode(&frame.payload) {
+                    // DurationChanged: a=element, c=ns (wire.rs mapping table).
+                    if row.kind == 13 {
+                        m.duration_ns = Some(row.c);
+                    }
                     let (text, severity) = format_bus(&row);
                     m.push_feed(text, severity, true);
                     // Topology-mutation kinds are the cue to re-GetTopology (wire.rs).
@@ -377,7 +401,7 @@ fn decode_counters(payload: &[u8]) -> Option<CounterSample> {
 }
 
 /// The BusMsg kind names, in the pinned ordinal order (wire.rs a/b/c/d table).
-const BUS_KIND_NAMES: [&str; 13] = [
+const BUS_KIND_NAMES: [&str; 14] = [
     "Error",
     "Warning",
     "Eos",
@@ -391,6 +415,7 @@ const BUS_KIND_NAMES: [&str; 13] = [
     "LatencyChanged",
     "Qos",
     "BranchSealed",
+    "DurationChanged",
 ];
 
 fn format_bus(row: &wire::BusMsgRow) -> (String, u8) {
@@ -408,6 +433,7 @@ fn format_bus(row: &wire::BusMsgRow) -> (String, u8) {
         10 => format!("[bus] LatencyChanged {}ns -> {}ns", row.c, row.d),
         11 => format!("[bus] Qos sink={} lateness={}ns", row.a, row.c as i64),
         12 => format!("[bus] BranchSealed group={} {text}", row.a),
+        13 => format!("[bus] DurationChanged el={} {}s", row.a, row.c / 1_000_000_000),
         _ => format!("[bus] {name} a={} b={}", row.a, row.b),
     };
     let severity = match row.kind {

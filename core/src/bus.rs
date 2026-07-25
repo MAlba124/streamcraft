@@ -38,6 +38,12 @@ pub enum BusMessage {
     Qos { sink: ElementId, lateness_ns: i64 },
     /// A branch failed and was isolated (spec: Supervision).
     BranchSealed { group: GroupId, error: Error },
+    /// A presentation duration became known — a demuxer parsed it from its headers
+    /// (mkv `Info\Duration`). Transport UIs act on this, so it rides the bus (spec:
+    /// the bus carries semantics the application acts on); it cannot ride negotiated
+    /// formats on a playback path, since announced fields survive fixation only when
+    /// the consumer's offers declare them (decoders don't declare `duration`).
+    DurationChanged { element: ElementId, ns: u64 },
 }
 
 /// The two message classes (spec: Events, queries, and the bus). `Critical` never
@@ -53,8 +59,9 @@ pub enum MessageClass {
 impl BusMessage {
     /// This message's drop class (spec). Critical: `Error`, `Eos`, `StateChanged`,
     /// `PadAdded`, `ElementAdded/Removed`, `LinkChanged`, `SubgraphJoined`,
-    /// `LatencyChanged`, `BranchSealed` — errors, EOS/state, and every topology mutation
-    /// a monitor tracks. Droppable: `Warning`, `Qos`, `Tags` — chatter.
+    /// `LatencyChanged`, `BranchSealed`, `DurationChanged` — errors, EOS/state,
+    /// topology mutations, and rare facts the app acts on. Droppable: `Warning`,
+    /// `Qos`, `Tags` — chatter.
     pub fn class(&self) -> MessageClass {
         match self {
             BusMessage::Warning { .. } | BusMessage::Qos { .. } | BusMessage::Tags { .. } => {
@@ -69,7 +76,8 @@ impl BusMessage {
             | BusMessage::LinkChanged { .. }
             | BusMessage::SubgraphJoined { .. }
             | BusMessage::LatencyChanged { .. }
-            | BusMessage::BranchSealed { .. } => MessageClass::Critical,
+            | BusMessage::BranchSealed { .. }
+            | BusMessage::DurationChanged { .. } => MessageClass::Critical,
         }
     }
 }

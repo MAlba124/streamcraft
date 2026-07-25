@@ -116,6 +116,10 @@ impl BusTapRow {
                 row.a = group.0;
                 row.copy_text(error_text(error));
             }
+            BusMessage::DurationChanged { element, ns } => {
+                row.a = element.0;
+                row.c = *ns;
+            }
         }
         row
     }
@@ -151,6 +155,7 @@ pub const fn bus_kind_ordinal(msg: &BusMessage) -> u8 {
         BusMessage::LatencyChanged { .. } => 10,
         BusMessage::Qos { .. } => 11,
         BusMessage::BranchSealed { .. } => 12,
+        BusMessage::DurationChanged { .. } => 13,
     }
 }
 

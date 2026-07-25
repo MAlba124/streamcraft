@@ -69,6 +69,8 @@ struct GraphView {
     press: Option<(f32, f32)>,
     last_mouse: (f32, f32),
     panning: bool,
+    /// Dragging the minimap's viewport rectangle.
+    mm_drag: bool,
     hover_edge: Option<usize>,
     selected_edge: Option<usize>,
 }
@@ -82,6 +84,7 @@ impl Default for GraphView {
             press: None,
             last_mouse: (0.0, 0.0),
             panning: false,
+            mm_drag: false,
             hover_edge: None,
             selected_edge: None,
         }
@@ -155,7 +158,7 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
                 },
             );
             let position = m.cur.as_ref().map(|c| c.now_ns).filter(|&t| t != u64::MAX);
-            let duration = m.topo.as_ref().and_then(|t| t.duration_ns);
+            let duration = m.duration_ns;
             (status, element_rates(&m), m.error.clone(), position, duration)
         };
 
@@ -295,9 +298,10 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
         let m = client.model.lock().unwrap_or_else(|e| e.into_inner());
         let (nel, ned) = m.topo.as_ref().map(|t| (t.elements.len(), t.edges.len())).unwrap_or((0, 0));
         eprintln!(
-            "scraft-scope: {frame} frames, {nel} elements, {ned} edges, counters={}, log lines={}",
+            "scraft-scope: {frame} frames, {nel} elements, {ned} edges, counters={}, log lines={}, duration={}",
             m.cur.is_some(),
             log.len(),
+            m.duration_ns.map(fmt_time).unwrap_or_else(|| "unknown".into()),
         );
     }
     Ok(())
@@ -504,6 +508,7 @@ fn draw_graph_panel(
     let node_bg = ui.theme().panel_bg;
     let title_bg = ui.theme().title_bg;
     let title_h = ui.theme().title_h;
+    let border = ui.theme().panel_border;
 
     // "Fit" button in the panel's title bar.
     let fit_btn = Rect::new(rect.right() - 44.0, rect.y + 2.0, 40.0, ui.theme().title_h - 4.0);
@@ -527,17 +532,42 @@ fn draw_graph_panel(
     let over = body.contains(mouse.0, mouse.1) && !splitting;
     let rel = (mouse.0 - body.x, mouse.1 - body.y);
 
-    if over && input.wheel != 0.0 {
+    // --- minimap geometry + interaction (steals the press from pan/select) ---
+    let bounds = content_bounds(laid);
+    let (bx0, by0, bx1, by1) = bounds;
+    let (bw, bh) = ((bx1 - bx0).max(1.0), (by1 - by0).max(1.0));
+    let mm_scale = ((body.w * 0.28).clamp(80.0, 220.0) / bw)
+        .min((body.h * 0.28).clamp(60.0, 170.0) / bh);
+    let mm = Rect::new(
+        body.right() - bw * mm_scale - 10.0,
+        body.bottom() - bh * mm_scale - 10.0,
+        bw * mm_scale,
+        bh * mm_scale,
+    );
+    let over_mm = over && mm.contains(mouse.0, mouse.1);
+    if over_mm && input.pressed(crate::ui::MouseButton::Left) {
+        gv.mm_drag = true;
+    }
+    if !input.down(crate::ui::MouseButton::Left) {
+        gv.mm_drag = false;
+    }
+    if gv.mm_drag {
+        // Centre the viewport on the content point under the cursor.
+        let c = ((mouse.0 - mm.x) / mm_scale + bx0, (mouse.1 - mm.y) / mm_scale + by0);
+        gv.pan = (body.w * 0.5 - c.0 * gv.zoom, body.h * 0.5 - c.1 * gv.zoom);
+    }
+
+    if over && !over_mm && input.wheel != 0.0 {
         let factor = 1.1f32.powf(input.wheel);
         let (pan, zoom) = zoom_at(gv.pan, gv.zoom, rel, factor);
         gv.pan = pan;
         gv.zoom = zoom;
     }
-    if over && input.pressed(crate::ui::MouseButton::Left) {
+    if over && !over_mm && !gv.mm_drag && input.pressed(crate::ui::MouseButton::Left) {
         gv.press = Some(mouse);
         gv.panning = false;
     }
-    if input.down(crate::ui::MouseButton::Left) {
+    if input.down(crate::ui::MouseButton::Left) && !gv.mm_drag {
         if let Some(origin) = gv.press {
             let moved = (mouse.0 - origin.0).abs() + (mouse.1 - origin.1).abs();
             if gv.panning || moved > 4.0 {
@@ -553,7 +583,7 @@ fn draw_graph_panel(
 
     // Edge hover: nearest polyline within 7 screen px.
     gv.hover_edge = None;
-    if over && !gv.panning {
+    if over && !over_mm && !gv.panning && !gv.mm_drag {
         let mut best = 7.0f32;
         for (i, e) in laid.edges.iter().enumerate() {
             for w in e.points.windows(2) {
@@ -577,16 +607,24 @@ fn draw_graph_panel(
     // --- draw, clipped to the body ---
     ui.draw_list_mut().push_clip(body);
 
-    // Group hulls: hue-tinted fill + border + label.
+    // Group hulls: hue-tinted fill + border + label. The hull reserves a strip
+    // above the content for the label so nodes never paint over it.
+    const GROUP_PAD: f32 = 12.0; // graph units around the content
+    const GROUP_LABEL_H: f32 = 18.0; // extra headroom for the label strip
     for g in &laid.groups {
         let hue = GROUP_HUES[g.group as usize % GROUP_HUES.len()];
-        let (x, y) = to_screen((g.x - 8.0, g.y - 8.0));
-        let r = Rect::new(x, y, (g.w + 16.0) * zoom, (g.h + 16.0) * zoom);
+        let (x, y) = to_screen((g.x - GROUP_PAD, g.y - GROUP_PAD - GROUP_LABEL_H));
+        let r = Rect::new(
+            x,
+            y,
+            (g.w + 2.0 * GROUP_PAD) * zoom,
+            (g.h + 2.0 * GROUP_PAD + GROUP_LABEL_H) * zoom,
+        );
         ui.draw_list_mut().fill_rect(r, hue.with_alpha(18));
         ui.draw_list_mut().rect_outline(r, 1.0, hue.with_alpha(150));
         let px = (12.0 * zoom).clamp(8.0, 16.0);
         if 12.0 * zoom >= 7.0 {
-            ui.text_px(r.x + 4.0, r.y + 2.0, &format!("group {}", g.group), px, hue.with_alpha(200));
+            ui.text_px(r.x + 5.0, r.y + 3.0, &format!("group {}", g.group), px, hue.with_alpha(220));
         }
     }
 
@@ -598,17 +636,6 @@ fn draw_graph_panel(
             let (ax, ay) = to_screen(w[0]);
             let (bx, by) = to_screen(w[1]);
             ui.draw_list_mut().line(ax, ay, bx, by, th, col);
-        }
-        // Family label near the first segment (full caps live on hover/click).
-        if 11.0 * zoom >= 7.5 {
-            if let (Some(info), Some(&a), Some(&b)) =
-                (cache.edges.get(i), e.points.first(), e.points.get(1))
-            {
-                let (ax, ay) = to_screen(a);
-                let (bx, by) = to_screen(b);
-                let (mx, my) = ((ax + bx) * 0.5, (ay + by) * 0.5);
-                ui.text_px(mx + 4.0, my - 12.0 * zoom, &info.family, 11.0 * zoom, dim);
-            }
         }
     }
 
@@ -633,6 +660,49 @@ fn draw_graph_panel(
                 let stats = format!("{} q{}", fmt_bitrate(rate.bytes_per_s), rate.queue_hw);
                 ui.text_px(r.x + 8.0 * zoom, r.y + 26.0 * zoom, &stats, 11.0 * zoom, dim);
             }
+        }
+    }
+
+    // Edge family labels — drawn after the nodes so a label near a box lands on
+    // top of it, never underneath (full caps live on hover/click).
+    if 11.0 * zoom >= 7.5 {
+        for (i, e) in laid.edges.iter().enumerate() {
+            if let (Some(info), Some(&a), Some(&b)) =
+                (cache.edges.get(i), e.points.first(), e.points.get(1))
+            {
+                let (ax, ay) = to_screen(a);
+                let (bx2, by2) = to_screen(b);
+                let (mx, my) = ((ax + bx2) * 0.5, (ay + by2) * 0.5);
+                ui.text_px(mx + 4.0, my - 12.0 * zoom, &info.family, 11.0 * zoom, dim);
+            }
+        }
+    }
+
+    // Minimap: whole-content overview bottom-right, with the visible viewport as a
+    // movable rectangle (drag inside the minimap to recentre the camera).
+    {
+        ui.draw_list_mut().fill_rect(mm, Color::rgba(0x0f, 0x11, 0x15, 225));
+        ui.draw_list_mut().rect_outline(mm, 1.0, border);
+        for n in &laid.nodes {
+            let r = Rect::new(
+                mm.x + (n.x - bx0) * mm_scale,
+                mm.y + (n.y - by0) * mm_scale,
+                (n.w * mm_scale).max(1.5),
+                (n.h * mm_scale).max(1.5),
+            );
+            ui.draw_list_mut().fill_rect(r, dim.with_alpha(170));
+        }
+        // Viewport rectangle: the content region currently visible in the body.
+        let v = Rect::new(
+            mm.x + (-gv.pan.0 / zoom - bx0) * mm_scale,
+            mm.y + (-gv.pan.1 / zoom - by0) * mm_scale,
+            body.w / zoom * mm_scale,
+            body.h / zoom * mm_scale,
+        );
+        let v = v.intersect(&mm);
+        if v.w > 2.0 && v.h > 2.0 {
+            ui.draw_list_mut().rect_outline(v, 1.5, accent);
+            ui.draw_list_mut().fill_rect(v, accent.with_alpha(20));
         }
     }
 

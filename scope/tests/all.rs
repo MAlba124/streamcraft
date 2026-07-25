@@ -662,3 +662,38 @@ fn time_formatting() {
     assert_eq!(fmt_time(83_000_000_000), "1:23");
     assert_eq!(fmt_time(3_723_000_000_000), "1:02:03");
 }
+
+#[test]
+fn draw_diagonal_line_is_a_rotated_quad() {
+    // A 45° line must emit an actual rotated quad, not its bounding rect (the
+    // "gray rectangle" fan-out bug): corners sit ±t/2 along the line normal.
+    let mut dl = DrawList::new();
+    dl.line(0.0, 0.0, 10.0, 10.0, 2.0, Color::WHITE);
+    let p = dl.prims()[0];
+    let c = p.corners.expect("diagonal line must carry explicit corners");
+    let inv = std::f32::consts::FRAC_1_SQRT_2; // unit normal component for 45°
+    assert!((c[0].0 - -inv).abs() < 1e-4 && (c[0].1 - inv).abs() < 1e-4);
+    assert!((c[2].0 - (10.0 + inv)).abs() < 1e-4 && (c[2].1 - (10.0 - inv)).abs() < 1e-4);
+    // Opposite edges stay `thickness` apart: |c0 - c3| == 2.
+    let d = ((c[0].0 - c[3].0).powi(2) + (c[0].1 - c[3].1).powi(2)).sqrt();
+    assert!((d - 2.0).abs() < 1e-4);
+    // Bbox covers the quad.
+    assert!(p.rect.x <= -inv && p.rect.right() >= 10.0 + inv);
+    // Axis-aligned lines keep the fast path (no corners).
+    let mut dl2 = DrawList::new();
+    dl2.line(0.0, 5.0, 30.0, 5.0, 2.0, Color::WHITE);
+    assert!(dl2.prims()[0].corners.is_none());
+}
+
+#[test]
+fn draw_build_rotated_quad_vertices() {
+    let mut dl = DrawList::new();
+    dl.line(0.0, 0.0, 8.0, 6.0, 2.0, Color::WHITE); // 3-4-5 diagonal
+    let mut arena = Arena::with_capacity(256);
+    let b = dl.build(&mut arena).pop().unwrap();
+    // Vertices are the rotated corners (normal = (-0.6, 0.8)): v0 = a + n,
+    // v3 = a - n.
+    assert!((b.xy[0] - -0.6).abs() < 1e-4 && (b.xy[1] - 0.8).abs() < 1e-4);
+    assert!((b.xy[6] - 0.6).abs() < 1e-4 && (b.xy[7] - -0.8).abs() < 1e-4);
+    assert_eq!(b.indices, &[0, 1, 2, 0, 2, 3]);
+}

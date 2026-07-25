@@ -783,6 +783,9 @@ pub struct MkvDemux {
     /// demuxer consumes **no input**, so upstream backs up into the scheduler's gates
     /// instead of this element ballooning. Holds at most a codec head + one frame.
     pending: std::collections::VecDeque<Carry>,
+    /// `DurationChanged` has been posted this run (once, from `process` — posted at
+    /// stream time, not preroll, so an introspection server started at `run()` sees it).
+    posted_duration: bool,
 }
 
 /// A partially-emitted blob: `bytes[off..]` still needs pool slots on `pad`.
@@ -807,6 +810,7 @@ impl MkvDemux {
             reader: MatroskaReader::new(),
             scratch: Vec::new(),
             pending: std::collections::VecDeque::new(),
+            posted_duration: false,
         }
     }
 
@@ -1188,6 +1192,16 @@ impl Element for MkvDemux {
             self.reader
                 .push(buf.memory.data())
                 .map_err(|e| Error::Resource(format!("mkvdemux: parse error: {e:?}")))?;
+            // Segment Info declared a presentation duration: post it once — a transport
+            // UI acts on it, and it can't ride negotiated formats on a playback path
+            // (decoders don't declare the `duration` field, so fixation drops it).
+            if !self.posted_duration {
+                if let Some(ns) = self.reader.duration_ns() {
+                    self.posted_duration = true;
+                    let element = ctx.element();
+                    ctx.post(BusMessage::DurationChanged { element, ns });
+                }
+            }
             if !self.drain(ctx) {
                 return Ok(Flow::Ok);
             }
@@ -1211,5 +1225,6 @@ impl Element for MkvDemux {
         self.reader = MatroskaReader::new();
         self.scratch = Vec::new();
         self.pending.clear();
+        self.posted_duration = false;
     }
 }

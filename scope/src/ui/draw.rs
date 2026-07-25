@@ -104,7 +104,11 @@ pub enum TexId {
 /// normalised atlas space and ignored for [`TexId::None`].
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Prim {
+    /// Axis-aligned bounds. The quad's corners when `corners` is `None`.
     pub rect: Rect,
+    /// Explicit corners (TL, TR, BR, BL winding) for rotated quads — diagonal
+    /// lines. `None` = the axis-aligned `rect` fast path.
+    pub corners: Option<[(f32, f32); 4]>,
     /// Normalised source rect in the atlas (`TexId::Font` only).
     pub uv: Rect,
     pub color: Color,
@@ -177,7 +181,30 @@ impl DrawList {
         if color.a == 0 && tex == TexId::None {
             return; // fully transparent solid: nothing to draw
         }
-        self.prims.push(Prim { rect, uv, color, tex, clip: self.current_clip() });
+        self.prims.push(Prim { rect, corners: None, uv, color, tex, clip: self.current_clip() });
+    }
+
+    /// A solid quad with explicit corners (TL, TR, BR, BL winding) — rotated
+    /// geometry (diagonal lines). `rect` is set to the bounding box.
+    fn push_quad_corners(&mut self, corners: [(f32, f32); 4], color: Color) {
+        if color.a == 0 {
+            return;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in &corners {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        self.prims.push(Prim {
+            rect: Rect::new(x0, y0, x1 - x0, y1 - y0),
+            corners: Some(corners),
+            uv: Rect::default(),
+            color,
+            tex: TexId::None,
+            clip: self.current_clip(),
+        });
     }
 
     /// A filled solid rectangle.
@@ -199,10 +226,8 @@ impl DrawList {
     }
 
     /// A line from `a` to `b`, drawn as a quad of the given thickness. Axis-aligned
-    /// lines stay crisp; diagonals are approximated by a rotated quad computed by
-    /// the backend — here we keep the simple axis-aligned fast path (the scope's
-    /// panels/bars/rows are all axis-aligned) and fall back to a thin bounding quad
-    /// for diagonals (graph edges are a later panel).
+    /// lines take the crisp `Rect` fast path; diagonals emit a properly rotated
+    /// quad (the graph view's routed edges are mostly diagonal).
     pub fn line(&mut self, ax: f32, ay: f32, bx: f32, by: f32, thickness: f32, color: Color) {
         let t = thickness.max(1.0);
         if (ay - by).abs() < 0.5 {
@@ -216,10 +241,20 @@ impl DrawList {
             let h = (ay - by).abs();
             self.fill_rect(Rect::new(ax - t / 2.0, y0, t, h), color);
         } else {
-            // diagonal: axis-aligned bounding quad (good enough for coarse edges).
-            let x0 = ax.min(bx);
-            let y0 = ay.min(by);
-            self.fill_rect(Rect::new(x0, y0, (ax - bx).abs().max(t), (ay - by).abs().max(t)), color);
+            // Rotated quad: offset both endpoints by ±half-thickness along the
+            // unit normal of the line direction.
+            let (dx, dy) = (bx - ax, by - ay);
+            let len = (dx * dx + dy * dy).sqrt();
+            let (nx, ny) = (-dy / len * t * 0.5, dx / len * t * 0.5);
+            self.push_quad_corners(
+                [
+                    (ax + nx, ay + ny),
+                    (bx + nx, by + ny),
+                    (bx - nx, by - ny),
+                    (ax - nx, ay - ny),
+                ],
+                color,
+            );
         }
     }
 
@@ -285,12 +320,12 @@ impl DrawList {
         for (i, p) in self.prims.iter().enumerate() {
             let v0 = i * 4;
             let r = p.rect;
-            let corners = [
+            let corners = p.corners.unwrap_or([
                 (r.x, r.y),
                 (r.right(), r.y),
                 (r.right(), r.bottom()),
                 (r.x, r.bottom()),
-            ];
+            ]);
             let uvc = [
                 (p.uv.x, p.uv.y),
                 (p.uv.right(), p.uv.y),

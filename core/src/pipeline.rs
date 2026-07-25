@@ -1495,12 +1495,21 @@ impl Pipeline {
             global_filter: None,
             log_channels: false,
         };
+        // The internal sticky tap: attached for the server's whole life so a client
+        // attaching mid-run can poll facts (duration) that were posted at preroll.
+        let bus_port = self.bus.tap_port();
+        let (sticky_tx, sticky_rx) = crate::ring::spsc(64);
+        bus_port.attach(sticky_tx);
         Arc::new(IntrospectShared {
             stop: AtomicBool::new(false),
             topology: Mutex::new(Arc::new(snap)),
             handles: Mutex::new(handles),
             log_taps: Arc::new(crate::introspect::tap::LogTapRegistry::new()),
-            bus_port: self.bus.tap_port(),
+            bus_port,
+            sticky: Mutex::new(crate::introspect::server::Sticky {
+                rx: Some(sticky_rx),
+                duration_ns: None,
+            }),
         })
     }
 

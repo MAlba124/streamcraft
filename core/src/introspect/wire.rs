@@ -23,7 +23,7 @@ use std::io::{self, Read};
 /// Wire protocol major version (breaking; never intended to change).
 pub const VER_MAJOR: u16 = 1;
 /// Wire protocol minor version (additive kinds + appended row fields).
-pub const VER_MINOR: u16 = 0;
+pub const VER_MINOR: u16 = 1;
 
 /// The 4-byte magic in the `Hello` frame — "SCIP" (StreamCraft Introspection Protocol).
 pub const MAGIC: [u8; 4] = *b"SCIP";
@@ -70,6 +70,8 @@ pub mod kind {
     pub const SET_TRACING: u16 = 0x0022; // C→S
     pub const SUBSCRIBE: u16 = 0x0023; // C→S
     pub const UNSUBSCRIBE: u16 = 0x0024; // C→S
+    pub const GET_INFO: u16 = 0x0025; // C→S (v1.1, empty)
+    pub const INFO: u16 = 0x0026; // S→C (v1.1)
 
     pub const STR_DEF: u16 = 0x0030; // S→C
     pub const BUS_MSG: u16 = 0x0031; // S→C (pushed)
@@ -1052,6 +1054,23 @@ pub fn decode_dropped(payload: &[u8]) -> Option<(u32, u64)> {
     Some((stream_id, count))
 }
 
+// --- Info (v1.1) -------------------------------------------------------------
+
+/// The `Info` reply (v1.1): sticky pipeline facts a late-attaching client would
+/// otherwise have missed on the bus. Currently: `duration_ns u64` ([`TS_NONE`] =
+/// unknown). Additive-versioned like table rows: new fields append, old clients
+/// read the prefix they know, new clients treat a short payload as "absent".
+pub fn encode_info(duration_ns: Option<u64>) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_u64(duration_ns.unwrap_or(TS_NONE));
+    w.into_vec()
+}
+pub fn decode_info(payload: &[u8]) -> Option<Option<u64>> {
+    let mut r = Reader::new(payload);
+    let ns = r.get_u64()?;
+    Some(if ns == TS_NONE { None } else { Some(ns) })
+}
+
 // --- BusMsg (96 B) ---------------------------------------------------------
 //
 // The per-kind a/b/c/d mapping (spec: document the mapping in wire.rs). `kind` is the
@@ -1070,6 +1089,7 @@ pub fn decode_dropped(payload: &[u8]) -> Option<(u32, u64)> {
 //   10 LatencyChanged c=old ns   d=new ns
 //   11 Qos            a=sink     c=lateness_ns (i64 bits)
 //   12 BranchSealed   a=group                        msg=truncated error text
+//   13 DurationChanged a=element  c=duration ns       (v1.1: presentation duration known)
 //
 // `class`: 0 droppable, 1 critical (from `BusMessage::class`). The topology-mutation
 // kinds (PadAdded/ElementAdded/ElementRemoved/LinkChanged) are the client's cue to

@@ -374,6 +374,10 @@ fn bus_tap_row_kind_and_mapping_table() {
         ),
         (BusMessage::Qos { sink: ElementId(12), lateness_ns: -5 }, 11, 0, 12, 0, (-5i64) as u64, 0),
         (BusMessage::BranchSealed { group: GroupId(13), error: Error::Todo("seal") }, 12, 1, 13, 0, 0, 0),
+        (
+            BusMessage::DurationChanged { element: ElementId(14), ns: 90_000_000_000 },
+            13, 1, 14, 0, 90_000_000_000, 0,
+        ),
     ];
     for (i, (msg, kind, class, a, b, c, d)) in cases.into_iter().enumerate() {
         let row = BusTapRow::from_msg(&msg, 1);

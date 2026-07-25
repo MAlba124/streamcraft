@@ -59,6 +59,17 @@ pub struct IntrospectShared {
     pub log_taps: Arc<LogTapRegistry>,
     /// The bus tap port (server-internal; `BusTapPort` is `pub(crate)`).
     pub(crate) bus_port: BusTapPort,
+    /// Sticky facts distilled from an always-attached internal bus tap, so a client
+    /// attaching mid-run can poll (`GetInfo`) what it missed on the bus — a demuxer
+    /// posts `DurationChanged` once at preroll. Server threads drain opportunistically.
+    pub sticky: Mutex<Sticky>,
+}
+
+/// See [`IntrospectShared::sticky`]. `rx` is the internal tap's consumer; `None` in
+/// tests that build shared state without a bus.
+pub struct Sticky {
+    pub(crate) rx: Option<crate::ring::Consumer<BusTapRow>>,
+    pub duration_ns: Option<u64>,
 }
 
 impl IntrospectShared {
@@ -71,6 +82,23 @@ impl IntrospectShared {
     /// Replace the control handles (spec: `run()` republishes handles too).
     pub fn set_handles(&self, handles: Handles) {
         *self.handles.lock().unwrap_or_else(|e| e.into_inner()) = handles;
+    }
+
+    /// Drain the internal sticky bus tap into the cached facts. Cheap (the messages
+    /// are rare) and called opportunistically from server threads, never streaming ones.
+    pub fn drain_sticky(&self) {
+        let mut s = self.sticky.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rx) = &s.rx else { return };
+        let mut duration = None;
+        while let Some(row) = rx.try_pop() {
+            // Ordinal 13 = DurationChanged (wire.rs mapping table): a=element, c=ns.
+            if row.kind == 13 {
+                duration = Some(row.c);
+            }
+        }
+        if duration.is_some() {
+            s.duration_ns = duration;
+        }
     }
 }
 
@@ -390,6 +418,11 @@ impl Conn {
             kind::GET_TOPOLOGY => self.reply_topology(shared, seq),
             kind::GET_DOT => self.reply_dot(shared, seq),
             kind::GET_COUNTERS => self.reply_counters(shared, seq),
+            kind::GET_INFO => {
+                shared.drain_sticky();
+                let d = shared.sticky.lock().unwrap_or_else(|e| e.into_inner()).duration_ns;
+                self.send(kind::INFO, seq, &wire::encode_info(d))
+            }
             kind::GET_LATENCY => self.reply_latency(shared, seq, &frame.payload),
             kind::GET_LATENCY_REPORT => self.reply_latency_report(shared, seq),
             kind::GET_PROPS => self.reply_props(shared, seq, &frame.payload),
