@@ -846,6 +846,16 @@ impl Ctx {
         std::mem::replace(&mut self.ins[i], replacement)
     }
 
+    /// Attach an in-band event to a src pad's output at the **current end** of what
+    /// this element has pushed (spec: Events — travel with buffers, ordered): it
+    /// reaches the downstream element's `event()` after every buffer pushed so far is
+    /// consumed. What a muxer uses to send [`Event::Patch`] after its final bytes.
+    /// (Format announcements go through [`announce_format`](Self::announce_format) /
+    /// [`forward_format`](Self::forward_format), which also re-fixate.)
+    pub fn push_event(&mut self, pad: PadId, event: Event) {
+        self.out_slot(pad).push_event(event);
+    }
+
     /// Hand a spent batch from [`take_input_on`](Self::take_input_on) back for reuse.
     /// An aggregator owns whole input batches; returning the drained shell keeps its
     /// column capacity in circulation for the next `take_input_on` replacement instead

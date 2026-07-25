@@ -67,6 +67,28 @@ pub const DURATION: &[u8] = &[0x44, 0x89];
     pub const BLOCK: &[u8] = &[0xA1];
     pub const BLOCK_DURATION: &[u8] = &[0x9B];
     pub const REFERENCE_BLOCK: &[u8] = &[0xFB];
+
+    // SeekHead (RFC 9559 §5.1.1) — the index at the Segment's start telling a player
+    // where the other level-1 masters live; how end-of-file Cues are discovered
+    // without scanning the whole Segment.
+    pub const SEEK_HEAD: &[u8] = &[0x11, 0x4D, 0x9B, 0x74];
+    pub const SEEK: &[u8] = &[0x4D, 0xBB];
+    pub const SEEK_ID: &[u8] = &[0x53, 0xAB];
+    pub const SEEK_POSITION: &[u8] = &[0x53, 0xAC];
+
+    // Cues (RFC 9559 §5.1.5) — the seek index: CueTime → (CueTrack,
+    // CueClusterPosition), one CuePoint per seekable Cluster. Positions are Segment
+    // Positions (relative to the first byte of the Segment's data — RFC 9559 §4).
+    pub const CUES: &[u8] = &[0x1C, 0x53, 0xBB, 0x6B];
+    pub const CUE_POINT: &[u8] = &[0xBB];
+    pub const CUE_TIME: &[u8] = &[0xB3];
+    pub const CUE_TRACK_POSITIONS: &[u8] = &[0xB7];
+    pub const CUE_TRACK: &[u8] = &[0xF7];
+    pub const CUE_CLUSTER_POSITION: &[u8] = &[0xF1];
+
+    // Void (RFC 8794 §11.3.2) — reserved dead space. The writer emits one where the
+    // SeekHead will go and overwrites it at finalize (the single back-patch).
+    pub const VOID: &[u8] = &[0xEC];
 }
 
 /// The fixed width, in octets, of a back-patched size (spec `§sizing`). An 8-octet size

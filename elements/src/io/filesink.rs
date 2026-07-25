@@ -142,7 +142,28 @@ impl Element for FileSink {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // The single back-patch (spec: Events — `Patch`): an indexed container's front
+        // reservation (a Matroska SeekHead) now that its target's offset is known.
+        // In-band, so it arrives after every buffer whose bytes precede it was popped;
+        // ordering versus still-in-flight appends is irrelevant — the offsets are
+        // disjoint and positioned IO is order-independent.
+        if let Event::Patch { offset, data } = event {
+            if !self.started {
+                return Err(Error::Todo("filesink not started"));
+            }
+            let buf = streamcraft_core::buffer::Buffer {
+                memory: data.clone(),
+                pts: Timestamp::NONE,
+                dts: Timestamp::NONE,
+                duration: Timestamp::NONE,
+                flags: streamcraft_core::buffer::BufferFlags::empty(),
+                format: streamcraft_core::id::FormatId(0),
+                sync: None,
+            };
+            ctx.io().submit_write(self.file, *offset, buf, 0);
+            self.in_flight += 1;
+        }
         Ok(())
     }
 

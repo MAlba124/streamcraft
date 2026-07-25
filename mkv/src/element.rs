@@ -439,7 +439,9 @@ impl MkvMux {
     fn finish_stream(&mut self, ctx: &mut Ctx) {
         self.done = true;
         if let Some(mut writer) = self.writer.take() {
-            writer.finalize_scatter(&mut self.out);
+            // Cues are not enabled on the single-pad mux (its streaming users have no
+            // seekable target), so there is never a patch to forward.
+            let _ = writer.finalize_scatter(&mut self.out);
         }
         self.drain_out_exact(ctx);
     }

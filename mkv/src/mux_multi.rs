@@ -645,6 +645,11 @@ impl MkvMuxN {
             configs.insert(0, a);
         }
         let mut writer = MatroskaWriter::new(configs);
+        // Cues + front SeekHead always on (RFC 9559 §5.1.5): this muxer targets files,
+        // and without cues players fall back to bisecting 1.5 GB of Clusters to seek.
+        // Costs a Vec push per Cluster and ~24 KB per movie; the one back-patch rides
+        // out as `Event::Patch` at finalize.
+        writer.enable_cues();
         if self.duration_ns > 0 {
             writer.set_duration_ns(self.duration_ns);
         }
@@ -732,10 +737,21 @@ impl MkvMuxN {
             self.build_writer(); // from the Ready lanes only (no-op when none)
         }
         self.merge(ctx, true);
-        if let Some(mut writer) = self.writer.take() {
-            writer.finalize_scatter(&mut self.out);
-        }
+        let patch = match self.writer.take() {
+            Some(mut writer) => writer.finalize_scatter(&mut self.out),
+            None => None,
+        };
         self.drain_out_exact(ctx);
+        if let Some(p) = patch {
+            // The SeekHead back-patch (RFC 9559 §5.1.1; spec: Events — `Patch`): the
+            // front reservation now points at the Cues just drained above. Pushed
+            // after every stream byte, so the sink applies it once the file is
+            // otherwise complete.
+            let mut buf = ctx.alloc_exact(SRC, p.bytes.len());
+            buf.memory.as_mut_full()[..p.bytes.len()].copy_from_slice(&p.bytes);
+            buf.memory.set_len(p.bytes.len());
+            ctx.push_event(SRC, Event::Patch { offset: p.offset, data: buf.memory });
+        }
     }
 
     /// Handle a runtime format announcement: attribute it to a pad (see the module docs

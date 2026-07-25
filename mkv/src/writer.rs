@@ -184,6 +184,10 @@ struct OpenCluster {
     /// Scatter-mode frame payloads, each pinned to the `buf` offset it must follow when
     /// the body is emitted (its SimpleBlock header's end). Empty in contiguous mode.
     pieces: Vec<(usize, Memory)>,
+    /// Whether a keyframe of the cue track landed in this Cluster — what makes it
+    /// cue-worthy (a CuePoint must reference a position decoding can start from;
+    /// mkvmerge cues video keyframes the same way).
+    has_cue_key: bool,
 }
 
 impl OpenCluster {
@@ -214,6 +218,40 @@ pub struct MatroskaWriter {
     /// lazily at the first frame, so no back-patching is ever needed). Without it, players
     /// treat the unknown-size Segment as a live stream with no duration or seek bar.
     duration_ns: Option<u64>,
+    /// Cue tracking (RFC 9559 §5.1.5), opt-in via [`enable_cues`](Self::enable_cues) —
+    /// `None` keeps the writer strictly single-pass and seek-free (the default).
+    cues: Option<CueState>,
+}
+
+/// Cue/SeekHead bookkeeping (RFC 9559 §5.1.1, §5.1.5) — filled while writing, spent at
+/// finalize. All "positions" are Segment Positions: byte offsets relative to the first
+/// byte of the Segment's data (RFC 9559 §4), which is exactly where the SeekHead
+/// reservation sits (it is the Segment's first child).
+struct CueState {
+    /// Absolute stream offset of the Segment data start == the SeekHead reservation.
+    segment_data_start: u64,
+    /// Segment Positions of the Info and Tracks masters (for the SeekHead).
+    info_pos: u64,
+    tracks_pos: u64,
+    /// The track CuePoints reference: the first video track, else the anchor track.
+    cue_track: u64,
+    /// One `(CueTime ticks, CueClusterPosition)` per cue-worthy Cluster, in order.
+    points: Vec<(u64, u64)>,
+}
+
+/// The fixed size of the SeekHead reservation (a Void the writer back-patches at
+/// finalize): SeekHead master (4-octet ID + 8-octet size) + three Seek entries (Info,
+/// Tracks, Cues), each ≤ 29 octets with 8-octet back-patched sizes — ≤ 99 total, so 128
+/// leaves room and keeps the remainder big enough for the trailing Void header.
+const SEEKHEAD_RESERVE: usize = 128;
+
+/// The back-patch [`MatroskaWriter::finalize_scatter`] returns when cues are enabled:
+/// `bytes` (exactly [`SEEKHEAD_RESERVE`] long — the SeekHead plus a Void filler)
+/// replace the reservation at absolute stream offset `offset`. The stream itself stays
+/// single-pass; this is the one positioned overwrite an indexed container needs.
+pub struct SeekHeadPatch {
+    pub offset: u64,
+    pub bytes: Vec<u8>,
 }
 
 impl MatroskaWriter {
@@ -235,7 +273,35 @@ impl MatroskaWriter {
             cluster: None,
             anchor_track,
             duration_ns: None,
+            cues: None,
         }
+    }
+
+    /// Track cue points and emit a `Cues` master + front `SeekHead` (RFC 9559 §5.1.1,
+    /// §5.1.5). Must be called before [`write_header`]. The header then reserves
+    /// [`SEEKHEAD_RESERVE`] octets of Void as the Segment's first child; finalize emits
+    /// the Cues after the last Cluster and produces the SeekHead bytes for that
+    /// reservation — [`finalize`](Self::finalize) patches them in place (the whole
+    /// stream is one `Vec`), [`finalize_scatter`](Self::finalize_scatter) returns a
+    /// [`SeekHeadPatch`] for the caller's sink to apply as one positioned write.
+    /// Without cues a player can only seek by scanning/bisecting Clusters.
+    pub fn enable_cues(&mut self) {
+        if self.header_written {
+            return; // too late — the reservation must precede Info/Tracks
+        }
+        let cue_track = self
+            .tracks
+            .iter()
+            .find(|t| t.video.is_some())
+            .map(|t| t.track_number)
+            .unwrap_or(self.anchor_track);
+        self.cues = Some(CueState {
+            segment_data_start: 0,
+            info_pos: 0,
+            tracks_pos: 0,
+            cue_track,
+            points: Vec::new(),
+        });
     }
 
     /// Declare the presentation duration (ns), to be written as `Info\Duration`. Must be
@@ -286,7 +352,21 @@ impl MatroskaWriter {
         // Segment: open with an unknown size — it runs to end of stream (spec `§sizing`).
         ebml::write_id(out, id::SEGMENT);
         ebml::write_unknown_size(out);
+        if let Some(cues) = &mut self.cues {
+            // The SeekHead reservation, as the Segment's first child (RFC 9559 §5.1.1
+            // recommends the SeekHead be the first element): a Void (RFC 8794 §11.3.2)
+            // finalize overwrites. Positions recorded here are `out`-relative; the
+            // scatter path rebases them to absolute stream offsets after the call.
+            cues.segment_data_start = out.len() as u64;
+            ebml::write_id(out, id::VOID);
+            ebml::write_size(out, (SEEKHEAD_RESERVE - 2) as u64); // 1-octet size VINT
+            out.resize(out.len() + SEEKHEAD_RESERVE - 2, 0);
+            cues.info_pos = out.len() as u64 - cues.segment_data_start;
+        }
         self.write_info(out);
+        if let Some(cues) = &mut self.cues {
+            cues.tracks_pos = out.len() as u64 - cues.segment_data_start;
+        }
         self.write_tracks(out);
         self.header_written = true;
         Ok(())
@@ -416,7 +496,11 @@ impl MatroskaWriter {
 
         // Safe: a Cluster is open now (just opened, or already was). Blocks stage into the
         // Cluster's buffer; `out` receives the whole sized Cluster when it closes.
+        let cue_key = keyframe && self.cues.as_ref().is_some_and(|c| c.cue_track == track);
         let cluster = self.cluster.as_mut().expect("cluster open");
+        if cue_key {
+            cluster.has_cue_key = true;
+        }
         let rel = (tick - cluster.base_tick) as i16; // within the checked window
         Self::write_simple_block(&mut cluster.buf, track, rel, bytes, keyframe);
         Ok(())
@@ -442,7 +526,11 @@ impl MatroskaWriter {
             self.open_cluster_scatter(out, tick);
         }
 
+        let cue_key = keyframe && self.cues.as_ref().is_some_and(|c| c.cue_track == track);
         let cluster = self.cluster.as_mut().expect("cluster open");
+        if cue_key {
+            cluster.has_cue_key = true;
+        }
         let rel = (tick - cluster.base_tick) as i16; // within the checked window
         Self::write_simple_block_header(&mut cluster.buf, track, rel, payload.len(), keyframe);
         cluster.pieces.push((cluster.buf.len(), payload));
@@ -452,7 +540,35 @@ impl MatroskaWriter {
     /// [`write_header`](Self::write_header) into a scatter output: the head bytes become
     /// one queued byte run.
     pub fn write_header_scatter(&mut self, out: &mut MuxOut) -> Result<(), WriteError> {
-        out.append_bytes_with(|b| self.write_header(b))
+        let stream_at = out.emitted();
+        let mut local_start = 0u64;
+        let r = out.append_bytes_with(|b| {
+            local_start = b.len() as u64;
+            self.write_header(b)
+        });
+        if r.is_ok() {
+            if let Some(cues) = &mut self.cues {
+                // `write_header` recorded the reservation's offset local to the byte
+                // arena; rebase it to the absolute stream offset (the arena may hold
+                // earlier runs). The Info/Tracks positions are Segment-relative and
+                // need no rebasing.
+                cues.segment_data_start = stream_at + (cues.segment_data_start - local_start);
+            }
+        }
+        r
+    }
+
+    /// Record a cue point for the Cluster being emitted at absolute stream offset
+    /// `cluster_at` (RFC 9559 §5.1.5): its base time in ticks, its Segment Position.
+    /// Only cue-worthy Clusters (a keyframe of the cue track landed in them) are
+    /// recorded — a CuePoint must reference a position decoding can start from.
+    fn record_cue(&mut self, c: &OpenCluster, cluster_at: u64) {
+        if !c.has_cue_key {
+            return;
+        }
+        if let Some(cues) = &mut self.cues {
+            cues.points.push((c.base_tick.max(0) as u64, cluster_at - cues.segment_data_start));
+        }
     }
 
     /// The per-frame preconditions shared by both write modes: header written, track
@@ -486,7 +602,7 @@ impl MatroskaWriter {
     fn opened(base_tick: i64, mut buf: Vec<u8>, pieces: Vec<(usize, Memory)>) -> OpenCluster {
         // Cluster base timestamp, in ticks (non-negative for a forward stream).
         ebml::write_uint(&mut buf, id::TIMESTAMP, base_tick.max(0) as u64);
-        OpenCluster { base_tick, buf, pieces }
+        OpenCluster { base_tick, buf, pieces, has_cue_key: false }
     }
 
     /// Open a new Cluster at `base_tick` (spec `§ID-tree` Cluster, `§sizing`), first
@@ -510,6 +626,9 @@ impl MatroskaWriter {
     /// for reuse (empty if no Cluster was open).
     fn close_cluster(&mut self, out: &mut Vec<u8>) -> (Vec<u8>, Vec<(usize, Memory)>) {
         let Some(mut c) = self.cluster.take() else { return (Vec::new(), Vec::new()) };
+        // Contiguous mode: `out` is the whole stream, so its length *is* the Cluster's
+        // absolute offset (the cue position, RFC 9559 §5.1.5.1.2).
+        self.record_cue(&c, out.len() as u64);
         ebml::write_id(out, id::CLUSTER);
         ebml::write_size(out, c.body_size());
         let mut cur = 0;
@@ -530,6 +649,7 @@ impl MatroskaWriter {
     /// allocations for reuse.
     fn close_cluster_scatter(&mut self, out: &mut MuxOut) -> (Vec<u8>, Vec<(usize, Memory)>) {
         let Some(mut c) = self.cluster.take() else { return (Vec::new(), Vec::new()) };
+        self.record_cue(&c, out.emitted());
         let body_size = c.body_size();
         out.append_bytes_with(|b| {
             ebml::write_id(b, id::CLUSTER);
@@ -588,16 +708,99 @@ impl MatroskaWriter {
 
     /// Finish the stream (spec `§sizing`): emit the final staged Cluster with its real
     /// size. The `Segment` stays an unknown-size master closed implicitly at end of
-    /// stream — nothing is back-patched in bytes already emitted, so the writer remains
-    /// single-pass and seek-free.
+    /// stream — nothing already emitted is back-patched, so the writer remains
+    /// single-pass and seek-free — **unless** cues are enabled: then the `Cues` master
+    /// is appended after the last Cluster and the SeekHead reservation is patched *in
+    /// place* (contiguous mode owns the whole stream in `out`, so the patch is a
+    /// memcpy, not a seek). `out` must be the same `Vec` the header was written into.
     pub fn finalize(&mut self, out: &mut Vec<u8>) {
         let _ = self.close_cluster(out);
+        if let Some(cues) = self.cues.take() {
+            if cues.points.is_empty() {
+                return; // nothing cue-worthy — the reservation stays a valid Void
+            }
+            let cues_pos = out.len() as u64 - cues.segment_data_start;
+            write_cues(out, cues.cue_track, &cues.points);
+            let sh = build_seekhead(&cues, cues_pos);
+            let at = cues.segment_data_start as usize;
+            out[at..at + sh.len()].copy_from_slice(&sh);
+        }
     }
 
-    /// [`finalize`](Self::finalize) into a scatter output.
-    pub fn finalize_scatter(&mut self, out: &mut MuxOut) {
+    /// [`finalize`](Self::finalize) into a scatter output. With cues enabled, appends
+    /// the `Cues` master and returns the [`SeekHeadPatch`] for the front reservation —
+    /// the caller's byte sink applies it as one positioned write (the scatter stream
+    /// has already left the writer, so it cannot patch in place).
+    pub fn finalize_scatter(&mut self, out: &mut MuxOut) -> Option<SeekHeadPatch> {
         let _ = self.close_cluster_scatter(out);
+        let cues = self.cues.take()?;
+        if cues.points.is_empty() {
+            return None; // nothing cue-worthy — the reservation stays a valid Void
+        }
+        let cues_pos = out.emitted() - cues.segment_data_start;
+        out.append_bytes_with(|b| write_cues(b, cues.cue_track, &cues.points));
+        Some(SeekHeadPatch {
+            offset: cues.segment_data_start,
+            bytes: build_seekhead(&cues, cues_pos),
+        })
     }
+}
+
+/// The `Cues` master (RFC 9559 §5.1.5): one CuePoint per cue-worthy Cluster —
+/// `CueTime` (ticks) and `CueTrackPositions { CueTrack, CueClusterPosition }`, the
+/// position being a Segment Position (RFC 9559 §4). Emitted after the last Cluster;
+/// discovered via the front SeekHead.
+fn write_cues(out: &mut Vec<u8>, cue_track: u64, points: &[(u64, u64)]) {
+    ebml::write_id(out, id::CUES);
+    let size_at = ebml::reserve_size(out);
+    let body = out.len();
+    for &(time, pos) in points {
+        ebml::write_id(out, id::CUE_POINT);
+        let p_at = ebml::reserve_size(out);
+        let p0 = out.len();
+        ebml::write_uint(out, id::CUE_TIME, time);
+        ebml::write_id(out, id::CUE_TRACK_POSITIONS);
+        let tp_at = ebml::reserve_size(out);
+        let tp0 = out.len();
+        ebml::write_uint(out, id::CUE_TRACK, cue_track);
+        ebml::write_uint(out, id::CUE_CLUSTER_POSITION, pos);
+        let tp_len = (out.len() - tp0) as u64;
+        ebml::patch_size(out, tp_at, tp_len);
+        let p_len = (out.len() - p0) as u64;
+        ebml::patch_size(out, p_at, p_len);
+    }
+    let len = (out.len() - body) as u64;
+    ebml::patch_size(out, size_at, len);
+}
+
+/// The bytes that replace the [`SEEKHEAD_RESERVE`]-octet reservation exactly: a
+/// SeekHead pointing at Info, Tracks and the just-emitted Cues (RFC 9559 §5.1.1),
+/// then a Void filling the remainder (RFC 8794 §11.3.2).
+fn build_seekhead(cues: &CueState, cues_pos: u64) -> Vec<u8> {
+    let mut sh = Vec::with_capacity(SEEKHEAD_RESERVE);
+    ebml::write_id(&mut sh, id::SEEK_HEAD);
+    let size_at = ebml::reserve_size(&mut sh);
+    let body = sh.len();
+    let targets: [(&[u8], u64); 3] =
+        [(id::INFO, cues.info_pos), (id::TRACKS, cues.tracks_pos), (id::CUES, cues_pos)];
+    for (target, pos) in targets {
+        ebml::write_id(&mut sh, id::SEEK);
+        let s_at = ebml::reserve_size(&mut sh);
+        let s0 = sh.len();
+        // SeekID's payload is the raw 4-octet element ID of the target master.
+        ebml::write_binary(&mut sh, id::SEEK_ID, target);
+        ebml::write_uint(&mut sh, id::SEEK_POSITION, pos);
+        let s_len = (sh.len() - s0) as u64;
+        ebml::patch_size(&mut sh, s_at, s_len);
+    }
+    let len = (sh.len() - body) as u64;
+    ebml::patch_size(&mut sh, size_at, len);
+    let rest = SEEKHEAD_RESERVE - sh.len();
+    debug_assert!(rest >= 2, "reservation sized for the SeekHead plus a Void header");
+    ebml::write_id(&mut sh, id::VOID);
+    ebml::write_size(&mut sh, (rest - 2) as u64);
+    sh.resize(SEEKHEAD_RESERVE, 0);
+    sh
 }
 
 /// Scatter-mode muxer output (ZERO-COPY.md Stage 2): an ordered queue of **byte runs**
@@ -614,6 +817,10 @@ pub struct MuxOut {
     bytes: Vec<u8>,
     /// The emission order.
     pieces: VecDeque<MuxPiece>,
+    /// Total bytes ever queued (byte runs + payloads) — the absolute stream offset of
+    /// whatever is queued next. What positions cue points and the SeekHead reservation
+    /// (RFC 9559 §4 Segment Position) without the writer ever seeing the sink.
+    emitted: u64,
 }
 
 /// One drainable piece of the muxed stream, in emission order.
@@ -637,6 +844,7 @@ impl MuxOut {
         let r = f(&mut self.bytes);
         let end = self.bytes.len();
         if end > start {
+            self.emitted += (end - start) as u64;
             if let Some(MuxPiece::Bytes { end: e, .. }) = self.pieces.back_mut() {
                 if *e == start {
                     *e = end;
@@ -652,8 +860,14 @@ impl MuxOut {
     /// zero-length frame is fully described by its SimpleBlock header.
     fn push_payload(&mut self, mem: Memory) {
         if !mem.is_empty() {
+            self.emitted += mem.len() as u64;
             self.pieces.push_back(MuxPiece::Payload(mem));
         }
+    }
+
+    /// Total bytes ever queued — the absolute stream offset of whatever comes next.
+    pub fn emitted(&self) -> u64 {
+        self.emitted
     }
 
     /// The byte arena [`MuxPiece::Bytes`] ranges index into.
@@ -690,10 +904,11 @@ impl MuxOut {
         }
     }
 
-    /// Drop everything (a stop/reset).
+    /// Drop everything (a stop/reset — a fresh stream, so the offset restarts too).
     pub fn clear(&mut self) {
         self.pieces.clear();
         self.bytes.clear();
+        self.emitted = 0;
     }
 }
 
@@ -703,6 +918,125 @@ mod tests {
 
     fn flac_track(n: u64) -> TrackConfig {
         TrackConfig::flac(n, vec![b'f', b'L', b'a', b'C', 0x80, 0, 0, 34], 48000.0, 2, 16)
+    }
+
+    /// Parse a VINT's total length from its first byte (RFC 8794 §4).
+    fn vint_len(b: u8) -> usize {
+        b.leading_zeros() as usize + 1
+    }
+
+    /// Parse an Element Data Size VINT at `*at`, advancing past it.
+    fn parse_size(buf: &[u8], at: &mut usize) -> u64 {
+        let n = vint_len(buf[*at]);
+        let mask = if n >= 8 { 0 } else { 0xFFu8 >> n }; // n=8: marker byte holds no data bits
+        let mut v = (buf[*at] & mask) as u64;
+        for i in 1..n {
+            v = (v << 8) | buf[*at + i] as u64;
+        }
+        *at += n;
+        v
+    }
+
+    /// A big-endian EBML unsigned integer payload.
+    fn parse_uint(buf: &[u8]) -> u64 {
+        buf.iter().fold(0, |a, &b| (a << 8) | b as u64)
+    }
+
+    /// Cues round-trip (RFC 9559 §5.1.1, §5.1.5): with [`MatroskaWriter::enable_cues`]
+    /// the Segment's first child is a SeekHead whose Seek entries land exactly on
+    /// Info, Tracks and the end-of-file Cues; every CueClusterPosition lands on a
+    /// Cluster ID whose Timestamp child equals the CueTime; only keyframe-bearing
+    /// Clusters of the video track are cued.
+    #[test]
+    fn cues_and_seekhead_roundtrip() {
+        let video = TrackConfig::video(1, "V_VP8", Vec::new(), 320, 240);
+        let mut w = MatroskaWriter::new(vec![video, flac_track(2)]);
+        w.enable_cues();
+        let mut out = Vec::new();
+        w.write_header(&mut out).unwrap();
+        // Two clusters, each opened by a video (anchor-track) keyframe.
+        w.write_frame(&mut out, 1, 0, &[1, 2, 3], true).unwrap();
+        w.write_frame(&mut out, 2, 5_000_000, &[9], true).unwrap();
+        w.write_frame(&mut out, 1, 40_000_000, &[4, 5], false).unwrap();
+        w.write_frame(&mut out, 1, 80_000_000, &[6], true).unwrap();
+        w.finalize(&mut out);
+
+        // Segment data start: right after the Segment ID + its 1-octet 0xFF size.
+        let seg = out.windows(4).position(|s| s == id::SEGMENT).expect("Segment");
+        let seg_data = seg + 4 + 1;
+
+        // First child: the patched SeekHead, then the Void filler.
+        assert_eq!(&out[seg_data..seg_data + 4], id::SEEK_HEAD, "SeekHead is first");
+        let mut at = seg_data + 4;
+        let sh_len = parse_size(&out, &mut at) as usize;
+        let sh_end = at + sh_len;
+        let mut targets: Vec<(Vec<u8>, usize)> = Vec::new();
+        while at < sh_end {
+            assert_eq!(&out[at..at + 2], id::SEEK);
+            at += 2;
+            let len = parse_size(&out, &mut at) as usize;
+            let end = at + len;
+            assert_eq!(&out[at..at + 2], id::SEEK_ID);
+            at += 2;
+            let idlen = parse_size(&out, &mut at) as usize;
+            let target = out[at..at + idlen].to_vec();
+            at += idlen;
+            assert_eq!(&out[at..at + 2], id::SEEK_POSITION);
+            at += 2;
+            let plen = parse_size(&out, &mut at) as usize;
+            let pos = parse_uint(&out[at..at + plen]) as usize;
+            at += plen;
+            assert_eq!(at, end, "Seek entry consumed exactly");
+            targets.push((target, seg_data + pos));
+        }
+        assert_eq!(out[sh_end], id::VOID[0], "Void filler follows the SeekHead");
+        let find = |wanted: &[u8]| {
+            targets.iter().find(|(t, _)| t == wanted).map(|&(_, p)| p).expect("seek target")
+        };
+        assert_eq!(&out[find(id::INFO)..][..4], id::INFO, "SeekHead → Info");
+        assert_eq!(&out[find(id::TRACKS)..][..4], id::TRACKS, "SeekHead → Tracks");
+        let cues_at = find(id::CUES);
+        assert_eq!(&out[cues_at..][..4], id::CUES, "SeekHead → Cues");
+
+        // Walk the Cues: each point lands on a Cluster whose Timestamp == CueTime.
+        let mut at = cues_at + 4;
+        let cues_len = parse_size(&out, &mut at) as usize;
+        let cues_end = at + cues_len;
+        let mut times = Vec::new();
+        while at < cues_end {
+            assert_eq!(&out[at..at + 1], id::CUE_POINT);
+            at += 1;
+            let plen = parse_size(&out, &mut at) as usize;
+            let pend = at + plen;
+            assert_eq!(&out[at..at + 1], id::CUE_TIME);
+            at += 1;
+            let tlen = parse_size(&out, &mut at) as usize;
+            let time = parse_uint(&out[at..at + tlen]);
+            at += tlen;
+            assert_eq!(&out[at..at + 1], id::CUE_TRACK_POSITIONS);
+            at += 1;
+            let _tplen = parse_size(&out, &mut at);
+            assert_eq!(&out[at..at + 1], id::CUE_TRACK);
+            at += 1;
+            let ctlen = parse_size(&out, &mut at) as usize;
+            assert_eq!(parse_uint(&out[at..at + ctlen]), 1, "cues reference the video track");
+            at += ctlen;
+            assert_eq!(&out[at..at + 1], id::CUE_CLUSTER_POSITION);
+            at += 1;
+            let cplen = parse_size(&out, &mut at) as usize;
+            let cpos = seg_data + parse_uint(&out[at..at + cplen]) as usize;
+            at += cplen;
+            assert_eq!(at, pend, "CuePoint consumed exactly");
+            assert_eq!(&out[cpos..cpos + 4], id::CLUSTER, "cue lands on a Cluster ID");
+            let mut cat = cpos + 4;
+            let _csize = parse_size(&out, &mut cat);
+            assert_eq!(&out[cat..cat + 1], id::TIMESTAMP);
+            cat += 1;
+            let tslen = parse_size(&out, &mut cat) as usize;
+            assert_eq!(parse_uint(&out[cat..cat + tslen]), time, "CueTime == Cluster Timestamp");
+            times.push(time);
+        }
+        assert_eq!(times, vec![0, 80], "both keyframe Clusters cued (1 ms ticks)");
     }
 
     #[test]

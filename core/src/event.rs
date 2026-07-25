@@ -5,6 +5,7 @@
 //! delivers through the same `event()` door at the same batch-boundary safe point.
 
 use crate::format::{FixedFormat, Value};
+use crate::memory::Memory;
 use crate::time::Timestamp;
 
 pub enum Event {
@@ -32,6 +33,16 @@ pub enum Event {
     /// The transport resumed: running time continues (the pause interval is excised
     /// by re-basing), delivered just before the group runs again.
     Resumed,
+    /// A positioned overwrite of bytes the sink has already written: `data` replaces
+    /// the bytes at absolute output offset `offset`. The **single back-patch** an
+    /// indexed container needs (a Matroska SeekHead reservation, an MP4 `moov` size)
+    /// while the stream itself stays single-pass. In-band like every event — it rides
+    /// after the bytes it patches, so a seekable byte sink applies it as one
+    /// positioned write; anything non-seekable (a socket) ignores it, which is
+    /// correct: indexed layouts only serve seekable targets. Note a pure transport
+    /// (the queue) consumes inbound events and must forward this one explicitly,
+    /// like `FormatChange`.
+    Patch { offset: u64, data: Memory },
 }
 
 /// Interned-key → value pairs, plus a blob reference for cover art. TODO(step 5).
