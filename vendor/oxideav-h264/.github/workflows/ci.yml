@@ -1,0 +1,22 @@
+name: CI
+
+# Thin shim around the OxideAV org-level reusable workflow. See
+# https://github.com/OxideAV/.github for the actual job definitions and
+# the input surface.
+#
+# Note: oxideav-h264 ships criterion benches + a `nightly` feature for
+# the portable-SIMD path, but neither is exercised by CI today. Add an
+# `enable_benchmarks` input upstream + flip it on here when we want
+# `cargo bench --no-run` coverage.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    secrets: inherit

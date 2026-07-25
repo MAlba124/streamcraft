@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+exclude = [
+    # Vendored oxideav-h264 0.1.7 + the RefPicStore eviction fix (see
+    # vendor/oxideav-h264/STREAMCRAFT-PATCHES.md); wired via [patch.crates-io].
+    "vendor/oxideav-h264",
+]
 members = [
     "core",
     "elements",
@@ -31,3 +36,10 @@ repository = "https://github.com/MAlba124/streamcraft"
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+# Upstream 0.1.7 leaks every reference picture: RefPicStore has insert() and no
+# eviction, so playback grows ~35 MB/s until OOM. Vendored with a minimal
+# retain_keys sweep (documented in vendor/oxideav-h264/STREAMCRAFT-PATCHES.md,
+# to be offered upstream).
+oxideav-h264 = { path = "vendor/oxideav-h264" }
