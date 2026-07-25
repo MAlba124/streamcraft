@@ -1,6 +1,6 @@
 [package]
 name = "streamcraft-scope"
-description = "Slint inspector GUI + MCP server over the core introspection protocol"
+description = "Immediate-mode SDL3 inspector GUI + MCP server over the core introspection protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,19 @@ name = "streamcraft_scope"
 name = "scraft-scope"
 path = "src/main.rs"
 
+# Standalone demo of the immediate-mode UI layer with fake pipeline data.
+# Headless: `SDL_VIDEODRIVER=dummy … cargo run --bin ui_demo -- --frames 60`.
+[[bin]]
+name = "ui_demo"
+path = "src/bin/ui_demo.rs"
+
 [dependencies]
 streamcraft-core = { path = "../core", features = ["introspect"] }
-# TODO: Slint (GUI) and an MCP server implementation are added when work begins.
-# Both are optional to the framework — apps that don't attach scope pay nothing.
+# The scope UI rides SDL3, exactly as the video sink does: pure auto-generated
+# bindings linked against the system libSDL3 via pkg-config (the `ash`/`pipewire`
+# pattern; never `build-from-source` — the repo toolchain has no SDL cmake/clang
+# build). All `unsafe` FFI is confined to `ui::backend`.
+sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
+# TODO: an MCP server implementation is added when the protocol client lands.
+# Both scope halves are optional to the framework — apps that don't attach pay
+# nothing.
