@@ -485,6 +485,12 @@ pub struct Pipeline {
     /// `run()` still reads the run's actual timeline (run() replaces the default
     /// with a sink-provided device clock).
     clock_shared: Arc<Mutex<Arc<dyn Clock>>>,
+    /// Verbosity rank for build-phase pipeline diagnostics (add/link/negotiation/
+    /// clock/groups — spec: Debuggability, "framework internals log too"), from
+    /// `STREAMCRAFT_DEBUG` under the pseudo-target `pipeline` (or the bare global
+    /// level). These happen before the per-element log channels are wired at
+    /// `run()`, and are one-shot build operations — they write straight to stderr.
+    build_log_rank: u8,
     /// The pause transport (spec: Clocking — pause is a clock op). See [`PauseHandle`].
     pause: Arc<PauseShared>,
     /// Start the next [`run`](Self::run) paused (preroll-and-hold: everything spins
@@ -529,6 +535,18 @@ impl Pipeline {
         let stop = Arc::new(AtomicBool::new(false));
         let base_shared = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
         let default_clock: Arc<dyn Clock> = Arc::new(InstantClock::new());
+        let build_log_rank = {
+            let spec = std::env::var("STREAMCRAFT_DEBUG")
+                .ok()
+                .map(|s| crate::log::DebugSpec::parse(&s))
+                .unwrap_or_default();
+            spec.targets
+                .iter()
+                .find(|(n, _)| n == "pipeline")
+                .map(|(_, r)| *r)
+                .or(spec.global)
+                .unwrap_or(0)
+        };
         Self {
             elements: Vec::new(),
             descs: Vec::new(),
@@ -555,6 +573,7 @@ impl Pipeline {
             log_queue_cap: 1024,
             clock: Arc::clone(&default_clock),
             clock_shared: Arc::new(Mutex::new(default_clock)),
+            build_log_rank,
             clock_explicit: false,
             base_shared: Arc::clone(&base_shared),
             pause: PauseShared::new(base_shared, stop),
@@ -659,6 +678,53 @@ impl Pipeline {
         self.log_level = level;
     }
 
+    // --- Build-phase diagnostics (spec: Debuggability — framework internals log) ---
+
+    /// Emit one build-phase pipeline line to stderr, gated like the log system
+    /// (`STREAMCRAFT_DEBUG=pipeline:debug`, or a bare global level, or the
+    /// programmatic [`set_log_level`](Self::set_log_level)). Build operations are
+    /// one-shot, never hot paths, so a formatted stderr line is the honest tool —
+    /// per-element ring channels do not exist until `run()` wires them.
+    fn plog(&self, level: Level, msg: std::fmt::Arguments<'_>) {
+        let rank = self.build_log_rank.max(self.log_level.map_or(0, Level::rank));
+        if level.rank() > rank {
+            return;
+        }
+        if crate::log::stderr_colors_enabled() {
+            eprintln!(
+                "\x1b[2m[       build]\x1b[0m {}{:5}\x1b[0m \x1b[94mpipeline\x1b[0m {msg}",
+                crate::log::level_sgr(level),
+                level.name(),
+            );
+        } else {
+            eprintln!("[       build] {:5} pipeline {msg}", level.name());
+        }
+    }
+
+    /// `name#id` display form for an element (the GStreamer-style handle).
+    fn display_of(&self, el: ElementId) -> String {
+        format!("{}#{}", self.name_of(el), el.0)
+    }
+
+    /// A negotiated format as `family, field=value, …` — the caps a link fixed
+    /// (resolved through this pipeline's interners; build-phase display only).
+    fn format_display(&self, f: &FixedFormat) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = write!(out, "{}", self.formats.resolve(f.family.0).unwrap_or("?"));
+        for (fid, v) in f.fields() {
+            let _ = write!(out, ", {}=", self.fields.resolve(fid.0).unwrap_or("?"));
+            let _ = match v {
+                Value::Int(i) => write!(out, "{i}"),
+                Value::Rat(n, d) => write!(out, "{n}/{d}"),
+                Value::Id(id) => {
+                    write!(out, "{}", self.values.resolve(id.0).unwrap_or("?"))
+                }
+            };
+        }
+        out
+    }
+
     // --- Topology: legal in every state (spec: Runtime configuration) ---
 
     /// Elements arrive already constructed: `pipeline.add(FileSrc::new(path))`.
@@ -683,6 +749,16 @@ impl Pipeline {
         self.pool_overrides.push(None);
         self.queue_overrides.push(None);
         self.leaky_overrides.push(None);
+        self.plog(
+            Level::Info,
+            format_args!(
+                "add {}#{} ({} static pad{})",
+                desc.name,
+                id.0,
+                desc.pads.len(),
+                if desc.pads.len() == 1 { "" } else { "s" },
+            ),
+        );
         id
     }
 
@@ -755,9 +831,27 @@ impl Pipeline {
             .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
             .collect();
 
+        self.plog(
+            Level::Debug,
+            format_args!(
+                "negotiate {}.{} (offers {:?}) x {}.{} (offers {:?})",
+                self.display_of(src.0),
+                src.1,
+                self.families(&src_offers),
+                self.display_of(sink.0),
+                sink.1,
+                self.families(&sink_offers),
+            ),
+        );
         let format = negotiate(&src_offers, &sink_offers).ok_or_else(|| {
             let (sn, sp) = (self.name_of(src.0), src.1);
             let (dn, dp) = (self.name_of(sink.0), sink.1);
+            // Debug, not Warn: probing links that may fail is normal (autoplug
+            // tries decoders in order and picks the one that negotiates).
+            self.plog(
+                Level::Debug,
+                format_args!("link FAILED {sn}.{sp} -> {dn}.{dp}: no common format"),
+            );
             Error::Resource(format!(
                 "link: no common format between {sn}.{sp} and {dn}.{dp} \
                  (offers {:?} vs {:?}) — negotiation failed",
@@ -766,6 +860,17 @@ impl Pipeline {
             ))
         })?;
 
+        self.plog(
+            Level::Info,
+            format_args!(
+                "link {}.{} -> {}.{} : {}",
+                self.display_of(src.0),
+                src.1,
+                self.display_of(sink.0),
+                sink.1,
+                self.format_display(&format),
+            ),
+        );
         let id = LinkId(self.edges.len() as u32);
         self.edges.push(Edge {
             src: src.0,
@@ -951,6 +1056,16 @@ impl Pipeline {
                     pad: ap.pad,
                     format: FixedFormat::new(family),
                 });
+                self.plog(
+                    Level::Info,
+                    format_args!(
+                        "pad added {}.{} ({:?}, offers {:?})",
+                        self.display_of(id),
+                        ap.name,
+                        ap.direction,
+                        ap.offers.iter().map(|o| o.family).collect::<Vec<_>>(),
+                    ),
+                );
                 appeared.push(AddedPadInfo { element: id, pad: ap.pad, name: ap.name.clone() });
                 self.dyn_pads[i].push(DynPad {
                     name: ap.name,
@@ -982,14 +1097,25 @@ impl Pipeline {
         // otherwise the most downstream element offering one masters the pipeline —
         // walked sinks-first so an audio sink's device clock beats anything upstream.
         if !self.clock_explicit {
+            let mut provider = None;
             for id in order.iter().rev() {
                 if let Some(el) = self.elements[id.0 as usize].as_mut() {
                     if let Some(c) = el.provide_clock() {
                         self.clock = c;
+                        provider = Some(*id);
                         break;
                     }
                 }
             }
+            match provider {
+                Some(p) => self.plog(
+                    Level::Info,
+                    format_args!("clock <- {} (sink-provided, masters the pipeline)", self.display_of(p)),
+                ),
+                None => self.plog(Level::Info, format_args!("clock <- default (InstantClock)")),
+            }
+        } else {
+            self.plog(Level::Info, format_args!("clock <- explicit (set_clock)"));
         }
         // Sample the running-time base once, at the instant the pipeline starts (spec:
         // Clocking — running time = clock.now() - base_time). The clock and base are
@@ -1009,6 +1135,15 @@ impl Pipeline {
             self.pause.pause();
         }
         let groups = self.compute_groups(&order)?;
+        for (gi, ids) in groups.iter().enumerate() {
+            self.plog(
+                Level::Info,
+                format_args!(
+                    "group {gi} (thread): {}",
+                    ids.iter().map(|i| self.display_of(*i)).collect::<Vec<_>>().join(" ! "),
+                ),
+            );
+        }
         let ng = groups.len();
         let total = self.elements.len();
         // The default pool plus per-element overrides (spec: pool negotiation,
@@ -2184,6 +2319,13 @@ fn deliver_events(
                     }
                 }
                 ctx.set_negotiated_one(pad, f.clone());
+                crate::log!(
+                    &*ctx,
+                    Level::Debug,
+                    "format_change",
+                    pad = pad.0 as u64,
+                    family = f.family.0 as u64,
+                );
             }
         }
         elem.event(ctx, &ev)?;

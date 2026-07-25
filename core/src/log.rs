@@ -75,6 +75,17 @@ impl Level {
 
     /// Parse a level *name* (case-insensitive). Numbers and "off" are handled by
     /// [`parse_level_token`], which the env syntax uses.
+    /// The canonical display name (uppercase, as the drain prints it).
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Error => "ERROR",
+            Level::Warn => "WARN",
+            Level::Info => "INFO",
+            Level::Debug => "DEBUG",
+            Level::Trace => "TRACE",
+        }
+    }
+
     pub fn from_name(s: &str) -> Option<Level> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "error" | "err" => Level::Error,
@@ -538,7 +549,7 @@ const SGR_RESET: &str = "\x1b[0m";
 const SGR_DIM: &str = "\x1b[2m";
 
 /// The level's SGR: severity at a glance (error red jumps out of a scroll).
-fn level_sgr(level: Level) -> &'static str {
+pub(crate) fn level_sgr(level: Level) -> &'static str {
     match level {
         Level::Error => "\x1b[1;31m", // bold red
         Level::Warn => "\x1b[33m",    // yellow
