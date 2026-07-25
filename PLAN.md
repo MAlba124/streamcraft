@@ -420,7 +420,11 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > `debug=\"line-tables-only\"` for heaptrack/perf. E2E exact: playing seek
 > lands 2690.0s, paused seek lands 1075.0s, stays paused, resumes clean.
 > Known limit: http has no Range-based seek; plain pause/resume still
-> excises the device drain (pre-existing, noted).
+> excises the device drain (pre-existing, noted). Also landed (`47772fa`):
+> **GStreamer-style pipeline diagnostics** — `STREAMCRAFT_DEBUG=pipeline:debug`
+> logs add/negotiate (offer menus, failed probes)/link (resolved caps)/dynamic
+> pads/clock selection/thread groups at build time; runtime `format_change`
+> rides the element ring.
 
 > **Update — session 4p (2026-07-25): scope fix round** (`28ac090`). (1) The
 > vanishing-pane dock bug: my collapse moved the sibling node into the parent
