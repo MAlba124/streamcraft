@@ -27,6 +27,7 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::harness::Harness;
 use streamcraft_core::id::PadId;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
@@ -371,6 +372,62 @@ fn ffmpeg_oracle_keyframe_stream_decodes_byte_exact() {
     }
     let (w, h, _pf) = rec.format.clone().expect("format announced");
     assert_eq!((w, h), (80, 64), "announced dimensions match the ffmpeg input");
+}
+
+/// Seek (spec: flush/seek): the intra-only decoder holds no cross-frame reference
+/// state, so its only flushable state is the backpressure carry (a decoded frame
+/// awaiting a pool slot). With a one-slot pool the first keyframe decodes but its copy
+/// stays *pending* (the slot is held by the previous, un-recycled buffer); `FlushStart`
+/// must drop that carry so no pre-flush picture — with its pre-flush pts — leaks after
+/// the seek. A fresh keyframe then decodes cleanly at the post-flush pts. Driven through
+/// the [`Harness`] so `FlushStart` can be delivered mid-stream.
+#[test]
+fn flush_start_drops_the_pending_carry_and_no_stale_frame_leaks() {
+    let reference = reference_decode(&[KEYFRAME.to_vec()]);
+    assert_eq!(reference.len(), 1, "the golden keyframe decodes via the library");
+
+    // A one-slot pool sized for the decoded frame: the first decode succeeds and emits,
+    // but until that buffer is pulled (recycled) the pool is dry, so the *next* decode's
+    // copy is left pending — exactly the carry the flush must drop.
+    let need = reference[0].len();
+    let mut h = Harness::with_pool(Vp9Dec::new(), need, 1);
+
+    // Frame 1: decodes and emits into the single slot at pts 0.
+    let mut b0 = h.alloc(KEYFRAME);
+    b0.pts = Timestamp::from_nanos(0);
+    h.push("sink", b0).expect("push frame 0");
+    // Frame 2 at pts FRAME_NS: decodes but the pool is dry (slot 0 not yet pulled), so
+    // the packed copy is stranded in the pending carry.
+    let mut b1 = h.alloc(KEYFRAME);
+    b1.pts = Timestamp::from_nanos(FRAME_NS);
+    h.push("sink", b1).expect("push frame 1");
+
+    // Simulate the scheduler discarding the in-flight (already-emitted) buffer on seek.
+    let staged = h.drain_outputs();
+    assert_eq!(staged.len(), 1, "one frame was staged before the pool went dry");
+    assert_eq!(staged[0].pts, Timestamp::from_nanos(0), "staged frame is pre-flush frame 0");
+    drop(staged); // recycles the slot, but the carry still holds the pre-flush frame 1
+
+    // Seek: flush the pending carry.
+    h.push_event(Event::FlushStart).expect("flush");
+
+    // Post-seek: a fresh keyframe at a new pts. It must decode cleanly and be the *only*
+    // frame that comes out — the pre-flush carried frame (pts FRAME_NS) must not appear.
+    let post_pts = Timestamp::from_nanos(1000 * FRAME_NS);
+    let mut b2 = h.alloc(KEYFRAME);
+    b2.pts = post_pts;
+    h.push("sink", b2).expect("push post-flush keyframe");
+
+    let out = h.drain_outputs();
+    assert_eq!(out.len(), 1, "exactly the post-flush keyframe — no stale carried frame leaked");
+    assert_eq!(out[0].pts, post_pts, "post-flush pts comes from post-flush input");
+    assert_eq!(out[0].memory.data(), reference[0].as_slice(), "post-flush keyframe decodes cleanly");
+
+    let ann = h.announced().expect("format announced");
+    let w = h.vocabulary().field_id("width").unwrap();
+    let ht = h.vocabulary().field_id("height").unwrap();
+    assert_eq!(ann.get(w), Some(Value::Int(W)));
+    assert_eq!(ann.get(ht), Some(Value::Int(H)));
 }
 
 /// Encode `width x height` `testsrc2` as keyframe-only VP9 (`-g 1`) into IVF via

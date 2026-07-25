@@ -20,6 +20,7 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::harness::Harness;
 use streamcraft_core::id::PadId;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
@@ -284,4 +285,54 @@ fn garbage_only_stream_emits_nothing_and_never_panics() {
     let garbage: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 64 + i * 33]).collect();
     let (_p, recorded) = run_pipeline(garbage);
     assert!(recorded.lock().unwrap().frames.is_empty());
+}
+
+/// Seek (spec: flush/seek): decode a couple of frames, deliver `Event::FlushStart`,
+/// then feed a fresh keyframe. The reference-slot state must be gone — the post-flush
+/// keyframe decodes cleanly (VP8 keyframes are self-delimiting and carry the
+/// dimensions, so it stands alone) and its pts is the post-flush pts, never a stale
+/// pre-flush one. Driven through the [`Harness`] so `FlushStart` can be delivered
+/// mid-stream (the pipeline delivers it only out-of-band on a real seek).
+#[test]
+fn flush_start_resets_decoder_and_no_stale_frame_leaks() {
+    let frames = encode_frames(3); // three independent keyframes
+    let reference = reference_decode(&frames);
+    let mut h = Harness::new(Vp8Dec::new());
+
+    // Decode two frames pre-flush.
+    for (i, f) in frames.iter().take(2).enumerate() {
+        let mut buf = h.alloc(f);
+        buf.pts = Timestamp::from_nanos(i as u64 * FRAME_NS);
+        h.push("sink", buf).expect("push pre-flush");
+    }
+    let pre0 = h.pull("src").expect("first frame emitted");
+    let pre1 = h.pull("src").expect("second frame emitted");
+    assert_eq!(pre0.pts, Timestamp::from_nanos(0));
+    assert_eq!(pre1.pts, Timestamp::from_nanos(FRAME_NS));
+    assert_eq!(pre0.memory.data(), reference[0].as_slice(), "pre-flush frame 0 decode");
+    assert!(h.pull("src").is_none(), "no extra buffers carried into the flush");
+
+    // Seek: flush all decode state.
+    h.push_event(Event::FlushStart).expect("flush");
+    assert!(h.pull("src").is_none(), "flush emits nothing");
+
+    // Post-seek: the demuxer resumes at a keyframe with a fresh (post-seek) pts.
+    let post_pts = Timestamp::from_nanos(100 * FRAME_NS);
+    let mut buf = h.alloc(&frames[2]);
+    buf.pts = post_pts;
+    h.push("sink", buf).expect("push post-flush keyframe");
+
+    let post = h.pull("src").expect("post-flush keyframe decoded cleanly");
+    assert_eq!(post.pts, post_pts, "post-flush pts comes from post-flush input");
+    // Same content as frame index 2's independent-keyframe reference decode: the
+    // reset put the decoder in a pristine state, so the keyframe reconstructs exactly.
+    assert_eq!(post.memory.data(), reference[2].as_slice(), "post-flush keyframe decode");
+    assert!(h.pull("src").is_none(), "exactly one post-flush frame");
+
+    // Announced dimensions are still the real ones after the reset.
+    let ann = h.announced().expect("format announced");
+    let w = h.vocabulary().field_id("width").unwrap();
+    let ht = h.vocabulary().field_id("height").unwrap();
+    assert_eq!(ann.get(w), Some(Value::Int(W as i64)));
+    assert_eq!(ann.get(ht), Some(Value::Int(H as i64)));
 }

@@ -28,6 +28,7 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::harness::Harness;
 use streamcraft_core::id::PadId;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
@@ -425,4 +426,61 @@ fn ffmpeg_oracle_decode_matches() {
         psnr >= 40.0,
         "our decode diverges from the ffmpeg oracle: PSNR {psnr:.1} dB (mse {mse:.3})"
     );
+}
+
+/// Seek (spec: flush/seek): prime the decoder with an IDR+P (pictures held in the DPB
+/// and their pts held in the feed-order FIFO), deliver `Event::FlushStart`, then feed
+/// a fresh IDR (which re-carries its SPS/PPS in Annex B) and drain at EOS. The rebuilt
+/// decoder + cleared pts FIFO must yield **exactly** the post-flush picture with the
+/// post-flush pts: had the flush not cleared the DPB / FIFO, the pre-flush pictures
+/// would leak out here (with their stale pre-flush timestamps). Driven through the
+/// [`Harness`] so `FlushStart` can be delivered mid-stream (a real pipeline delivers it
+/// only out-of-band on a seek).
+#[test]
+fn flush_start_rebuilds_decoder_and_no_stale_frame_or_pts_leaks() {
+    // Pre-flush: IDR + one P — enough to populate the DPB and the pts FIFO. We do NOT
+    // drain them: the flush must discard whatever the decoder is still holding.
+    let pre = encode_i_then_p(1);
+    // Post-flush: an independent IDR (its own SPS/PPS). Reference-decode it alone, as a
+    // fresh decoder would after a seek lands on it.
+    let post = encode_i_then_p(0);
+    let post_ref = reference_decode(&post);
+    assert_eq!(post_ref.len(), 1, "the post-flush IDR decodes to one picture");
+
+    let mut h = Harness::new(H264Dec::new());
+
+    // Feed the pre-flush access units with pts on the 33 ms grid; leave the resulting
+    // pictures pending in the DPB (no EOS drain before the flush).
+    for (i, au) in pre.iter().enumerate() {
+        let mut buf = h.alloc(au);
+        buf.pts = Timestamp::from_nanos(i as u64 * FRAME_NS);
+        h.push("sink", buf).expect("push pre-flush AU");
+    }
+
+    // Seek: flush all decode state (rebuild decoder, clear pts FIFO + carry).
+    h.push_event(Event::FlushStart).expect("flush");
+    assert!(h.pull("src").is_none(), "flush emits nothing");
+
+    // Post-seek: a fresh IDR at a new, far-away pts.
+    let post_pts = Timestamp::from_nanos(1000 * FRAME_NS);
+    let mut buf = h.alloc(&post[0]);
+    buf.pts = post_pts;
+    h.push("sink", buf).expect("push post-flush IDR");
+    // EOS forces the decoder to bump the post-flush IDR out of the DPB.
+    let mut tail = h.eos().expect("eos drains the post-flush picture");
+    assert_eq!(
+        tail.len(),
+        1,
+        "exactly the post-flush IDR came out — no stale pre-flush frame leaked across the flush"
+    );
+    let out = tail.remove(0);
+    assert_eq!(out.pts, post_pts, "post-flush pts comes from post-flush input — FIFO was cleared");
+    assert_eq!(out.memory.data(), post_ref[0].as_slice(), "post-flush IDR decodes cleanly");
+
+    // Announced dimensions survive the reset (announce is intentionally kept).
+    let ann = h.announced().expect("format announced");
+    let w = h.vocabulary().field_id("width").unwrap();
+    let ht = h.vocabulary().field_id("height").unwrap();
+    assert_eq!(ann.get(w), Some(Value::Int(W as i64)));
+    assert_eq!(ann.get(ht), Some(Value::Int(H as i64)));
 }

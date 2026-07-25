@@ -25,6 +25,7 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::harness::Harness;
 use streamcraft_core::id::PadId;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
@@ -388,4 +389,77 @@ fn matches_ffmpeg_oracle() {
     let ours: Vec<u8> = rec.frames.iter().flat_map(|(_, p)| p.clone()).collect();
     assert_eq!(ours.len(), ff.len(), "decoded size matches ffmpeg");
     assert_eq!(ours, ff, "H265Dec output byte-exact against the ffmpeg oracle");
+}
+
+/// Seek (spec: flush/seek): prime the decoder with an IDR+P (pictures held in the
+/// reorder window, their pts in the min-heap), deliver `Event::FlushStart`, then feed a
+/// fresh IDR (carrying its own VPS/SPS/PPS) and drain at EOS. The reset must clear the
+/// `SequenceDecoder`, the reorder window, the ready carry and the pts heap: exactly the
+/// post-flush picture comes out, with the post-flush pts — had the reorder window / pts
+/// heap survived, the pre-flush pictures (and their stale timestamps) would leak here.
+/// Driven through the [`Harness`] so `FlushStart` can be delivered mid-stream (a real
+/// pipeline delivers it only out-of-band on a seek).
+#[test]
+fn flush_start_resets_decoder_and_no_stale_frame_or_pts_leaks() {
+    // Pre-flush: the IDR+P fixture — populates the reorder window and the pts heap. We
+    // deliberately do NOT drain it; the flush must discard whatever is still buffered.
+    let pre = split_access_units(IP);
+    assert_eq!(pre.len(), 2, "IDR + P are two access units");
+    // Post-flush: an independent IDR (its own parameter sets). Reference-decode alone.
+    let post = split_access_units(TINY_I);
+    assert_eq!(post.len(), 1, "the tiny fixture is one access unit");
+    let post_ref = reference_decode(TINY_I);
+    assert_eq!(post_ref.len(), 1, "one output frame");
+
+    let mut h = Harness::new(H265Dec::new());
+
+    // Feed the pre-flush access units with pts on the 33 ms grid, and record how many
+    // pictures the element released (its pts values ride the src pad — the pre-flush
+    // timestamps). On a real seek the scheduler discards these in-flight buffers, so
+    // drain and drop them here — the flush is about clearing the element's *internal*
+    // reorder window + pts heap, not the already-staged output.
+    let mut pre_pts: Vec<Timestamp> = Vec::new();
+    for (i, au) in pre.iter().enumerate() {
+        let mut buf = h.alloc(au);
+        buf.pts = Timestamp::from_nanos(i as u64 * FRAME_NS);
+        h.push("sink", buf).expect("push pre-flush AU");
+    }
+    for b in h.drain_outputs() {
+        pre_pts.push(b.pts);
+    }
+
+    // Seek: flush all decoder + reorder + pts state.
+    h.push_event(Event::FlushStart).expect("flush");
+    assert!(h.pull("src").is_none(), "flush emits nothing");
+
+    // Post-seek: a fresh IDR at a new, far-away pts.
+    let post_pts = Timestamp::from_nanos(1000 * FRAME_NS);
+    let mut buf = h.alloc(&post[0]);
+    buf.pts = post_pts;
+    h.push("sink", buf).expect("push post-flush IDR");
+    // EOS drains the reorder window (depth 0), releasing the post-flush picture.
+    let mut tail = h.eos().expect("eos drains the post-flush picture");
+    assert_eq!(
+        tail.len(),
+        1,
+        "exactly the post-flush IDR came out — no stale pre-flush frame leaked across the flush"
+    );
+    let out = tail.remove(0);
+    assert_eq!(
+        out.pts, post_pts,
+        "post-flush pts comes from post-flush input — the pts heap was cleared"
+    );
+    assert!(
+        !pre_pts.contains(&out.pts),
+        "post-flush frame did not inherit a stale pre-flush pts from the heap"
+    );
+    assert_eq!(out.memory.data(), post_ref[0].as_slice(), "post-flush IDR decodes cleanly");
+
+    // The announce is reset on flush (h265 clears `announced`), so it re-fires with the
+    // real dimensions after the seek.
+    let ann = h.announced().expect("format re-announced after flush");
+    let w = h.vocabulary().field_id("width").unwrap();
+    let ht = h.vocabulary().field_id("height").unwrap();
+    assert_eq!(ann.get(w), Some(Value::Int(16)));
+    assert_eq!(ann.get(ht), Some(Value::Int(16)));
 }
