@@ -69,6 +69,11 @@ type Result<T> = core::result::Result<T, Error>;
 /// scale and the half-coefficient phase are the only normalization
 /// the spec attaches to the inverse transform; the energy-correcting
 /// window then follows in the per-sequence windowing step.
+///
+/// This direct `O(N²)` sum is the *executable reference* — the literal spec
+/// formula. Production synthesis runs the `O(N log N)` [`ImdctPlan`] below;
+/// the test suite pins the two against each other (streamcraft patch).
+#[cfg_attr(not(test), allow(dead_code))]
 fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
     let half = n_transform / 2;
     debug_assert_eq!(spec.len(), half);
@@ -99,6 +104,165 @@ fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
         *slot = scale * acc;
     }
     out
+}
+
+/// A complex value for the [`ImdctPlan`] FFT. The crate carries no complex
+/// dependency; this is the minimal arithmetic the plan needs.
+#[derive(Clone, Copy, Debug)]
+struct C64 {
+    re: f64,
+    im: f64,
+}
+
+impl C64 {
+    #[inline]
+    fn mul(self, o: C64) -> C64 {
+        C64 {
+            re: self.re * o.re - self.im * o.im,
+            im: self.re * o.im + self.im * o.re,
+        }
+    }
+}
+
+/// `e^{iθ}`.
+#[inline]
+fn cis(theta: f64) -> C64 {
+    C64 {
+        re: theta.cos(),
+        im: theta.sin(),
+    }
+}
+
+/// An `O(N log N)` plan for the §4.6.11.3.1 IMDCT of one transform length
+/// (streamcraft patch — see STREAMCRAFT-PATCHES.md; the naive [`imdct`] above is
+/// kept as the executable reference the tests compare against).
+///
+/// Derivation (clean-room, from the spec formula):
+///
+/// 1. **IMDCT is a shifted DCT-IV.** With `M = N/2`, `ω = 2π/N = π/M` and the
+///    spec phase `n0 = M/2 + 1/2`, the kernel is
+///    `cos(π/M · (n + M/2 + 1/2)(k + 1/2))` — i.e. the DCT-IV kernel
+///    `cos(π/M · (p + 1/2)(k + 1/2))` evaluated at `p = n + M/2`. The DCT-IV
+///    extension is symmetric about `p = −1/2`, antisymmetric about
+///    `p = M − 1/2`, and antiperiodic with period `2M`, so the `N` outputs are
+///    the `M` DCT-IV values scattered with mirrors and sign flips (this is the
+///    time-domain-aliasing structure of Princen–Bradley TDAC filterbanks; fast
+///    form after P. Duhamel, Y. Mahieux, J. P. Petit, "A fast algorithm for
+///    the implementation of filter banks based on time domain aliasing
+///    cancellation", Proc. ICASSP 1991).
+/// 2. **DCT-IV via a quarter-length complex FFT.** Pair the inputs as
+///    `y[j] = X[2j] + i·X[M−1−2j]`, `j ∈ [0, Q)`, `Q = M/2`. Expanding the
+///    DCT-IV sum at even outputs `p = 2r` (real part) and mirrored odd outputs
+///    `p = M−1−2r` (negated imaginary part) gives, with
+///    `φ_{r,j} = π(2r+1/2)(2j+1/2)/M = 2πrj/Q + π(r + j + 1/4)/M`:
+///    `C4[2r] = Re(G[r])`, `C4[M−1−2r] = −Im(G[r])`, where
+///    `G[r] = e^{−iπr/M} · Σ_j (y[j]·e^{−iπ(j+1/4)/M}) e^{−2πi rj/Q}` — a
+///    pre-twiddle, a forward `Q`-point DFT (radix-2 Cooley–Tukey, 1965), and a
+///    post-twiddle.
+///
+/// Total: `O(N log N)` versus the reference's `O(N²)` — the direct sum was
+/// measured at **50.5% of the whole playback process** (2·10⁶ multiply-adds
+/// per long frame per channel; perf + simprof, 2026-07-25).
+#[derive(Clone, Debug)]
+struct ImdctPlan {
+    /// The transform length `N`.
+    n: usize,
+    /// Pre-twiddles `e^{−iπ(j + 1/4)/M}`, `Q` entries.
+    pre: Vec<C64>,
+    /// Post-twiddles `e^{−iπ r/M}`, `Q` entries.
+    post: Vec<C64>,
+    /// FFT twiddles `e^{−2πi i/Q}`, `Q/2` entries (stage-strided).
+    tw: Vec<C64>,
+    /// Bit-reversal permutation for the `Q`-point radix-2 FFT.
+    brev: Vec<u32>,
+}
+
+impl ImdctPlan {
+    /// Build the plan for transform length `n` (`n` a power of two, ≥ 8).
+    fn new(n: usize) -> ImdctPlan {
+        let m = n / 2;
+        let q = n / 4;
+        debug_assert!(q.is_power_of_two() && q >= 2);
+        let mf = m as f64;
+        let pre = (0..q)
+            .map(|j| cis(-core::f64::consts::PI * (j as f64 + 0.25) / mf))
+            .collect();
+        let post = (0..q).map(|r| cis(-core::f64::consts::PI * r as f64 / mf)).collect();
+        let tw = (0..q / 2)
+            .map(|i| cis(-2.0 * core::f64::consts::PI * i as f64 / q as f64))
+            .collect();
+        let bits = q.trailing_zeros();
+        let brev = (0..q as u32).map(|i| i.reverse_bits() >> (32 - bits)).collect();
+        ImdctPlan { n, pre, post, tw, brev }
+    }
+
+    /// The fast IMDCT: same contract as the reference [`imdct`] (spec in,
+    /// `N` time-domain values out, `2/N` scale included).
+    fn imdct(&self, spec: &[f64]) -> Vec<f64> {
+        let n = self.n;
+        let (m, q) = (n / 2, n / 4);
+        debug_assert_eq!(spec.len(), m);
+        let scale = 2.0 / n as f64;
+
+        // Pair + pre-twiddle: z[j] = (X[2j] + i·X[M−1−2j]) · e^{−iπ(j+1/4)/M}.
+        let mut z: Vec<C64> = (0..q)
+            .map(|j| {
+                C64 {
+                    re: spec[2 * j],
+                    im: spec[m - 1 - 2 * j],
+                }
+                .mul(self.pre[j])
+            })
+            .collect();
+
+        // In-place radix-2 decimation-in-time FFT (Cooley–Tukey 1965).
+        for i in 0..q {
+            let j = self.brev[i] as usize;
+            if i < j {
+                z.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= q {
+            let half = len / 2;
+            let stride = q / len;
+            let mut base = 0;
+            while base < q {
+                for k in 0..half {
+                    let w = self.tw[k * stride];
+                    let t = z[base + half + k].mul(w);
+                    let u = z[base + k];
+                    z[base + k] = C64 { re: u.re + t.re, im: u.im + t.im };
+                    z[base + half + k] = C64 { re: u.re - t.re, im: u.im - t.im };
+                }
+                base += len;
+            }
+            len <<= 1;
+        }
+
+        // Post-twiddle → the M DCT-IV values.
+        let mut c4 = vec![0.0f64; m];
+        for r in 0..q {
+            let g = z[r].mul(self.post[r]);
+            c4[2 * r] = g.re;
+            c4[m - 1 - 2 * r] = -g.im;
+        }
+
+        // Scatter with the extension symmetries (step 1 above): direct over
+        // p = n + M/2 ∈ [M/2, M), antisymmetric mirror about M − 1/2, then the
+        // 2M-antiperiodic wrap.
+        let mut out = vec![0.0f64; n];
+        for (i, slot) in out.iter_mut().take(m / 2).enumerate() {
+            *slot = scale * c4[i + m / 2];
+        }
+        for i in m / 2..3 * m / 2 {
+            out[i] = -scale * c4[3 * m / 2 - 1 - i];
+        }
+        for i in 3 * m / 2..n {
+            out[i] = -scale * c4[i - 3 * m / 2];
+        }
+        out
+    }
 }
 
 /// §4.6.15.3.3 / §4.6.11.3.1 — the forward (analysis) MDCT for a
@@ -286,6 +450,10 @@ pub struct Filterbank {
     /// frame: per §4.6.11.3.2 the first block's left and right halves
     /// share its own `window_shape`.
     prev_shape: Option<WindowShape>,
+    /// The `O(N log N)` IMDCT plan for the length-2048 long transform.
+    plan_long: ImdctPlan,
+    /// The plan for the length-256 short transform.
+    plan_short: ImdctPlan,
 }
 
 impl Default for Filterbank {
@@ -302,6 +470,8 @@ impl Filterbank {
         Filterbank {
             overlap: vec![0.0f64; LONG_WINDOW_LEN as usize],
             prev_shape: None,
+            plan_long: ImdctPlan::new(LONG_TRANSFORM_LEN),
+            plan_short: ImdctPlan::new(SHORT_TRANSFORM_LEN),
         }
     }
 
@@ -409,7 +579,7 @@ impl Filterbank {
         if spec.len() != LONG_WINDOW_LEN as usize {
             return Err(Error::FilterbankInvalid);
         }
-        let x = imdct(spec, LONG_TRANSFORM_LEN);
+        let x = self.plan_long.imdct(spec);
         let w = self.long_window(left_shape, right_shape, kind);
         let z: Vec<f64> = x.iter().zip(w.iter()).map(|(&xv, &wv)| xv * wv).collect();
         Ok(z)
@@ -508,7 +678,7 @@ impl Filterbank {
         let mut windowed: Vec<Vec<f64>> = Vec::with_capacity(NUM_SHORT_WINDOWS);
         for j in 0..NUM_SHORT_WINDOWS {
             let coeffs = &spec[j * short_len..(j + 1) * short_len];
-            let x = imdct(coeffs, SHORT_TRANSFORM_LEN);
+            let x = self.plan_short.imdct(coeffs);
             // W_0 left half inherits the previous block's shape; all
             // other windows' left halves use this block's shape.
             let this_left = if j == 0 { left_shape } else { right_shape };
@@ -655,6 +825,35 @@ mod tests {
         assert!((bessel_i0(0.0) - 1.0).abs() < 1e-15);
         assert!((bessel_i0(1.0) - 1.266_065_877_752_008_4).abs() < 1e-12);
         assert!((bessel_i0(2.0) - 2.279_585_302_336_067_3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fast_imdct_matches_the_reference_sum() {
+        // The ImdctPlan (DCT-IV + quarter-length FFT) against the literal
+        // §4.6.11.3.1 sum, over dense pseudo-random spectra, at both
+        // production sizes plus the smallest legal plan (Q = 2 edge).
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = move || {
+            // SplitMix64 (Steele et al. 2014) — deterministic test spectra.
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z = z ^ (z >> 31);
+            (z >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        for n in [8usize, SHORT_TRANSFORM_LEN, LONG_TRANSFORM_LEN] {
+            let spec: Vec<f64> = (0..n / 2).map(|_| rng()).collect();
+            let want = imdct(&spec, n);
+            let got = ImdctPlan::new(n).imdct(&spec);
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-9,
+                    "N={n} n={i}: fast {g} vs reference {w}"
+                );
+            }
+        }
     }
 
     #[test]
