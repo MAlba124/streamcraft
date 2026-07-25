@@ -281,6 +281,23 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > beside the video chain — clock + latency infra is ready); mp4demux still has
 > the shared-offer-menu autoplug weakness mkv got fixed for (d2a2440).
 
+> **Update — session 4l (2026-07-25): A+V plays for real.** play_file wires
+> `aacdec ! pipewireaudiosink` beside the video chain (DAC = pipeline clock,
+> audio-master sync). Three rounds of whack-a-stall to get there, each caught
+> by instrumentation: (1) aacdec's 4 KB frames pinned whole 4 MiB shared slots
+> → own 64 KiB pool; (2) the demuxer interleave problem (one thread feeds both
+> pads; either full ring blocks the other track) → deep rings both branches;
+> (3) **the real one** (`4efa3ab`): perf showed 40.9% of the process in libm
+> `__cos_fma` — upstream oxideav-aac computes the IMDCT as a naive O(N²) sum
+> with a cos() per term (~200M/s at 48 kHz stereo). Vendored with a Chebyshev
+> three-term-recurrence patch (STREAMCRAFT-PATCHES.md #2): crate suite green,
+> oracle SNR identical to the digit, audio holds realtime, video back at
+> 25 fps. Example also gained mimalloc + thin-LTO release (adopted decoders
+> are alloc/call-heavy) and SC_AUDIO_DROP / SC_FORCE_WALL discriminators.
+> Soak: minutes of A+V, all counters realtime. Upstream debt list for
+> oxideav-aac grows: N·log N IMDCT is the real fix; the ~15 dB real-content
+> fidelity + clustered AU failures remain from 4k.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
