@@ -152,10 +152,16 @@ pub struct VaapiH264Dec {
     // DPB + POC + reference state.
     dpb: Vec<DpbEntry>,
     poc: h264parse::PocState,
-    /// Pictures decoded and reference-marked but not yet output, in POC order.
+    /// Pictures decoded and reference-marked but not yet output, in (gop, POC) order.
     output_queue: VecDeque<PendingOut>,
-    /// surface → POC, for ordering the output queue (§C.4-style bumping).
-    output_poc: std::collections::HashMap<ffi::VASurfaceID, i32>,
+    /// surface → (gop, POC), for ordering the output queue (§C.4-style bumping).
+    /// POC resets to 0 at every IDR (§8.2.1), so raw POC alone would sort a new
+    /// GOP's pictures *ahead* of the previous GOP's still-queued tail — the old
+    /// scene would flash back after the cut. The gop counter makes the key
+    /// globally monotonic in display order.
+    output_key: std::collections::HashMap<ffi::VASurfaceID, (u32, i32)>,
+    /// Monotonic coded-video-sequence counter, bumped at each IDR.
+    gop: u32,
     /// The one picture currently in readback (backpressure carry).
     pending: Option<PendingOut>,
 
@@ -192,7 +198,8 @@ impl VaapiH264Dec {
             dpb: Vec::new(),
             poc: h264parse::PocState::new(),
             output_queue: VecDeque::new(),
-            output_poc: std::collections::HashMap::new(),
+            output_key: std::collections::HashMap::new(),
+            gop: 0,
             pending: None,
             announced: false,
             dims: None,
@@ -263,10 +270,15 @@ impl VaapiH264Dec {
         }
         let Some(display) = &self.display else { return false };
 
-        // Surface budget: DPB size (level-bounded, use max_num_ref_frames + margin)
-        // plus a few in-flight (the picture being decoded + backpressure carry).
+        // Surface budget: every holder must fit simultaneously — the DPB
+        // (≤ max_num_ref refs), a *full* reorder queue (maybe_bump's budget:
+        // max_num_ref+1), the readback carry, the picture being decoded, and
+        // slack. Undersizing doesn't just stall: under a realtime-pacing sink
+        // the exhaustion path then emits the queue front *below* the reorder
+        // budget, and a later-decoded smaller-POC B-frame displays after a
+        // newer frame — visible as old-frame glitches.
         let dpb_slots = (sps.max_num_ref_frames + 1).clamp(2, 16);
-        let count = dpb_slots + 5;
+        let count = dpb_slots * 2 + 4;
 
         let profile = ffi::VAProfileH264High; // High ⊇ Main/CB for VLD on Intel.
         let config = match Config::new_decode(display, profile) {
@@ -432,10 +444,12 @@ impl VaapiH264Dec {
             return;
         }
 
-        // 4) IDR resets DPB + POC (§8.2.1, §8.2.5.3).
+        // 4) IDR resets DPB + POC (§8.2.1, §8.2.5.3) and starts a new coded video
+        // sequence — the output-order key's gop component (see `output_key`).
         if is_idr {
             self.reset_dpb();
             self.poc.reset();
+            self.gop = self.gop.wrapping_add(1);
         }
 
         // 5) POC for this picture (§8.2.1).
@@ -482,10 +496,10 @@ impl VaapiH264Dec {
             width,
             height,
         });
-        // Keep the output queue POC-sorted by pairing surface→poc: we sort by the
-        // matching DPB/output ordering. Simplest correct model for our subset:
-        // reorder the output queue by POC of the just-decoded picture set. We track
-        // POC alongside in a parallel field.
+        // Keep the output queue (gop, POC)-sorted by pairing surface→key: we sort
+        // by the matching DPB/output ordering. Simplest correct model for our
+        // subset: reorder the output queue by key of the just-decoded picture set,
+        // tracked in a parallel table.
         self.reorder_output(target, poc);
 
         // If this picture is NOT a reference, its surface must be freed after
@@ -497,18 +511,19 @@ impl VaapiH264Dec {
         self.maybe_bump(&sps);
     }
 
-    /// Reorder the just-pushed output entry into POC order within the queue. POC is
-    /// carried on a side table keyed by surface (see `poc_of`).
+    /// Reorder the just-pushed output entry into (gop, POC) order within the queue.
+    /// The key is carried on a side table keyed by surface; the gop component keeps
+    /// pictures from before an IDR ahead of the new sequence (POC restarts at 0).
     fn reorder_output(&mut self, surface: ffi::VASurfaceID, poc: i32) {
-        self.output_poc.insert(surface, poc);
-        // Insertion sort the tail into place by POC.
+        self.output_key.insert(surface, (self.gop, poc));
+        // Insertion sort the tail into place by (gop, POC).
         let mut i = self.output_queue.len().saturating_sub(1);
         while i > 0 {
             let a = self.output_queue[i - 1].surface;
             let b = self.output_queue[i].surface;
-            let pa = *self.output_poc.get(&a).unwrap_or(&i32::MAX);
-            let pb = *self.output_poc.get(&b).unwrap_or(&i32::MAX);
-            if pa > pb {
+            let ka = *self.output_key.get(&a).unwrap_or(&(u32::MAX, i32::MAX));
+            let kb = *self.output_key.get(&b).unwrap_or(&(u32::MAX, i32::MAX));
+            if ka > kb {
                 self.output_queue.swap(i - 1, i);
                 i -= 1;
             } else {
@@ -989,7 +1004,7 @@ impl VaapiH264Dec {
     /// After a picture is output, free its surface *only if it is not a live DPB
     /// reference*. Reference surfaces are freed when evicted.
     fn recycle_output_surface(&mut self, surface: ffi::VASurfaceID) {
-        self.output_poc.remove(&surface);
+        self.output_key.remove(&surface);
         self.release_if_unreferenced(surface);
     }
 
@@ -1050,7 +1065,7 @@ impl Element for VaapiH264Dec {
                     .chain(self.output_queue.drain(..))
                     .map(|o| o.surface)
                     .collect();
-                self.output_poc.clear();
+                self.output_key.clear();
                 for id in outs {
                     self.release_if_unreferenced(id);
                 }
@@ -1402,5 +1417,37 @@ mod tests {
         assert_eq!(l0, vec![2, 0, 6, 8]);
         // list1: [6, 8] (POC>cur ascending) then [2, 0] (POC<cur descending).
         assert_eq!(l1, vec![6, 8, 2, 0]);
+    }
+
+    #[test]
+    fn output_order_survives_idr_poc_reset() {
+        // POC restarts at 0 on an IDR (§8.2.1). Raw-POC ordering would sort the
+        // new GOP's pictures ahead of the previous GOP's still-queued tail —
+        // the old scene would flash back after the cut. The (gop, poc) key must
+        // keep queue order [old GOP..., new GOP...].
+        let mut dec = VaapiH264Dec::new();
+        let push = |dec: &mut VaapiH264Dec, surface: u32, poc: i32| {
+            dec.output_queue.push_back(PendingOut {
+                surface,
+                pts: Timestamp::ZERO,
+                duration: Timestamp::ZERO,
+                width: 16,
+                height: 16,
+            });
+            dec.reorder_output(surface, poc);
+        };
+        // Old GOP tail, decode order with a B reorder (POC 202 before 200).
+        push(&mut dec, 1, 202);
+        push(&mut dec, 2, 200);
+        // IDR: new coded video sequence, POC restarts.
+        dec.gop = dec.gop.wrapping_add(1);
+        push(&mut dec, 3, 0);
+        push(&mut dec, 4, 2);
+        let order: Vec<u32> = dec.output_queue.iter().map(|o| o.surface).collect();
+        assert_eq!(
+            order,
+            vec![2, 1, 3, 4],
+            "old GOP (POC-sorted) must drain before the new GOP's POC-0 IDR"
+        );
     }
 }
