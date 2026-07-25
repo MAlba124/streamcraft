@@ -201,6 +201,28 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > idle park (~374K sched_yield/movie), writev gather in FileSink, single-track
 > MkvMux aac offer, av1C, the one-batch EOS-race note in MkvMuxN.
 
+> **Update — session 4h (2026-07-25): shell-recycling leaks + Cues.** (1) User
+> report "still 140K allocs, walls of 1B–512B" → four leaks in batch-shell
+> recycling (`6d2fd91`, 141K → **12.2K** allocs/movie): inert-pad `take_output`
+> destroyed a warm spare per idle pass; `take_input_on` minted fresh shells
+> (→ public `Ctx::recycle_input`); shared spare pool paired capacities
+> pessimally (→ split out-duty/input-duty pools); and the load-bearer — shell
+> return rings sized == data ring silently dropped burst returns (→ `2*cap+2`,
+> spare retention scales via new `ring::capacity()`). Lesson: instrument
+> (capacity-logging run) after the first wrong theory, not the third. EOS
+> drain now gathers small pieces (was per-header exact alloc+Arc). Remaining
+> 12K: mkv reader `to_vec` (the queued retained-slice conversion), Mp4Reader
+> chunk-boundary copies, EOS finalize. (2) **Cues + front SeekHead**
+> (`e7bf564`): `MatroskaWriter::enable_cues` (opt-in; MkvMuxN default-on) —
+> 128-octet Void reservation, cue-worthy = cluster holds a cue-track keyframe,
+> Cues after last Cluster, and the new core **`Event::Patch{offset,data}`**
+> (single positioned overwrite; `Ctx::push_event`; FileSink applies — its IO
+> was positioned already; queue must forward it like FormatChange if one ever
+> sits before a byte sink). Movie: 1078 CuePoints/89.8 min, mpv 0/50%/95%
+> clean, ffprobe silent. Benchmark-vs-ffmpeg protocol: `time (cmd && sync)`
+> both ways — ffmpeg exits with ~1 GB dirty; its extra index is ~24 KB (not
+> the speed story).
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
