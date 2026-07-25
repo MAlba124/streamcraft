@@ -298,6 +298,36 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > oxideav-aac grows: N·log N IMDCT is the real fix; the ~15 dB real-content
 > fidelity + clustered AU failures remain from 4k.
 
+> **Update — session 4m (2026-07-25): introspection protocol + scraft-scope live.**
+> Three parallel Opus agents + inline integration. (1) **Core** (`3cc31ec`,
+> `core/src/introspect/`, feature `introspect`, still zero-dep/`deny(unsafe_code)`):
+> the **SCIP v1.0 wire format** — LE length-prefixed POD frames, 8 B header
+> `len/kind/seq`, per-connection string interning (`StrDef`, `&'static str` by
+> pointer identity), `row_size`-strided tables for forward compat; request/reply
+> Topology (3 tables incl. per-edge `FixedFormat`)/Dot/Counters(+`now_ns`)/Latency/
+> LatencyReport/Props, pushed Subscribe streams BusMsg(100 B — the brief's "96" was
+> an arithmetic slip)/LogRec(88 B)/Dropped, controls SetProp/Pause/Resume/
+> SetLogLevel/SetTracing (Step reserved → Error(6)). Server = accept thread +
+> per-client blocking threads; slow client ⇒ `try_push`-drop + Dropped gap frames
+> (ring has no drop-oldest, by design). **Bus tap** copies rows under the existing
+> send lock (never steals from the app); **log tap** rides `LogDrainThread`;
+> `build_logging` wires threshold-off channels (cap 256) when serving so streaming
+> cost stays byte-identical. `pipeline.serve_introspection(path)` or
+> `STREAMCRAFT_INTROSPECT=<path>` env (zero-code attach). 22 pinned wire/round-trip
+> tests. (2) **scope UI** (`755364e`): immediate-mode toolkit on
+> `SDL_RenderGeometryRaw` — per-frame bump arena, batched draw list w/ clip stack,
+> original CC0 8x8 bitmap font atlas, panels/kv/fill-bar/button/toggle/tabs/log
+> view, all window-free-testable (35 tests) + `ui_demo --frames N` headless.
+> (3) **layout** (`18e4517`): pure Sugiyama layered DAG (longest-path layering,
+> barycenter sweeps, dummy waypoints, port-ordered attach points, group boxes;
+> 17 golden/invariant tests). (4) **Integration** (`adcbda7`): protocol client
+> (blocking reader thread — framing never torn; `Model` + topo_gen; counters
+> polled 100 ms, re-GetTopology on mutation cues), graph/elements/events+logs
+> panels, `scraft-scope <sock> [--frames N]`, `Scope::spawn` embed (same app on a
+> temp socket). **E2E**: play_pattern + env attach → headless scope decodes
+> 2 elements/1 edge + live counters, both exit 0. Deferred: MCP server, step(),
+> prop-editing UI, latency panel, TCP, buffer peeking.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
