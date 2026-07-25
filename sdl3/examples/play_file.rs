@@ -16,6 +16,13 @@
 
 use sc_mkv::ebml::id;
 use sc_mkv::MkvDemux;
+
+// The adopted h264 decoder allocates ~1.5M times/s internally (upstream churn,
+// see PLAN); glibc malloc makes that the decode bottleneck (one pegged core at
+// ~12-22 fps for 720p25). mimalloc buys the headroom until the churn is fixed
+// at the source. Example-only — the libraries stay allocator-agnostic.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use sc_sdl3::Sdl3VideoSink;
 use streamcraft_core::element::Element;
 use streamcraft_core::error::Error;
@@ -163,6 +170,7 @@ fn main() {
     };
 
     let mut sink_id = None;
+    let mut audio_sink_id = None;
     if let Some(dec) = dec {
         // The decoder gets its OWN pool (spec: pool negotiation, explicit v1 —
         // set_element_pool): decoded frames must never compete with the shared
@@ -172,17 +180,48 @@ fn main() {
         // the only element that could unblock the chain — can never allocate the
         // frame it is carrying (measured: outstanding=24/24, all counters flat).
         p.set_element_pool(dec, 4 * 1024 * 1024, 24);
+        // A deep inbound ring (the classic post-demux queue): the demuxer's
+        // thread emits BOTH tracks, and a full ring on either pad blocks it —
+        // starving the other track. With the default 4-batch rings it ping-pongs
+        // between blocked-on-video and blocked-on-audio: video halves, audio
+        // underruns (audible stutter). Depth here is the interleave slack.
+        p.set_queue_capacity(dec, 16);
         let sink = p.add_boxed(Box::new(Sdl3VideoSink::new().with_title("streamcraft — play_file")));
         p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
         sink_id = Some(sink);
     }
     if let Some(adec) = audio_dec {
-        // s16 interleaved audio/raw straight into the device sink (the same
-        // chain shape as the flac "play an audio file" milestone). The pipewire
-        // sink provides the AudioDeviceClock — sinks-first selection makes it
-        // the pipeline clock, so the video sink's wait_until paces on the DAC.
-        let asink = p.add(sc_pipewire::PipeWireAudioSink::new());
-        p.link((adec, "src"), (asink, "sink")).expect("aacdec ! audiosink");
+        // The audio decoder gets its OWN small-slot pool (pool negotiation v1,
+        // same lesson as the video decoder above but inverted): a decoded AAC
+        // frame is ~4 KB, and `try_alloc` hands out whole slots — from the
+        // shared pool that is a 4 MiB slot pinned per 4 KB frame, so a couple
+        // dozen in-flight audio buffers exhausted the pool: the demuxer starved
+        // (video froze) and the audio sink underran (stutter). Worse, the DAC
+        // is the *pipeline* clock now — an underrun freezes video pacing too.
+        p.set_element_pool(adec, 64 * 1024, 64);
+        p.set_queue_capacity(adec, 64); // interleave slack — see the video note
+        // Diagnostics: SC_AUDIO_DROP=1 decodes audio but drops it (no device, no
+        // audio clock); SC_FORCE_WALL=1 keeps the device but paces on the wall
+        // clock. Both isolate "audio chain CPU" from "audio-master clock" when
+        // hunting pacing regressions.
+        if std::env::var_os("SC_AUDIO_DROP").is_some() {
+            let (tsink, _stats) = TestSink::new();
+            let drop_id = p.add(tsink);
+            p.link((adec, "src"), (drop_id, "sink")).expect("aacdec ! drop");
+            println!("  (audio decoded but dropped — SC_AUDIO_DROP)");
+        } else {
+            // s16 interleaved audio/raw straight into the device sink (the same
+            // chain shape as the flac "play an audio file" milestone). The pipewire
+            // sink provides the AudioDeviceClock — sinks-first selection makes it
+            // the pipeline clock, so the video sink's wait_until paces on the DAC.
+            let asink = p.add(sc_pipewire::PipeWireAudioSink::new());
+            p.link((adec, "src"), (asink, "sink")).expect("aacdec ! audiosink");
+            audio_sink_id = Some(asink);
+            if std::env::var_os("SC_FORCE_WALL").is_some() {
+                p.set_clock(std::sync::Arc::new(streamcraft_core::clock::InstantClock::new()));
+                println!("  (wall clock forced — SC_FORCE_WALL)");
+            }
+        }
     }
 
     println!("playing {path} — 'p'⏎ pause/resume, 'q'⏎ quit (or close the window / Ctrl-C)…");
@@ -194,6 +233,8 @@ fn main() {
             ("filesrc", Some(src)),
             ("mkvdemux", Some(demux)),
             ("dec", dec),
+            ("adec", audio_dec),
+            ("asink", audio_sink_id),
         ]
         .into_iter()
         .filter_map(|(n, id)| id.map(|id| (n.to_string(), id)))

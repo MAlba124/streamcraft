@@ -4,6 +4,7 @@ exclude = [
     # Vendored oxideav-h264 0.1.7 + the RefPicStore eviction fix (see
     # vendor/oxideav-h264/STREAMCRAFT-PATCHES.md); wired via [patch.crates-io].
     "vendor/oxideav-h264",
+    "vendor/oxideav-aac",
 ]
 members = [
     "core",
@@ -35,6 +36,11 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/MAlba124/streamcraft"
 
+[profile.release]
+# Thin LTO: the adopted decoders (oxideav-*) are allocation- and call-heavy;
+# cross-crate inlining buys real throughput on the playback path.
+lto = "thin"
+
 [profile.bench]
 debug = true
 
@@ -44,3 +50,7 @@ debug = true
 # retain_keys sweep (documented in vendor/oxideav-h264/STREAMCRAFT-PATCHES.md,
 # to be offered upstream).
 oxideav-h264 = { path = "vendor/oxideav-h264" }
+# Upstream 0.1.6 computes the IMDCT as a naive O(N²) sum with a libm cos()
+# per term (~40% of a playback process's CPU; audio couldn't hold realtime).
+# Vendored with a Chebyshev-recurrence patch (STREAMCRAFT-PATCHES.md).
+oxideav-aac = { path = "vendor/oxideav-aac" }
