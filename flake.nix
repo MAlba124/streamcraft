@@ -37,12 +37,14 @@
             pkgs.cargo-fuzz
             pkgs.mold
             pkgs.clang # libclang, for the pipewire crate's bindgen
+            pkgs.libva-utils # vainfo, for VA-API driver debugging
           ];
 
-          # PipeWire (libpipewire-0.3 + libspa) and SDL3, found via pkg-config.
-          # Only sc-pipewire links libpipewire and only sc-sdl3 links SDL3 (spec:
-          # windowing/graphics ride SDL3); the core stays dependency-free.
-          buildInputs = [ pkgs.pipewire pkgs.sdl3 ];
+          # PipeWire (libpipewire-0.3 + libspa), SDL3, and libva (+ libva-drm),
+          # found via pkg-config. Only sc-pipewire links libpipewire, only sc-sdl3
+          # links SDL3, and only sc-vaapi links libva (spec: a device backend is
+          # the one "buy, don't build"); the core stays dependency-free.
+          buildInputs = [ pkgs.pipewire pkgs.sdl3 pkgs.libva ];
 
           # Self-contained linking: the stdenv `cc` driver with mold, so the shell
           # doesn't depend on a globally-configured linker. Plain RUSTFLAGS is used
@@ -56,9 +58,13 @@
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
-          # So the dynamically-linked libSDL3.so.0 resolves at run time inside the
-          # pure devshell (it is not on the default search path here).
-          LD_LIBRARY_PATH = "${pkgs.sdl3}/lib";
+          # So the dynamically-linked libSDL3.so.0 / libva.so resolve at run time
+          # inside the pure devshell (not on the default search path here).
+          LD_LIBRARY_PATH = "${pkgs.sdl3}/lib:${pkgs.libva}/lib";
+
+          # VA-API driver discovery must be self-contained too (the host is not
+          # NixOS): iHD for Intel, Mesa's for AMD. The runtime picks by probing.
+          LIBVA_DRIVERS_PATH = "${pkgs.intel-media-driver}/lib/dri:${pkgs.mesa}/lib/dri";
 
           shellHook = ''
             echo "streamcraft devshell — $(rustc --version)"
