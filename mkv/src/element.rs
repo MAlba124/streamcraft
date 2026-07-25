@@ -749,6 +749,14 @@ struct PadTrack {
     track: Track,
     /// False until the codec head + the format announcement have been emitted on this pad.
     started: bool,
+    /// True for a video track (a codec whose family [`is_video_family`]). Only video tracks
+    /// need post-seek keyframe gating — an inter-frame decoder must start at a keyframe.
+    is_video: bool,
+    /// Post-seek keyframe gate (spec: flush/seek). Set on `FlushStart` for a video track; while
+    /// set, delta frames are dropped until the first `keyframe` frame after the flush (a decoder
+    /// that resumed mid-GOP would render garbage). Audio tracks never set it. Cleared once the
+    /// first post-seek keyframe passes.
+    awaiting_keyframe: bool,
 }
 
 /// Demultiplexes a Matroska/WebM byte stream into one src pad per track (spec: dynamic pads).
@@ -955,6 +963,16 @@ impl MkvDemux {
             let Some(idx) = self.pad_tracks.iter().position(|pt| pt.track_number == frame.track_number) else {
                 continue; // undiscovered track — no pad to route to
             };
+            // Post-seek keyframe gate (spec: flush/seek): after a FlushStart a video track drops
+            // delta frames until its first keyframe — a decoder resuming mid-GOP would render
+            // garbage. Audio never gates. The first keyframe clears the gate and passes through.
+            if self.pad_tracks[idx].awaiting_keyframe {
+                if frame.keyframe {
+                    self.pad_tracks[idx].awaiting_keyframe = false;
+                } else {
+                    continue; // delta before the first post-seek keyframe — drop
+                }
+            }
             // Reframe the Block payload to the downstream bytes (before touching pool memory)
             // so a malformed access unit is dropped without ever emitting the codec head/format
             // for a track that would then carry nothing (announce happens only on a good frame).
@@ -1158,6 +1176,8 @@ impl Element for MkvDemux {
                 reframer,
                 track: track.clone(),
                 started: false,
+                is_video: is_video_family(family),
+                awaiting_keyframe: false,
             });
         }
         Ok(())
@@ -1210,11 +1230,39 @@ impl Element for MkvDemux {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // On EOS, flush everything still parked or queued — exact-size allocations, since
-        // waiting for pool slots is no longer an option. The Matroska streamed masters
-        // (Segment/Cluster) end implicitly, so there is no trailer beyond this.
-        if matches!(event, Event::Eos) {
-            self.flush_exact(ctx);
+        match event {
+            // On EOS, flush everything still parked or queued — exact-size allocations, since
+            // waiting for pool slots is no longer an option. The Matroska streamed masters
+            // (Segment/Cluster) end implicitly, so there is no trailer beyond this.
+            Event::Eos => self.flush_exact(ctx),
+            // Seek (spec: flush/seek). The byte source (filesrc) has already resumed reads at
+            // the seek target byte; here the demuxer resets its *parse* state to match. We do
+            // NOT rebuild the reader (`::new` would forget the discovered tracks/scale, which
+            // the post-seek stream does not resend) — `resync_streaming` keeps that state and
+            // scans forward for the next Cluster, tolerating a proportional seek that lands
+            // mid-block. pts recover automatically: each post-seek Cluster's Timestamp
+            // re-establishes the base, and a block's pts is always `cluster_base + rel_ts`.
+            Event::FlushStart => {
+                self.reader.resync_streaming();
+                // Drop any staged, pre-seek output — those are buffers for content now behind us.
+                self.pending.clear();
+                for pt in &mut self.pad_tracks {
+                    // Re-emit the codec head after the seek: downstream decoders reset on
+                    // FlushStart and the NAL codecs (h264/h265) need their SPS/PPS again to
+                    // decode the first post-seek keyframe. `started = false` makes `drain`
+                    // re-announce + re-emit the head before the next frame; restore the head
+                    // and reframer (`start()`/first-frame took the head via `mem::take`).
+                    pt.started = false;
+                    let (head, reframer) = Self::head_and_reframer(&pt.track);
+                    pt.codec_head = head;
+                    pt.reframer = reframer;
+                    // Gate video tracks until their first post-seek keyframe (a proportional
+                    // seek, and even a cue-indexed one, resumes at a Cluster whose first video
+                    // frame is a keyframe — but a mid-block estimate may surface a delta first).
+                    pt.awaiting_keyframe = pt.is_video;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

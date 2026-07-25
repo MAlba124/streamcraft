@@ -69,9 +69,19 @@
 //! - **Frame-preserving demux emission**: a frame larger than the demuxer's pool slot is
 //!   emitted split, which a downstream muxer would write as several blocks; remuxing such
 //!   streams needs `Pipeline::set_element_pool` sizing today.
-//! - **Seeking metadata**: no Cues/SeekHead — a streaming muxer does not need them, and
-//!   `finalize` stays seek-free; the demuxer walks Clusters linearly. A later two-pass /
-//!   index-driven mode can add them.
+//! ## Seeking (spec: flush/seek; RFC 9559 §5.1.1, §5.1.5)
+//! The writer's [`enable_cues`](MatroskaWriter::enable_cues) emits a front SeekHead + a Cues
+//! index. The read side turns that into time-based seeking:
+//! - [`parse_seek_head`] walks the header bytes for the Cues Segment Position + TimestampScale,
+//!   and [`parse_cues`] turns a Cues master into a sorted `(time_ns, absolute_byte)` index —
+//!   both pure functions over byte slices (the app does the file IO). Without Cues the app
+//!   estimates a byte proportionally.
+//! - [`MatroskaReader::resync_streaming`] resets the reader for a mid-Segment resume (keeping
+//!   the discovered tracks/scale) and scans forward for the next Cluster ID, tolerating garbage
+//!   before it (a proportional seek lands anywhere).
+//! - [`MkvDemux`] handles `Event::FlushStart`: it resyncs the reader, drops staged output,
+//!   re-emits codec heads (downstream decoders reset on flush), and gates each video track's
+//!   post-seek output until its first keyframe (audio passes immediately).
 
 #![deny(unsafe_code)]
 
@@ -85,7 +95,7 @@ pub mod writer;
 pub use codec::{family_for, nal_head_from_config, Reframer, ReframeError};
 pub use element::{MkvDemux, MkvMux};
 pub use mux_multi::MkvMuxN;
-pub use reader::{Frame, MatroskaReader, Track};
+pub use reader::{parse_cues, parse_seek_head, Frame, MatroskaReader, SeekHeadInfo, Track};
 pub use writer::{
     AudioConfig, MatroskaWriter, MuxOut, MuxPiece, TrackConfig, VideoConfig, WriteError,
     APP_NAME, DEFAULT_TIMESTAMP_SCALE,
