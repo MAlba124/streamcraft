@@ -274,8 +274,9 @@ unsafe fn upload_font_atlas(renderer: *mut SDL_Renderer, font: &Font) -> Result<
     if tex.is_null() {
         return Err(err("create font texture"));
     }
-    // Nearest sampling keeps the bitmap crisp; blend so transparent bg composites.
-    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+    // Linear sampling: the atlas is anti-aliased and quads scale fractionally
+    // between baked sizes when zooming; blend so transparent bg composites.
+    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
     SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
     let pixels = font.atlas_rgba();
     let pitch = (w * 4) as c_int;

@@ -58,6 +58,9 @@ pub struct EdgeView {
 pub struct TopoView {
     pub elements: Vec<ElementView>,
     pub edges: Vec<EdgeView>,
+    /// Presentation duration when any negotiated format carried a `duration`
+    /// field (ns) — e.g. the mkv demuxer announces `Info\Duration` on its pads.
+    pub duration_ns: Option<u64>,
 }
 
 /// One counters reply: the server's `now_ns` plus a row per element. Rates are the
@@ -318,6 +321,7 @@ fn decode_topology(payload: &[u8], strings: &HashMap<u32, String>) -> Option<Top
     }
 
     let mut edges = Vec::new();
+    let mut duration_ns: Option<u64> = None;
     let th = wire::TableHeader::read(&mut r)?;
     for _ in 0..th.row_count {
         let start = r.pos();
@@ -325,11 +329,14 @@ fn decode_topology(payload: &[u8], strings: &HashMap<u32, String>) -> Option<Top
         r.skip((th.row_size as usize).saturating_sub(r.pos() - start))?;
         let mut fields = Vec::with_capacity(row.nfields as usize);
         for slot in row.fields.iter().take(row.nfields as usize) {
-            fields.push(format!(
-                "{}={}",
-                resolve(strings, slot.field_str),
-                format_slot_value(slot, strings)
-            ));
+            let name = resolve(strings, slot.field_str);
+            // A demuxer that knows the presentation duration announces it as a
+            // format field (mkv: Info\Duration, ns) — surface it as the stream
+            // duration rather than an edge-label detail.
+            if name == "duration" && slot.tag as u32 == wire::WireValue::TAG_INT {
+                duration_ns = Some(duration_ns.unwrap_or(0).max(slot.bits));
+            }
+            fields.push(format!("{name}={}", format_slot_value(slot, strings)));
         }
         edges.push(EdgeView {
             src: row.src,
@@ -341,7 +348,7 @@ fn decode_topology(payload: &[u8], strings: &HashMap<u32, String>) -> Option<Top
         });
     }
 
-    Some(TopoView { elements, edges })
+    Some(TopoView { elements, edges, duration_ns })
 }
 
 fn format_slot_value(slot: &wire::FieldSlot, strings: &HashMap<u32, String>) -> String {

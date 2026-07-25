@@ -6,7 +6,7 @@
 
 use streamcraft_scope::ui::arena::Arena;
 use streamcraft_scope::ui::draw::{Color, DrawList, Rect, TexId};
-use streamcraft_scope::ui::font::{Font, ATLAS_H, ATLAS_W, CELL};
+use streamcraft_scope::ui::font::{Font, ATLAS_H, ATLAS_W};
 use streamcraft_scope::ui::widgets::{LogView, UiState};
 use streamcraft_scope::ui::{Id, Input, Key, Mods, MouseButton, Ui};
 
@@ -218,19 +218,36 @@ fn id_is_stable_and_label_sensitive() {
 
 #[test]
 fn font_measure_single_line() {
+    // Monospace: width is exactly chars × advance, height one line, at any size.
     let f = Font::new();
     let (w, h) = f.measure("ABCD");
-    assert_eq!(w, 4.0 * CELL as f32);
-    assert_eq!(h, CELL as f32);
-    assert_eq!(f.measure_line("hi"), 2.0 * CELL as f32);
+    assert_eq!(w, 4.0 * f.cell_w());
+    assert_eq!(h, f.line_h());
+    assert_eq!(f.measure_line("hi"), 2.0 * f.cell_w());
 }
 
 #[test]
 fn font_measure_multiline() {
     let f = Font::new();
     let (w, h) = f.measure("ab\ncdef\ng");
-    assert_eq!(w, 4.0 * CELL as f32); // longest line "cdef"
-    assert_eq!(h, 3.0 * CELL as f32); // 3 lines
+    assert_eq!(w, 4.0 * f.cell_w()); // longest line "cdef"
+    assert_eq!(h, 3.0 * f.line_h()); // 3 lines
+}
+
+#[test]
+fn font_measure_scales_linearly_with_px() {
+    // measure_px at 2× the size is exactly 2× as wide (monospace advance is
+    // linear in px: snapped size × residual ratio).
+    let f = Font::new();
+    let (w14, _) = f.measure_px("stream", 14.0);
+    let (w28, _) = f.measure_px("stream", 28.0);
+    // Within 1% — different baked sizes rasterise to slightly different ratios.
+    assert!((w28 - 2.0 * w14).abs() < 0.01 * w28, "w14={w14} w28={w28}");
+    // Unbaked sizes interpolate: strictly between the neighbours' widths.
+    let (w20, _) = f.measure_px("stream", 20.0);
+    let (w18, _) = f.measure_px("stream", 18.0);
+    let (w24, _) = f.measure_px("stream", 24.0);
+    assert!(w18 < w20 && w20 < w24);
 }
 
 #[test]
@@ -240,27 +257,36 @@ fn font_atlas_dimensions() {
     assert_eq!(f.atlas_rgba().len(), ATLAS_W * ATLAS_H * 4);
 }
 
-#[test]
-fn font_atlas_letter_a_has_lit_pixels() {
-    // Cell for 'A' (0x41) must contain some opaque texels; a blank glyph would be
-    // fully transparent.
-    let f = Font::new();
+/// Fraction of texels with nonzero alpha inside a quad's uv rect.
+fn uv_coverage(f: &Font, uv: Rect) -> f32 {
     let atlas = f.atlas_rgba();
-    let b = b'A' as usize;
-    let cx = (b % 16) * CELL;
-    let cy = (b / 16) * CELL;
-    let mut lit = 0;
-    for row in 0..CELL {
-        for col in 0..CELL {
-            let px = cx + col;
-            let py = cy + row;
-            let o = (py * ATLAS_W + px) * 4;
-            if atlas[o + 3] != 0 {
+    let (x0, y0) = ((uv.x * ATLAS_W as f32) as usize, (uv.y * ATLAS_H as f32) as usize);
+    let (w, h) = ((uv.w * ATLAS_W as f32) as usize, (uv.h * ATLAS_H as f32) as usize);
+    let mut lit = 0usize;
+    for py in y0..(y0 + h).min(ATLAS_H) {
+        for px in x0..(x0 + w).min(ATLAS_W) {
+            if atlas[(py * ATLAS_W + px) * 4 + 3] != 0 {
                 lit += 1;
             }
         }
     }
-    assert!(lit > 4, "'A' should have several lit pixels, got {lit}");
+    lit as f32 / (w * h).max(1) as f32
+}
+
+#[test]
+fn font_glyphs_have_ink_and_distinct_uvs() {
+    // Each printable glyph's quad must point at atlas texels with real coverage,
+    // and different glyphs at different atlas regions.
+    let f = Font::new();
+    let mut dl = DrawList::new();
+    f.layout_into(&mut dl, "AW.", 0.0, 0.0, 1.0, Color::WHITE);
+    assert_eq!(dl.len(), 3);
+    let uvs: Vec<Rect> = dl.prims().iter().map(|p| p.uv).collect();
+    for uv in &uvs {
+        assert!(uv_coverage(&f, *uv) > 0.15, "glyph uv region looks blank");
+    }
+    assert!(uvs[0].x != uvs[1].x || uvs[0].y != uvs[1].y);
+    assert!(uvs[1].x != uvs[2].x || uvs[1].y != uvs[2].y);
 }
 
 #[test]
@@ -270,7 +296,7 @@ fn font_space_emits_no_quad_but_advances() {
     // "a b" -> two glyph quads (a, b), the space emits nothing.
     let (pen_x, _) = f.layout_into(&mut dl, "a b", 0.0, 0.0, 1.0, Color::WHITE);
     assert_eq!(dl.len(), 2);
-    assert_eq!(pen_x, 3.0 * CELL as f32); // pen advanced past all 3 cells
+    assert_eq!(pen_x, 3.0 * f.cell_w()); // pen advanced past all 3 cells
 }
 
 #[test]
@@ -285,17 +311,16 @@ fn font_non_ascii_uses_replacement_box() {
 }
 
 #[test]
-fn font_glyph_uv_maps_to_correct_cell() {
+fn font_glyph_quads_carry_bearings() {
+    // An AA glyph quad sits at pen + bearing and is narrower than the advance
+    // (JetBrains Mono side bearings) — i.e. we are not drawing full cells.
     let f = Font::new();
     let mut dl = DrawList::new();
-    // 'A' = 0x41 => atlas cell (col 1, row 4).
-    f.layout_into(&mut dl, "A", 0.0, 0.0, 1.0, Color::WHITE);
-    let uv = dl.prims()[0].uv;
-    let expect_x = 1.0 * CELL as f32 / ATLAS_W as f32;
-    let expect_y = 4.0 * CELL as f32 / ATLAS_H as f32;
-    assert!((uv.x - expect_x).abs() < 1e-6);
-    assert!((uv.y - expect_y).abs() < 1e-6);
-    assert!((uv.w - CELL as f32 / ATLAS_W as f32).abs() < 1e-6);
+    f.layout_into(&mut dl, "o", 10.0, 20.0, 1.0, Color::WHITE);
+    let q = dl.prims()[0].rect;
+    assert!(q.x >= 10.0, "bearing must not move ink left of the pen");
+    assert!(q.y > 20.0, "lowercase 'o' starts below the line-box top");
+    assert!(q.w < f.cell_w(), "ink narrower than the advance");
 }
 
 // ---------------------------------------------------------------------------
@@ -575,4 +600,65 @@ fn input_key_pressed_lookup() {
     i.keys.push((Key::Escape, Mods { ctrl: true, ..Default::default() }));
     assert!(i.key_pressed(Key::Escape));
     assert!(!i.key_pressed(Key::Enter));
+}
+
+// ---------------------------------------------------------------------------
+// App: pure camera / hit-test / formatting helpers
+// ---------------------------------------------------------------------------
+
+use streamcraft_scope::app::{dist_point_segment, fit_camera, fmt_time, zoom_at};
+
+#[test]
+fn point_segment_distance() {
+    // Perpendicular foot inside the segment.
+    assert_eq!(dist_point_segment((5.0, 3.0), (0.0, 0.0), (10.0, 0.0)), 3.0);
+    // Beyond an endpoint: distance to the endpoint.
+    assert_eq!(dist_point_segment((13.0, 4.0), (0.0, 0.0), (10.0, 0.0)), 5.0);
+    // Degenerate zero-length segment.
+    assert_eq!(dist_point_segment((3.0, 4.0), (0.0, 0.0), (0.0, 0.0)), 5.0);
+}
+
+#[test]
+fn zoom_keeps_anchor_stationary() {
+    // The content point under the anchor must stay under it across a zoom step:
+    // screen = pan + p*zoom; solve p at the anchor before and after.
+    let (pan, zoom) = ((30.0, -12.0), 0.8);
+    let anchor = (100.0, 60.0);
+    let p_before = ((anchor.0 - pan.0) / zoom, (anchor.1 - pan.1) / zoom);
+    let ((px, py), z2) = zoom_at(pan, zoom, anchor, 1.25);
+    let p_after = ((anchor.0 - px) / z2, (anchor.1 - py) / z2);
+    assert!((p_before.0 - p_after.0).abs() < 1e-3);
+    assert!((p_before.1 - p_after.1).abs() < 1e-3);
+    assert!((z2 - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn zoom_clamps_to_range() {
+    let ((_, _), z) = zoom_at((0.0, 0.0), 2.9, (0.0, 0.0), 10.0);
+    assert_eq!(z, 3.0);
+    let ((_, _), z) = zoom_at((0.0, 0.0), 0.3, (0.0, 0.0), 0.01);
+    assert_eq!(z, 0.2);
+}
+
+#[test]
+fn fit_camera_centres_content() {
+    // A 100x50 content box in a 400x300 body: fully visible, centred.
+    let ((px, py), z) = fit_camera((10.0, 20.0, 110.0, 70.0), 400.0, 300.0);
+    for (cx, cy) in [(10.0, 20.0), (110.0, 70.0), (60.0, 45.0)] {
+        let sx = px + cx * z;
+        let sy = py + cy * z;
+        assert!((0.0..=400.0).contains(&sx), "x {sx} out of body");
+        assert!((0.0..=300.0).contains(&sy), "y {sy} out of body");
+    }
+    // Centre of content lands at the centre of the body.
+    let (sx, sy) = (px + 60.0 * z, py + 45.0 * z);
+    assert!((sx - 200.0).abs() < 1e-3 && (sy - 150.0).abs() < 1e-3);
+}
+
+#[test]
+fn time_formatting() {
+    assert_eq!(fmt_time(0), "0:00");
+    assert_eq!(fmt_time(59_500_000_000), "0:59");
+    assert_eq!(fmt_time(83_000_000_000), "1:23");
+    assert_eq!(fmt_time(3_723_000_000_000), "1:02:03");
 }

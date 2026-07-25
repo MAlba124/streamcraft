@@ -57,8 +57,8 @@ impl Default for Theme {
             bar_bg: Color::rgb(0x2a, 0x30, 0x3a),
             bar_fill: Color::rgb(0x4a, 0xa8, 0xff),
             pad: 6.0,
-            row_h: 18.0,
-            title_h: 20.0,
+            row_h: 20.0,
+            title_h: 22.0,
             text_scale: 1.0,
         }
     }
@@ -208,6 +208,22 @@ impl<'a> Ui<'a> {
         let scale = self.theme.text_scale;
         self.font.layout_into(&mut self.dl, s, x, y, scale, color);
         self.font.measure_line(s) * scale
+    }
+
+    /// Draw a line of text at an explicit pixel size (the graph view zooms text
+    /// with its content, bypassing the theme scale); returns its pixel width.
+    pub fn text_px(&mut self, x: f32, y: f32, s: &str, px: f32, color: Color) -> f32 {
+        self.font.layout_px(&mut self.dl, s, x, y, px, color);
+        self.font.measure_px(s, px).0
+    }
+
+    /// Shift the current panel body's layout cursor up by `off` px — the hook for
+    /// caller-managed wheel scrolling of overflowing panel content (the panel clip
+    /// pushed by [`Ui::begin_panel`] hides what moves out of the body).
+    pub fn scroll_body(&mut self, off: f32) {
+        if let Some(c) = self.cursors.last_mut() {
+            c.y -= off;
+        }
     }
 
     /// Vertically centre a line of text within `row` (left-aligned at `row.x + pad`).

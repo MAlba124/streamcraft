@@ -36,6 +36,7 @@ pub mod arena;
 pub mod backend;
 pub mod draw;
 pub mod font;
+mod font_data;
 pub mod widgets;
 
 pub use arena::Arena;
