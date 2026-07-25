@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::time::Duration;
 
 use sc_http::HttpSrc;
 use streamcraft_core::pipeline::Pipeline;
@@ -70,6 +71,45 @@ fn serve_once_no_close(head: &'static str, body: Vec<u8>) -> (u16, std::sync::mp
         // Now the connection (and listener) drop, closing the socket.
     });
     (port, tx)
+}
+
+/// Serve `head` then dribble `body` out in `piece`-sized writes, sleeping `gap`
+/// between them, and close at the end. This forces the client's reactor read path to
+/// span many `process()` passes: each write lands as its own `Recv` completion, so the
+/// framing decoder repeatedly starves (`NeedMore`) and resumes as bytes trickle in —
+/// the streaming case a single blocking read would have hidden. Returns the port.
+fn serve_slow(head: &'static str, body: Vec<u8>, piece: usize, gap: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_request(&mut stream);
+        let _ = stream.write_all(head.as_bytes());
+        for chunk in body.chunks(piece.max(1)) {
+            if stream.write_all(chunk).is_err() {
+                return;
+            }
+            std::thread::sleep(gap);
+        }
+        // Drop closes the connection → client sees EOF (for the close-delimited case).
+    });
+    port
+}
+
+/// Serve `head` then only `sent` of `total` promised bytes and close — an early EOF
+/// under a `Content-Length: total`. The client must error (RFC 9112 §6.3 rule 6:
+/// truncated message), not silently accept a short body. Returns the port.
+fn serve_early_eof(head: &'static str, sent: Vec<u8>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        read_request(&mut stream);
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&sent);
+        // Close early — fewer than the promised Content-Length bytes were sent.
+    });
+    port
 }
 
 /// Encode `body` as an HTTP/1.1 `chunked` message body (RFC 9112 §7.1): a series of
@@ -265,4 +305,142 @@ fn chunked_with_extensions_and_trailer_is_decoded() {
     assert_eq!(got, b"hello world", "chunk-ext/trailer ignored, data intact");
 
     let _ = std::fs::remove_file(&outp);
+}
+
+#[test]
+fn slow_chunked_delivery_reassembles_across_reads() {
+    // The reactor read path proven under **trickle** delivery: the chunked body is
+    // written 137 bytes at a time with a gap, so most `Recv` completions land a
+    // fraction of a chunk. The decoder must span passes (starve → read → resume)
+    // without corrupting the byte stream or spinning on partial framing.
+    let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i.wrapping_mul(97) % 251) as u8).collect();
+    let sizes = [3usize, 1, 5000, 17, 20000, 1];
+    let encoded = chunked_encode(&body, &sizes);
+    let port = serve_slow(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        encoded,
+        137,
+        Duration::from_micros(200),
+    );
+
+    let outp = temp_path("slow_chunked_out");
+    let mut p = Pipeline::new();
+    let src = p.add(HttpSrc::new(format!("http://127.0.0.1:{port}/file")));
+    let sink = p.add(FileSink::new(&outp));
+    p.link((src, "src"), (sink, "sink")).expect("link");
+    p.run().expect("run");
+
+    let got = std::fs::read(&outp).expect("read output");
+    assert_eq!(got.len(), body.len(), "slow chunked length matches");
+    assert_eq!(got, body, "slow chunked bytes are byte-identical");
+
+    let _ = std::fs::remove_file(&outp);
+}
+
+#[test]
+fn slow_length_delivery_reassembles_across_reads() {
+    // Same trickle stress on the `Content-Length` path: the client must accumulate
+    // exactly N bytes across many small reads and terminate on the length.
+    let body: Vec<u8> = (0..48 * 1024u32).map(|i| (i.wrapping_mul(53) % 249) as u8).collect();
+    let head: &'static str = Box::leak(
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_boxed_str(),
+    );
+    let port = serve_slow(head, body.clone(), 211, Duration::from_micros(150));
+
+    let outp = temp_path("slow_len_out");
+    let mut p = Pipeline::new();
+    let src = p.add(HttpSrc::new(format!("http://127.0.0.1:{port}/file")));
+    let sink = p.add(FileSink::new(&outp));
+    p.link((src, "src"), (sink, "sink")).expect("link");
+    p.run().expect("run");
+
+    let got = std::fs::read(&outp).expect("read output");
+    assert_eq!(got.len(), body.len(), "slow Content-Length length matches");
+    assert_eq!(got, body, "slow Content-Length bytes are byte-identical");
+
+    let _ = std::fs::remove_file(&outp);
+}
+
+#[test]
+fn content_length_early_eof_errors() {
+    // The server promises 1000 bytes but sends 400 then closes. RFC 9112 §6.3 rule 6:
+    // the message is incomplete → the run must error, not accept a truncated body.
+    let head = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+    let sent: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
+    let port = serve_early_eof(head, sent);
+
+    let outp = temp_path("early_eof_out");
+    let mut p = Pipeline::new();
+    let src = p.add(HttpSrc::new(format!("http://127.0.0.1:{port}/file")));
+    let sink = p.add(FileSink::new(&outp));
+    p.link((src, "src"), (sink, "sink")).expect("link");
+
+    assert!(p.run().is_err(), "a truncated Content-Length body must error");
+
+    let _ = std::fs::remove_file(&outp);
+}
+
+#[test]
+fn empty_eof_body_terminates() {
+    // A close-delimited response with a zero-length body: the server closes right
+    // after the headers. The client must terminate cleanly (EOS on the first empty
+    // read), producing an empty output rather than hanging.
+    let port = serve_once("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", Vec::new());
+
+    let outp = temp_path("empty_eof_out");
+    let mut p = Pipeline::new();
+    let src = p.add(HttpSrc::new(format!("http://127.0.0.1:{port}/empty")));
+    let sink = p.add(FileSink::new(&outp));
+    p.link((src, "src"), (sink, "sink")).expect("link");
+    p.run().expect("run");
+
+    let got = std::fs::read(&outp).expect("read output");
+    assert!(got.is_empty(), "empty close-delimited body yields empty output");
+
+    let _ = std::fs::remove_file(&outp);
+}
+
+/// The streaming `Recv` op on a **real** io_uring ring: the reactor issues
+/// `IORING_OP_READ` with offset -1 against the socket fd, so this proves the async
+/// path end-to-end (not just the SyncReactor's blocking `read(2)`). Both framings run
+/// through it; the download must still be byte-identical.
+#[cfg(feature = "io-uring")]
+#[test]
+fn downloads_over_io_uring_reactor() {
+    use streamcraft_elements::io::IoUringReactor;
+
+    fn run_over_uring(head: &'static str, wire: Vec<u8>, tag: &str) -> Vec<u8> {
+        let port = serve_once(head, wire);
+        let outp = temp_path(tag);
+        let mut p = Pipeline::new();
+        p.set_reactor_factory(std::sync::Arc::new(|| {
+            Ok(Box::new(IoUringReactor::new()?) as Box<dyn streamcraft_core::io::Reactor>)
+        }));
+        let src = p.add(HttpSrc::new(format!("http://127.0.0.1:{port}/file")));
+        let sink = p.add(FileSink::new(&outp));
+        p.link((src, "src"), (sink, "sink")).expect("link");
+        p.run().expect("run");
+        let got = std::fs::read(&outp).expect("read output");
+        let _ = std::fs::remove_file(&outp);
+        got
+    }
+
+    // Close-delimited (EOF framing): several pool slots' worth of body.
+    let body: Vec<u8> = (0..400 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let got = run_over_uring(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+        body.clone(),
+        "uring_eof_out",
+    );
+    assert_eq!(got, body, "io_uring EOF-framed download is byte-identical");
+
+    // Chunked framing over the same ring.
+    let sizes = [1usize, 5000, 130 * 1024, 7, 63 * 1024];
+    let encoded = chunked_encode(&body, &sizes);
+    let got = run_over_uring(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        encoded,
+        "uring_chunked_out",
+    );
+    assert_eq!(got, body, "io_uring chunked download is byte-identical");
 }
