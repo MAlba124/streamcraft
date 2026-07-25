@@ -88,6 +88,12 @@ enum Phase {
     Discovering,
     /// Tracks known; walking Clusters and decoding blocks.
     Streaming,
+    /// Mid-Segment resume after a seek (spec: flush/seek): the byte source jumped to a new
+    /// offset — either an exact cue-indexed Cluster start, or a proportional estimate that can
+    /// land *anywhere*, including mid-block. Before parsing resumes we scan forward for the next
+    /// Cluster ID (0x1F43B675), discarding any leading garbage; once found we drop back to
+    /// [`Phase::Streaming`] at that Cluster's ID.
+    Resyncing,
 }
 
 /// The default TimestampScale when Info omits it (Matroska `basics`: 1_000_000 ns/tick).
@@ -228,6 +234,9 @@ impl MatroskaReader {
     /// right now (buffer empty at this level), or an error. `Incomplete` bubbles up to
     /// [`parse`](Self::parse), which buffers.
     fn step(&mut self) -> Result<bool, ReadError> {
+        if self.phase == Phase::Resyncing {
+            return self.step_resync();
+        }
         if self.pos >= self.buf.len() {
             return Ok(false);
         }
@@ -296,6 +305,100 @@ impl MatroskaReader {
 
         self.pos = de;
         Ok(true)
+    }
+
+    /// Scan forward for the next Cluster ID while [`Resyncing`](Phase::Resyncing) after a seek.
+    /// The byte source jumped to a new offset that may fall mid-block (a proportional-estimate
+    /// seek lands anywhere), so the buffered bytes at `pos` are not guaranteed to begin on an
+    /// element boundary. We search `buf[pos..]` for the 4-octet Cluster ID (0x1F43B675) and, on
+    /// finding it, drop every byte before it and switch back to [`Streaming`](Phase::Streaming)
+    /// so the normal parser resumes at that Cluster.
+    ///
+    /// Returns `Ok(true)` when a Cluster ID was found and committed to (progress: garbage
+    /// discarded, phase advanced), `Ok(false)` when none is in the buffer yet (need more bytes —
+    /// the trailing window that might be a partial ID is retained). Never panics: bounds-checked
+    /// throughout, and a **false positive** (four garbage bytes that happen to equal the Cluster
+    /// ID but are not followed by a well-formed element size) resumes scanning past it rather
+    /// than committing — so a genuine Cluster later in the buffer is still found, per the
+    /// flush/seek contract ("worst case keep scanning or surface Incomplete", never crash).
+    fn step_resync(&mut self) -> Result<bool, ReadError> {
+        // Bounded memory (spec: performance #1 — no whole-file buffering): while scanning we
+        // discard everything before the current search position, so the buffer holds only the
+        // still-unscanned tail. Keep the last 3 bytes as a possible partial Cluster-ID prefix
+        // that completes in the next push.
+        const CID: &[u8] = id::CLUSTER; // [0x1F, 0x43, 0xB6, 0x75]
+        // Scan from `pos`, testing each Cluster-ID candidate: a real Cluster is the ID followed
+        // by a readable size VINT. A candidate whose size VINT is malformed is a false positive
+        // — skip it and keep scanning. A candidate whose size VINT is not yet buffered is
+        // Incomplete — wait for more bytes (do not discard it).
+        let mut search_from = self.pos;
+        loop {
+            let hay = &self.buf[search_from..];
+            let Some(rel) = find_subslice(hay, CID) else { break };
+            let cand = search_from + rel;
+            match ebml::read_element_header(&self.buf, cand) {
+                Ok(_) => {
+                    // A well-formed Cluster header: commit here and hand back to the normal parser.
+                    self.pos = cand;
+                    self.phase = Phase::Streaming;
+                    self.cluster_base_tick = 0;
+                    self.compact();
+                    return Ok(true);
+                }
+                Err(ReadError::Incomplete) => {
+                    // The candidate's size VINT straddles the input boundary — keep this
+                    // candidate (drop only what precedes it) and wait for more bytes.
+                    if cand > self.pos {
+                        self.buf.drain(self.pos..cand);
+                    }
+                    return Ok(false);
+                }
+                Err(_) => {
+                    // False positive (garbage matched the ID but is not a valid header) —
+                    // advance one byte past this match and keep scanning.
+                    search_from = cand + 1;
+                }
+            }
+        }
+        // No committable Cluster in the buffer. Drop everything except the trailing
+        // (CID.len()-1) bytes — the longest prefix that could be the head of a Cluster ID split
+        // across pushes — so scanning stays O(total bytes) and memory stays bounded. Drain the
+        // consumed prefix (`..pos`) together with the fully-scanned middle in one go.
+        let keep = CID.len() - 1;
+        let end = self.buf.len();
+        let drop_to = end.saturating_sub(keep);
+        if drop_to > 0 {
+            self.buf.drain(..drop_to);
+        }
+        self.pos = 0;
+        Ok(false)
+    }
+
+    /// Reset the reader for a **mid-Segment resume** after a seek (spec: flush/seek), keeping the
+    /// already-discovered stream shape. The byte source has repositioned to a new offset (an
+    /// exact cue-indexed Cluster start, or a proportional estimate that can land mid-block), and
+    /// the demuxer is about to feed bytes from there. We:
+    /// - clear the buffered bytes, the parse cursor, and any half-decoded pending frames;
+    /// - reset `cluster_base_tick` to 0 (the next Cluster's Timestamp re-establishes it — a
+    ///   block's absolute pts is `cluster_base + rel_ts`, always recomputed per Cluster, so no
+    ///   pre-seek base leaks into post-seek pts);
+    /// - **keep** the discovered tracks, `tracks_ready`, `timestamp_scale`, and `duration_ns`
+    ///   (those describe the whole stream and never change across a seek — re-discovering them
+    ///   would need the header bytes again, which the post-seek source does not resend);
+    /// - enter [`Resyncing`](Phase::Resyncing), which scans forward for the next Cluster ID
+    ///   before resuming normal parsing, tolerating garbage before it.
+    ///
+    /// Unlike [`new`](Self::new) this preserves state a fresh reader would lose; unlike the
+    /// EOS/stop path it does not tear down. The demuxer calls it on `Event::FlushStart`.
+    pub fn resync_streaming(&mut self) {
+        self.buf.clear();
+        self.pos = 0;
+        self.pending.clear();
+        self.cluster_base_tick = 0;
+        // Only resync from a resumable point if discovery already completed; if a seek somehow
+        // arrives before the Tracks are known, stay in Discovering (the source will resend the
+        // header from byte 0) rather than scan for a Cluster we cannot yet route.
+        self.phase = if self.tracks_ready { Phase::Resyncing } else { Phase::Discovering };
     }
 
 }
@@ -638,6 +741,242 @@ struct LaceSizes {
     frames: Vec<usize>,
 }
 
+/// Find the first occurrence of `needle` in `hay`, returning its start offset. A tiny
+/// windowed scan — `needle` is a 4-octet element ID, so this is the byte-search the resync
+/// uses to relocate the next Cluster (spec: flush/seek). `None` if absent.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// What a front SeekHead + Info yields a seeking caller (RFC 9559 §5.1.1): where the Cues
+/// live and the geometry to turn Segment Positions into absolute byte offsets. Returned by
+/// [`parse_seek_head`]. All positions are Segment Positions (relative to the first byte of the
+/// Segment's data — RFC 9559 §4); add [`segment_data_start`](Self::segment_data_start) for an
+/// absolute stream offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekHeadInfo {
+    /// Absolute stream offset of the Segment's data (the byte right after the Segment
+    /// ID + size header). Every Segment Position is measured from here, so the Cues element
+    /// lives at `segment_data_start + cues_pos` and a CueClusterPosition resolves the same way.
+    pub segment_data_start: u64,
+    /// The `Cues` element's Segment Position from the SeekHead, or `None` if the SeekHead
+    /// had no Cues entry (an un-indexed file — the caller falls back to a proportional seek).
+    pub cues_pos: Option<u64>,
+    /// The stream's `Info\TimestampScale` in ns/tick (RFC 9559 §5.1.2.4), or the Matroska
+    /// default (1_000_000) if Info omitted it. Needed to turn a CueTime (ticks) into ns.
+    pub timestamp_scale: u64,
+}
+
+/// Walk the stream **header** bytes (EBML Header + the start of the Segment) and extract the
+/// front SeekHead + TimestampScale (RFC 9559 §5.1.1) — the pure, IO-free parse the app's seek
+/// index is built from. `header` must begin at byte 0 of the stream and include at least the
+/// EBML Header, the Segment ID+size, the front SeekHead, and the Info master (i.e. the same
+/// prefix `MkvDemux::new` is handed — everything up to the first Cluster).
+///
+/// Returns `None` only if the Segment itself cannot be located (not a Matroska stream, or the
+/// header is truncated before the Segment header). A Segment with no SeekHead still returns
+/// `Some` with `cues_pos == None` (an un-indexed file); the caller then seeks proportionally.
+///
+/// This does not read the file — the caller preads the Cues bytes at
+/// `segment_data_start + cues_pos` and passes them to [`parse_cues`].
+pub fn parse_seek_head(header: &[u8]) -> Option<SeekHeadInfo> {
+    // Find the Segment header and the absolute offset of its data (RFC 9559 §4). We do a linear
+    // top-level walk: the EBML Header is a definite-size master we skip past, then the Segment.
+    let mut at = 0usize;
+    let segment_data_start = loop {
+        let h = ebml::read_element_header(header, at).ok()?;
+        if h.id == id::SEGMENT {
+            // The Segment is an unknown-size streamed master; its data starts right after the
+            // ID + size header (the 0xFF marker).
+            break h.data_start as u64;
+        }
+        // A definite-size top-level element (the EBML Header) — skip its whole data.
+        let end = h.data_end().ok()??;
+        if end <= at || end > header.len() {
+            return None; // truncated before the Segment, or a malformed size
+        }
+        at = end;
+    };
+
+    // Walk the Segment's level-1 children within the header window, collecting the SeekHead's
+    // Cues position and the Info TimestampScale. We stop at the first Cluster (frames start;
+    // the front SeekHead and Info both precede it) or when the window runs out.
+    let mut cues_pos = None;
+    let mut timestamp_scale = DEFAULT_TIMESTAMP_SCALE;
+    let mut at = segment_data_start as usize;
+    while at < header.len() {
+        let Ok(h) = ebml::read_element_header(header, at) else { break };
+        if h.id == id::CLUSTER {
+            break; // frames begin — nothing more of interest in the header
+        }
+        // Every level-1 child before the first Cluster (SeekHead, Info, Tracks, Void…) is
+        // definite-size; a child whose data runs past the window means the caller passed too
+        // little header — stop and return what we have.
+        let Ok(Some(end)) = h.data_end() else { break };
+        if end > header.len() {
+            break;
+        }
+        if h.id == id::SEEK_HEAD {
+            if let Some(p) = seek_head_cues_pos(&header[h.data_start..end]) {
+                cues_pos = Some(p);
+            }
+        } else if h.id == id::INFO {
+            if let Ok((Some(scale), _)) = parse_info(&header[h.data_start..end]) {
+                timestamp_scale = scale;
+            }
+        }
+        at = end;
+    }
+
+    Some(SeekHeadInfo { segment_data_start, cues_pos, timestamp_scale })
+}
+
+/// Scan one SeekHead master's children for the Seek entry whose SeekID targets the Cues
+/// element, returning its SeekPosition (a Segment Position, RFC 9559 §5.1.1). `None` if the
+/// SeekHead indexes no Cues. Malformed entries are skipped, never panicked on.
+fn seek_head_cues_pos(data: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at).ok()?;
+        let end = h.data_end().ok()??;
+        if end > data.len() {
+            return None;
+        }
+        if h.id == id::SEEK {
+            if let Some(p) = seek_entry_cues_pos(&data[h.data_start..end]) {
+                return Some(p);
+            }
+        }
+        at = end;
+    }
+    None
+}
+
+/// Parse one Seek entry (SeekID + SeekPosition): if its SeekID payload is the Cues element ID,
+/// return its SeekPosition. `None` for any other target or a malformed entry.
+fn seek_entry_cues_pos(data: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    let mut is_cues = false;
+    let mut pos = None;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at).ok()?;
+        let end = h.data_end().ok()??;
+        if end > data.len() {
+            return None;
+        }
+        let body = &data[h.data_start..end];
+        if h.id == id::SEEK_ID {
+            // SeekID's payload is the raw element ID of the target master (the writer emits it
+            // via `write_binary`). Compare against the Cues ID verbatim.
+            is_cues = body == id::CUES;
+        } else if h.id == id::SEEK_POSITION {
+            pos = Some(read_uint(body));
+        }
+        at = end;
+    }
+    if is_cues { pos } else { None }
+}
+
+/// Parse a `Cues` master into a seek index: `(time_ns, absolute_byte)` per CuePoint, sorted
+/// ascending by time, malformed entries skipped (RFC 9559 §5.1.5). `cues_bytes` is the Cues
+/// element **including** its ID + size header — exactly the bytes the caller preads at
+/// `segment_data_start + cues_pos` (the `SeekHeadInfo::cues_pos`), so a caller that read the
+/// element header to learn its length can hand the same buffer straight back.
+///
+/// `segment_data_start` and `timestamp_scale` come from [`SeekHeadInfo`]. For each CuePoint:
+/// `time_ns = CueTime × timestamp_scale`, and `absolute_byte = segment_data_start +
+/// CueClusterPosition` (the position is a Segment Position, RFC 9559 §4). A CuePoint with
+/// several CueTrackPositions (multi-track cues) contributes one entry per position; we take the
+/// first per CuePoint (they share the CueTime and, for the writer's single-cue-track output,
+/// there is exactly one). Never panics.
+pub fn parse_cues(
+    cues_bytes: &[u8],
+    segment_data_start: u64,
+    timestamp_scale: u64,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    // Accept the element with its header (ID + size): find the Cues ID and descend into the
+    // payload. If the header is missing (caller passed payload-only), a leading CuePoint ID
+    // would not match Cues — so require the wrapping element for an unambiguous contract.
+    let Ok(h) = ebml::read_element_header(cues_bytes, 0) else { return out };
+    if h.id != id::CUES {
+        return out;
+    }
+    let end = match h.data_end() {
+        Ok(Some(e)) => e.min(cues_bytes.len()),
+        _ => cues_bytes.len(),
+    };
+    let body = &cues_bytes[h.data_start..end];
+
+    let mut at = 0usize;
+    while at < body.len() {
+        let Ok(cp) = ebml::read_element_header(body, at) else { break };
+        let cp_end = match cp.data_end() {
+            Ok(Some(e)) if e <= body.len() => e,
+            _ => break, // truncated CuePoint — stop rather than mis-slice
+        };
+        if cp.id == id::CUE_POINT {
+            if let Some((ticks, pos)) = parse_cue_point(&body[cp.data_start..cp_end]) {
+                let time_ns = ticks.saturating_mul(timestamp_scale);
+                let abs = segment_data_start.saturating_add(pos);
+                out.push((time_ns, abs));
+            }
+        }
+        at = cp_end;
+    }
+    out.sort_by_key(|&(t, _)| t);
+    out
+}
+
+/// Parse one CuePoint (CueTime + the first CueTrackPositions' CueClusterPosition), returning
+/// `(cue_time_ticks, cue_cluster_position)` (RFC 9559 §5.1.5). `None` if either field is
+/// absent or the CuePoint is malformed — the caller skips it.
+fn parse_cue_point(data: &[u8]) -> Option<(u64, u64)> {
+    let mut at = 0usize;
+    let mut time = None;
+    let mut cluster_pos = None;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at).ok()?;
+        let end = h.data_end().ok()??;
+        if end > data.len() {
+            return None;
+        }
+        if h.id == id::CUE_TIME {
+            time = Some(read_uint(&data[h.data_start..end]));
+        } else if h.id == id::CUE_TRACK_POSITIONS && cluster_pos.is_none() {
+            // First CueTrackPositions wins (the writer emits one per CuePoint).
+            cluster_pos = cue_track_positions_cluster(&data[h.data_start..end]);
+        }
+        at = end;
+    }
+    match (time, cluster_pos) {
+        (Some(t), Some(p)) => Some((t, p)),
+        _ => None,
+    }
+}
+
+/// Parse one CueTrackPositions master for its CueClusterPosition (RFC 9559 §5.1.5.1.2), the
+/// Segment Position of the Cluster the CuePoint indexes. `None` if absent/malformed.
+fn cue_track_positions_cluster(data: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    let mut pos = None;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at).ok()?;
+        let end = h.data_end().ok()??;
+        if end > data.len() {
+            return None;
+        }
+        if h.id == id::CUE_CLUSTER_POSITION {
+            pos = Some(read_uint(&data[h.data_start..end]));
+        }
+        at = end;
+    }
+    pos
+}
+
 /// Read an EBML unsigned integer from its big-endian octets (RFC 8794 §7.1). An empty slice
 /// is `0` (a zero-length uint is legal). Saturates at `u64` for over-long input rather than
 /// panicking.
@@ -750,5 +1089,234 @@ mod tests {
             // Draining what is ready must not panic either.
             while r.next_frame().is_some() {}
         }
+    }
+
+    // =================================================================================
+    // Seek support (spec: flush/seek; RFC 9559 §5.1.1, §5.1.5): SeekHead/Cues parsing +
+    // mid-stream resync. These build a real multi-cluster **video** stream with the writer
+    // (cues on) so the seek index and Cluster offsets are the ones a player would see.
+    // =================================================================================
+
+    /// Build a multi-cluster V_VP8 video stream with cues enabled. Each `(ts_ns, keyframe,
+    /// data)` is one frame on track 1; the writer opens a fresh Cluster on every anchor-track
+    /// keyframe (spec `§simpleblock`), so a keyframe list of length K yields K cue-indexed
+    /// Clusters. Returns the muxed stream bytes.
+    fn build_cued_video(frames: &[(u64, bool, &[u8])]) -> Vec<u8> {
+        let track = TrackConfig::vp8(1, 320, 240);
+        let mut w = MatroskaWriter::new(vec![track]);
+        w.enable_cues();
+        let mut out = Vec::new();
+        w.write_header(&mut out).unwrap();
+        for &(ts, key, data) in frames {
+            w.write_frame(&mut out, 1, ts, data, key).unwrap();
+        }
+        w.finalize(&mut out);
+        out
+    }
+
+    /// The header prefix a seeking caller has on hand: everything up to the first Cluster
+    /// (EBML Header + Segment header + SeekHead + Info + Tracks) — what `parse_seek_head`
+    /// and `MkvDemux::new` consume.
+    fn header_prefix(stream: &[u8]) -> &[u8] {
+        let cl = stream.windows(4).position(|w| w == id::CLUSTER).expect("a Cluster");
+        &stream[..cl]
+    }
+
+    /// Round-trip: mux a small multi-cluster cued file, then `parse_seek_head` + `parse_cues`
+    /// on its bytes → the index entries point AT Cluster IDs, with ascending times matching the
+    /// Cluster timestamps (RFC 9559 §5.1.5). Also checks the derived `segment_data_start` and
+    /// TimestampScale.
+    #[test]
+    fn parse_seek_head_and_cues_roundtrip() {
+        // Four anchor keyframes → four Clusters; the middle frame is a delta inside cluster #2.
+        let stream = build_cued_video(&[
+            (0, true, &[1, 2, 3]),
+            (40_000_000, true, &[4, 5]),
+            (60_000_000, false, &[6]), // delta — same cluster as the 40ms keyframe
+            (80_000_000, true, &[7, 8, 9]),
+            (120_000_000, true, &[10]),
+        ]);
+
+        let info = parse_seek_head(header_prefix(&stream)).expect("SeekHead + Info");
+        assert_eq!(info.timestamp_scale, 1_000_000, "default 1 ms/tick");
+        // Segment data start: right after the Segment ID + its 1-octet 0xFF size.
+        let seg = stream.windows(4).position(|w| w == id::SEGMENT).unwrap();
+        assert_eq!(info.segment_data_start, (seg + 4 + 1) as u64, "Segment data offset derived");
+        let cues_pos = info.cues_pos.expect("SeekHead indexes Cues");
+
+        // Pread the Cues element (id + size + payload) exactly, as the app would.
+        let cues_abs = (info.segment_data_start + cues_pos) as usize;
+        assert_eq!(&stream[cues_abs..cues_abs + 4], id::CUES, "Cues position lands on the Cues ID");
+        let h = ebml::read_element_header(&stream, cues_abs).unwrap();
+        let cues_end = h.data_end().unwrap().unwrap();
+        let cues_bytes = &stream[cues_abs..cues_end];
+
+        let index = parse_cues(cues_bytes, info.segment_data_start, info.timestamp_scale);
+        // Four cue-worthy (keyframe) clusters at 0, 40, 80, 120 ms.
+        assert_eq!(index.len(), 4, "one cue per keyframe cluster");
+        let times: Vec<u64> = index.iter().map(|&(t, _)| t).collect();
+        assert_eq!(times, vec![0, 40_000_000, 80_000_000, 120_000_000], "times ascending, in ns");
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "sorted ascending");
+        for &(_, abs) in &index {
+            let a = abs as usize;
+            assert_eq!(stream[a], 0x1F, "cue byte points AT a Cluster ID (0x1F...)");
+            assert_eq!(&stream[a..a + 4], id::CLUSTER, "cue byte is the full Cluster ID");
+        }
+    }
+
+    /// A file muxed **without** cues has no SeekHead → `cues_pos == None` (the app then seeks
+    /// proportionally), yet `parse_seek_head` still returns the Segment geometry + scale.
+    #[test]
+    fn parse_seek_head_no_cues() {
+        let (stream, _) = build_single(&[&[1], &[2], &[3]]);
+        let info = parse_seek_head(header_prefix(&stream)).expect("Segment located");
+        assert_eq!(info.cues_pos, None, "no SeekHead/Cues in an un-indexed file");
+        assert_eq!(info.timestamp_scale, 1_000_000);
+    }
+
+    /// Malformed / non-Matroska bytes never panic and return `None` (no Segment).
+    #[test]
+    fn parse_seek_head_garbage_is_none() {
+        assert_eq!(parse_seek_head(&[]), None);
+        assert_eq!(parse_seek_head(&[0xFF; 32]), None);
+        assert_eq!(parse_seek_head(&[0x1A, 0x45, 0xDF]), None, "truncated EBML id");
+    }
+
+    /// `parse_cues` skips a truncated / malformed CuePoint rather than panicking, and rejects
+    /// bytes that are not a Cues element.
+    #[test]
+    fn parse_cues_robust_to_bad_bytes() {
+        assert!(parse_cues(&[], 0, 1_000_000).is_empty());
+        // A Cluster ID (not Cues) → empty, no panic.
+        assert!(parse_cues(id::CLUSTER, 0, 1_000_000).is_empty());
+        // A Cues element whose declared size runs past the buffer: clamp, decode nothing.
+        let mut cues = Vec::new();
+        ebml::write_id(&mut cues, id::CUES);
+        ebml::write_size(&mut cues, 1000); // lies — no body follows
+        assert!(parse_cues(&cues, 0, 1_000_000).is_empty());
+    }
+
+    /// Resync at an **exact** cue offset: after `resync_streaming`, feeding the reader bytes
+    /// from a cue-indexed Cluster start decodes frames whose pts match that Cluster's timestamp
+    /// (spec: flush/seek). The discovered track survives the resync.
+    #[test]
+    fn resync_at_exact_cluster_offset() {
+        let stream = build_cued_video(&[
+            (0, true, &[1, 2, 3]),
+            (40_000_000, true, &[4, 5]),
+            (80_000_000, true, &[6, 7]),
+        ]);
+        let info = parse_seek_head(header_prefix(&stream)).unwrap();
+        let cues_abs = (info.segment_data_start + info.cues_pos.unwrap()) as usize;
+        let h = ebml::read_element_header(&stream, cues_abs).unwrap();
+        let cues_bytes = &stream[cues_abs..h.data_end().unwrap().unwrap()];
+        let index = parse_cues(cues_bytes, info.segment_data_start, info.timestamp_scale);
+        // Seek to the 40 ms cue (the second cluster).
+        let (want_time, seek_byte) = index[1];
+        assert_eq!(want_time, 40_000_000);
+
+        // Discover tracks from the header, then resync and feed from the cue byte.
+        let mut r = MatroskaReader::new();
+        r.push(header_prefix(&stream)).unwrap();
+        assert!(r.tracks_ready(), "tracks discovered before seek");
+        while r.next_frame().is_some() {} // drain the header probe (no frames yet)
+
+        r.resync_streaming();
+        r.push(&stream[seek_byte as usize..]).unwrap();
+        let first = r.next_frame().expect("a frame after resync");
+        assert_eq!(first.pts_ns, 40_000_000, "first post-seek frame at the cue timestamp");
+        assert_eq!(first.data, vec![4, 5], "the 40 ms cluster's frame, bit-exact");
+        assert_eq!(r.tracks().len(), 1, "the discovered track survived resync");
+    }
+
+    /// Resync from a **garbage** offset (a few bytes before the cue, i.e. mid-block): the
+    /// forward scan discards the garbage and recovers at the next Cluster — no panic, frames
+    /// decode with the right pts (spec: flush/seek — a proportional estimate lands anywhere).
+    #[test]
+    fn resync_from_garbage_offset_recovers_at_next_cluster() {
+        let stream = build_cued_video(&[
+            (0, true, &[1, 2, 3]),
+            (40_000_000, true, &[9, 9, 9, 9]),
+            (80_000_000, true, &[7, 7]),
+        ]);
+        let info = parse_seek_head(header_prefix(&stream)).unwrap();
+        let cues_abs = (info.segment_data_start + info.cues_pos.unwrap()) as usize;
+        let h = ebml::read_element_header(&stream, cues_abs).unwrap();
+        let cues_bytes = &stream[cues_abs..h.data_end().unwrap().unwrap()];
+        let index = parse_cues(cues_bytes, info.segment_data_start, info.timestamp_scale);
+        // Land 5 bytes *before* the 40 ms cue — squarely inside the previous cluster's data,
+        // so the reader sees a partial block before the next Cluster ID.
+        let cue_byte = index[1].1 as usize;
+        let garbage_start = cue_byte - 5;
+
+        let mut r = MatroskaReader::new();
+        r.push(header_prefix(&stream)).unwrap();
+        while r.next_frame().is_some() {}
+        r.resync_streaming();
+        r.push(&stream[garbage_start..]).unwrap();
+
+        // The scan skips the 5 garbage bytes and any partial block, recovering at the 40 ms
+        // Cluster — the first decoded frame is that Cluster's, not a mis-parse of the garbage.
+        let first = r.next_frame().expect("recovered a frame");
+        assert_eq!(first.pts_ns, 40_000_000, "recovered at the next Cluster's timestamp");
+        assert_eq!(first.data, vec![9, 9, 9, 9]);
+    }
+
+    /// A **false-positive** Cluster ID in the garbage (four bytes equal to 0x1F43B675 but not
+    /// followed by a valid element size) must be skipped, and the scan must recover at the real
+    /// Cluster that follows (spec: flush/seek — worst case keep scanning, never crash).
+    #[test]
+    fn resync_skips_false_positive_cluster_id() {
+        let stream = build_cued_video(&[(0, true, &[1]), (40_000_000, true, &[5, 5, 5])]);
+        let info = parse_seek_head(header_prefix(&stream)).unwrap();
+        let cues_abs = (info.segment_data_start + info.cues_pos.unwrap()) as usize;
+        let h = ebml::read_element_header(&stream, cues_abs).unwrap();
+        let cues_bytes = &stream[cues_abs..h.data_end().unwrap().unwrap()];
+        let index = parse_cues(cues_bytes, info.segment_data_start, info.timestamp_scale);
+        let cluster40 = index[1].1 as usize;
+
+        let mut r = MatroskaReader::new();
+        r.push(header_prefix(&stream)).unwrap();
+        while r.next_frame().is_some() {}
+        r.resync_streaming();
+        // Feed: [garbage] [fake Cluster ID + 0x00 (an illegal size VINT — VintTooLong)] then the
+        // real 40 ms Cluster onward. The scanner must reject the fake and land on the real one.
+        let mut fed = vec![0xDE, 0xAD];
+        fed.extend_from_slice(id::CLUSTER); // false positive
+        fed.push(0x00); // 0x00 as a size VINT is illegal (width > 8) → not a valid header
+        fed.extend_from_slice(&[0xBE, 0xEF]);
+        fed.extend_from_slice(&stream[cluster40..]); // the real Cluster
+        r.push(&fed).unwrap();
+
+        let first = r.next_frame().expect("recovered past the false positive");
+        assert_eq!(first.pts_ns, 40_000_000, "recovered at the real Cluster, not the fake ID");
+        assert_eq!(first.data, vec![5, 5, 5]);
+    }
+
+    /// Resync byte-by-byte from a garbage offset: the scan must tolerate a Cluster ID split
+    /// across pushes and never panic (spec: incremental + flush/seek).
+    #[test]
+    fn resync_scan_survives_split_cluster_id() {
+        let stream = build_cued_video(&[
+            (0, true, &[1]),
+            (40_000_000, true, &[2, 2]),
+        ]);
+        let info = parse_seek_head(header_prefix(&stream)).unwrap();
+        let cues_abs = (info.segment_data_start + info.cues_pos.unwrap()) as usize;
+        let h = ebml::read_element_header(&stream, cues_abs).unwrap();
+        let cues_bytes = &stream[cues_abs..h.data_end().unwrap().unwrap()];
+        let index = parse_cues(cues_bytes, info.segment_data_start, info.timestamp_scale);
+        let start = index[1].1 as usize - 7; // a few bytes before the cue
+
+        let mut r = MatroskaReader::new();
+        r.push(header_prefix(&stream)).unwrap();
+        while r.next_frame().is_some() {}
+        r.resync_streaming();
+        for &b in &stream[start..] {
+            r.push(&[b]).expect("byte-by-byte resync never errors");
+        }
+        let first = r.next_frame().expect("recovered a frame");
+        assert_eq!(first.pts_ns, 40_000_000);
+        assert_eq!(first.data, vec![2, 2]);
     }
 }
