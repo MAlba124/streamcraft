@@ -196,6 +196,14 @@ impl Client {
         }
     }
 
+    /// Request a time seek (protocol v1.2). The server clamps to the known
+    /// duration and maps time→byte through the app-installed `SeekIndex`; a
+    /// pipeline without one answers Error(UNSUPPORTED), which lands in the feed.
+    pub fn seek(&mut self, target_ns: u64) {
+        let s = self.next_seq();
+        let _ = send(&mut self.writer, kind::SEEK, s, &wire::encode_seek(target_ns));
+    }
+
     /// Send Pause or Resume. The Ack is ignored; the UI reflects its own toggle.
     pub fn set_paused(&mut self, paused: bool) {
         let k = if paused { kind::PAUSE } else { kind::RESUME };

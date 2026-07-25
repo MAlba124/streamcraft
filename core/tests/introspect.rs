@@ -20,7 +20,7 @@ use streamcraft_core::format::{Constraint, OfferDesc, Value};
 use streamcraft_core::id::{ElementId, PadId};
 use streamcraft_core::introspect::strtab::StrTab;
 use streamcraft_core::introspect::tap::{BusTapRow, LogTapRegistry};
-use streamcraft_core::introspect::wire::{self, kind};
+use streamcraft_core::introspect::wire::{self, errcode, kind};
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
 
@@ -940,3 +940,37 @@ fn dropping_server_unlinks_socket_and_ends_connection() {
 
     drop(p);
 }
+
+#[test]
+fn seek_maps_time_through_the_index_or_errors_unsupported() {
+    use streamcraft_core::pipeline::SeekIndex;
+
+    // Without an index: Seek → Error(UNSUPPORTED).
+    let (mut p, _src, _sink) = build_pipeline(4);
+    let sock = temp_socket();
+    p.serve_introspection(&sock).expect("serve");
+    let mut c = Client::connect(&sock);
+    c.send(kind::CLIENT_HELLO, 1, &wire::ClientHello { ver_major: wire::VER_MAJOR, ver_minor: wire::VER_MINOR }.encode());
+    c.send(kind::SEEK, 2, &wire::encode_seek(1_000_000_000));
+    let f = c.recv_until(kind::ERROR);
+    let (code, _msg) = wire::decode_error(&f.payload).expect("error payload");
+    assert_eq!(code, errcode::UNSUPPORTED, "no index installed");
+    drop(c);
+    p.stop_introspection();
+
+    // With an index: Seek → Ack (floor lookup maps time→byte; the pipeline-side
+    // rebase mechanics are covered by elements/tests/seek.rs).
+    let (mut p, _src, _sink) = build_pipeline(4);
+    p.set_seek_index(SeekIndex {
+        entries: vec![(0, 0), (1_000_000_000, 4096), (2_000_000_000, 9000)],
+        file_len: None,
+    });
+    let sock = temp_socket();
+    p.serve_introspection(&sock).expect("serve");
+    let mut c = Client::connect(&sock);
+    c.send(kind::CLIENT_HELLO, 1, &wire::ClientHello { ver_major: wire::VER_MAJOR, ver_minor: wire::VER_MINOR }.encode());
+    c.send(kind::SEEK, 2, &wire::encode_seek(1_500_000_000));
+    let f = c.recv_until_any(&[kind::ACK, kind::ERROR]);
+    assert_eq!(f.kind, kind::ACK, "seek accepted through the index");
+}
+

@@ -273,6 +273,46 @@ impl StopHandle {
     }
 }
 
+/// A time→byte seek index for the pipeline's byte source (spec: flush/seek — mapping a
+/// time to a byte offset is the seek issuer's job; a byte source has no notion of time).
+/// Built by the application from container metadata (e.g. mkv Cues) and installed with
+/// [`Pipeline::set_seek_index`]; the introspection server uses it to serve time-based
+/// `Seek` requests. With no entries but a known `file_len`, [`byte_for`](Self::byte_for)
+/// falls back to a proportional estimate — safe when the demuxer re-syncs by scanning.
+#[derive(Debug, Default, Clone)]
+pub struct SeekIndex {
+    /// `(time_ns, absolute byte offset)`, ascending by time. Each entry should point
+    /// at a resume-safe position (a container cluster starting with a keyframe).
+    pub entries: Vec<(u64, u64)>,
+    /// Total source length in bytes, for the proportional fallback.
+    pub file_len: Option<u64>,
+}
+
+impl SeekIndex {
+    /// The byte offset to resume reading from for a seek to `target`: the last index
+    /// entry at or before `target`, else a proportional estimate over `duration`,
+    /// else `None` (time seeking unavailable).
+    pub fn byte_for(&self, target: Timestamp, duration: Timestamp) -> Option<u64> {
+        let ns = target.nanos()?;
+        // Floor lookup over the (ascending) entries.
+        let floor = self
+            .entries
+            .iter()
+            .take_while(|(t, _)| *t <= ns)
+            .last()
+            .map(|(_, b)| *b);
+        if floor.is_some() {
+            return floor;
+        }
+        match (self.file_len, duration.nanos()) {
+            (Some(len), Some(dur)) if dur > 0 => {
+                Some(((ns as u128).saturating_mul(len as u128) / dur as u128) as u64)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A handle to seek this pipeline from another thread while `run()` is blocking (spec:
 /// flush/seek). Publishing a target makes the source resume reading at `to_byte`, discards
 /// the data already in flight (out-of-band, so it is responsive rather than playing out the
@@ -325,6 +365,9 @@ pub struct Pipeline {
     /// Shared seek request (spec: flush/seek). Bumped by a [`SeekHandle`]; observed by every
     /// group thread (to flush) and by the source/sink elements (to re-seek / reset position).
     seek: Arc<SeekState>,
+    /// Optional time→byte seek index installed by the app (spec: flush/seek); the
+    /// introspection server maps time-based Seek requests through it.
+    seek_index: Option<Arc<SeekIndex>>,
     bus_sender: BusSender,
     bus: Bus,
     slot_size: usize,
@@ -406,6 +449,7 @@ impl Pipeline {
             elements: Vec::new(),
             descs: Vec::new(),
             props: Vec::new(),
+            seek_index: None,
             edges: Vec::new(),
             formats: Interner::new(),
             fields: Interner::new(),
@@ -494,6 +538,13 @@ impl Pipeline {
     /// (spec: flush/seek). See [`SeekHandle`].
     pub fn seek_handle(&self) -> SeekHandle {
         SeekHandle { seek: Arc::clone(&self.seek), pause: Arc::clone(&self.pause) }
+    }
+
+    /// Install a time→byte [`SeekIndex`] (spec: flush/seek). The introspection
+    /// server serves time-based `Seek` requests through it; call before or after
+    /// `serve_introspection` (the handles republished at `run()` pick it up).
+    pub fn set_seek_index(&mut self, index: SeekIndex) {
+        self.seek_index = Some(Arc::new(index));
     }
 
     /// Configure the shared buffer pool for the next [`run`](Self::run) (spec: Memory —
@@ -992,6 +1043,8 @@ impl Pipeline {
                 tap: self.tap_handle(),
                 props: self.prop_handle(),
                 pause: self.pause_handle(),
+                seek: self.seek_handle(),
+                seek_index: self.seek_index.clone(),
                 tracing: Arc::clone(&self.tracing),
                 filters: logging.filters,
                 global_filter: logging.global_filter,
@@ -1522,6 +1575,8 @@ impl Pipeline {
             tap: self.tap_handle(),
             props: self.prop_handle(),
             pause: self.pause_handle(),
+            seek: self.seek_handle(),
+            seek_index: self.seek_index.clone(),
             tracing: Arc::clone(&self.tracing),
             filters: Vec::new(),
             global_filter: None,

@@ -23,7 +23,7 @@ use std::io::{self, Read};
 /// Wire protocol major version (breaking; never intended to change).
 pub const VER_MAJOR: u16 = 1;
 /// Wire protocol minor version (additive kinds + appended row fields).
-pub const VER_MINOR: u16 = 1;
+pub const VER_MINOR: u16 = 2;
 
 /// The 4-byte magic in the `Hello` frame — "SCIP" (StreamCraft Introspection Protocol).
 pub const MAGIC: [u8; 4] = *b"SCIP";
@@ -72,6 +72,7 @@ pub mod kind {
     pub const UNSUBSCRIBE: u16 = 0x0024; // C→S
     pub const GET_INFO: u16 = 0x0025; // C→S (v1.1, empty)
     pub const INFO: u16 = 0x0026; // S→C (v1.1)
+    pub const SEEK: u16 = 0x0027; // C→S (v1.2) → Ack, or Error(6) with no seek index
 
     pub const STR_DEF: u16 = 0x0030; // S→C
     pub const BUS_MSG: u16 = 0x0031; // S→C (pushed)
@@ -1052,6 +1053,22 @@ pub fn decode_dropped(payload: &[u8]) -> Option<(u32, u64)> {
     r.skip(4)?;
     let count = r.get_u64()?;
     Some((stream_id, count))
+}
+
+// --- Seek (v1.2) -------------------------------------------------------------
+
+/// A `Seek` request (v1.2): `target_ns u64` — stream time to seek to. The server
+/// clamps to the known duration, maps time→byte through the app-installed
+/// `SeekIndex`, and issues the pipeline seek; Ack on success, `Error(UNSUPPORTED)`
+/// when no index is installed.
+pub fn encode_seek(target_ns: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_u64(target_ns);
+    w.into_vec()
+}
+pub fn decode_seek(payload: &[u8]) -> Option<u64> {
+    let mut r = Reader::new(payload);
+    r.get_u64()
 }
 
 // --- Info (v1.1) -------------------------------------------------------------

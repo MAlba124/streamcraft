@@ -136,6 +136,8 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
     let mut dock = DockTree::two_over_one(PanelId::Graph, PanelId::Elements, PanelId::Log, 0.66, 0.7);
     let mut dock_state = DockState::default();
     let mut elements_scroll = 0.0f32;
+    // In-flight progress-bar scrub: the fraction under the cursor; seek on release.
+    let mut seek_drag: Option<f32> = None;
 
     // ~120 fps budget: a real compositor vsync-blocks in present, so this only
     // paces headless drivers (SDL_VIDEODRIVER=dummy present returns immediately).
@@ -203,9 +205,34 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
                 if let Some(dur) = duration_ns {
                     let frac = (pos as f64 / dur.max(1) as f64).clamp(0.0, 1.0) as f32;
                     let bar = Rect::new(x0, mid - 4.0, bar_w, 8.0);
+
+                    // Click / drag to seek: scrub shows the target; release seeks.
+                    let hit = Rect::new(bar.x, bar.y - 5.0, bar.w, bar.h + 10.0);
+                    let mouse_frac =
+                        (((input.mouse_x - bar.x) / bar.w.max(1.0)).clamp(0.0, 1.0)).max(0.0);
+                    if hit.contains(input.mouse_x, input.mouse_y)
+                        && input.pressed(crate::ui::MouseButton::Left)
+                    {
+                        seek_drag = Some(mouse_frac);
+                    }
+                    if seek_drag.is_some() && input.down(crate::ui::MouseButton::Left) {
+                        seek_drag = Some(mouse_frac);
+                    }
+                    let shown_frac = seek_drag.unwrap_or(frac);
                     ui.draw_list_mut().fill_rect(bar, bar_bg);
                     ui.draw_list_mut()
-                        .fill_rect(Rect::new(bar.x, bar.y, bar.w * frac, bar.h), accent);
+                        .fill_rect(Rect::new(bar.x, bar.y, bar.w * shown_frac, bar.h), accent);
+                    if let Some(f) = seek_drag {
+                        // Scrub marker + target time above the cursor.
+                        let x = bar.x + bar.w * f;
+                        ui.draw_list_mut().fill_rect(Rect::new(x - 1.0, bar.y - 3.0, 2.0, bar.h + 6.0), text);
+                        let t = (f as f64 * dur as f64) as u64;
+                        ui.text(x + 6.0, bar.y - 18.0, &fmt_time(t), text);
+                        if input.released(crate::ui::MouseButton::Left) {
+                            client.seek(t);
+                            seek_drag = None;
+                        }
+                    }
                 }
                 ui.text(x0 + if bar_w > 0.0 { bar_w + 8.0 } else { 0.0 }, text_y, &time_text, text);
                 left_limit = x0 - 16.0;

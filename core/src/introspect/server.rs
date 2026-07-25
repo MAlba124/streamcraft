@@ -40,6 +40,9 @@ pub struct Handles {
     pub tap: TapHandle,
     pub props: PropHandle,
     pub pause: PauseHandle,
+    pub seek: crate::pipeline::SeekHandle,
+    /// The app-installed time→byte index; `None` = time seeking unavailable.
+    pub seek_index: Option<std::sync::Arc<crate::pipeline::SeekIndex>>,
     pub tracing: Arc<AtomicBool>,
     /// Per-element log filters (one per element, index = ElementId), flipped live by
     /// `SetLogLevel`. Empty when logging channels were not wired this run.
@@ -418,6 +421,52 @@ impl Conn {
             kind::GET_TOPOLOGY => self.reply_topology(shared, seq),
             kind::GET_DOT => self.reply_dot(shared, seq),
             kind::GET_COUNTERS => self.reply_counters(shared, seq),
+            kind::SEEK => {
+                let Some(target_ns) = wire::decode_seek(&frame.payload) else {
+                    return self.send(
+                        kind::ERROR,
+                        seq,
+                        &wire::encode_error(errcode::BAD_FRAME, "bad Seek payload"),
+                    );
+                };
+                // Clamp to the known duration (sticky) and map time→byte via the
+                // app-installed index; without one, time seeking is unsupported.
+                shared.drain_sticky();
+                let duration = shared
+                    .sticky
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .duration_ns
+                    .map(crate::time::Timestamp)
+                    .unwrap_or(crate::time::Timestamp::NONE);
+                let target = crate::time::Timestamp(match duration.nanos() {
+                    Some(d) => target_ns.min(d),
+                    None => target_ns,
+                });
+                let g = shared.handles.lock().unwrap_or_else(|e| e.into_inner());
+                let byte = g
+                    .seek_index
+                    .as_ref()
+                    .and_then(|idx| idx.byte_for(target, duration));
+                match byte {
+                    Some(b) => {
+                        g.seek.seek(b, target);
+                        drop(g);
+                        self.send(kind::ACK, seq, &[])
+                    }
+                    None => {
+                        drop(g);
+                        self.send(
+                            kind::ERROR,
+                            seq,
+                            &wire::encode_error(
+                                errcode::UNSUPPORTED,
+                                "no seek index installed (Pipeline::set_seek_index)",
+                            ),
+                        )
+                    }
+                }
+            }
             kind::GET_INFO => {
                 shared.drain_sticky();
                 let d = shared.sticky.lock().unwrap_or_else(|e| e.into_inner()).duration_ns;
