@@ -328,6 +328,25 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > 2 elements/1 edge + live counters, both exit 0. Deferred: MCP server, step(),
 > prop-editing UI, latency panel, TCP, buffer peeking.
 
+> **Update — session 4n (2026-07-25): scope UI feedback round** (`a946001`). User
+> feedback: font/zoom/pan/splitters/caps/groups/progress/scrolling. Font: the
+> hand-drawn 8x8 replaced by **JetBrains Mono 2.304 (OFL-1.1) baked offline**
+> (`scope/tools/bake_font.py`, Pillow via nix-shell) into one AA A8 atlas at 6 px
+> sizes (`font_data.rs` + `font_atlas.a8`, committed) — real typeface, zero new
+> deps; requested px snaps to nearest baked size, residual scales the quads
+> (linear filtering), so graph-zoom text stays smooth. Graph view: wheel-zoom
+> anchored at the cursor, drag-pan (4 px click/drag threshold), auto-fit per
+> topology + Fit button + zoom readout; **caps inspection** = hover an edge for a
+> tooltip with the full negotiated format, click to pin (edge fields were already
+> on the wire; `duration` field also feeds transport); groups = per-group hue
+> hull fills + borders + labels. Splitters between graph|elements and body|log
+> (drag fractions); elements panel wheel-scrolls (`Ui::scroll_body`) with a
+> scrollbar. Transport: running-time clock (counters `now_ns`) + progress bar
+> against duration when a format announced one (mkv `Info\Duration` rides the
+> demuxer pad formats — no core change needed). Camera/hit-test helpers are pure
+> + tested (58 scope tests). Known gap: position is *running time* — drifts from
+> media time after a seek; honest fix needs a position query (backlog).
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
