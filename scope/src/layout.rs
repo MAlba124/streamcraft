@@ -53,6 +53,10 @@ pub struct Opts {
     /// Number of barycenter sweeps for crossing reduction. Even ⇒ ends on a
     /// down (forward) sweep. 8 is ample for these small graphs.
     pub sweeps: u32,
+    /// Extra vertical gap (on top of `node_gap`) between vertically adjacent
+    /// nodes of *different* groups, so cluster hulls drawn around the groups
+    /// (padding + a label strip) never overlap each other.
+    pub group_gap: f32,
     /// Top-left origin of the whole drawing.
     pub origin_x: f32,
     pub origin_y: f32,
@@ -65,6 +69,7 @@ impl Default for Opts {
             node_gap: 20.0,
             dummy_h: 12.0,
             sweeps: 8,
+            group_gap: 48.0,
             origin_x: 0.0,
             origin_y: 0.0,
         }
@@ -493,13 +498,19 @@ fn assign_coordinates(
     opts: &Opts,
 ) {
     // First, seed cy from the stacked order so the barycenter pass has a
-    // starting position: stack each layer top-down with node_gap.
+    // starting position: stack each layer top-down with node_gap (+ the group
+    // gap across group boundaries).
     for layer in layers {
         let mut y = opts.origin_y;
+        let mut prev_group: Option<u32> = None;
         for &vi in layer {
             let h = verts[vi].h;
+            if prev_group.is_some_and(|g| g != verts[vi].group) {
+                y += opts.group_gap;
+            }
             verts[vi].cy = y + h / 2.0;
             y += h + opts.node_gap;
+            prev_group = Some(verts[vi].group);
         }
     }
     // A few alignment passes: pull each node toward the barycenter of its
@@ -560,13 +571,17 @@ fn separate_layer(verts: &mut [Vert], layer: &[usize], opts: &Opts) {
     let desired: Vec<f32> = layer.iter().map(|&vi| verts[vi].cy).collect();
 
     // (1) Downward sweep: ensure each node is at least min-gap below the prev.
+    // Crossing a group boundary widens the gap by `group_gap` so the cluster
+    // hulls (node padding + label strip) drawn around groups cannot overlap.
     let mut prev_bottom_center = f32::NEG_INFINITY;
     let mut prev_h = 0.0f32;
+    let mut prev_group = 0u32;
     let mut first = true;
     for &vi in layer {
         let h = verts[vi].h;
         if !first {
-            let min_cy = prev_bottom_center + prev_h / 2.0 + opts.node_gap + h / 2.0;
+            let extra = if prev_group != verts[vi].group { opts.group_gap } else { 0.0 };
+            let min_cy = prev_bottom_center + prev_h / 2.0 + opts.node_gap + extra + h / 2.0;
             if verts[vi].cy < min_cy {
                 verts[vi].cy = min_cy;
             }
@@ -574,6 +589,7 @@ fn separate_layer(verts: &mut [Vert], layer: &[usize], opts: &Opts) {
         first = false;
         prev_bottom_center = verts[vi].cy;
         prev_h = h;
+        prev_group = verts[vi].group;
     }
 
     // (2) Recentre the (now rigid, gap-satisfying) block toward desired. The
@@ -598,7 +614,8 @@ fn separate_layer(verts: &mut [Vert], layer: &[usize], opts: &Opts) {
 }
 
 /// Turn the working graph into the public [`Layout`]: real-node positions, edge
-/// polylines (with port-ordered attach points), and per-group boxes.
+/// polylines (attach points ordered by edge direction, port as tiebreak), and
+/// per-group boxes.
 fn emit(
     verts: &[Vert],
     wedges: &[WEdge],
@@ -663,69 +680,106 @@ fn emit(
 
     // --- Edge routes. -------------------------------------------------------
     // For each original edge, gather its chain segments (in layer order), read
-    // the waypoint centres from the dummies, and cap the ends with port-ordered
-    // attach points on the source's right side and destination's left side.
+    // the waypoint centres from the dummies, and cap the ends with attach
+    // points on the source's right side and destination's left side.
     //
-    // Attach ports vertically by port index so two edges into (or out of) a
-    // multi-pad node do not cross at the node boundary: within a node, sort the
-    // set of ports actually used and space them evenly down the node's side.
+    // Attach slots are ordered by the edge's *direction* — the y of its first
+    // waypoint past the node (a dummy centre, else the far node's centre) —
+    // with the port index only as tiebreak. Ordering by port index alone would
+    // cross/overlap a fan-out right at the node boundary whenever crossing
+    // reduction stacked the targets in a different order than the pads.
     let vert_x = |vi: usize| layer_x[verts[vi].layer as usize];
 
-    // Precompute, per real node, the sorted set of used src ports (right side)
-    // and dst ports (left side) so attach ordering is stable and monotone.
-    let mut out_ports: BTreeMap<usize, Vec<u16>> = BTreeMap::new();
-    let mut in_ports: BTreeMap<usize, Vec<u16>> = BTreeMap::new();
-    for we in wedges {
-        out_ports.entry(we.from).or_default().push(we.src_port);
-        in_ports.entry(we.to).or_default().push(we.dst_port);
+    // Dummy waypoints per original edge, in layer order.
+    let mut dummies_by_edge: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for seg in chain {
+        if verts[seg.to].id.is_none() {
+            dummies_by_edge.entry(seg.orig).or_default().push(seg.to);
+        }
     }
-    for v in out_ports.values_mut() {
-        v.sort_unstable();
-        v.dedup();
+    for d in dummies_by_edge.values_mut() {
+        d.sort_by_key(|&v| (verts[v].layer, verts[v].seq));
     }
-    for v in in_ports.values_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
-    // Attach point on the right side of node `vi` for src `port`.
-    let attach_out = |vi: usize, port: u16| -> (f32, f32) {
-        let x = vert_x(vi) + verts[vi].w;
-        (x, port_y(verts, vi, out_ports.get(&vi), port))
+
+    // The y an edge heads toward right after leaving its source / before
+    // reaching its destination.
+    let out_anchor = |ei: usize| -> f32 {
+        let we = &wedges[ei];
+        dummies_by_edge
+            .get(&we.orig)
+            .and_then(|d| d.first())
+            .map(|&d| verts[d].cy)
+            .unwrap_or(verts[we.to].cy)
     };
-    // Attach point on the left side of node `vi` for dst `port`.
-    let attach_in = |vi: usize, port: u16| -> (f32, f32) {
-        let x = vert_x(vi);
-        (x, port_y(verts, vi, in_ports.get(&vi), port))
+    let in_anchor = |ei: usize| -> f32 {
+        let we = &wedges[ei];
+        dummies_by_edge
+            .get(&we.orig)
+            .and_then(|d| d.last())
+            .map(|&d| verts[d].cy)
+            .unwrap_or(verts[we.from].cy)
     };
 
-    // Index chain segments by original edge, preserving their construction
-    // order (which is layer order: src → dummies → dst).
-    let mut seg_by_edge: BTreeMap<usize, Vec<&WEdge>> = BTreeMap::new();
-    for seg in chain {
-        seg_by_edge.entry(seg.orig).or_default().push(seg);
+    // Group edges per node side, order by (anchor, port), assign evenly spaced
+    // slots down the side: slot k of n at top + h*(k+1)/(n+1).
+    let mut start_y: Vec<f32> = vec![0.0; wedges.len()];
+    let mut end_y: Vec<f32> = vec![0.0; wedges.len()];
+    let mut out_by_node: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut in_by_node: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (ei, we) in wedges.iter().enumerate() {
+        out_by_node.entry(we.from).or_default().push(ei);
+        in_by_node.entry(we.to).or_default().push(ei);
+    }
+    let slot_y = |vi: usize, k: usize, n: usize| -> f32 {
+        if n <= 1 {
+            verts[vi].cy
+        } else {
+            let top = verts[vi].cy - verts[vi].h / 2.0;
+            top + verts[vi].h * (k as f32 + 1.0) / (n as f32 + 1.0)
+        }
+    };
+    for (&vi, eis) in &out_by_node {
+        let mut order = eis.clone();
+        order.sort_by(|&a, &b| {
+            out_anchor(a)
+                .partial_cmp(&out_anchor(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| wedges[a].src_port.cmp(&wedges[b].src_port))
+                .then_with(|| a.cmp(&b))
+        });
+        let n = order.len();
+        for (k, &ei) in order.iter().enumerate() {
+            start_y[ei] = slot_y(vi, k, n);
+        }
+    }
+    for (&vi, eis) in &in_by_node {
+        let mut order = eis.clone();
+        order.sort_by(|&a, &b| {
+            in_anchor(a)
+                .partial_cmp(&in_anchor(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| wedges[a].dst_port.cmp(&wedges[b].dst_port))
+                .then_with(|| a.cmp(&b))
+        });
+        let n = order.len();
+        for (k, &ei) in order.iter().enumerate() {
+            end_y[ei] = slot_y(vi, k, n);
+        }
     }
 
     let mut routes: Vec<EdgeRoute> = Vec::with_capacity(wedges.len());
-    for we in wedges {
+    for (ei, we) in wedges.iter().enumerate() {
         let mut points: Vec<(f32, f32)> = Vec::new();
-        // Start: source port attach on right side of `we.from`.
-        points.push(attach_out(we.from, we.src_port));
-        // Interior: dummy waypoints (centres), sorted by their layer.
-        if let Some(segs) = seg_by_edge.get(&we.orig) {
-            // Collect dummy vertices along the chain, then sort by seq/layer.
-            let mut dummies: Vec<usize> = Vec::new();
-            for seg in segs {
-                if verts[seg.to].id.is_none() {
-                    dummies.push(seg.to);
-                }
-            }
-            dummies.sort_by_key(|&d| (verts[d].layer, verts[d].seq));
-            for d in dummies {
+        // Start: attach on the right side of `we.from`.
+        points.push((vert_x(we.from) + verts[we.from].w, start_y[ei]));
+        // Interior: dummy waypoints (centres), in layer order.
+        if let Some(dummies) = dummies_by_edge.get(&we.orig) {
+            for &d in dummies {
                 points.push((vert_x(d), verts[d].cy));
             }
         }
-        // End: destination port attach on left side of `we.to`.
-        points.push(attach_in(we.to, we.dst_port));
+        // End: attach on the left side of `we.to`.
+        points.push((vert_x(we.to), end_y[ei]));
         routes.push(EdgeRoute {
             src: verts[we.from].id.unwrap_or(0),
             src_port: we.src_port,
@@ -743,25 +797,6 @@ fn emit(
         nodes: placed,
         edges: routes,
         groups,
-    }
-}
-
-/// Vertical attach position for a `port` on node `vi`, given the sorted list of
-/// ports actually used on that side. Ports are spaced evenly down the node's
-/// side in ascending port order, so higher port index ⇒ lower attach point —
-/// which keeps port-ordered edges from crossing at the boundary. A single port
-/// (or an unknown port) attaches at the node's vertical centre.
-fn port_y(verts: &[Vert], vi: usize, ports: Option<&Vec<u16>>, port: u16) -> f32 {
-    let top = verts[vi].cy - verts[vi].h / 2.0;
-    let h = verts[vi].h;
-    match ports {
-        Some(ps) if ps.len() > 1 => {
-            let idx = ps.iter().position(|&p| p == port).unwrap_or(0);
-            // Evenly spaced slots centred in the node: slot k at
-            // top + h*(k+1)/(n+1). Monotone in idx ⇒ port order preserved.
-            top + h * (idx as f32 + 1.0) / (ps.len() as f32 + 1.0)
-        }
-        _ => verts[vi].cy, // 0 or 1 port on this side: centre.
     }
 }
 
@@ -1187,4 +1222,73 @@ mod tests {
             assert!(p.y >= g1.y - 0.01 && p.y + p.h <= g1.y + g1.h + 0.01);
         }
     }
+
+    #[test]
+    fn fan_out_attach_follows_target_order() {
+        // One source with three out-edges whose PORT order (0,1,2) deliberately
+        // disagrees with where the targets end up vertically. The attach points
+        // on the source's right side must follow the edges' *direction* (target
+        // y order), not the port order — otherwise the fan-out overlaps/crosses
+        // right at the node boundary.
+        let nodes = vec![
+            Node { id: 0, w: 80.0, h: 40.0, group: 0 },
+            Node { id: 1, w: 80.0, h: 40.0, group: 0 },
+            Node { id: 2, w: 80.0, h: 40.0, group: 0 },
+            Node { id: 3, w: 80.0, h: 40.0, group: 0 },
+        ];
+        let edges = vec![
+            Edge { src: 0, src_port: 0, dst: 1, dst_port: 0 },
+            Edge { src: 0, src_port: 1, dst: 2, dst_port: 0 },
+            Edge { src: 0, src_port: 2, dst: 3, dst_port: 0 },
+        ];
+        let l = layout(&nodes, &edges, &Opts::default());
+        // Each route starts at a distinct y (no overlapping attach points).
+        let mut starts: Vec<(u32, f32)> =
+            l.edges.iter().map(|e| (e.dst, e.points[0].1)).collect();
+        for i in 0..starts.len() {
+            for j in (i + 1)..starts.len() {
+                assert!(
+                    (starts[i].1 - starts[j].1).abs() > 1.0,
+                    "attach points must not overlap: {starts:?}"
+                );
+            }
+        }
+        // Attach order matches the targets' vertical order: sort both ways and
+        // compare pairings.
+        let y_of = |id: u32| l.nodes.iter().find(|n| n.id == id).unwrap().y;
+        starts.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let mut by_target: Vec<u32> = starts.iter().map(|(d, _)| *d).collect();
+        let mut targets_by_y: Vec<u32> = vec![1, 2, 3];
+        targets_by_y.sort_by(|&a, &b| y_of(a).partial_cmp(&y_of(b)).unwrap());
+        by_target.dedup();
+        assert_eq!(by_target, targets_by_y, "attach order must follow target order");
+    }
+
+    #[test]
+    fn different_groups_keep_hull_clearance() {
+        // Two two-node chains in different groups share layers; vertically
+        // adjacent nodes from different groups must be separated by node_gap +
+        // group_gap so the drawn hulls (padding + label strip) cannot overlap.
+        let nodes = vec![
+            Node { id: 0, w: 80.0, h: 40.0, group: 0 },
+            Node { id: 1, w: 80.0, h: 40.0, group: 0 },
+            Node { id: 2, w: 80.0, h: 40.0, group: 1 },
+            Node { id: 3, w: 80.0, h: 40.0, group: 1 },
+        ];
+        let edges = vec![
+            Edge { src: 0, src_port: 0, dst: 1, dst_port: 0 },
+            Edge { src: 2, src_port: 0, dst: 3, dst_port: 0 },
+        ];
+        let opts = Opts::default();
+        let l = layout(&nodes, &edges, &opts);
+        let g0 = l.groups.iter().find(|g| g.group == 0).unwrap();
+        let g1 = l.groups.iter().find(|g| g.group == 1).unwrap();
+        let (top, bottom) = if g0.y < g1.y { (g0, g1) } else { (g1, g0) };
+        let clearance = bottom.y - (top.y + top.h);
+        assert!(
+            clearance >= opts.node_gap + opts.group_gap - 0.5,
+            "group boxes must be separated by node_gap+group_gap, got {clearance}"
+        );
+    }
+
 }

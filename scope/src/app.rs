@@ -184,7 +184,11 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
             let text = ui.theme().text;
             let accent = ui.theme().accent;
             let bar_bg = ui.theme().bar_bg;
-            let tw = ui.text(pad, pad + 5.0, "scraft-scope", text);
+            // One shared mid-line for everything in the bar (title, status,
+            // progress, time), matching the pause button's vertical centre.
+            let mid = pad + (top_h - 6.0) * 0.5;
+            let text_y = (mid - font.line_h() * 0.5).floor();
+            let tw = ui.text(pad, text_y, "scraft-scope", text);
 
             // Transport block right of centre: [progress bar] mm:ss / mm:ss.
             let mut left_limit = btn.x - 12.0;
@@ -198,12 +202,12 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
                 let x0 = btn.x - 12.0 - text_w - if bar_w > 0.0 { bar_w + 8.0 } else { 0.0 };
                 if let Some(dur) = duration_ns {
                     let frac = (pos as f64 / dur.max(1) as f64).clamp(0.0, 1.0) as f32;
-                    let bar = Rect::new(x0, pad + (top_h - 6.0 - 8.0) * 0.5, bar_w, 8.0);
+                    let bar = Rect::new(x0, mid - 4.0, bar_w, 8.0);
                     ui.draw_list_mut().fill_rect(bar, bar_bg);
                     ui.draw_list_mut()
                         .fill_rect(Rect::new(bar.x, bar.y, bar.w * frac, bar.h), accent);
                 }
-                ui.text(x0 + if bar_w > 0.0 { bar_w + 8.0 } else { 0.0 }, pad + 5.0, &time_text, text);
+                ui.text(x0 + if bar_w > 0.0 { bar_w + 8.0 } else { 0.0 }, text_y, &time_text, text);
                 left_limit = x0 - 16.0;
             }
 
@@ -215,7 +219,7 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
             } else {
                 status.clone()
             };
-            ui.text(pad + tw + 14.0, pad + 5.0, &shown, dim);
+            ui.text(pad + tw + 14.0, text_y, &shown, dim);
 
             let label = if paused { "Resume" } else { "Pause" };
             if ui.button_in(label, btn) {

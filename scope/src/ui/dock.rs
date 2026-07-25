@@ -118,12 +118,19 @@ impl<P: Copy + PartialEq> DockTree<P> {
         DockTree { nodes, root }
     }
 
-    /// Every panel docked anywhere in the tree.
+    /// Every panel docked in the *reachable* tree. Walked from the root, not a
+    /// flat node scan: collapses leave orphaned slots in `nodes` by design
+    /// (index stability), and orphans must not count.
     pub fn all_panels(&self) -> Vec<P> {
         let mut ids = Vec::new();
-        for n in &self.nodes {
-            if let Node::Leaf { panels, .. } = n {
-                ids.extend_from_slice(panels);
+        let mut stack = vec![self.root];
+        while let Some(i) = stack.pop() {
+            match &self.nodes[i] {
+                Node::Split { a, b, .. } => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Node::Leaf { panels, .. } => ids.extend_from_slice(panels),
             }
         }
         ids
@@ -257,8 +264,7 @@ impl<P: Copy + PartialEq> DockTree<P> {
         }
     }
 
-    /// Remove `panel` from its leaf; an emptied leaf collapses its parent split
-    /// (the sibling takes the split's slot, so outer indices stay valid).
+    /// Remove `panel` from its leaf; an emptied leaf collapses its parent split.
     pub fn remove_panel(&mut self, panel: P) {
         let mut emptied = None;
         for (i, n) in self.nodes.iter_mut().enumerate() {
@@ -271,28 +277,62 @@ impl<P: Copy + PartialEq> DockTree<P> {
                     if panels.is_empty() {
                         emptied = Some(i);
                     }
+                    break;
                 }
             }
         }
-        let Some(empty) = emptied else { return };
-        // Find the parent split and promote the sibling into the parent's slot.
-        let parent = self.nodes.iter().position(|n| match n {
-            Node::Split { a, b, .. } => *a == empty || *b == empty,
-            _ => false,
-        });
-        let Some(parent) = parent else { return }; // root leaf may stay empty
+        if let Some(empty) = emptied {
+            self.collapse_leaf(empty);
+        }
+    }
+
+    /// Replace the split that has `empty_leaf` as a child with its sibling child,
+    /// by **repointing the grandparent (or the root) at the sibling** — never by
+    /// moving nodes between slots. This keeps every reachable node's index valid
+    /// through the collapse (a drop target captured before a `move_panel` may be
+    /// the sibling itself); the parent split and the empty leaf become orphans in
+    /// `nodes`, which is why parents are found by walking the *reachable* tree —
+    /// a flat scan could match a dead orphan still recording `empty_leaf` as a
+    /// child. (The same invariant simprof's dockspace documents.)
+    fn collapse_leaf(&mut self, empty_leaf: usize) {
+        // Reachable-parent map: node index → its parent split index.
+        let mut parent_of: Vec<(usize, usize)> = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(i) = stack.pop() {
+            if let Node::Split { a, b, .. } = self.nodes[i] {
+                parent_of.push((a, i));
+                parent_of.push((b, i));
+                stack.push(a);
+                stack.push(b);
+            }
+        }
+        let find = |idx: usize| parent_of.iter().find(|(c, _)| *c == idx).map(|(_, p)| *p);
+        let Some(parent) = find(empty_leaf) else {
+            return; // the empty leaf is the root (or already detached): leave as-is
+        };
         let sibling = match &self.nodes[parent] {
             Node::Split { a, b, .. } => {
-                if *a == empty {
+                if *a == empty_leaf {
                     *b
                 } else {
                     *a
                 }
             }
-            _ => unreachable!(),
+            _ => return,
         };
-        let sib = std::mem::replace(&mut self.nodes[sibling], Node::Leaf { panels: vec![], active: 0 });
-        self.nodes[parent] = sib;
+        match find(parent) {
+            None => self.root = sibling,
+            Some(grand) => {
+                if let Node::Split { a, b, .. } = &mut self.nodes[grand] {
+                    if *a == parent {
+                        *a = sibling;
+                    }
+                    if *b == parent {
+                        *b = sibling;
+                    }
+                }
+            }
+        }
     }
 
     /// Move the node at `idx` into a fresh slot, returning the new index; the old
@@ -398,9 +438,11 @@ pub fn dock_begin<P: Copy + PartialEq>(
     });
 
     // --- draw chrome: per-leaf tab bar strip, tabs, dividers ---
+    // The strip is darker than the tabs and each tab is drawn 1px narrower than
+    // its slot, so the strip shows through as a divider between adjacent tabs.
     for r in &layout.regions {
         ui.draw_list_mut()
-            .fill_rect(Rect::new(r.rect.x, r.rect.y, r.rect.w, TAB_H), t.title_bg);
+            .fill_rect(Rect::new(r.rect.x, r.rect.y, r.rect.w, TAB_H), t.bg);
     }
     for (i, tab) in layout.tabs.iter().enumerate() {
         let hot = tab.rect.contains(mx, my);
@@ -411,10 +453,11 @@ pub fn dock_begin<P: Copy + PartialEq>(
         } else {
             t.title_bg
         };
-        ui.draw_list_mut().fill_rect(tab.rect, bg);
+        let face = Rect::new(tab.rect.x, tab.rect.y, tab.rect.w - 1.0, tab.rect.h);
+        ui.draw_list_mut().fill_rect(face, bg);
         if tab.active {
             ui.draw_list_mut()
-                .fill_rect(Rect::new(tab.rect.x, tab.rect.y, tab.rect.w, 2.0), t.accent);
+                .fill_rect(Rect::new(face.x, face.y, face.w, 2.0), t.accent);
         }
         let color = if tab.active { t.text } else { t.text_dim };
         let ty = tab.rect.y + (TAB_H - ui.font().line_h()) * 0.5;

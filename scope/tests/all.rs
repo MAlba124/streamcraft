@@ -849,6 +849,9 @@ fn dock_panels_survive_arbitrary_moves() {
         t.move_panel(panel, target, zone);
         let l2 = lay(&t);
         assert_eq!(t.all_panels().len(), 3, "no panel lost");
+        for p in [P::Graph, P::Elements, P::Log] {
+            assert!(l2.tabs.iter().any(|s| s.panel == p), "{p:?} lost a tab");
+        }
         // Every region still has at least one tab and the layout still tiles.
         for r in &l2.regions {
             assert!(l2.tabs.iter().any(|s| s.leaf == r.leaf), "region without tabs");
@@ -856,5 +859,42 @@ fn dock_panels_survive_arbitrary_moves() {
         let ra: f32 = l2.regions.iter().map(|r| r.rect.w * r.rect.h).sum();
         let da: f32 = l2.dividers.iter().map(|d| d.rect.w * d.rect.h).sum();
         assert!((ra + da - 1000.0 * 800.0).abs() < 1.0);
+    }
+}
+
+#[test]
+fn dock_move_onto_sibling_leaf_keeps_panel_visible() {
+    // Regression: dropping a panel onto its own split-sibling. The source leaf
+    // empties and the split collapses; the collapse must keep the sibling's
+    // node index valid (repoint the grandparent, never move nodes), or the
+    // drop inserts into an orphaned slot and the panel vanishes.
+    for zone in [DropZone::Center, DropZone::Left, DropZone::Bottom] {
+        let mut t = tree(); // Graph | Elements over Log
+        let l = lay(&t);
+        let graph_leaf = l.tabs.iter().find(|s| s.panel == P::Graph).map(|s| s.leaf).unwrap();
+        t.move_panel(P::Elements, graph_leaf, zone);
+        let l2 = lay(&t);
+        assert!(
+            l2.tabs.iter().any(|s| s.panel == P::Elements),
+            "Elements lost after {zone:?} drop onto sibling"
+        );
+        let mut all = t.all_panels();
+        all.sort_by_key(|p| format!("{p:?}"));
+        assert_eq!(all, vec![P::Elements, P::Graph, P::Log], "{zone:?}");
+    }
+}
+
+#[test]
+fn dock_all_panels_ignores_orphans() {
+    let mut t = tree();
+    let l = lay(&t);
+    let log_leaf = l.tabs.iter().find(|s| s.panel == P::Log).map(|s| s.leaf).unwrap();
+    // Empty the Elements leaf (collapse leaves orphaned slots behind).
+    t.move_panel(P::Elements, log_leaf, DropZone::Center);
+    assert_eq!(t.all_panels().len(), 3);
+    // And every panel is actually reachable in the layout.
+    let l2 = lay(&t);
+    for p in [P::Graph, P::Elements, P::Log] {
+        assert!(l2.tabs.iter().any(|s| s.panel == p), "{p:?} must have a tab");
     }
 }
