@@ -429,25 +429,79 @@ impl MkvMuxN {
         true
     }
 
-    /// The EOS drain: exact-size allocations for the byte runs — waiting for a pool slot
-    /// is no longer an option at end of stream (see `MkvMux::drain_out_exact`).
+    /// The EOS drain: exact-size allocations — waiting for a pool slot is no longer an
+    /// option at end of stream (see `MkvMux::drain_out_exact`). Coalesces here too:
+    /// consecutive byte runs and sub-[`COALESCE_MAX`] payloads gather into **one**
+    /// exact buffer (capped), not one heap allocation (plus its `Arc`) per ~10-octet
+    /// block header — the finalize tail (queued audio blocks, then Cues) otherwise
+    /// pays thousands of tiny allocations at EOS (measured: ~11% of a remux's total).
     fn drain_out_exact(&mut self, ctx: &mut Ctx) {
-        while let Some(piece) = self.out.pop_front() {
-            match piece {
-                MuxPiece::Bytes { start, end } => {
-                    let at = start + self.out_off;
-                    self.out_off = 0;
-                    if at >= end {
-                        continue;
-                    }
-                    let n = end - at;
-                    let mut buf = ctx.alloc_exact(SRC, n);
-                    buf.memory.as_mut_full()[..n]
-                        .copy_from_slice(&self.out.header_bytes()[at..end]);
-                    buf.memory.set_len(n);
-                    ctx.out(SRC).push(buf);
+        const GATHER_MAX: usize = 256 << 10;
+        // The pool-dry resume offset into the front byte run (set by `drain_out`);
+        // consumed by the first gathered piece below.
+        let mut off = std::mem::take(&mut self.out_off);
+        loop {
+            // Pre-scan: the total size of the leading run of coalescible pieces
+            // (never splitting a piece; only the first may exceed the cap alone).
+            let mut total = 0usize;
+            let mut o = off;
+            for piece in self.out.pieces() {
+                let n = match piece {
+                    MuxPiece::Bytes { start, end } => (end - start).saturating_sub(o),
+                    MuxPiece::Payload(mem) if mem.len() <= COALESCE_MAX => mem.len(),
+                    MuxPiece::Payload(_) => break,
+                };
+                o = 0;
+                if total != 0 && total + n > GATHER_MAX {
+                    break;
                 }
-                MuxPiece::Payload(mem) => Self::emit_payload(ctx, mem, self.out_fmt),
+                total += n;
+                if total >= GATHER_MAX {
+                    break;
+                }
+            }
+            if total > 0 {
+                let mut buf = ctx.alloc_exact(SRC, total);
+                let mut filled = 0usize;
+                while filled < total {
+                    match self.out.front() {
+                        Some(&MuxPiece::Bytes { start, end }) => {
+                            let at = start + off;
+                            off = 0;
+                            let n = end - at;
+                            if filled + n > total {
+                                break; // not pre-scanned (cap): next gather's
+                            }
+                            buf.memory.as_mut_full()[filled..filled + n]
+                                .copy_from_slice(&self.out.header_bytes()[at..end]);
+                            filled += n;
+                            self.out.pop_front();
+                        }
+                        Some(MuxPiece::Payload(mem))
+                            if mem.len() <= COALESCE_MAX && filled + mem.len() <= total =>
+                        {
+                            let n = mem.len();
+                            buf.memory.as_mut_full()[filled..filled + n]
+                                .copy_from_slice(mem.data());
+                            filled += n;
+                            self.out.pop_front();
+                        }
+                        _ => break,
+                    }
+                }
+                buf.memory.set_len(filled);
+                ctx.out(SRC).push(buf);
+                continue;
+            }
+            // No coalescible bytes up front: forward a large payload by refcount, or
+            // pop a byte run the resume offset already fully consumed, or finish.
+            match self.out.pop_front() {
+                Some(MuxPiece::Payload(mem)) => Self::emit_payload(ctx, mem, self.out_fmt),
+                Some(MuxPiece::Bytes { start, end }) => {
+                    debug_assert!(start + off >= end, "non-empty byte run must gather");
+                    off = 0;
+                }
+                None => break,
             }
         }
         self.out.reclaim();
@@ -857,6 +911,7 @@ impl Element for MkvMuxN {
             while let Some(buf) = batch.pop_front() {
                 self.accept(i, buf)?;
             }
+            ctx.recycle_input(batch);
         }
         self.maybe_write_header();
         self.merge(ctx, false);

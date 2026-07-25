@@ -666,6 +666,12 @@ impl MuxOut {
         self.pieces.front()
     }
 
+    /// The queued pieces in emission order — a drain's look-ahead (e.g. sizing one
+    /// coalesced buffer over several consecutive small pieces before popping them).
+    pub fn pieces(&self) -> impl Iterator<Item = &MuxPiece> {
+        self.pieces.iter()
+    }
+
     /// Remove and return the next piece.
     pub fn pop_front(&mut self) -> Option<MuxPiece> {
         self.pieces.pop_front()

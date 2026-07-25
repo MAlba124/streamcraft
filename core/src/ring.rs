@@ -290,6 +290,12 @@ pub fn spsc_leaky<T>(capacity: usize, leaky: Leaky) -> (Producer<T>, Consumer<T>
 }
 
 impl<T> Producer<T> {
+    /// The ring's slot count (the `capacity` given at creation, rounded up to a
+    /// power of two) — how many items can be in flight at once.
+    pub fn capacity(&self) -> usize {
+        self.inner.cap
+    }
+
     /// Non-blocking push. `Err(val)` if the ring is full.
     pub fn try_push(&self, val: T) -> Result<(), T> {
         // `tail` is producer-owned: `Relaxed` — no other thread stores it, and the
@@ -403,6 +409,11 @@ impl<T> Producer<T> {
 }
 
 impl<T> Consumer<T> {
+    /// The ring's slot count — see [`Producer::capacity`].
+    pub fn capacity(&self) -> usize {
+        self.inner.cap
+    }
+
     /// Non-blocking pop. `None` if the ring is empty.
     pub fn try_pop(&self) -> Option<T> {
         // `head` is consumer-owned: `Relaxed`. The publish ordering that matters

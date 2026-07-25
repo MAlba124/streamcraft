@@ -885,8 +885,14 @@ impl Pipeline {
             // consumer sends drained batch shells back so the producer's
             // `take_output` reuses their column capacity instead of allocating.
             // Non-blocking on both ends; an empty/full shell ring just means an
-            // alloc/drop — correctness never depends on it.
-            let (shell_tx, shell_rx) = spsc::<Batch>(cap);
+            // alloc/drop — correctness never depends on it. Sized to hold a whole
+            // data-ring's worth of returns *plus* the previous burst: the consumer's
+            // feed loop can drain the full data ring in one pass and return every
+            // shell before the producer's next drain, and a full return ring
+            // silently destroys a warm shell — each one a future cold shell that
+            // re-grows its columns from zero (measured as a steady churn of
+            // odd-capacity shells at the muxer).
+            let (shell_tx, shell_rx) = spsc::<Batch>(2 * cap + 2);
             group_downstream[gs].push((PadId(edge.src_pad as u32), p, shell_rx));
             group_upstream[gd].push((PadId(edge.sink_pad as u32), c, shell_tx));
         }
@@ -1648,6 +1654,17 @@ fn run_group(
     for (ctx, (npads, src_pads)) in ctxs.iter_mut().zip(pad_infos.iter()) {
         ctx.configure_pads(*npads, src_pads);
     }
+    // Size the tail's spare-shell retention to its real shell circulation (spec:
+    // Batching — zero-alloc transport). Per downstream link, up to data-ring +
+    // shell-ring slots (plus the one the consumer holds) can be in flight; an
+    // undersized cap makes `recycle_shell` drop warm shells in bursts while
+    // `take_output` mints cold ones — every cold shell then re-grows its columns
+    // from zero.
+    let tail_shells: usize =
+        downstream.iter().map(|(_, p, s)| p.capacity() + s.capacity() + 1).sum();
+    if tail_shells > 0 {
+        ctxs[m - 1].bump_spare_cap(tail_shells);
+    }
     // Install each element's link-time-negotiated formats before `start()`, so an
     // element can read `ctx.negotiated(pad)` in `start()` as well as `process()`.
     for (ctx, per_pad) in ctxs.iter_mut().zip(formats) {
@@ -2018,32 +2035,39 @@ fn run_group(
             }
         }
         for (src_pad, down, _) in &downstream {
-            let mut out = ctxs[m - 1].take_output(*src_pad);
-            if !out.is_inert() {
-                // Stamp the generation so the consuming group can drop it if a seek
-                // supersedes it before it is processed (spec: flush/seek).
-                out.seek_gen = seek_gen;
-                // Latency tracing: stamp the push instant so the consumer's pop measures
-                // ring residency (spec: Debuggability).
-                if tracing.load(Ordering::Relaxed) {
-                    out.pushed_at = Some(std::time::Instant::now());
-                }
-                progressed = true;
-                // On a leaky ring a full push drops the batch inside the ring (never
-                // blocks — the live-source policy); surface it in the producer's
-                // drops counter (spec: Queues — leaky modes; drops are observable).
-                let nbuf = out.len() as u64;
-                let dropped_before = down.dropped();
-                if down.push(out).is_err() {
-                    break 'group Ok(()); // this downstream is gone
-                }
-                if down.dropped() > dropped_before {
-                    counters[m - 1].record_drops(nbuf);
-                }
-                // Queue-fill high-water on the producing element (spec: Taps —
-                // backpressure shows as the ring sitting at capacity).
-                counters[m - 1].record_queue_fill(down.len() as u32);
+            // An idle pad's slot stays put: taking it would swap in a spare shell
+            // only for the empty batch to be dropped — destroying one recycled
+            // shell's column capacity per idle pass. A muxer that emits only on
+            // cluster close idles most passes; this drained the spare pool faster
+            // than the consumer returned shells, so every real batch grew its
+            // columns from zero (measured: ~75% of a remux's allocations).
+            if ctxs[m - 1].output_on(*src_pad).is_inert() {
+                continue;
             }
+            let mut out = ctxs[m - 1].take_output(*src_pad);
+            // Stamp the generation so the consuming group can drop it if a seek
+            // supersedes it before it is processed (spec: flush/seek).
+            out.seek_gen = seek_gen;
+            // Latency tracing: stamp the push instant so the consumer's pop measures
+            // ring residency (spec: Debuggability).
+            if tracing.load(Ordering::Relaxed) {
+                out.pushed_at = Some(std::time::Instant::now());
+            }
+            progressed = true;
+            // On a leaky ring a full push drops the batch inside the ring (never
+            // blocks — the live-source policy); surface it in the producer's
+            // drops counter (spec: Queues — leaky modes; drops are observable).
+            let nbuf = out.len() as u64;
+            let dropped_before = down.dropped();
+            if down.push(out).is_err() {
+                break 'group Ok(()); // this downstream is gone
+            }
+            if down.dropped() > dropped_before {
+                counters[m - 1].record_drops(nbuf);
+            }
+            // Queue-fill high-water on the producing element (spec: Taps —
+            // backpressure shows as the ring sitting at capacity).
+            counters[m - 1].record_queue_fill(down.len() as u32);
         }
         // Whatever is still in the output table has no ring: an *unlinked* src pad
         // (a demuxer track nobody connected). Policy: discard it here, every pass,

@@ -126,7 +126,24 @@ pub struct Ctx {
     /// `Batch`es whose column capacity survived a trip downstream, returned by the
     /// consumer over the link's shell ring. [`take_output`](Self::take_output) reuses
     /// one instead of allocating fresh columns. Bounded (see `recycle_shell`).
+    ///
+    /// **Out-duty only.** Spent *input* shells go to `spare_inputs` instead: the two
+    /// populations have different column-capacity histories (an out shell is sized by
+    /// this element's emissions, an input shell by upstream's batches), and a shared
+    /// pool paired them pessimally — `take_output` kept drawing a small input shell
+    /// (or a cold one minted when the input side transiently drained the pool) and
+    /// re-growing its columns from zero, ~75% of a remux's allocations.
     spare_shells: Vec<Batch>,
+    /// Retention cap for `spare_shells`. The scheduler bumps it to the element's real
+    /// shell circulation (downstream data+shell ring slots) — a cap below circulation
+    /// makes `recycle_shell` drop warm shells during bursts while `take_output` mints
+    /// cold ones, and every cold shell re-grows its columns from zero on first use.
+    spare_cap: usize,
+    /// Recycled *input* shells for [`take_input_on`](Self::take_input_on) replacements
+    /// — a closed loop with [`recycle_input`](Self::recycle_input) inside an
+    /// aggregator's pass (one take + one recycle per pad), so it is exactly balanced
+    /// and never competes with the out-duty pool above.
+    spare_inputs: Vec<Batch>,
     /// The format negotiated on each of this element's pads, indexed by local pad
     /// index (`PadId.0` == index into `desc().pads`). `None` for an unlinked pad.
     /// Filled once, at link time, by the pipeline — read cheaply in `start()` /
@@ -214,6 +231,8 @@ impl Ctx {
         Self {
             input: Batch::new(out_format),
             spare_shells: Vec::new(),
+            spare_cap: 8,
+            spare_inputs: Vec::new(),
             outs: Vec::new(),
             primary_out: 0,
             single_src: None,
@@ -720,11 +739,17 @@ impl Ctx {
     /// (scheduler hook — shells arrive over the link's shell ring). Cleared here;
     /// capped so a burst can't hoard column memory.
     pub(crate) fn recycle_shell(&mut self, mut shell: Batch) {
-        const MAX_SPARES: usize = 8;
-        if self.spare_shells.len() < MAX_SPARES {
+        if self.spare_shells.len() < self.spare_cap {
             shell.clear();
             self.spare_shells.push(shell);
         }
+    }
+
+    /// Raise the spare-shell retention cap by `n` (scheduler hook, at group setup):
+    /// called once per downstream link (data + shell ring slots) and per fan-in pad,
+    /// so the cap tracks how many shells can legitimately be in flight at once.
+    pub(crate) fn bump_spare_cap(&mut self, n: usize) {
+        self.spare_cap += n;
     }
 
     /// Total buffers and used bytes across all src pads (for counters).
@@ -811,7 +836,28 @@ impl Ctx {
             self.ins.resize_with(i + 1, || Batch::new(self.out_format));
         }
         let fmt = self.out_format;
-        std::mem::replace(&mut self.ins[i], Batch::new(fmt))
+        let replacement = match self.spare_inputs.pop() {
+            Some(mut shell) => {
+                shell.format = fmt;
+                shell
+            }
+            None => Batch::new(fmt),
+        };
+        std::mem::replace(&mut self.ins[i], replacement)
+    }
+
+    /// Hand a spent batch from [`take_input_on`](Self::take_input_on) back for reuse.
+    /// An aggregator owns whole input batches; returning the drained shell keeps its
+    /// column capacity in circulation for the next `take_input_on` replacement instead
+    /// of re-growing a fresh batch's columns from zero on every pass. Anything left in
+    /// the batch is cleared (buffers recycle to their pool).
+    pub fn recycle_input(&mut self, mut batch: Batch) {
+        // One shell per fan-in pad plus slack fully covers the take/recycle loop; the
+        // cap only guards against an element hoarding shells it never takes back.
+        if self.spare_inputs.len() < 2 * self.ins.len().max(1) {
+            batch.clear();
+            self.spare_inputs.push(batch);
+        }
     }
 
     /// Whether a sink pad's upstream has closed (no more input will arrive on it), so an

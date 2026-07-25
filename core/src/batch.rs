@@ -208,6 +208,11 @@ impl Batch {
         }
     }
 
+    /// Row capacity of the memories column (diagnostics).
+    pub fn cap_rows(&self) -> usize {
+        self.memories.capacity()
+    }
+
     /// Whether this batch carries no buffers *and* no events (so pushing it downstream
     /// would be a no-op).
     pub fn is_inert(&self) -> bool {
