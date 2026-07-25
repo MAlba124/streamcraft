@@ -697,3 +697,164 @@ fn draw_build_rotated_quad_vertices() {
     assert!((b.xy[6] - 0.6).abs() < 1e-4 && (b.xy[7] - -0.8).abs() < 1e-4);
     assert_eq!(b.indices, &[0, 1, 2, 0, 2, 3]);
 }
+
+// ---------------------------------------------------------------------------
+// Dock tree (model: simprof's dockspace — splits with tabbed leaves)
+// ---------------------------------------------------------------------------
+
+use streamcraft_scope::ui::dock::{drop_zone_at, DockTree, DropZone, DIVIDER, TAB_H};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum P {
+    Graph,
+    Elements,
+    Log,
+}
+
+fn tree() -> DockTree<P> {
+    DockTree::two_over_one(P::Graph, P::Elements, P::Log, 0.6, 0.7)
+}
+
+fn lay(t: &DockTree<P>) -> streamcraft_scope::ui::dock::DockLayout<P> {
+    t.layout(Rect::new(0.0, 0.0, 1000.0, 800.0), &|p| format!("{p:?}"), &|s| {
+        s.len() as f32 * 8.0 + 20.0
+    })
+}
+
+#[test]
+fn dock_default_layout_tiles_the_area() {
+    let t = tree();
+    let l = lay(&t);
+    assert_eq!(l.panels.len(), 3);
+    assert_eq!(l.regions.len(), 3);
+    assert_eq!(l.dividers.len(), 2);
+    // Regions cover the area: total region area + divider area == total.
+    let ra: f32 = l.regions.iter().map(|r| r.rect.w * r.rect.h).sum();
+    let da: f32 = l.dividers.iter().map(|d| d.rect.w * d.rect.h).sum();
+    assert!((ra + da - 1000.0 * 800.0).abs() < 1.0, "regions+dividers must tile");
+    // Panel content sits below its region's tab bar.
+    for p in &l.panels {
+        let region = l
+            .regions
+            .iter()
+            .find(|r| r.rect.contains(p.rect.x + 1.0, p.rect.y + 1.0))
+            .expect("panel inside a region");
+        assert!((p.rect.y - (region.rect.y + TAB_H)).abs() < 0.5);
+    }
+    // The horizontal split ratio is honoured (60% of the top strip minus divider).
+    let graph = l.panels.iter().find(|p| p.id == P::Graph).unwrap();
+    assert!((graph.rect.w - (1000.0 - DIVIDER) * 0.6).abs() < 1.0);
+}
+
+#[test]
+fn dock_activate_switches_tabs() {
+    let mut t = DockTree::single(vec![P::Graph, P::Elements]);
+    let l = lay(&t);
+    assert_eq!(l.panels[0].id, P::Graph);
+    t.activate(P::Elements);
+    let l = lay(&t);
+    assert_eq!(l.panels[0].id, P::Elements);
+    // Both tabs exist either way.
+    assert_eq!(l.tabs.len(), 2);
+}
+
+#[test]
+fn dock_move_to_center_joins_tab_group_and_collapses_source() {
+    let mut t = tree();
+    let l = lay(&t);
+    let log_leaf = l
+        .tabs
+        .iter()
+        .find(|s| s.panel == P::Log)
+        .map(|s| s.leaf)
+        .unwrap();
+    t.move_panel(P::Elements, log_leaf, DropZone::Center);
+    let l = lay(&t);
+    // Elements now tabs with Log (2 tabs in that leaf), and is the active one.
+    let leaf_tabs: Vec<_> = l.tabs.iter().filter(|s| s.leaf == log_leaf).collect();
+    assert_eq!(leaf_tabs.len(), 2);
+    assert!(leaf_tabs.iter().any(|s| s.panel == P::Elements && s.active));
+    // The emptied Elements leaf collapsed: only 2 regions remain, all panels kept.
+    assert_eq!(l.regions.len(), 2);
+    let mut all = t.all_panels();
+    all.sort_by_key(|p| format!("{p:?}"));
+    assert_eq!(all, vec![P::Elements, P::Graph, P::Log]);
+}
+
+#[test]
+fn dock_move_to_side_splits_target() {
+    let mut t = tree();
+    let l = lay(&t);
+    let graph_leaf = l.tabs.iter().find(|s| s.panel == P::Graph).map(|s| s.leaf).unwrap();
+    t.move_panel(P::Log, graph_leaf, DropZone::Bottom);
+    let l = lay(&t);
+    // Still three visible panels; Log now sits below Graph within the old region.
+    assert_eq!(l.panels.len(), 3);
+    let g = l.panels.iter().find(|p| p.id == P::Graph).unwrap().rect;
+    let lg = l.panels.iter().find(|p| p.id == P::Log).unwrap().rect;
+    assert!(lg.y > g.y, "Log splits below Graph");
+    assert!((lg.x - g.x).abs() < 0.5, "same column");
+}
+
+#[test]
+fn dock_move_only_panel_onto_itself_is_noop() {
+    let mut t = DockTree::single(vec![P::Graph]);
+    let l = lay(&t);
+    t.move_panel(P::Graph, l.regions[0].leaf, DropZone::Left);
+    let l2 = lay(&t);
+    assert_eq!(l2.panels.len(), 1);
+    assert_eq!(l2.regions.len(), 1);
+}
+
+#[test]
+fn dock_ratio_clamps() {
+    let mut t = tree();
+    let l = lay(&t);
+    let d = l.dividers[0];
+    t.set_ratio_from_pointer(&d, -10_000.0, -10_000.0);
+    let l2 = lay(&t);
+    // The clamped split still leaves both children >= 10% of the region.
+    for r in &l2.regions {
+        assert!(r.rect.w > 50.0 && r.rect.h > 50.0, "region collapsed: {:?}", r.rect);
+    }
+}
+
+#[test]
+fn dock_drop_zones_classify_by_position() {
+    let r = Rect::new(0.0, 0.0, 100.0, 100.0);
+    assert_eq!(drop_zone_at(r, 50.0, 50.0).0, DropZone::Center);
+    assert_eq!(drop_zone_at(r, 10.0, 50.0).0, DropZone::Left);
+    assert_eq!(drop_zone_at(r, 90.0, 50.0).0, DropZone::Right);
+    assert_eq!(drop_zone_at(r, 50.0, 10.0).0, DropZone::Top);
+    assert_eq!(drop_zone_at(r, 50.0, 90.0).0, DropZone::Bottom);
+    // The preview covers the half the split would take.
+    let (_, prev) = drop_zone_at(r, 10.0, 50.0);
+    assert_eq!(prev, Rect::new(0.0, 0.0, 50.0, 100.0));
+}
+
+#[test]
+fn dock_panels_survive_arbitrary_moves() {
+    let mut t = tree();
+    let seq = [
+        (P::Graph, DropZone::Right),
+        (P::Log, DropZone::Center),
+        (P::Elements, DropZone::Top),
+        (P::Graph, DropZone::Center),
+        (P::Log, DropZone::Left),
+    ];
+    for (panel, zone) in seq {
+        let l = lay(&t);
+        // Always target the first region that doesn't (only) hold the panel.
+        let target = l.regions[l.regions.len() - 1].leaf;
+        t.move_panel(panel, target, zone);
+        let l2 = lay(&t);
+        assert_eq!(t.all_panels().len(), 3, "no panel lost");
+        // Every region still has at least one tab and the layout still tiles.
+        for r in &l2.regions {
+            assert!(l2.tabs.iter().any(|s| s.leaf == r.leaf), "region without tabs");
+        }
+        let ra: f32 = l2.regions.iter().map(|r| r.rect.w * r.rect.h).sum();
+        let da: f32 = l2.dividers.iter().map(|d| d.rect.w * d.rect.h).sum();
+        assert!((ra + da - 1000.0 * 800.0).abs() < 1.0);
+    }
+}

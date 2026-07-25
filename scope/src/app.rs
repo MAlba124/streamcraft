@@ -15,6 +15,7 @@ use std::path::Path;
 use crate::client::{Client, Model};
 use crate::layout::{self, Layout};
 use crate::ui::backend::Backend;
+use crate::ui::dock::{self, DockState, DockTree};
 use crate::ui::widgets::{LogView, UiState};
 use crate::ui::{Color, Font, Input, Rect, Ui};
 
@@ -100,12 +101,22 @@ struct ElemRate {
     drops: u64,
 }
 
-/// Which splitter the mouse is currently dragging.
-#[derive(PartialEq, Clone, Copy)]
-enum DragSplit {
-    None,
-    X,
-    Y,
+/// The dockable panels (spec: what scraft-scope shows; the dock model follows
+/// simprof's tree-of-splits-with-tabbed-leaves).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanelId {
+    Graph,
+    Elements,
+    Log,
+}
+
+fn panel_label(p: PanelId) -> String {
+    match p {
+        PanelId::Graph => "Graph",
+        PanelId::Elements => "Elements",
+        PanelId::Log => "Events & logs",
+    }
+    .into()
 }
 
 /// Connect to `path` and run the inspector window until closed (or `max_frames`).
@@ -121,10 +132,9 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
     let mut cache = GraphCache::default();
     let mut gview = GraphView::default();
     let mut paused = false;
-    // Pane fractions: graph width share of the body, body height share above the log.
-    let mut split_x = 0.68f32;
-    let mut split_y = 0.72f32;
-    let mut drag_split = DragSplit::None;
+    // The dock: graph | elements side by side, the log across the bottom.
+    let mut dock = DockTree::two_over_one(PanelId::Graph, PanelId::Elements, PanelId::Log, 0.66, 0.7);
+    let mut dock_state = DockState::default();
     let mut elements_scroll = 0.0f32;
 
     // ~120 fps budget: a real compositor vsync-blocks in present, so this only
@@ -217,67 +227,31 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
             ui.text(pad, top_h + pad, err, Color::rgb(0xe0, 0x6c, 0x4c));
         }
 
-        // --- pane geometry from the split fractions + splitter drag ---
-        let body_y = pad + top_h;
-        let body_h = (size.1 - body_y - pad).max(120.0);
-        let cols_h = (body_h * split_y - pad * 0.5).clamp(80.0, body_h - 60.0);
-        let log_y = body_y + cols_h + pad;
-        let log_h = (size.1 - log_y - pad).max(40.0);
-        let inner_w = size.0 - 3.0 * pad;
-        let graph_w = (inner_w * split_x).clamp(160.0, inner_w - 140.0);
-        let right_x = pad * 2.0 + graph_w;
-        let right_w = size.0 - right_x - pad;
-
-        let vsplit = Rect::new(right_x - pad, body_y, pad, cols_h);
-        let hsplit = Rect::new(pad, body_y + cols_h, size.0 - 2.0 * pad, pad);
-        {
-            let hover_v = vsplit.contains(input.mouse_x, input.mouse_y);
-            let hover_h = hsplit.contains(input.mouse_x, input.mouse_y);
-            if input.pressed(crate::ui::MouseButton::Left) {
-                if hover_v {
-                    drag_split = DragSplit::X;
-                } else if hover_h {
-                    drag_split = DragSplit::Y;
+        // --- the dockspace: tab bars, dividers, drag-to-dock (model: simprof) ---
+        let area = Rect::new(
+            pad,
+            pad + top_h,
+            (size.0 - 2.0 * pad).max(100.0),
+            (size.1 - top_h - 2.0 * pad).max(120.0),
+        );
+        let frame_dock = dock::dock_begin(&mut ui, &mut dock, &mut dock_state, area, &panel_label);
+        let busy = dock_state.interacting();
+        for geom in &frame_dock.layout.panels {
+            match geom.id {
+                PanelId::Graph => {
+                    draw_graph_panel(&mut ui, geom.rect, &cache, &mut gview, &rates, busy)
+                }
+                PanelId::Elements => {
+                    draw_elements_panel(&mut ui, geom.rect, &cache, &rates, &mut elements_scroll)
+                }
+                PanelId::Log => {
+                    ui.begin_region(geom.rect);
+                    ui.log_view(&mut log);
+                    ui.end_region();
                 }
             }
-            if !input.down(crate::ui::MouseButton::Left) {
-                drag_split = DragSplit::None;
-            }
-            match drag_split {
-                DragSplit::X => split_x = ((input.mouse_x - pad) / inner_w).clamp(0.2, 0.85),
-                DragSplit::Y => split_y = ((input.mouse_y - body_y) / body_h).clamp(0.2, 0.9),
-                DragSplit::None => {}
-            }
-            // Feedback: tint the strip when hovered or dragging.
-            let accent = ui.theme().accent.with_alpha(90);
-            if hover_v || drag_split == DragSplit::X {
-                ui.draw_list_mut().fill_rect(vsplit, accent);
-            }
-            if hover_h || drag_split == DragSplit::Y {
-                ui.draw_list_mut().fill_rect(hsplit, accent);
-            }
         }
-
-        let splitting = drag_split != DragSplit::None;
-        draw_graph_panel(
-            &mut ui,
-            Rect::new(pad, body_y, graph_w, cols_h),
-            &cache,
-            &mut gview,
-            &rates,
-            splitting,
-        );
-        draw_elements_panel(
-            &mut ui,
-            Rect::new(right_x, body_y, right_w, cols_h),
-            &cache,
-            &rates,
-            &mut elements_scroll,
-        );
-
-        ui.begin_panel("Events & logs", Rect::new(pad, log_y, size.0 - 2.0 * pad, log_h));
-        ui.log_view(&mut log);
-        ui.end_panel();
+        dock::dock_finish(&mut ui, &mut dock, &mut dock_state, &frame_dock);
 
         let dl = ui.finish();
         backend.render(&dl, Color::rgb(0x14, 0x16, 0x1a));
@@ -499,19 +473,20 @@ fn draw_graph_panel(
     rates: &[ElemRate],
     splitting: bool,
 ) {
-    let body = ui.begin_panel("Graph", rect);
-    ui.end_panel();
-
     let dim = ui.theme().text_dim;
     let text = ui.theme().text;
     let accent = ui.theme().accent;
     let node_bg = ui.theme().panel_bg;
     let title_bg = ui.theme().title_bg;
-    let title_h = ui.theme().title_h;
     let border = ui.theme().panel_border;
 
-    // "Fit" button in the panel's title bar.
-    let fit_btn = Rect::new(rect.right() - 44.0, rect.y + 2.0, 40.0, ui.theme().title_h - 4.0);
+    // Region chrome (the dock's tab bar replaces the old title).
+    ui.draw_list_mut().fill_rect(rect, node_bg);
+    ui.draw_list_mut().rect_outline(rect, 1.0, border);
+    let body = rect.inset(1.0);
+
+    // "Fit" button + zoom readout overlay, top-right of the content.
+    let fit_btn = Rect::new(body.right() - 48.0, body.y + 4.0, 42.0, 20.0);
     let refit = ui.button_in("Fit", fit_btn);
 
     let Some(laid) = &cache.laid else {
@@ -745,14 +720,14 @@ fn draw_graph_panel(
 
     ui.draw_list_mut().pop_clip();
 
-    // Zoom readout, bottom-right of the title bar area.
+    // Zoom readout, left of the Fit button.
     let ztext = format!("{:.0}%", zoom * 100.0);
     let zw = ui.font().measure_line(&ztext);
     ui.draw_list_mut().fill_rect(
-        Rect::new(fit_btn.x - zw - 14.0, rect.y + 2.0, zw + 10.0, title_h - 4.0),
+        Rect::new(fit_btn.x - zw - 14.0, fit_btn.y, zw + 10.0, fit_btn.h),
         title_bg,
     );
-    ui.text(fit_btn.x - zw - 9.0, rect.y + 5.0, &ztext, dim);
+    ui.text(fit_btn.x - zw - 9.0, fit_btn.y + 3.0, &ztext, dim);
 }
 
 /// The elements panel: per-element throughput (relative bar) + counters.
@@ -768,7 +743,7 @@ fn draw_elements_panel(
     let row_h = ui.theme().row_h;
     let bar_bg = ui.theme().bar_bg;
     let text_dim = ui.theme().text_dim;
-    let body = ui.begin_panel("Elements", rect);
+    let body = ui.begin_region(rect);
 
     // Row gap is the panel cursor's 4.0; each element renders 3 rows.
     let block_h = 3.0 * (row_h + 4.0);
@@ -802,5 +777,5 @@ fn draw_elements_panel(
         ui.draw_list_mut()
             .fill_rect(Rect::new(track.x, thumb_y, track.w, thumb_h), text_dim);
     }
-    ui.end_panel();
+    ui.end_region();
 }

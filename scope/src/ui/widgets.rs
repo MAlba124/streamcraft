@@ -297,6 +297,24 @@ impl<'a> Ui<'a> {
         body
     }
 
+    /// Begin a title-less panel region occupying `rect` (frame + clip + layout
+    /// cursor, no title bar) — the dock's tab bars replace panel titles.
+    pub fn begin_region(&mut self, rect: Rect) -> Rect {
+        let t = self.theme;
+        self.dl.fill_rect(rect, t.panel_bg);
+        self.dl.rect_outline(rect, 1.0, t.panel_border);
+        let body = rect.inset(t.pad);
+        self.dl.push_clip(rect);
+        self.cursors.push(Cursor::new(body, 4.0));
+        body
+    }
+
+    /// End a [`Ui::begin_region`] (pops its clip + layout cursor).
+    pub fn end_region(&mut self) {
+        self.cursors.pop();
+        self.dl.pop_clip();
+    }
+
     /// End the current panel (pops its clip + layout cursor).
     pub fn end_panel(&mut self) {
         self.cursors.pop();

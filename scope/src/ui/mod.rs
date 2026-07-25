@@ -34,6 +34,7 @@
 
 pub mod arena;
 pub mod backend;
+pub mod dock;
 pub mod draw;
 pub mod font;
 mod font_data;
