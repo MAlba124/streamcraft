@@ -216,6 +216,45 @@ impl PropHandle {
             .ok_or(Error::Todo("set: unknown element"))?;
         validate_and_set(el, desc, table, prop, v, true)
     }
+
+    /// Validate and park a live-property set addressed by property *index* (the
+    /// introspection server addresses props by index — spec: SetProp). Same closed
+    /// validation as [`set`](Self::set); a structural (`live: false`) property is
+    /// rejected while playing.
+    pub fn set_by_index(&self, el: ElementId, prop_index: usize, v: Value) -> Result<(), Error> {
+        let (desc, table) = self
+            .entries
+            .get(el.0 as usize)
+            .ok_or(Error::Todo("set: unknown element"))?;
+        let pd = desc
+            .props
+            .get(prop_index)
+            .ok_or(Error::Todo("set: unknown property index"))?;
+        validate_and_set(el, desc, table, pd.name, v, true)
+    }
+
+    /// The current value of an element's property by index (spec: Props reply — the
+    /// "current value" slot, `None`/Unset while never set). Reads the same mailbox the
+    /// element reads.
+    pub fn get(&self, el: ElementId, prop_index: usize) -> Option<Value> {
+        let (_, table) = self.entries.get(el.0 as usize)?;
+        table.get(prop_index)
+    }
+
+    /// The number of elements this handle observes.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The static descriptor of an element (spec: props getters — iterate descs to
+    /// serve Props without `&Pipeline`). `None` for an unknown id.
+    pub fn desc(&self, el: ElementId) -> Option<&'static ElementDesc> {
+        self.entries.get(el.0 as usize).map(|(d, _)| *d)
+    }
 }
 
 #[cfg(test)]

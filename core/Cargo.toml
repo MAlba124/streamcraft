@@ -5,9 +5,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# One integration-test binary (spec: Testing). Disable cargo's per-file test
+# autodiscovery so only the declared `all` target below is built; it `mod`-includes the
+# sub-suites (`tests/introspect.rs`) rather than compiling each as its own binary.
+autotests = false
 
 [lib]
 name = "streamcraft_core"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 # Hand-rolled SPSC-ring microbench (spec: Performance doctrine — no criterion, core
 # stays dep-free). `harness = false` → the bench's own `main` is the harness.

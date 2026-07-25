@@ -39,6 +39,12 @@ const BYTES: FormatId = FormatId(0);
 /// amortize, small enough that no single chain position can starve the shared pool.
 const INLINE_INPUT_CAP: usize = 8;
 
+/// Reduced per-element log ring capacity used when logging is wired *only* to feed the
+/// introspection server (no level enabled yet). Small: the drain runs, but a burst of
+/// records with no subscriber just drops-and-counts rather than holding memory.
+#[cfg(feature = "introspect")]
+const INTROSPECT_LOG_CAP: usize = 256;
+
 /// A negotiated edge: the two pads it joins (by element + local pad index) and the
 /// [`FixedFormat`] the solver fixed on it at [`link`](Pipeline::link) time (spec:
 /// Formats — fixed formats live on edges).
@@ -350,6 +356,11 @@ pub struct Pipeline {
     /// `ElementId`; grown to match `elements` in [`add`](Self::add) and populated by
     /// [`preroll`](Self::preroll). Empty for a static pipeline.
     dyn_pads: Vec<Vec<DynPad>>,
+    /// The introspection server, if serving (spec: Introspection protocol). `None`
+    /// until [`serve_introspection`](Self::serve_introspection) or the
+    /// `STREAMCRAFT_INTROSPECT` env attach in `run()`; dropping it shuts down.
+    #[cfg(feature = "introspect")]
+    introspect: Option<crate::introspect::IntrospectServer>,
 }
 
 impl Pipeline {
@@ -394,6 +405,8 @@ impl Pipeline {
             pool_overrides: Vec::new(),
             queue_overrides: Vec::new(),
             leaky_overrides: Vec::new(),
+            #[cfg(feature = "introspect")]
+            introspect: None,
         }
     }
 
@@ -787,6 +800,14 @@ impl Pipeline {
     /// joins them all, and returns the first error (if any).
     pub fn run(&mut self) -> Result<(), Error> {
         self.stop.store(false, Ordering::Release);
+        // Zero-code attach mode (spec: server architecture): if no server is active and
+        // `STREAMCRAFT_INTROSPECT=<path>` is set, serve on that path for this run.
+        #[cfg(feature = "introspect")]
+        if self.introspect.is_none() {
+            if let Some(path) = std::env::var_os("STREAMCRAFT_INTROSPECT") {
+                let _ = self.serve_introspection(std::path::PathBuf::from(path));
+            }
+        }
         let order = self.topo_order()?;
         // Clock selection (spec: Clocking): a clock forced by `set_clock` wins;
         // otherwise the most downstream element offering one masters the pipeline —
@@ -923,7 +944,28 @@ impl Pipeline {
         // is actually enabled*, wire one log channel per element and one low-priority
         // drain thread. When logging is off nothing here allocates or spawns — the
         // disabled path stays at zero cost, which is the point (performance is #1).
-        let (mut per_elem_logs, log_drain) = self.build_logging(total);
+        let logging = self.build_logging(total);
+        let mut per_elem_logs = logging.logs;
+        let log_drain = logging.drain;
+
+        // Republish the topology (dynamic pads are now instantiated) and the control
+        // handles (with the live log filters just built) into the introspection server,
+        // so a client sees the running shape and can flip levels/tracing live.
+        #[cfg(feature = "introspect")]
+        if let Some(server) = &self.introspect {
+            let shared = Arc::clone(server.shared());
+            let snap = self.introspect_snapshot();
+            shared.publish_topology(snap);
+            shared.set_handles(crate::introspect::server::Handles {
+                tap: self.tap_handle(),
+                props: self.prop_handle(),
+                pause: self.pause_handle(),
+                tracing: Arc::clone(&self.tracing),
+                filters: logging.filters,
+                global_filter: logging.global_filter,
+                log_channels: logging.channels_wired,
+            });
+        }
 
         // Per-element pad shape (total pad count, src pad indices) — static pads plus any
         // runtime-added dynamic pads — so each Ctx sizes its per-pad output table and the
@@ -1080,7 +1122,7 @@ impl Pipeline {
     /// per-target `name:level` rules from `STREAMCRAFT_DEBUG` raise matching elements
     /// above it. If nothing is enabled, this wires *nothing* — no channels, no thread —
     /// so a run with logging off pays only this one comparison.
-    fn build_logging(&self, total: usize) -> (Vec<Option<Log>>, Option<LogDrainThread>) {
+    fn build_logging(&self, total: usize) -> LoggingBuild {
         // Fold the programmatic level and the env global into one shared gate; the more
         // verbose (higher rank) of the two wins.
         let filter = LevelFilter::new();
@@ -1109,22 +1151,63 @@ impl Pipeline {
         };
         let any_target = spec.targets.iter().any(|(_, r)| *r > 0);
 
-        // Nothing enabled anywhere → wire nothing (the zero-overhead disabled path).
-        if global_rank == 0 && !any_target {
-            return ((0..total).map(|_| None).collect(), None);
+        // Whether an introspection server is active this run: if so, we wire channels
+        // (at threshold-off if no level is enabled) so `Subscribe(logs)` has something to
+        // deliver, and hand the drain a tap. Emission stays the existing one-relaxed-load
+        // gate, so streaming cost is byte-identical to logging-off.
+        #[cfg(feature = "introspect")]
+        let (server_active, log_taps) = match &self.introspect {
+            Some(s) => (true, Some(Arc::clone(&s.shared().log_taps))),
+            None => (false, None),
+        };
+        #[cfg(not(feature = "introspect"))]
+        let server_active = false;
+
+        // Nothing enabled anywhere *and* no server → wire nothing (the zero-overhead
+        // disabled path). A server active with nothing enabled still wires channels below
+        // (at threshold-off, reduced cap) so it can flip a level on live.
+        if global_rank == 0 && !any_target && !server_active {
+            return LoggingBuild {
+                logs: (0..total).map(|_| None).collect(),
+                drain: None,
+                #[cfg(feature = "introspect")]
+                filters: Vec::new(),
+                #[cfg(feature = "introspect")]
+                global_filter: None,
+                #[cfg(feature = "introspect")]
+                channels_wired: false,
+            };
         }
+
+        // When the only reason to wire is the server, run channels at threshold-off with a
+        // small ring — the drain still runs (feeding taps), the elements just don't emit
+        // until `SetLogLevel` flips a filter live. (`server_active` is always false with
+        // the feature off, so this collapses to the default cap and the const is unused.)
+        #[cfg(feature = "introspect")]
+        let cap = if global_rank == 0 && !any_target && server_active {
+            INTROSPECT_LOG_CAP
+        } else {
+            self.log_queue_cap
+        };
+        #[cfg(not(feature = "introspect"))]
+        let cap = self.log_queue_cap;
 
         let shared = Arc::new(filter);
         let mut logs: Vec<Option<Log>> = Vec::with_capacity(total);
         let mut drains: Vec<LogDrain> = Vec::new();
+        #[cfg(feature = "introspect")]
+        let mut filters: Vec<Arc<LevelFilter>> = Vec::with_capacity(total);
         for i in 0..total {
             let name = self.name_of(ElementId(i as u32));
             let tr = target_rank(name);
-            // Elements not matched by a target log at the global level; matched ones get
-            // their own filter raised to `max(global, target)`. Both `>0` ⇒ a channel.
             let elem_rank = global_rank.max(tr);
-            if elem_rank == 0 {
+            // Without a server, an element the gate leaves off gets no channel. With a
+            // server, EVERY element gets a channel (at its computed threshold, possibly
+            // off) so a live SetLogLevel can turn it on.
+            if elem_rank == 0 && !server_active {
                 logs.push(None);
+                #[cfg(feature = "introspect")]
+                filters.push(Arc::clone(&shared));
                 continue;
             }
             let elem_filter = if tr > global_rank {
@@ -1134,15 +1217,30 @@ impl Pipeline {
             } else {
                 Arc::clone(&shared)
             };
-            let (sink, drain) = log_channel(self.log_queue_cap);
+            #[cfg(feature = "introspect")]
+            filters.push(Arc::clone(&elem_filter));
+            let (sink, drain) = log_channel(cap);
             let mut log = Log::new(sink, elem_filter);
             log.set_element(ElementId(i as u32), name);
             logs.push(Some(log));
             drains.push(drain);
         }
 
+        #[cfg(feature = "introspect")]
+        let drain = LogDrainThread::spawn(drains, log_taps);
+        #[cfg(not(feature = "introspect"))]
         let drain = LogDrainThread::spawn(drains);
-        (logs, Some(drain))
+
+        LoggingBuild {
+            logs,
+            drain: Some(drain),
+            #[cfg(feature = "introspect")]
+            filters,
+            #[cfg(feature = "introspect")]
+            global_filter: Some(shared),
+            #[cfg(feature = "introspect")]
+            channels_wired: true,
+        }
     }
 
     /// The report from the most recent [`run`](Self::run).
@@ -1360,6 +1458,52 @@ impl Pipeline {
         todo!("spec: Latency")
     }
 
+    /// Serve the introspection protocol on a Unix socket at `path` (spec: Introspection
+    /// protocol and scraft-scope). Costs nothing until a client connects. Call after the
+    /// topology is built (same convention as [`tap_handle`](Self::tap_handle)); a second
+    /// call replaces the server. `run()` republishes the topology + handles after
+    /// preroll so dynamic pads and the live log filters become visible.
+    #[cfg(feature = "introspect")]
+    pub fn serve_introspection(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), Error> {
+        let shared = self.build_introspect_shared();
+        let server = crate::introspect::IntrospectServer::spawn(path, shared)
+            .map_err(|e| Error::Resource(format!("serve_introspection: {e}")))?;
+        self.introspect = Some(server); // replaces (and drops) any prior server
+        Ok(())
+    }
+
+    /// Stop the introspection server, if any (spec). Idempotent; dropping the server
+    /// signals stop, joins its threads, and unlinks the socket.
+    #[cfg(feature = "introspect")]
+    pub fn stop_introspection(&mut self) {
+        self.introspect = None;
+    }
+
+    /// Build the shared server state from the current topology + handles. The log
+    /// filters are empty here (logging is wired at `run()`); `run()` republishes the
+    /// handles with the real filters and the topology with dynamic pads.
+    #[cfg(feature = "introspect")]
+    fn build_introspect_shared(&self) -> Arc<crate::introspect::IntrospectShared> {
+        use crate::introspect::server::{Handles, IntrospectShared};
+        let snap = self.introspect_snapshot();
+        let handles = Handles {
+            tap: self.tap_handle(),
+            props: self.prop_handle(),
+            pause: self.pause_handle(),
+            tracing: Arc::clone(&self.tracing),
+            filters: Vec::new(),
+            global_filter: None,
+            log_channels: false,
+        };
+        Arc::new(IntrospectShared {
+            stop: AtomicBool::new(false),
+            topology: Mutex::new(Arc::new(snap)),
+            handles: Mutex::new(handles),
+            log_taps: Arc::new(crate::introspect::tap::LogTapRegistry::new()),
+            bus_port: self.bus.tap_port(),
+        })
+    }
+
     // --- Observability ---
 
     pub fn bus(&self) -> &Bus {
@@ -1472,12 +1616,254 @@ impl Pipeline {
             .map(|c| c.snapshot())
             .unwrap_or_default()
     }
+
+    /// Build an owned, interner-free topology image for the introspection server (spec:
+    /// server architecture — every interned id resolved to an owned string here, on the
+    /// app thread, so the server never touches the pipeline's live interners). Reuses
+    /// `topo_order`/`compute_groups`/`latency_report`/`dump_dot`. Callable before or
+    /// after `run()`; the caller republishes it after preroll so dynamic pads are shown.
+    #[cfg(feature = "introspect")]
+    pub(crate) fn introspect_snapshot(&self) -> crate::introspect::snapshot::TopologySnapshot {
+        use crate::introspect::snapshot::{
+            SnapEdge, SnapElement, SnapField, SnapLatencyPath, SnapPad, SnapProp, SnapValue,
+            TopologySnapshot,
+        };
+
+        let n = self.elements.len();
+
+        // Group assignment: reuse the scheduler's own grouping. If grouping fails (an
+        // ill-formed graph before a run would fail loudly anyway), fall back to group 0.
+        let mut group_of = vec![0u32; n];
+        if let Ok(order) = self.topo_order() {
+            if let Ok(groups) = self.compute_groups(&order) {
+                for (gi, ids) in groups.iter().enumerate() {
+                    for id in ids {
+                        group_of[id.0 as usize] = gi as u32;
+                    }
+                }
+            }
+        }
+
+        // Source = no incoming edge; sink = no outgoing edge; plus the linked-pad map.
+        let mut has_in = vec![false; n];
+        let mut has_out = vec![false; n];
+        for e in &self.edges {
+            has_out[e.src.0 as usize] = true;
+            has_in[e.sink.0 as usize] = true;
+        }
+        // Linked pads, per (element, local pad index).
+        let mut linked: Vec<Vec<bool>> = (0..n)
+            .map(|i| {
+                let static_n = self.elements[i].as_ref().map_or(0, |e| e.desc().pads.len());
+                let dyn_n = self.dyn_pads[i].iter().map(|p| p.index + 1).max().unwrap_or(0);
+                vec![false; static_n.max(dyn_n)]
+            })
+            .collect();
+        for e in &self.edges {
+            if let Some(v) = linked.get_mut(e.src.0 as usize) {
+                if e.src_pad < v.len() {
+                    v[e.src_pad] = true;
+                }
+            }
+            if let Some(v) = linked.get_mut(e.sink.0 as usize) {
+                if e.sink_pad < v.len() {
+                    v[e.sink_pad] = true;
+                }
+            }
+        }
+
+        let dir_ordinal = |d: Direction| -> u8 {
+            match d {
+                Direction::Sink => 0,
+                Direction::Src => 1,
+            }
+        };
+
+        let mut elements = Vec::with_capacity(n);
+        for i in 0..n {
+            let desc = self.descs[i];
+            let mut pads: Vec<SnapPad> = Vec::new();
+            for (pi, pd) in desc.pads.iter().enumerate() {
+                pads.push(SnapPad {
+                    pad: pi as u32,
+                    name: pd.name.to_string(),
+                    direction: dir_ordinal(pd.direction),
+                    dynamic: pd.dynamic,
+                    linked: linked[i].get(pi).copied().unwrap_or(false),
+                });
+            }
+            for dp in &self.dyn_pads[i] {
+                pads.push(SnapPad {
+                    pad: dp.index as u32,
+                    name: dp.name.clone(),
+                    direction: dir_ordinal(dp.direction),
+                    dynamic: true,
+                    linked: linked[i].get(dp.index).copied().unwrap_or(false),
+                });
+            }
+            let lat = &desc.latency;
+            elements.push(SnapElement {
+                id: i as u32,
+                name: desc.name.to_string(),
+                group: group_of[i],
+                sched: match desc.sched {
+                    SchedHint::Passive => 0,
+                    SchedHint::Active => 1,
+                },
+                is_source: !has_in[i],
+                is_sink: !has_out[i],
+                is_live: lat.is_live,
+                latency_min_ns: lat.min.0,
+                latency_max_ns: lat.max.0,
+                jitter_ns: lat.jitter.0,
+                pads,
+            });
+        }
+
+        // Edges: resolve the fixed format's family + field names, flatten values.
+        let value_to_snap = |v: Value| -> SnapValue {
+            match v {
+                Value::Int(i) => SnapValue {
+                    tag: 1, // TAG_INT (see wire::WireValue tags)
+                    bits: i as u64,
+                    id_name: String::new(),
+                },
+                Value::Rat(num, den) => SnapValue {
+                    tag: 2, // TAG_RAT
+                    bits: ((num as u32 as u64) << 32) | (den as u32 as u64),
+                    id_name: String::new(),
+                },
+                Value::Id(ValueId(id)) => SnapValue {
+                    tag: 3, // TAG_ID
+                    bits: id as u64, // the pipeline ValueId, for SetProp mapping
+                    id_name: self.values.resolve(id).unwrap_or("").to_string(),
+                },
+            }
+        };
+
+        let mut edges = Vec::with_capacity(self.edges.len());
+        for e in &self.edges {
+            let family_name = self.formats.resolve(e.format.family.0).unwrap_or("?").to_string();
+            let mut fields = Vec::with_capacity(e.format.fields().len());
+            for (fid, v) in e.format.fields() {
+                let sv = value_to_snap(*v);
+                fields.push(SnapField {
+                    field_name: self.fields.resolve(fid.0).unwrap_or("?").to_string(),
+                    tag: sv.tag,
+                    bits: sv.bits,
+                    id_name: sv.id_name,
+                });
+            }
+            edges.push(SnapEdge {
+                src: e.src.0,
+                src_pad: e.src_pad as u32,
+                sink: e.sink.0,
+                sink_pad: e.sink_pad as u32,
+                family_name,
+                fields,
+            });
+        }
+
+        // Props: descriptor + current value, constraint flattened.
+        let mut props = Vec::new();
+        for i in 0..n {
+            let desc = self.descs[i];
+            for (pi, pd) in desc.props.iter().enumerate() {
+                let (ckind, allowed) = constraint_to_snap(&pd.allowed, |id| {
+                    self.values.resolve(id).unwrap_or("").to_string()
+                });
+                let current = self.props[i].get(pi).map(value_to_snap);
+                props.push(SnapProp {
+                    element: i as u32,
+                    prop_index: pi as u16,
+                    name: pd.name.to_string(),
+                    live: pd.live,
+                    ckind,
+                    allowed,
+                    current,
+                });
+            }
+        }
+
+        // Latency report → flattened paths.
+        let report = self.latency_report();
+        let latency_paths = report
+            .paths
+            .iter()
+            .map(|p| SnapLatencyPath {
+                sink: p.sink.0,
+                is_live: p.is_live,
+                total_ns: p.total.0,
+                elems: p.per_element.iter().map(|(e, t)| (e.0, t.0)).collect(),
+            })
+            .collect();
+
+        TopologySnapshot {
+            pid: std::process::id(),
+            elements,
+            edges,
+            props,
+            dot: self.dump_dot(),
+            latency_paths,
+        }
+    }
 }
 
 impl Default for Pipeline {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Flatten a [`Constraint`](crate::format::Constraint) into `(ckind, values)` for the
+/// introspection Props reply (spec: PropRow — Any⇒0, Eq⇒1 value, Range⇒3 min/max/step,
+/// Set⇒len). `resolve` names a categorical value id. Kept out of `format.rs` (which is
+/// dep-free and feature-agnostic) so the wire shape lives with the protocol.
+#[cfg(feature = "introspect")]
+fn constraint_to_snap(
+    c: &crate::format::Constraint,
+    resolve: impl Fn(u32) -> String,
+) -> (u8, Vec<crate::introspect::snapshot::SnapValue>) {
+    use crate::format::{Constraint, Value};
+    use crate::introspect::snapshot::SnapValue;
+    let to_snap = |v: Value| -> SnapValue {
+        match v {
+            Value::Int(i) => SnapValue { tag: 1, bits: i as u64, id_name: String::new() },
+            Value::Rat(num, den) => SnapValue {
+                tag: 2,
+                bits: ((num as u32 as u64) << 32) | (den as u32 as u64),
+                id_name: String::new(),
+            },
+            Value::Id(ValueId(id)) => {
+                SnapValue { tag: 3, bits: id as u64, id_name: resolve(id) }
+            }
+        }
+    };
+    match c {
+        Constraint::Any => (0, Vec::new()),
+        Constraint::Eq(v) => (1, vec![to_snap(*v)]),
+        Constraint::Range { min, max, step } => {
+            (2, vec![to_snap(*min), to_snap(*max), to_snap(*step)])
+        }
+        Constraint::Set(vs) => (3, vs.iter().map(|v| to_snap(*v)).collect()),
+    }
+}
+
+/// What [`Pipeline::build_logging`] produces for a run: the per-element `Log`s, the
+/// drain thread, and (under the `introspect` feature) the live filters + wiring flag the
+/// introspection server needs to flip levels and report `Hello` flags bit1.
+struct LoggingBuild {
+    logs: Vec<Option<Log>>,
+    drain: Option<LogDrainThread>,
+    /// Per-element `Arc<LevelFilter>` (index = ElementId), for live `SetLogLevel`.
+    #[cfg(feature = "introspect")]
+    filters: Vec<Arc<LevelFilter>>,
+    /// The shared/global filter, if channels were wired.
+    #[cfg(feature = "introspect")]
+    global_filter: Option<Arc<LevelFilter>>,
+    /// Whether log channels were wired this run (Hello flags bit1).
+    #[cfg(feature = "introspect")]
+    channels_wired: bool,
 }
 
 /// The single low-priority drain thread for a run (spec: Debuggability — Logging: a
@@ -1491,6 +1877,19 @@ struct LogDrainThread {
 }
 
 impl LogDrainThread {
+    #[cfg(feature = "introspect")]
+    fn spawn(
+        drains: Vec<LogDrain>,
+        tap: Option<Arc<crate::introspect::tap::LogTapRegistry>>,
+    ) -> Self {
+        let handle = std::thread::Builder::new()
+            .name("sc-log-drain".into())
+            .spawn(move || Self::run(drains, tap))
+            .expect("spawn log drain");
+        Self { handle }
+    }
+
+    #[cfg(not(feature = "introspect"))]
     fn spawn(drains: Vec<LogDrain>) -> Self {
         let handle = std::thread::Builder::new()
             .name("sc-log-drain".into())
@@ -1499,7 +1898,10 @@ impl LogDrainThread {
         Self { handle }
     }
 
-    fn run(drains: Vec<LogDrain>) {
+    fn run(
+        drains: Vec<LogDrain>,
+        #[cfg(feature = "introspect")] tap: Option<Arc<crate::introspect::tap::LogTapRegistry>>,
+    ) {
         use std::io::Write;
         let styled = crate::log::stderr_colors_enabled();
         let stderr = std::io::stderr();
@@ -1515,6 +1917,12 @@ impl LogDrainThread {
                     let mut drained_this = false;
                     while let Some(rec) = d.try_next() {
                         let _ = crate::log::format_record_styled(&mut lock, &rec, styled);
+                        // Publish to subscribed introspection clients (spec: log tap).
+                        // Fast path is one relaxed nsubs load when nobody is subscribed.
+                        #[cfg(feature = "introspect")]
+                        if let Some(t) = &tap {
+                            t.publish(&rec);
+                        }
                         progressed = true;
                         drained_this = true;
                     }

@@ -38,6 +38,10 @@ pub mod event;
 pub mod format;
 pub mod harness;
 pub mod id;
+/// The introspection protocol + server (spec: Introspection protocol and scraft-scope).
+/// Feature-gated; zero cost — and zero code — when `introspect` is off.
+#[cfg(feature = "introspect")]
+pub mod introspect;
 pub mod io;
 pub mod log;
 pub mod memory;

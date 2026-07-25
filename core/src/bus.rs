@@ -99,6 +99,17 @@ struct Inner {
     /// Live [`BusSender`] count. `recv` returns `None` only once this hits zero *and*
     /// the queue has drained, mirroring `std::mpsc`'s disconnect semantics.
     senders: usize,
+    /// Introspection bus taps (spec: The two hot-path touches). Attached by a
+    /// [`BusTapPort`], read under this same lock so publishing a tap row is one memcpy
+    /// inside the already-held `send` lock. Empty (and untouched) with no client, so a
+    /// tapless run pays one `is_empty()` per posted message — and nothing when the
+    /// feature is off.
+    #[cfg(feature = "introspect")]
+    taps: Vec<crate::introspect::tap::BusTapSlot>,
+    /// A per-bus monotonic sequence stamped on each tap row under the lock, so a client
+    /// sees a total order of bus messages regardless of which tap ring it reads.
+    #[cfg(feature = "introspect")]
+    tap_seq: u64,
 }
 
 impl Inner {
@@ -185,6 +196,20 @@ impl BusSender {
     /// application has dropped the [`Bus`]. Wakes a blocked [`Bus::recv`].
     pub fn send(&self, msg: BusMessage) {
         let mut inner = self.shared.inner.lock().unwrap();
+        // Introspection bus tap (spec: The two hot-path touches). Inside the lock we
+        // already hold, and only when a client is attached: stamp a monotonic seq,
+        // build a POD row (zero alloc), and copy it into each attached slot. The tap
+        // copies, never steals — `inner.post(msg)` below still consumes the original,
+        // so the app's `try_recv` is unaffected.
+        #[cfg(feature = "introspect")]
+        if !inner.taps.is_empty() {
+            inner.tap_seq += 1;
+            let seq = inner.tap_seq;
+            let row = crate::introspect::tap::BusTapRow::from_msg(&msg, seq);
+            for slot in inner.taps.iter_mut() {
+                slot.publish(row);
+            }
+        }
         let dropped = inner.post(msg);
         drop(inner);
         if dropped > 0 {
@@ -229,6 +254,10 @@ impl Bus {
                 queue: VecDeque::new(),
                 capacity: capacity.max(1),
                 senders: 1,
+                #[cfg(feature = "introspect")]
+                taps: Vec::new(),
+                #[cfg(feature = "introspect")]
+                tap_seq: 0,
             }),
             ready: Condvar::new(),
         });
@@ -267,6 +296,63 @@ impl Bus {
     /// here — they are never dropped.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// A port for the introspection server to attach/detach bus taps (spec: The two
+    /// hot-path touches). Sharing the bus `Shared` means attach/detach/take_dropped are
+    /// brief locks of the same mutex `send` uses — no second lock on the hot path.
+    #[cfg(feature = "introspect")]
+    pub(crate) fn tap_port(&self) -> BusTapPort {
+        BusTapPort { shared: Arc::clone(&self.shared) }
+    }
+}
+
+/// A handle for the introspection server to add/remove bus taps on a live bus (spec:
+/// The two hot-path touches — "Bus gains tap_port"). Each op briefly locks the same
+/// `Inner` mutex `send` holds, so a tap only ever perturbs a message post by the
+/// bounded time to memcpy rows into rings.
+#[cfg(feature = "introspect")]
+pub(crate) struct BusTapPort {
+    shared: Arc<Shared>,
+}
+
+#[cfg(feature = "introspect")]
+impl BusTapPort {
+    /// Attach a producer ring; returns its [`TapId`](crate::introspect::tap::TapId) for
+    /// later detach. Ids are dense per port from 0.
+    pub(crate) fn attach(
+        &self,
+        tx: crate::ring::Producer<crate::introspect::tap::BusTapRow>,
+    ) -> crate::introspect::tap::TapId {
+        use crate::introspect::tap::{BusTapSlot, TapId};
+        let mut inner = self.shared.inner.lock().unwrap();
+        // Dense id from the current max + 1 (taps are 1-2, so a linear scan is fine).
+        let id = TapId(inner.taps.iter().map(|s| s.id.0 + 1).max().unwrap_or(0));
+        inner.taps.push(BusTapSlot { id, tx, dropped: 0 });
+        id
+    }
+
+    /// Detach a tap, returning its final drop count.
+    pub(crate) fn detach(&self, id: crate::introspect::tap::TapId) -> u64 {
+        let mut inner = self.shared.inner.lock().unwrap();
+        if let Some(pos) = inner.taps.iter().position(|s| s.id == id) {
+            let dropped = inner.taps[pos].dropped;
+            inner.taps.remove(pos);
+            dropped
+        } else {
+            0
+        }
+    }
+
+    /// The current drop count for a tap (for a `Dropped` push when it advances).
+    pub(crate) fn take_dropped(&self, id: crate::introspect::tap::TapId) -> u64 {
+        let inner = self.shared.inner.lock().unwrap();
+        inner
+            .taps
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.dropped)
+            .unwrap_or(0)
     }
 }
 
