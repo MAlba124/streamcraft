@@ -445,6 +445,50 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > them; flush/seek was validated on the flac path). That is its own milestone —
 > next session candidate.
 
+> **Update — session 4q (2026-07-25): time-based seeking end-to-end.** mkv Cues
+> parsing → `SeekIndex` (1078 cue points on the movie), protocol `Seek` (SCIP
+> v1.2, scrub-bar click in scope), out-of-band seek generation + signed base
+> rebase (`core/src/time.rs` helpers, `PauseShared::rebase_to` anchored to
+> `clock.now()`). Hard-won: **always seek to the RESOLVED cue time** (rebasing to
+> the requested time while content resumes at the preceding cluster = permanent
+> lateness = QoS drops everything → frozen video); seek-while-paused flushes
+> immediately, prerolls one frame, stays paused (`ParkWake` gate: wake-on-seek +
+> 100 ms Tick + burst re-prime while progressed); `ClockWait::wait_ticked` so
+> MockClock waits observe seeks. Also: HttpSrc ported to the Reactor, release
+> profile `debug="line-tables-only"` (heaptrack), nightly toolchain for codec
+> SIMD, GStreamer-style build-phase pipeline logging (`STREAMCRAFT_DEBUG=
+> pipeline:debug`), duration/progress end-to-end in scope.
+
+> **Update — session 4r (2026-07-25): colorimetry + owned GPU renderer + vaapi
+> decode live.** Three tracks. (1) **Colorimetry plumbing** (`3d3338b`):
+> `video/src/color.rs` vocab (matrix/range/transfer/primaries, H.273 §8.1–8.3
+> mappings, height≥720 defaults), mkv `Colour` parse/announce/write-back
+> (RFC 9559 §5.1.4.1.31; reader defaults 2/0/2/2 — 0 is *valid* matrix
+> identity, never an absent sentinel), passthrough on all five decoders.
+> **Interning lesson #2**: an `Any` field declaration interns the field name but
+> not its categorical *values* — `build_fixed` dropped the demux announcement
+> whole (broke vp8 remux); muxer offers now declare the value names via `Set`
+> (the `MUX_SAMPLE_VALUES` precedent), and an unresolvable announcement is a loud
+> bus Warning in the scheduler instead of a silent drop. (2) **Owned GPU render
+> pipeline** (agent, `82569ef`, merged `39e5272`): SDL3 GPU API (Vulkan) +
+> our SPIR-V shaders (offline glslang bake), color science in Rust as uniforms
+> (BT.601/709/2020 matrices, BT.1886/sRGB/PQ/HLG EOTFs, 203-nit BT.2408
+> normalize + Reinhard tone-map slot v1 — BT.2390 EETF is the named follow-up),
+> classic-renderer fallback + `SC_RENDER` override, 16 tests incl. two real
+> on-device YCbCr goldens. (3) **sc-vaapi** (agent `81024f8` + fix round
+> `72b071c`): hand-rolled libva FFI (~26 fns, size-asserted structs),
+> capability-gated registration, working `vaapih264dec` (DPB/POC/ref-lists,
+> NV12 readback). Post-merge fixes that made it actually play: DRM node opened
+> read-*write* (read-only fd answers every query then fails the first GEM
+> allocation at vaCreateContext), surfaces/context at *coded* MB-aligned size,
+> one surface-ownership rule (`release_if_unreferenced` — IDR reset was
+> aliasing queued surfaces, MMCO unmark ops leaked them, flush leaked the
+> queue), and surface exhaustion as *backpressure* not AU drops. play_file
+> prefers hw decode (probe-gated, link-through fallback): movie holds 25 fps
+> hw-decoded, zero drops. **Encode**: probe reports per-profile
+> EncSlice/EncSliceLP (this box: h264+h265), `Config::new_encode` + hw tests
+> prove an encode context allocates — `vaapih264enc` element is the follow-up.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
