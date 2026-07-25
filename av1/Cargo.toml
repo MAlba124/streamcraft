@@ -19,7 +19,7 @@ streamcraft-core = { path = "../core" }
 # nothing, so the transitive deps still ride along (already in our lockfile). See
 # lib.rs for the adoption rationale, the enforced output subset, and the debt list.
 oxideav-av1 = { version = "0.1", default-features = false }
+streamcraft-video = { path = "../video" }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
-streamcraft-video = { path = "../video" }

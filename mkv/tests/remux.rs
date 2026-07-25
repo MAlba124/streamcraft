@@ -268,6 +268,38 @@ fn vp8_remux_preserves_dims_and_keyframes() {
     }
 }
 
+/// Colorimetry survives the round-trip: a source `Video\Colour` element (H.273 code
+/// points, RFC 9559 §5.1.4.1.31) is announced by the demuxer as categorical names and
+/// written back by the caps-driven muxer — the full dynamic-caps path, including value
+/// interning via the muxer's `Set` field constraints.
+#[test]
+fn vp8_remux_preserves_colour() {
+    let mut tc = TrackConfig::vp8(1, 1920, 1080);
+    // BT.2020 PQ limited — every child off its default, exercising all four maps.
+    tc.video.as_mut().unwrap().colour =
+        Some(sc_mkv::ColourConfig { matrix: 9, range: 1, transfer: 16, primaries: 9 });
+    let mut w = MatroskaWriter::new(vec![tc]);
+    let mut src = Vec::new();
+    w.write_header(&mut src).unwrap();
+    for i in 0..4u8 {
+        w.write_frame(&mut src, 1, i as u64 * 20_000_000, &[i; 32], i == 0).unwrap();
+    }
+    w.finalize(&mut src);
+
+    let out = remux(src, 700).expect("remux runs");
+    let (tracks, got) = read_all(&out);
+
+    assert_eq!(tracks.len(), 1);
+    let t = &tracks[0];
+    assert_eq!(t.codec_id, "V_VP8");
+    assert_eq!(
+        (t.colour_matrix, t.colour_range, t.colour_transfer, t.colour_primaries),
+        (9, 1, 16, 9),
+        "Colour code points preserved through announce names → mux write-back"
+    );
+    assert_eq!(got.len(), 4);
+}
+
 /// A family the muxer cannot write conformantly yet (`av1` — needs an av1C
 /// CodecPrivate) fails the run loudly at the announcement instead of producing a
 /// silently non-conformant file.

@@ -86,6 +86,7 @@
 #![deny(unsafe_code)]
 
 pub mod codec;
+mod color_map;
 pub mod ebml;
 pub mod element;
 pub mod mux_multi;
@@ -97,8 +98,8 @@ pub use element::{MkvDemux, MkvMux};
 pub use mux_multi::MkvMuxN;
 pub use reader::{parse_cues, parse_seek_head, Frame, MatroskaReader, SeekHeadInfo, Track};
 pub use writer::{
-    AudioConfig, MatroskaWriter, MuxOut, MuxPiece, TrackConfig, VideoConfig, WriteError,
-    APP_NAME, DEFAULT_TIMESTAMP_SCALE,
+    AudioConfig, ColourConfig, MatroskaWriter, MuxOut, MuxPiece, TrackConfig, VideoConfig,
+    WriteError, APP_NAME, DEFAULT_TIMESTAMP_SCALE,
 };
 
 use streamcraft_core::element::Element;

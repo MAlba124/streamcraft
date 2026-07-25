@@ -10,6 +10,7 @@ repository.workspace = true
 name = "sc_h265"
 
 [dependencies]
+streamcraft-video = { path = "../video" }
 streamcraft-core = { path = "../core" }
 # A sanctioned plugin-crate dependency (like libpipewire for sc-pipewire): pure
 # Rust, no build.rs, no unsafe, MIT. Unlike sc-vp8 it is NOT zero-dep — at 0.0.9 it

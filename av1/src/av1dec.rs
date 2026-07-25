@@ -35,6 +35,7 @@ use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
 use streamcraft_core::id::PadId;
+use streamcraft_video::color;
 use streamcraft_core::time::Timestamp;
 
 // `video/raw` family/field/value names. Kept as literals (not a dep on
@@ -51,20 +52,38 @@ const PIXFMT_I420: &str = "i420";
 const PIXFMT_GRAY8: &str = "gray8";
 
 const SRC_PAD: PadId = PadId(1);
+/// The sink pad's local index (pads are `[sink, src]`).
+const SINK_PAD: PadId = PadId(0);
 
 static PIXFMT_VALUES: [ValueDesc; 2] = [ValueDesc::Id(PIXFMT_I420), ValueDesc::Id(PIXFMT_GRAY8)];
 
 // A broad `video/raw` template: any dimensions, i420 or gray8 (the 8-bit output
 // shapes we admit). The concrete width/height/pixfmt are announced at runtime from
 // the headers — the src pad is `dynamic` for exactly this reason.
-static SRC_FIELDS: [FieldDesc; 3] = [
+static SRC_FIELDS: [FieldDesc; 7] = [
     FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_PIXFMT, allowed: ConstraintDesc::Set(&PIXFMT_VALUES), preferred: None },
+    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via streamcraft-video's
+    // color vocab): announced only when the demuxer declared it upstream.
+    FieldDesc { field: color::FIELD_MATRIX, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: color::FIELD_RANGE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: color::FIELD_TRANSFER, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: color::FIELD_PRIMARIES, allowed: ConstraintDesc::Any, preferred: None },
 ];
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }];
 // One AV1 temporal unit per buffer, as a demuxer (mkv V_AV1, IVF) hands them out.
-static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("av1")];
+// The sink offer declares the colorimetry field names so the demuxer's Colour
+// announcement survives interning (announced field names resolve only against
+// declared offers — the duration-field lesson); `Any` admits every closed value.
+static SINK_COLOR_FIELDS: [FieldDesc; 4] = [
+    FieldDesc { field: color::FIELD_MATRIX, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: color::FIELD_RANGE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: color::FIELD_TRANSFER, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: color::FIELD_PRIMARIES, allowed: ConstraintDesc::Any, preferred: None },
+];
+static SINK_OFFERS: [OfferDesc; 1] =
+    [OfferDesc { family: "av1", fields: &SINK_COLOR_FIELDS }];
 
 static PADS: [PadDesc; 2] = [
     PadDesc {
@@ -260,15 +279,13 @@ impl Element for Av1Dec {
                     continue;
                 };
                 if !self.announced {
-                    ctx.announce_format(
-                        SRC_PAD,
-                        FAMILY,
-                        &[
+                    let mut fields = vec![
                             (F_WIDTH, ValueDesc::Int(frame.width as i64)),
                             (F_HEIGHT, ValueDesc::Int(frame.height as i64)),
                             (F_PIXFMT, ValueDesc::Id(pixfmt)),
-                        ],
-                    );
+                        ];
+                        color_passthrough(ctx, SINK_PAD, &mut fields);
+                        ctx.announce_format(SRC_PAD, FAMILY, &fields);
                     self.announced = true;
                 }
                 self.pending.push_back(PendingFrame {
@@ -302,4 +319,26 @@ impl Element for Av1Dec {
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {}
+}
+
+/// Colorimetry passthrough (spec: Formats — dynamic caps): forward the container's
+/// announced colour fields from the negotiated sink format onto `video/raw`, names
+/// re-anchored to `'static` through the closed color vocabulary (ITU-T H.273 via
+/// `streamcraft_video::color`). Absent/unknown fields stay unannounced — the
+/// renderer defaults by resolution.
+fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDesc)>) {
+    let Some(fmt) = ctx.negotiated(pad) else { return };
+    type Statify = fn(&str) -> Option<&'static str>;
+    let table: [(&'static str, Statify); 4] = [
+        (color::FIELD_MATRIX, |s| color::Matrix::from_caps_name(s).map(|v| v.caps_name())),
+        (color::FIELD_RANGE, |s| color::Range::from_caps_name(s).map(|v| v.caps_name())),
+        (color::FIELD_TRANSFER, |s| color::TransferFn::from_caps_name(s).map(|v| v.caps_name())),
+        (color::FIELD_PRIMARIES, |s| color::Primaries::from_caps_name(s).map(|v| v.caps_name())),
+    ];
+    for (field, statify) in table {
+        let Some(fid) = ctx.field_id(field) else { continue };
+        let Some(streamcraft_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
+        let Some(stat) = ctx.value_name(vid).and_then(statify) else { continue };
+        out.push((field, ValueDesc::Id(stat)));
+    }
 }

@@ -18,7 +18,7 @@ streamcraft-core = { path = "../core" }
 # oxideav-core (serde_json/thiserror/bytemuck) unconditionally; there is no feature to
 # turn it off, so `default-features = false` is a no-op kept for symmetry with sc-vp8.
 oxideav-vp9 = { version = "0.0.12", default-features = false }
+streamcraft-video = { path = "../video" }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
-streamcraft-video = { path = "../video" }

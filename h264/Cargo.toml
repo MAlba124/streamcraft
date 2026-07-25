@@ -23,7 +23,9 @@ oxideav-h264 = { version = "0.1", default-features = false, features = ["nightly
 # Consumed types (Packet / Frame / VideoFrame / Decoder trait / CodecId). Pinned
 # to the same 0.1.x line oxideav-h264 resolves so no duplicate copy is linked.
 oxideav-core = { version = "0.1", default-features = false }
+# The video/raw vocabulary (pixel formats + the H.273 color mapping used for the
+# colorimetry passthrough) — pure vocab, no heavier than core.
+streamcraft-video = { path = "../video" }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
-streamcraft-video = { path = "../video" }

@@ -101,13 +101,46 @@ static MUX_AUDIO_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: "channels", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "sample", allowed: ConstraintDesc::Set(&MUX_SAMPLE_VALUES), preferred: None },
 ];
-static MUX_VIDEO_FIELDS: [FieldDesc; 3] = [
+/// The colorimetry value names an upstream (demuxer) announcement may carry — `Set`,
+/// not `Any`, for the same reason as [`MUX_SAMPLE_VALUES`]: declaring the *values* is
+/// what interns them, and `build_fixed` drops an announcement whose names never
+/// interned. The names mirror `streamcraft-video`'s color vocabulary (pinned by that
+/// crate's tests); the muxer maps them back to H.273 code points in `color_map`.
+static MUX_MATRIX_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("bt601"),
+    ValueDesc::Id("bt2020"),
+    ValueDesc::Id("identity"),
+];
+static MUX_RANGE_VALUES: [ValueDesc; 2] = [ValueDesc::Id("limited"), ValueDesc::Id("full")];
+static MUX_TRANSFER_VALUES: [ValueDesc; 5] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("srgb"),
+    ValueDesc::Id("pq"),
+    ValueDesc::Id("hlg"),
+    ValueDesc::Id("linear"),
+];
+static MUX_PRIMARIES_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("bt601"),
+    ValueDesc::Id("bt2020"),
+    ValueDesc::Id("dci-p3"),
+];
+static MUX_VIDEO_FIELDS: [FieldDesc; 7] = [
     FieldDesc { field: "width", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "height", allowed: ConstraintDesc::Any, preferred: None },
     // Optional presentation duration (ns) — a remuxing demuxer knows it from the source's
     // tables and this muxer writes it as `Info\Duration`, so the output has a duration and
     // a seek bar instead of reading as a live stream.
     FieldDesc { field: "duration", allowed: ConstraintDesc::Any, preferred: None },
+    // Optional colorimetry names (H.273 via the pipeline color vocab) — written
+    // back as `Video\Colour` so a remux preserves color metadata. (Link-time
+    // fixation may pin a phantom value here; harmless — the muxer configures
+    // only from the runtime announcement, never the link format.)
+    FieldDesc { field: "matrix", allowed: ConstraintDesc::Set(&MUX_MATRIX_VALUES), preferred: None },
+    FieldDesc { field: "range", allowed: ConstraintDesc::Set(&MUX_RANGE_VALUES), preferred: None },
+    FieldDesc { field: "transfer", allowed: ConstraintDesc::Set(&MUX_TRANSFER_VALUES), preferred: None },
+    FieldDesc { field: "primaries", allowed: ConstraintDesc::Set(&MUX_PRIMARIES_VALUES), preferred: None },
 ];
 static MUX_SINK_OFFERS: [OfferDesc; 6] = [
     OfferDesc { family: "flac", fields: &MUX_AUDIO_FIELDS },
@@ -173,7 +206,14 @@ enum Setup {
     /// buffer** is the raw `avcC`/`hvcC` record (the demuxer emits it as one leading
     /// buffer — it is a few hundred octets, far below any pool slot), taken verbatim as
     /// `CodecPrivate` (RFC 9559 §12); every later buffer is one length-prefixed sample.
-    NalHead { codec_id: &'static str, width: u32, height: u32, duration_ns: Option<u64> },
+    NalHead {
+        codec_id: &'static str,
+        width: u32,
+        height: u32,
+        duration_ns: Option<u64>,
+        /// Announced colorimetry → written back as `Video\Colour` (H.273 points).
+        colour: Option<crate::writer::ColourConfig>,
+    },
 }
 
 /// Muxes a single track into Matroska: one encoded frame **per input buffer** on the sink
@@ -511,7 +551,7 @@ impl Element for MkvMux {
                             }
                         }
                     }
-                    Setup::NalHead { codec_id, width, height, duration_ns } => {
+                    Setup::NalHead { codec_id, width, height, duration_ns, colour } => {
                         // First buffer = the raw config record, verbatim (RFC 9559 §12:
                         // CodecPrivate *is* the AVC/HEVCDecoderConfigurationRecord).
                         // configurationVersion is 1 for both records — a cheap guard
@@ -523,8 +563,13 @@ impl Element for MkvMux {
                                  (configurationVersion != 1)",
                             ));
                         }
-                        let (codec_id, w, h, dur) = (*codec_id, *width, *height, *duration_ns);
-                        self.configure(TrackConfig::video(TRACK, codec_id, head, w, h), dur);
+                        let (codec_id, w, h, dur, col) =
+                            (*codec_id, *width, *height, *duration_ns, *colour);
+                        let mut tc = TrackConfig::video(TRACK, codec_id, head, w, h);
+                        if let Some(v) = tc.video.as_mut() {
+                            v.colour = col;
+                        }
+                        self.configure(tc, dur);
                         continue; // the record is CodecPrivate, never a block
                     }
                     Setup::AwaitCaps => {
@@ -611,6 +656,8 @@ impl Element for MkvMux {
                             Value::Int(n) if n > 0 => Some(n as u64),
                             _ => None,
                         });
+                    // Optional colorimetry → written back as `Video\Colour`.
+                    let colour = crate::color_map::colour_from_format(ctx, f);
                     match family.as_str() {
                         // The CodecPrivate is the in-band native head; absorb it first.
                         "flac" => self.setup = Setup::FlacHead(Vec::new()),
@@ -621,10 +668,11 @@ impl Element for MkvMux {
                                 ));
                             };
                             let id = if family == "vp8" { "V_VP8" } else { "V_VP9" };
-                            self.configure(
-                                TrackConfig::video(TRACK, id, Vec::new(), w, h),
-                                duration_ns,
-                            );
+                            let mut tc = TrackConfig::video(TRACK, id, Vec::new(), w, h);
+                            if let Some(v) = tc.video.as_mut() {
+                                v.colour = colour;
+                            }
+                            self.configure(tc, duration_ns);
                         }
                         // Passthrough NAL remux: the CodecPrivate arrives as the first
                         // buffer (the raw record); defer writer creation until then.
@@ -644,6 +692,7 @@ impl Element for MkvMux {
                                 width: w,
                                 height: h,
                                 duration_ns,
+                                colour,
                             };
                         }
                         // Families we cannot mux *conformantly* yet — loud, with the reason
@@ -1099,14 +1148,28 @@ impl MkvDemux {
                 ],
             );
         } else if is_video_family(family) && track.pixel_width != 0 && track.pixel_height != 0 {
-            ctx.announce_format(
-                pad,
-                family,
-                &[
-                    ("width", ValueDesc::Int(track.pixel_width as i64)),
-                    ("height", ValueDesc::Int(track.pixel_height as i64)),
-                ],
-            );
+            // Colorimetry from the Colour element (RFC 9559 §5.1.4.1.31; values are
+            // H.273 code points), mapped to the pipeline's categorical names. Only
+            // announced when declared — absent fields stay unspecified and the
+            // renderer defaults by resolution.
+            let mut fields: Vec<(&str, ValueDesc)> = vec![
+                ("width", ValueDesc::Int(track.pixel_width as i64)),
+                ("height", ValueDesc::Int(track.pixel_height as i64)),
+            ];
+            use crate::color_map::*;
+            if let Some(m) = h273_matrix_name(track.colour_matrix) {
+                fields.push(("matrix", ValueDesc::Id(m)));
+            }
+            if let Some(r) = mkv_range_name(track.colour_range) {
+                fields.push(("range", ValueDesc::Id(r)));
+            }
+            if let Some(t) = h273_transfer_name(track.colour_transfer) {
+                fields.push(("transfer", ValueDesc::Id(t)));
+            }
+            if let Some(p) = h273_primaries_name(track.colour_primaries) {
+                fields.push(("primaries", ValueDesc::Id(p)));
+            }
+            ctx.announce_format(pad, family, &fields);
         } else {
             ctx.announce_format(pad, family, &[]);
         }
@@ -1118,6 +1181,7 @@ impl MkvDemux {
 fn is_video_family(family: &str) -> bool {
     matches!(family, "vp8" | "vp9" | "av1" | "h264/annexb" | "h265/annexb")
 }
+
 
 /// Map a bit depth to the `sample` categorical name `flacdec` uses (spec: dynamic caps). An
 /// unusual/zero depth falls back to `s16` — the most common audio depth — so the announcement
@@ -1276,3 +1340,4 @@ impl Element for MkvDemux {
         self.posted_duration = false;
     }
 }
+

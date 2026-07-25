@@ -59,6 +59,16 @@ pub struct Track {
     pub pixel_width: u32,
     /// `Video\PixelHeight` in pixels (RFC 9559 §5.1.4.1.28.7), or `0` if absent.
     pub pixel_height: u32,
+    /// `Colour\MatrixCoefficients` — an H.273 §8.3 code point. Initialized to the
+    /// RFC 9559 default `2` ("unspecified") when the Colour element is absent — `0`
+    /// cannot be the absent sentinel, it is a *valid* code point (identity/RGB).
+    pub colour_matrix: u8,
+    /// `Colour\Range` (RFC 9559: 1 limited, 2 full); default `0` = unspecified.
+    pub colour_range: u8,
+    /// `Colour\TransferCharacteristics` — H.273 §8.2 code point; default `2` = unspecified.
+    pub colour_transfer: u8,
+    /// `Colour\Primaries` — H.273 §8.1 code point; default `2` = unspecified.
+    pub colour_primaries: u8,
 }
 
 /// One decoded frame ready to route to a track's src pad (spec `§simpleblock`, RFC 9559
@@ -469,6 +479,12 @@ fn parse_track_entry(data: &[u8]) -> Result<Track, ReadError> {
         bit_depth: 0,
         pixel_width: 0,
         pixel_height: 0,
+        // The RFC 9559 defaults: 2 = H.273 "unspecified" (0 is a *valid* matrix
+        // code point — identity), 0 = unspecified range.
+        colour_matrix: 2,
+        colour_range: 0,
+        colour_transfer: 2,
+        colour_primaries: 2,
     };
     let mut at = 0;
     while at < data.len() {
@@ -538,6 +554,34 @@ fn parse_video(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
             track.pixel_width = read_uint(body) as u32;
         } else if h.id == id::PIXEL_HEIGHT {
             track.pixel_height = read_uint(body) as u32;
+        } else if h.id == id::COLOUR {
+            parse_colour(body, track)?;
+        }
+        at = end;
+    }
+    Ok(())
+}
+
+/// Parse the nested `Colour` master (RFC 9559 §5.1.4.1.31) — the values are
+/// ITU-T H.273 code points, stored raw here; the demuxer maps them to the
+/// pipeline's categorical colorimetry names when announcing.
+fn parse_colour(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
+    let mut at = 0;
+    while at < data.len() {
+        let h = ebml::read_element_header(data, at)?;
+        let end = h.data_end()?.ok_or(ReadError::Malformed("unknown-size child in Colour"))?;
+        if end > data.len() {
+            return Err(ReadError::Malformed("Colour child runs past its master"));
+        }
+        let body = &data[h.data_start..end];
+        if h.id == id::MATRIX_COEFFICIENTS {
+            track.colour_matrix = read_uint(body) as u8;
+        } else if h.id == id::COLOUR_RANGE {
+            track.colour_range = read_uint(body) as u8;
+        } else if h.id == id::TRANSFER_CHARACTERISTICS {
+            track.colour_transfer = read_uint(body) as u8;
+        } else if h.id == id::PRIMARIES {
+            track.colour_primaries = read_uint(body) as u8;
         }
         at = end;
     }

@@ -751,6 +751,7 @@ dependencies = [
  "oxideav-h265",
  "streamcraft-core",
  "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]

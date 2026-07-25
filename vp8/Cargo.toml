@@ -18,7 +18,7 @@ streamcraft-core = { path = "../core" }
 # `simd`: std::simd (portable_simd, nightly) paths in the transforms + loop
 # filter — the workspace toolchain is nightly for exactly this.
 oxideav-vp8 = { version = "0.2", default-features = false, features = ["simd"] }
+streamcraft-video = { path = "../video" }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
-streamcraft-video = { path = "../video" }

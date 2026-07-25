@@ -129,10 +129,41 @@ static MUXN_AAC_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: "channels", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "duration", allowed: ConstraintDesc::Any, preferred: None },
 ];
-static MUXN_VIDEO_FIELDS: [FieldDesc; 3] = [
+/// Colorimetry value names an announcement may carry — `Set` interns the *values*
+/// (same rationale as [`MUXN_SAMPLE_VALUES`]); names mirror `streamcraft-video`'s
+/// color vocabulary, mapped back to H.273 code points in `color_map`.
+static MUXN_MATRIX_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("bt601"),
+    ValueDesc::Id("bt2020"),
+    ValueDesc::Id("identity"),
+];
+static MUXN_RANGE_VALUES: [ValueDesc; 2] = [ValueDesc::Id("limited"), ValueDesc::Id("full")];
+static MUXN_TRANSFER_VALUES: [ValueDesc; 5] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("srgb"),
+    ValueDesc::Id("pq"),
+    ValueDesc::Id("hlg"),
+    ValueDesc::Id("linear"),
+];
+static MUXN_PRIMARIES_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("bt601"),
+    ValueDesc::Id("bt2020"),
+    ValueDesc::Id("dci-p3"),
+];
+static MUXN_VIDEO_FIELDS: [FieldDesc; 7] = [
     FieldDesc { field: "width", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "height", allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: "duration", allowed: ConstraintDesc::Any, preferred: None },
+    // Optional colorimetry names (H.273 via the pipeline color vocab) — written
+    // back as `Video\Colour` so a remux preserves color metadata. (Link-time
+    // fixation may pin a phantom value here; harmless — a lane configures only
+    // from the runtime announcement, never the link format.)
+    FieldDesc { field: "matrix", allowed: ConstraintDesc::Set(&MUXN_MATRIX_VALUES), preferred: None },
+    FieldDesc { field: "range", allowed: ConstraintDesc::Set(&MUXN_RANGE_VALUES), preferred: None },
+    FieldDesc { field: "transfer", allowed: ConstraintDesc::Set(&MUXN_TRANSFER_VALUES), preferred: None },
+    FieldDesc { field: "primaries", allowed: ConstraintDesc::Set(&MUXN_PRIMARIES_VALUES), preferred: None },
 ];
 static MUXN_SINK_OFFERS: [OfferDesc; 6] = [
     OfferDesc { family: "flac", fields: &MUXN_AUDIO_FIELDS },
@@ -222,6 +253,9 @@ struct Lane {
     /// frame's ns, advanced by `frame_dur_ns` per frame and kept ahead of real PTS.
     next_ts_ns: u64,
     frame_dur_ns: u64,
+    /// Announced colorimetry, attached to the writer track when the lane readies
+    /// (H.273 code points — written back as `Video\Colour`).
+    colour: Option<crate::writer::ColourConfig>,
 }
 
 impl Lane {
@@ -581,7 +615,11 @@ impl MkvMuxN {
                     ));
                 }
                 let (codec_id, w, h) = (*codec_id, *width, *height);
-                Self::lane_ready(lane, TrackConfig::video(track, codec_id, head, w, h));
+                let mut tc = TrackConfig::video(track, codec_id, head, w, h);
+                if let Some(v) = tc.video.as_mut() {
+                    v.colour = lane.colour;
+                }
+                Self::lane_ready(lane, tc);
                 Ok(())
             }
             LaneState::AacHead { rate, channels } => {
@@ -806,8 +844,11 @@ impl MkvMuxN {
             self.duration_ns = self.duration_ns.max(d);
         }
 
+        // Optional announced colorimetry → written back as `Video\Colour`.
+        let colour = crate::color_map::colour_from_format(ctx, &f);
         let track = self.lanes[idx].track;
         let lane = &mut self.lanes[idx];
+        lane.colour = colour.or(lane.colour);
         match family.as_str() {
             // The CodecPrivate is the in-band native head; absorb it first.
             "flac" => lane.state = LaneState::FlacHead(Vec::new()),
@@ -816,7 +857,11 @@ impl MkvMuxN {
                     return Err(Error::Todo("mkvmuxn: video announcement without width/height"));
                 };
                 let id = if family == "vp8" { "V_VP8" } else { "V_VP9" };
-                Self::lane_ready(lane, TrackConfig::video(track, id, Vec::new(), w, h));
+                let mut tc = TrackConfig::video(track, id, Vec::new(), w, h);
+                if let Some(v) = tc.video.as_mut() {
+                    v.colour = lane.colour;
+                }
+                Self::lane_ready(lane, tc);
             }
             // Passthrough NAL remux: the CodecPrivate arrives as the first buffer.
             "h264/avcc" | "h265/hvcc" => {
@@ -877,6 +922,7 @@ impl Element for MkvMuxN {
                     queue: VecDeque::new(),
                     next_ts_ns: 0,
                     frame_dur_ns: 0,
+                    colour: None,
                 });
             }
         }

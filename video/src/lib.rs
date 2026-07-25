@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+pub mod color;
 pub mod format;
 pub mod frame;
 pub mod geometry;

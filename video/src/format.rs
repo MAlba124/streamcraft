@@ -120,7 +120,28 @@ static PIXFMT_VALUES: [ValueDesc; 4] = [
     ValueDesc::Id("gray8"),
 ];
 
-static RAW_ANY_FIELDS: [FieldDesc; 4] = [
+static MATRIX_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("bt601"),
+    ValueDesc::Id("bt2020"),
+    ValueDesc::Id("identity"),
+];
+static RANGE_VALUES: [ValueDesc; 2] = [ValueDesc::Id("limited"), ValueDesc::Id("full")];
+static TRANSFER_VALUES: [ValueDesc; 5] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("srgb"),
+    ValueDesc::Id("pq"),
+    ValueDesc::Id("hlg"),
+    ValueDesc::Id("linear"),
+];
+static PRIMARIES_VALUES: [ValueDesc; 4] = [
+    ValueDesc::Id("bt709"),
+    ValueDesc::Id("bt601"),
+    ValueDesc::Id("bt2020"),
+    ValueDesc::Id("dci-p3"),
+];
+
+static RAW_ANY_FIELDS: [FieldDesc; 8] = [
     FieldDesc {
         field: FIELD_WIDTH,
         allowed: ConstraintDesc::Any,
@@ -139,6 +160,28 @@ static RAW_ANY_FIELDS: [FieldDesc; 4] = [
     FieldDesc {
         field: FIELD_FPS,
         allowed: ConstraintDesc::Any,
+        preferred: None,
+    },
+    // Optional colorimetry (spec: Formats; ITU-T H.273 via crate::color) — absent
+    // fields stay unspecified and the consumer defaults by resolution.
+    FieldDesc {
+        field: crate::color::FIELD_MATRIX,
+        allowed: ConstraintDesc::Set(&MATRIX_VALUES),
+        preferred: None,
+    },
+    FieldDesc {
+        field: crate::color::FIELD_RANGE,
+        allowed: ConstraintDesc::Set(&RANGE_VALUES),
+        preferred: None,
+    },
+    FieldDesc {
+        field: crate::color::FIELD_TRANSFER,
+        allowed: ConstraintDesc::Set(&TRANSFER_VALUES),
+        preferred: None,
+    },
+    FieldDesc {
+        field: crate::color::FIELD_PRIMARIES,
+        allowed: ConstraintDesc::Set(&PRIMARIES_VALUES),
         preferred: None,
     },
 ];

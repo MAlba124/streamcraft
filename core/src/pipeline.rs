@@ -2758,19 +2758,44 @@ fn run_group(
             for ann in ctxs[i].take_announcements() {
                 let fixed = match ann.payload {
                     crate::ctx::AnnouncePayload::Named { family, fields } => {
-                        vocabulary.build_fixed(family, &fields)
+                        match vocabulary.build_fixed(family, &fields) {
+                            Some(f) => f,
+                            None => {
+                                // A name (family, field, or categorical value) no pad's
+                                // offers interned resolves to nothing. Dropping the
+                                // announcement silently strands a caps-driven peer
+                                // waiting for its FormatChange — be loud (spec: Formats
+                                // — dynamic caps). Warning, not fatal: a caps-ignoring
+                                // byte peer never needed it.
+                                let element = ctxs[i].element();
+                                let names: Vec<&str> =
+                                    fields.iter().map(|(n, _)| *n).collect();
+                                ctxs[i].post(BusMessage::Warning {
+                                    element,
+                                    error: Error::Element {
+                                        element,
+                                        message: format!(
+                                            "format announcement '{family}' (fields \
+                                             {names:?}) uses a family/field/value name \
+                                             never interned by any pad's offers — \
+                                             dropped (declare the name on an offer; \
+                                             `Set` interns categorical values)"
+                                        ),
+                                    },
+                                });
+                                continue;
+                            }
+                        }
                     }
                     // Already resolved — the forwarding path (a queue re-emitting a
                     // FormatChange it received; spec: Formats — dynamic caps).
-                    crate::ctx::AnnouncePayload::Fixed(f) => Some(f),
+                    crate::ctx::AnnouncePayload::Fixed(f) => f,
                 };
-                if let Some(f) = fixed {
-                    // Ride the FormatChange on the announced src pad's batch, at the row
-                    // the announcement was made (correct when the element branches, and
-                    // when it announces mid-`process()` — the event splits the batch
-                    // exactly there; spec: Events ordered relative to buffers).
-                    ctxs[i].output_on(ann.pad).push_event_at(ann.at, Event::FormatChange(f));
-                }
+                // Ride the FormatChange on the announced src pad's batch, at the row
+                // the announcement was made (correct when the element branches, and
+                // when it announces mid-`process()` — the event splits the batch
+                // exactly there; spec: Events ordered relative to buffers).
+                ctxs[i].output_on(ann.pad).push_event_at(ann.at, Event::FormatChange(fixed));
             }
             let (nbuf, nbytes) = ctxs[i].total_output();
             // Only touch the counters when something was produced: an idle pass pays

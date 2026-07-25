@@ -75,6 +75,39 @@ pub struct VideoConfig {
     pub pixel_width: u32,
     /// `PixelHeight` (RFC 9559 §5.1.4.1.28.7) — encoded frame height in pixels. MUST be nonzero.
     pub pixel_height: u32,
+    /// Optional `Video\Colour` colorimetry (RFC 9559 §5.1.4.1.31) — preserved on
+    /// remux when the upstream announcement carried it.
+    pub colour: Option<ColourConfig>,
+}
+
+/// The `Colour` element's children as ITU-T H.273 code points (RFC 9559
+/// §5.1.4.1.31). A child equal to its RFC 9559 default — `2` ("unspecified")
+/// for the H.273 points, `0` for `Range` — is not written. `0` cannot mark an
+/// absent matrix: it is a *valid* code point (identity/RGB).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColourConfig {
+    /// H.273 §8.3 `MatrixCoefficients`.
+    pub matrix: u8,
+    /// mkv `Range` (1 limited, 2 full).
+    pub range: u8,
+    /// H.273 §8.2 `TransferCharacteristics`.
+    pub transfer: u8,
+    /// H.273 §8.1 `Primaries`.
+    pub primaries: u8,
+}
+
+impl Default for ColourConfig {
+    /// All children at their RFC 9559 defaults — an empty config, nothing written.
+    fn default() -> Self {
+        Self { matrix: 2, range: 0, transfer: 2, primaries: 2 }
+    }
+}
+
+impl ColourConfig {
+    /// Whether anything at all would be written.
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 /// One track to mux (spec `§ID-tree` TrackEntry). The writer holds a `Vec` of these. A track
@@ -135,7 +168,7 @@ impl TrackConfig {
             codec_id: codec_id.to_string(),
             codec_private,
             audio: AudioConfig { sampling_frequency: 0.0, channels: 0, bit_depth: 0 },
-            video: Some(VideoConfig { pixel_width, pixel_height }),
+            video: Some(VideoConfig { pixel_width, pixel_height, colour: None }),
         }
     }
 
@@ -468,6 +501,29 @@ impl MatroskaWriter {
         let video_start = out.len();
         ebml::write_uint(out, id::PIXEL_WIDTH, video.pixel_width as u64);
         ebml::write_uint(out, id::PIXEL_HEIGHT, video.pixel_height as u64);
+        // Optional Colour master (RFC 9559 §5.1.4.1.31): H.273 code points,
+        // written only for children off their RFC 9559 defaults — remux
+        // preserves color, an unspecified child stays implicit.
+        if let Some(c) = video.colour.filter(|c| !c.is_empty()) {
+            let dflt = ColourConfig::default();
+            ebml::write_id(out, id::COLOUR);
+            let colour_size_at = ebml::reserve_size(out);
+            let colour_start = out.len();
+            if c.matrix != dflt.matrix {
+                ebml::write_uint(out, id::MATRIX_COEFFICIENTS, c.matrix as u64);
+            }
+            if c.range != dflt.range {
+                ebml::write_uint(out, id::COLOUR_RANGE, c.range as u64);
+            }
+            if c.transfer != dflt.transfer {
+                ebml::write_uint(out, id::TRANSFER_CHARACTERISTICS, c.transfer as u64);
+            }
+            if c.primaries != dflt.primaries {
+                ebml::write_uint(out, id::PRIMARIES, c.primaries as u64);
+            }
+            let colour_len = (out.len() - colour_start) as u64;
+            ebml::patch_size(out, colour_size_at, colour_len);
+        }
         let video_len = (out.len() - video_start) as u64;
         ebml::patch_size(out, video_size_at, video_len);
     }

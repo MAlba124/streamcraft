@@ -55,6 +55,15 @@ pub const DURATION: &[u8] = &[0x44, 0x89];
     pub const PIXEL_WIDTH: &[u8] = &[0xB0];
     pub const PIXEL_HEIGHT: &[u8] = &[0xBA];
 
+    // Video\Colour (RFC 9559 §5.1.4.1.31): colorimetry metadata. The child values
+    // are ITU-T H.273 code points (MatrixCoefficients §8.3, TransferCharacteristics
+    // §8.2, Primaries §8.1); Range is mkv's own enum (1 limited, 2 full).
+    pub const COLOUR: &[u8] = &[0x55, 0xB0];
+    pub const MATRIX_COEFFICIENTS: &[u8] = &[0x55, 0xB1];
+    pub const COLOUR_RANGE: &[u8] = &[0x55, 0xB9];
+    pub const TRANSFER_CHARACTERISTICS: &[u8] = &[0x55, 0xBA];
+    pub const PRIMARIES: &[u8] = &[0x55, 0xBB];
+
     // Cluster.
     pub const CLUSTER: &[u8] = &[0x1F, 0x43, 0xB6, 0x75];
     pub const TIMESTAMP: &[u8] = &[0xE7];
