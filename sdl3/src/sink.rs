@@ -36,6 +36,8 @@ use streamcraft_core::log;
 use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
+use crate::gpu::renderer::PlaneFormat;
+use crate::gpu::{Colorimetry, GpuRenderer};
 use crate::video::VideoWindow;
 
 const SINK: PadId = PadId(0);
@@ -47,6 +49,13 @@ const F_WIDTH: &str = "width";
 const F_HEIGHT: &str = "height";
 const F_PIXFMT: &str = "pixfmt";
 const F_FPS: &str = "fps";
+// The pinned colorimetry contract (a parallel task adds the producer side — these
+// names are the exact fields the GPU color pipeline reads). All optional; the
+// defaults rule in `gpu::Colorimetry::resolve` applies when a field is absent.
+const F_MATRIX: &str = "matrix";
+const F_RANGE: &str = "range";
+const F_TRANSFER: &str = "transfer";
+const F_PRIMARIES: &str = "primaries";
 const PIXFMT_I420: &str = "i420";
 const PIXFMT_GRAY8: &str = "gray8";
 const PIXFMT_NV12: &str = "nv12";
@@ -56,11 +65,19 @@ const PIXFMT_NV12: &str = "nv12";
 // via the decoder's FormatChange, so the pad is `dynamic`.
 static PIXFMT_VALUES: [ValueDesc; 3] =
     [ValueDesc::Id(PIXFMT_I420), ValueDesc::Id(PIXFMT_GRAY8), ValueDesc::Id(PIXFMT_NV12)];
-static SINK_FIELDS: [FieldDesc; 4] = [
+// The colorimetry fields are declared with `ConstraintDesc::Any` so the sink accepts
+// whatever the producer announces (or none). Declaring them matters: an announced
+// field only survives interning when the consumer also declares it (hard-won repo
+// lesson), so absent these four the GPU pipeline could never read colorimetry.
+static SINK_FIELDS: [FieldDesc; 8] = [
     FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_PIXFMT, allowed: ConstraintDesc::Set(&PIXFMT_VALUES), preferred: None },
     FieldDesc { field: F_FPS, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_MATRIX, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_RANGE, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_TRANSFER, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_PRIMARIES, allowed: ConstraintDesc::Any, preferred: None },
 ];
 static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SINK_FIELDS }];
 static PADS: [PadDesc; 1] = [PadDesc {
@@ -117,6 +134,49 @@ struct FrameFormat {
     /// Nanoseconds per frame (from fps), used for the QoS "more than one frame late"
     /// test. `0` when fps is unknown — then QoS is disabled (never drop for lateness).
     frame_dur_ns: u64,
+    /// The resolved colorimetry (parsed from the negotiated matrix/range/transfer/
+    /// primaries fields with the H.273 defaults rule) — drives the GPU color pipeline.
+    colorimetry: Colorimetry,
+}
+
+impl Pix {
+    /// The GPU plane arrangement for this pixel format.
+    fn plane_format(self) -> PlaneFormat {
+        match self {
+            Pix::I420 => PlaneFormat::I420,
+            Pix::Nv12 => PlaneFormat::Nv12,
+            Pix::Gray8 => PlaneFormat::Gray8,
+        }
+    }
+}
+
+/// Which presentation backend the sink is using.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// The owned GPU render pipeline (custom SPIR-V color shaders).
+    Gpu,
+    /// The classic `SDL_Renderer` fixed-function YUV path.
+    Classic,
+}
+
+/// The `SC_RENDER` env override: `gpu` forces the GPU path (no fallback attempt is
+/// skipped, but classic is not tried first), `classic` forces the classic path, and
+/// anything else (or unset) is `auto` — try GPU, fall back to classic.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendPref {
+    Auto,
+    Gpu,
+    Classic,
+}
+
+impl BackendPref {
+    fn from_env() -> BackendPref {
+        match std::env::var("SC_RENDER").ok().as_deref() {
+            Some("gpu") => BackendPref::Gpu,
+            Some("classic") => BackendPref::Classic,
+            _ => BackendPref::Auto,
+        }
+    }
 }
 
 /// The SDL3 video sink. Construct with [`Sdl3VideoSink::new`] and set a window title
@@ -124,6 +184,11 @@ struct FrameFormat {
 pub struct Sdl3VideoSink {
     title: String,
     window: Option<VideoWindow>,
+    /// The owned GPU renderer, when the GPU backend is active (else the classic
+    /// `SDL_Renderer` path in `window` presents).
+    gpu: Option<GpuRenderer>,
+    /// Which backend is presenting (once a window is open).
+    backend: Backend,
     format: Option<FrameFormat>,
     /// Set once we could not open a window / hit a fatal render error, so we stop
     /// trying to present and accept frames as drops (never hang the pipeline).
@@ -142,6 +207,8 @@ impl Sdl3VideoSink {
         Self {
             title: "streamcraft".to_string(),
             window: None,
+            gpu: None,
+            backend: Backend::Classic,
             format: None,
             disabled: false,
             close_reported: false,
@@ -181,7 +248,24 @@ impl Sdl3VideoSink {
                 _ => None,
             })
             .unwrap_or(0);
-        Some(FrameFormat { width, height, pixfmt, frame_dur_ns })
+        // Colorimetry (all optional; the H.273 defaults rule fills the gaps). Each is
+        // a categorical `Value::Id` resolved back to its name.
+        let read_id = |field: &str| -> Option<&str> {
+            ctx.field_id(field)
+                .and_then(|id| f.get(id))
+                .and_then(|v| match v {
+                    Value::Id(vid) => ctx.value_name(vid),
+                    _ => None,
+                })
+        };
+        let colorimetry = Colorimetry::resolve(
+            height,
+            read_id(F_MATRIX),
+            read_id(F_RANGE),
+            read_id(F_TRANSFER),
+            read_id(F_PRIMARIES),
+        );
+        Some(FrameFormat { width, height, pixfmt, frame_dur_ns, colorimetry })
     }
 
     /// Configure the sink from a negotiated format: learn the geometry and, on first
@@ -202,21 +286,85 @@ impl Sdl3VideoSink {
         );
         self.format = Some(fmt);
 
+        // A live geometry / pixfmt change on an already-open window is fine: both
+        // backends recreate their plane textures on the next present when the format
+        // record differs. Only open a window / pick a backend on first use.
         if self.disabled || self.window.is_some() {
             return Ok(());
         }
-        match VideoWindow::open(&self.title, fmt.width as u32, fmt.height as u32) {
-            Ok(w) => {
-                log!(&*ctx, Level::Debug, "window_open");
-                self.window = Some(w);
+        self.open_backend(ctx, fmt);
+        Ok(())
+    }
+
+    /// Open a window and choose the presentation backend: `SC_RENDER=gpu|classic`
+    /// forces one; otherwise (auto) try the owned GPU pipeline and fall back to the
+    /// classic `SDL_Renderer` path on any GPU init failure. Failing to open any window
+    /// (headless / CI) disables the sink (frames drop) — never fails the pipeline.
+    fn open_backend(&mut self, ctx: &mut Ctx, fmt: FrameFormat) {
+        let pref = BackendPref::from_env();
+        let c = fmt.colorimetry;
+        let (w, h) = (fmt.width as u32, fmt.height as u32);
+
+        // Try GPU unless explicitly classic.
+        if pref != BackendPref::Classic {
+            match VideoWindow::open_windowed(&self.title, w, h) {
+                // SAFETY: `win` is a live window we just created on this thread with
+                // the video subsystem up, and it is stored in `self.window` (kept
+                // alive) alongside the returned renderer; the renderer unclaims it
+                // before the window is destroyed (see Drop ordering in on_close/stop).
+                #[allow(unsafe_code)]
+                Ok(win) => match unsafe { GpuRenderer::new(win.raw_window()) } {
+                    Ok(gpu) => {
+                        log!(
+                            &*ctx, Level::Info, "backend",
+                            render = "gpu", driver = gpu.driver(),
+                            matrix = c.matrix.name(), range = c.range.name(),
+                            transfer = c.transfer.name(), primaries = c.primaries.name(),
+                        );
+                        self.window = Some(win);
+                        self.gpu = Some(gpu);
+                        self.backend = Backend::Gpu;
+                        return;
+                    }
+                    Err(_e) => {
+                        // GPU init failed: drop this windowed window (no classic
+                        // renderer attached) and fall through to the classic path,
+                        // unless the user forced GPU.
+                        drop(win);
+                        if pref == BackendPref::Gpu {
+                            log!(&*ctx, Level::Debug, "gpu_forced_failed");
+                            self.disabled = true;
+                            return;
+                        }
+                        log!(&*ctx, Level::Debug, "gpu_fallback_classic");
+                    }
+                },
+                Err(_e) => {
+                    // No display at all: disable (headless degrade).
+                    log!(&*ctx, Level::Debug, "no_display_disabled");
+                    self.disabled = true;
+                    return;
+                }
+            }
+        }
+
+        // Classic path (forced, or GPU fell back).
+        match VideoWindow::open(&self.title, w, h) {
+            Ok(win) => {
+                log!(
+                    &*ctx, Level::Info, "backend",
+                    render = "classic",
+                    matrix = c.matrix.name(), range = c.range.name(),
+                    transfer = c.transfer.name(), primaries = c.primaries.name(),
+                );
+                self.window = Some(win);
+                self.backend = Backend::Classic;
             }
             Err(_e) => {
-                // No display (headless / CI): disable silently and drop frames.
                 log!(&*ctx, Level::Debug, "no_display_disabled");
                 self.disabled = true;
             }
         }
-        Ok(())
     }
 
     /// Present one frame's bytes on the clock, with QoS. Returns `Ok(())` always — a
@@ -262,10 +410,21 @@ impl Sdl3VideoSink {
             return Ok(());
         }
 
-        let shown = match fmt.pixfmt {
-            Pix::I420 => window.present_i420(data, fmt.width, fmt.height),
-            Pix::Gray8 => window.present_gray8(data, fmt.width, fmt.height),
-            Pix::Nv12 => window.present_nv12(data, fmt.width, fmt.height),
+        // Present via the active backend: the owned GPU pipeline (colorimetry-aware
+        // custom shaders) or the classic fixed-function SDL_Renderer path.
+        let shown = match (self.backend, self.gpu.as_mut()) {
+            (Backend::Gpu, Some(gpu)) => gpu.present(
+                data,
+                fmt.width,
+                fmt.height,
+                fmt.pixfmt.plane_format(),
+                fmt.colorimetry,
+            ),
+            _ => match fmt.pixfmt {
+                Pix::I420 => window.present_i420(data, fmt.width, fmt.height),
+                Pix::Gray8 => window.present_gray8(data, fmt.width, fmt.height),
+                Pix::Nv12 => window.present_nv12(data, fmt.width, fmt.height),
+            },
         };
         match shown {
             Ok(drawn) => {
@@ -293,6 +452,9 @@ impl Sdl3VideoSink {
             self.close_reported = true;
         }
         self.disabled = true;
+        // Drop the GPU renderer *before* the window: it unclaims the window from its
+        // device, and the window is destroyed on its own drop.
+        self.gpu = None;
         self.window = None;
     }
 }
@@ -368,7 +530,9 @@ impl Element for Sdl3VideoSink {
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {
-        // Tear the window down (Drop of VideoWindow closes SDL cleanly).
+        // Tear down GPU renderer first (it unclaims the window), then the window
+        // (Drop of VideoWindow closes SDL cleanly).
+        self.gpu = None;
         self.window = None;
     }
 }

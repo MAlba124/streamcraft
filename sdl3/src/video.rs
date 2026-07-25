@@ -42,8 +42,16 @@ pub struct Pump {
 }
 
 /// A window + renderer + (lazily sized) streaming IYUV texture.
+///
+/// Two shapes: the classic path holds an `SDL_Renderer` + streaming texture and
+/// converts YUV via SDL's fixed function; the GPU path holds only the window (the
+/// [`GpuRenderer`](crate::gpu::GpuRenderer) owns the device/swapchain claimed on this
+/// window). A window is created without a classic renderer when built for GPU, since
+/// a claimed GPU device and an `SDL_Renderer` on the same window conflict.
 pub struct VideoWindow {
     window: *mut SDL_Window,
+    /// The classic-path renderer, or null when the window was opened for the GPU
+    /// backend (the GPU device owns presentation then).
     renderer: *mut SDL_Renderer,
     texture: *mut SDL_Texture,
     tex_w: c_int,
@@ -62,9 +70,27 @@ pub struct VideoWindow {
 unsafe impl Send for VideoWindow {}
 
 impl VideoWindow {
-    /// Init SDL video and open a resizable window. Errors (no display, no driver)
-    /// are for the caller to degrade on — a headless box must not fail a pipeline.
+    /// Init SDL video and open a resizable window with a classic `SDL_Renderer`
+    /// (the fixed-function YUV presentation path). Errors (no display, no driver) are
+    /// for the caller to degrade on — a headless box must not fail a pipeline.
     pub fn open(title: &str, width: u32, height: u32) -> Result<Self, Error> {
+        let mut w = Self::open_windowed(title, width, height)?;
+        // SAFETY: `w.window` is a live window we own; creating its classic renderer.
+        unsafe {
+            let renderer = SDL_CreateRenderer(w.window, std::ptr::null());
+            if renderer.is_null() {
+                // Drop of `w` tears down the window + subsystem ref.
+                return Err(resource("create renderer"));
+            }
+            w.renderer = renderer;
+        }
+        Ok(w)
+    }
+
+    /// Init SDL video and open a resizable window with **no** classic renderer — for
+    /// the owned GPU backend, which claims the window with its own device. The caller
+    /// must attach a [`GpuRenderer`](crate::gpu::GpuRenderer) via [`raw_window`].
+    pub fn open_windowed(title: &str, width: u32, height: u32) -> Result<Self, Error> {
         let title = CString::new(title).unwrap_or_default();
         // SAFETY: plain C calls; SDL_InitSubSystem is refcounted per subsystem.
         unsafe {
@@ -81,16 +107,9 @@ impl VideoWindow {
                 SDL_QuitSubSystem(SDL_INIT_VIDEO);
                 return Err(resource("create window"));
             }
-            let renderer = SDL_CreateRenderer(window, std::ptr::null());
-            if renderer.is_null() {
-                let e = resource("create renderer");
-                SDL_DestroyWindow(window);
-                SDL_QuitSubSystem(SDL_INIT_VIDEO);
-                return Err(e);
-            }
             Ok(Self {
                 window,
-                renderer,
+                renderer: std::ptr::null_mut(),
                 texture: std::ptr::null_mut(),
                 tex_w: 0,
                 tex_h: 0,
@@ -98,6 +117,13 @@ impl VideoWindow {
                 flat_chroma: Vec::new(),
             })
         }
+    }
+
+    /// The raw `SDL_Window` — for the GPU backend to claim with its device. The
+    /// window outlives the [`GpuRenderer`](crate::gpu::GpuRenderer): the renderer
+    /// unclaims on drop, this window destroys on its own drop.
+    pub fn raw_window(&self) -> *mut SDL_Window {
+        self.window
     }
 
     /// (Re)create the streaming texture when the frame geometry or pixel format
@@ -265,12 +291,16 @@ impl VideoWindow {
 
 impl Drop for VideoWindow {
     fn drop(&mut self) {
-        // SAFETY: tearing down objects we own, then dropping our subsystem ref.
+        // SAFETY: tearing down objects we own, then dropping our subsystem ref. The
+        // classic renderer/texture are null for a GPU-backed window (the GpuRenderer,
+        // dropped before this, already unclaimed the window from its device).
         unsafe {
             if !self.texture.is_null() {
                 SDL_DestroyTexture(self.texture);
             }
-            SDL_DestroyRenderer(self.renderer);
+            if !self.renderer.is_null() {
+                SDL_DestroyRenderer(self.renderer);
+            }
             SDL_DestroyWindow(self.window);
             SDL_QuitSubSystem(SDL_INIT_VIDEO);
         }

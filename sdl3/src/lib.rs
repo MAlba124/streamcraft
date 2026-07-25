@@ -4,20 +4,26 @@
 //!
 //! This crate replaces the hand-written `sc-wayland` shm client *and* the
 //! clean-room `sc-vk` Vulkan renderer with one thin layer over SDL3: window,
-//! events, and a GPU-accelerated presentation path (streaming IYUV texture —
-//! YUV→RGB on the GPU, no CPU conversion pass). It is also where the scope UI's
-//! draw backend will live (immediate mode over `SDL_RenderGeometryRaw`,
-//! per-frame vertex arenas).
+//! events, and a GPU-accelerated presentation path. Two backends exist. The
+//! **owned GPU render pipeline** ([`gpu`]) uses custom SPIR-V shaders doing
+//! colorimetry-aware YCbCr→RGB (with a tone-map slot for HDR) on the SDL3 GPU API —
+//! all color science is ours, since `SDL_UpdateYUVTexture` lets SDL pick the matrix
+//! and cannot tone-map. The classic `SDL_Renderer` streaming-texture path
+//! ([`video`]) is the fixed-function fallback used when GPU device creation fails,
+//! and the backend the scope UI stays on. This crate is also where the scope UI's
+//! draw backend lives (immediate mode over `SDL_RenderGeometryRaw`, per-frame
+//! vertex arenas).
 //!
 //! The one sanctioned dependency is `sdl3-sys` — pure auto-generated bindings, no
 //! logic (the `ash`/`pipewire` pattern for plugin crates), linking the system
-//! libSDL3 via pkg-config. All `unsafe` is confined to [`video`], with a SAFETY
-//! note per block (workspace lint policy).
+//! libSDL3 via pkg-config. All `unsafe` is confined to [`video`] and [`gpu`], with a
+//! SAFETY note per block (workspace lint policy).
 //!
 //! Elements:
 //! - [`Sdl3VideoSink`] (`sdl3videosink`) — clock-paced windowed video sink with
 //!   QoS, dynamic-caps geometry, degrade-to-drops on headless boxes.
 
+pub mod gpu;
 pub mod sink;
 pub mod video;
 
