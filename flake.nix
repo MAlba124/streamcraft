@@ -38,6 +38,7 @@
             pkgs.mold
             pkgs.clang # libclang, for the pipewire crate's bindgen
             pkgs.libva-utils # vainfo, for VA-API driver debugging
+            pkgs.glslang # glslangValidator, for the offline SPIR-V shader bake
           ];
 
           # PipeWire (libpipewire-0.3 + libspa), SDL3, and libva (+ libva-drm),
