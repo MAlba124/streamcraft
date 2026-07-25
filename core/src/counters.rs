@@ -9,7 +9,7 @@
 //! the observer's policy: bitrate is `Δbytes / Δrunning_time` between two
 //! snapshots, throughput is `Δbuffers`, backpressure is the queue high-water.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::clock::Clock;
@@ -194,15 +194,16 @@ impl ElementCounters {
 pub struct TapHandle {
     entries: Arc<[(&'static str, Arc<ElementCounters>)]>,
     clock: Arc<dyn Clock>,
-    /// Raw ns of the current run's base time; `u64::MAX` until the first `run()`.
-    base: Arc<AtomicU64>,
+    /// Signed ns of the current run's base time; [`crate::time::BASE_UNSET`] until
+    /// the first `run()`. Signed: a seek rebase can push it negative.
+    base: Arc<AtomicI64>,
 }
 
 impl TapHandle {
     pub(crate) fn new(
         entries: Vec<(&'static str, Arc<ElementCounters>)>,
         clock: Arc<dyn Clock>,
-        base: Arc<AtomicU64>,
+        base: Arc<AtomicI64>,
     ) -> Self {
         Self { entries: entries.into(), clock, base }
     }
@@ -239,13 +240,15 @@ impl TapHandle {
     }
 
     /// Running time on the pipeline clock — the denominator for rate windows.
-    /// [`Timestamp::NONE`] before the first `run()` samples a base time.
+    /// [`Timestamp::NONE`] before the first `run()` samples a base time. Not
+    /// monotonic across seeks: a backward seek rebases it backward (observers
+    /// windowing rates should skip non-increasing samples).
     pub fn now(&self) -> Timestamp {
         let base = self.base.load(Ordering::Acquire);
-        if base == u64::MAX {
+        if base == crate::time::BASE_UNSET {
             return Timestamp::NONE;
         }
-        self.clock.now().saturating_sub(Timestamp(base))
+        crate::time::running_time(self.clock.now().0, base)
     }
 }
 
@@ -311,7 +314,7 @@ mod tests {
 
         let counters = Arc::new(ElementCounters::default());
         let clock = MockClock::new();
-        let base = Arc::new(AtomicU64::new(u64::MAX));
+        let base = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
         let tap = TapHandle::new(
             vec![("testsrc", Arc::clone(&counters))],
             Arc::new(clock.clone()),
@@ -323,7 +326,7 @@ mod tests {
         assert!(tap.snapshot(ElementId(1)).is_none(), "unknown element");
 
         // A "run" starts: base is sampled; the clock then advances 5 ms.
-        base.store(clock.now().0, Ordering::Release);
+        base.store(crate::time::base_from_clock(clock.now()), Ordering::Release);
         clock.advance(Timestamp::from_millis(5));
         counters.record_out(1, 1_000_000);
 

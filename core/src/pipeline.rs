@@ -9,7 +9,7 @@
 //! all-active chain (e.g. `filesrc ! filesink`) this yields one thread per element
 //! with a ring between them.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -108,9 +108,10 @@ pub(crate) struct PauseShared {
     hint: AtomicBool,
     inner: Mutex<PauseInner>,
     cond: Condvar,
-    /// Raw ns of the running-time base — the same cell `TapHandle` reads; resume
-    /// shifts it forward so paused time never counts as running time.
-    base: Arc<AtomicU64>,
+    /// Signed ns of the running-time base — the same cell `TapHandle` reads; resume
+    /// shifts it forward so paused time never counts as running time, and a seek
+    /// rebases it (possibly negative — see `time::running_time`).
+    base: Arc<AtomicI64>,
     /// The pipeline stop flag, so a pause-parked wait still honours shutdown.
     stop: Arc<AtomicBool>,
 }
@@ -126,7 +127,7 @@ struct PauseInner {
 }
 
 impl PauseShared {
-    fn new(base: Arc<AtomicU64>, stop: Arc<AtomicBool>) -> Arc<Self> {
+    fn new(base: Arc<AtomicI64>, stop: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             hint: AtomicBool::new(false),
             inner: Mutex::new(PauseInner {
@@ -174,9 +175,9 @@ impl PauseShared {
             if let Some(c) = &i.clock {
                 let delta = c.now().saturating_sub(i.pause_at);
                 let base = self.base.load(Ordering::Acquire);
-                if base != u64::MAX {
-                    self.base
-                        .store(base.saturating_add(delta.nanos().unwrap_or(0)), Ordering::Release);
+                if base != crate::time::BASE_UNSET {
+                    let shifted = base.saturating_add(delta.nanos().unwrap_or(0) as i64);
+                    self.base.store(shifted, Ordering::Release);
                 }
             }
             i.paused = false;
@@ -184,6 +185,26 @@ impl PauseShared {
         }
         drop(i);
         self.cond.notify_all();
+    }
+
+    /// Seek rebase (spec: flush/seek): make running time read `target` *now* —
+    /// `base := reference − target`, signed, where `reference` is `pause_at` while
+    /// paused (so the resume shift composes to `target + post-resume elapsed`) and
+    /// `clock.now()` while playing. Serialized under the same mutex as pause/resume
+    /// so the two base writers never interleave. No-op before the first run (no
+    /// clock installed yet — `run()` samples a fresh base anyway). Assumes a clock
+    /// provided by a device that pauses *privately* (outside `PauseShared`) freezes
+    /// while so paused — true of `AudioDeviceClock`.
+    pub(crate) fn rebase_to(&self, target: Timestamp) {
+        let i = self.inner.lock().unwrap();
+        let Some(c) = &i.clock else { return };
+        let reference = if i.paused { i.pause_at } else { c.now() };
+        let base = reference.0.min(i64::MAX as u64) as i128
+            - target.0.min(i64::MAX as u64) as i128;
+        self.base.store(
+            base.clamp((i64::MIN + 1) as i128, i64::MAX as i128) as i64,
+            Ordering::Release,
+        );
     }
 
     /// Block while paused (a sink's expired clock wait lands here; also the group
@@ -255,21 +276,31 @@ impl StopHandle {
 /// A handle to seek this pipeline from another thread while `run()` is blocking (spec:
 /// flush/seek). Publishing a target makes the source resume reading at `to_byte`, discards
 /// the data already in flight (out-of-band, so it is responsive rather than playing out the
-/// queue first), and resets the reported play position to `to_frame`. Cloneable and cheap.
+/// queue first), and **rebases running time to `to_time`** so post-seek deadlines
+/// (`base + pts + latency`) are immediately schedulable — a forward seek does not stall
+/// sinks, a backward seek does not mass-drop as "late". Cloneable and cheap.
 #[derive(Clone)]
-pub struct SeekHandle(Arc<SeekState>);
+pub struct SeekHandle {
+    seek: Arc<SeekState>,
+    /// The pause transport owns the base cell, the installed clock, and the mutex
+    /// that serializes base writers (pause/resume/seek).
+    pause: Arc<PauseShared>,
+}
 
 impl SeekHandle {
-    /// Request a seek: resume the source at byte offset `to_byte`, and reset the reported
-    /// play position to PCM frame `to_frame`. The targets are published before the
-    /// generation bump, so any observer that sees the new generation also sees the targets.
-    /// Mapping a wall-clock time to a byte offset is the caller's job (a byte source has no
-    /// notion of time); for FLAC without a seektable that is a proportional estimate the
-    /// decoder then re-syncs from.
-    pub fn seek(&self, to_byte: u64, to_frame: u64) {
-        self.0.to_byte.store(to_byte, Ordering::Release);
-        self.0.to_frame.store(to_frame, Ordering::Release);
-        self.0.gen.fetch_add(1, Ordering::Release);
+    /// Request a seek: resume the source at byte offset `to_byte`; stream position
+    /// becomes `to_time` (running time is rebased under the pause lock; a device
+    /// sink derives its own play-position units from `to_time` on FlushStart).
+    /// Targets and the rebase are published before the generation bump, so any
+    /// observer that sees the new generation also sees them. Mapping a time to a
+    /// byte offset is the caller's job (a byte source has no notion of time) — a
+    /// container seek index, or a proportional estimate the demuxer/decoder then
+    /// re-syncs from. Before `run()` this is a consistent no-op.
+    pub fn seek(&self, to_byte: u64, to_time: Timestamp) {
+        self.seek.to_byte.store(to_byte, Ordering::Release);
+        self.seek.to_time_ns.store(to_time.0, Ordering::Release);
+        self.pause.rebase_to(to_time);
+        self.seek.gen.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -323,10 +354,11 @@ pub struct Pipeline {
     /// [`provide_clock`](crate::element::Element::provide_clock)s master the pipeline
     /// (spec: Clocking — an audio sink's device clock paces everyone).
     clock_explicit: bool,
-    /// Raw ns of the running-time base sampled by the current/last [`run`](Self::run)
-    /// (`u64::MAX` before the first run), shared into [`TapHandle`]s so observers can
-    /// window counter deltas over running time (spec: Taps — bitrate is Δbytes/Δt).
-    base_shared: Arc<AtomicU64>,
+    /// Signed ns of the running-time base sampled by the current/last [`run`](Self::run)
+    /// ([`crate::time::BASE_UNSET`] before the first run), shared into [`TapHandle`]s so
+    /// observers can window counter deltas over running time (spec: Taps — bitrate is
+    /// Δbytes/Δt). Signed: a seek rebase can push it negative (`time::running_time`).
+    base_shared: Arc<AtomicI64>,
     /// The pause transport (spec: Clocking — pause is a clock op). See [`PauseHandle`].
     pause: Arc<PauseShared>,
     /// Start the next [`run`](Self::run) paused (preroll-and-hold: everything spins
@@ -369,7 +401,7 @@ impl Pipeline {
         // Bound first: the pause transport shares the running-time base cell and the
         // stop flag (a paused wait must still honour shutdown).
         let stop = Arc::new(AtomicBool::new(false));
-        let base_shared = Arc::new(AtomicU64::new(u64::MAX));
+        let base_shared = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
         Self {
             elements: Vec::new(),
             descs: Vec::new(),
@@ -461,7 +493,7 @@ impl Pipeline {
     /// A handle to seek this pipeline from another thread while `run()` is blocking
     /// (spec: flush/seek). See [`SeekHandle`].
     pub fn seek_handle(&self) -> SeekHandle {
-        SeekHandle(Arc::clone(&self.seek))
+        SeekHandle { seek: Arc::clone(&self.seek), pause: Arc::clone(&self.pause) }
     }
 
     /// Configure the shared buffer pool for the next [`run`](Self::run) (spec: Memory —
@@ -828,7 +860,7 @@ impl Pipeline {
         let clock = Arc::clone(&self.clock);
         let base_time = clock.now();
         // Publish the base so TapHandles can window counter deltas over running time.
-        self.base_shared.store(base_time.0, Ordering::Release);
+        self.base_shared.store(crate::time::base_from_clock(base_time), Ordering::Release);
         // Arm the pause transport with the selected clock (its resume re-bases the
         // shared base); a start-paused run holds at the first gate/render.
         self.pause.install_clock(Arc::clone(&clock));
@@ -2037,7 +2069,7 @@ fn run_group(
     seek: Arc<SeekState>,
     vocabulary: Arc<Vocabulary>,
     clock: Arc<dyn Clock>,
-    base: Arc<AtomicU64>,
+    base: Arc<AtomicI64>,
     pad_infos: Vec<(usize, Vec<usize>)>,
     path_latencies: Vec<Timestamp>,
     tracing: Arc<AtomicBool>,

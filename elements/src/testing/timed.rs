@@ -102,7 +102,18 @@ impl Element for TimedTestSrc {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // Seek (spec: flush/seek): resume producing at the target position — the
+        // synthetic-stream analogue of a byte source resuming at `to_byte`.
+        if matches!(event, Event::FlushStart) {
+            if let Some(t) = ctx.seek_target() {
+                if let (Some(ns), Some(period)) = (t.to_time.nanos(), self.period.nanos()) {
+                    if period > 0 {
+                        self.produced = ns / period;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

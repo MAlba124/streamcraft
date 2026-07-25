@@ -70,6 +70,46 @@ impl Timestamp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Signed running-time base (spec: Clocking + flush/seek)
+// ---------------------------------------------------------------------------
+//
+// Running time = clock.now() − base. A seek rebases running time to the seek
+// target (`base := reference − target`), and the target can exceed the clock
+// reading (a device clock starts near zero; a forward seek targets minutes in) —
+// so the base is *signed*. These helpers keep the signed arithmetic in one place;
+// every observer still sees unsigned, non-negative running time.
+
+/// "No base sampled yet" sentinel for the shared base cell. Unreachable by
+/// construction: a real base is `reference − target` with both < 2^63 ns
+/// (~292 years), and rebases clamp to `i64::MIN + 1`.
+pub(crate) const BASE_UNSET: i64 = i64::MIN;
+
+/// Clamp a clock reading into signed-base range (a run-start base is the raw
+/// clock reading).
+pub(crate) fn base_from_clock(ts: Timestamp) -> i64 {
+    ts.0.min(i64::MAX as u64) as i64
+}
+
+/// Running time for observers: `clock − base`, clamped to `[0, MAX]` — negative
+/// running time (clock still behind a backward-rebased base) reads as zero.
+pub(crate) fn running_time(clock_ns: u64, base: i64) -> Timestamp {
+    Timestamp((clock_ns as i128 - base as i128).clamp(0, Timestamp::MAX.0 as i128) as u64)
+}
+
+/// A wait deadline on the raw clock: `base + running + latency`, computed in
+/// i128 so a negative base folds in exactly. Negative results clamp to zero
+/// ("already due"); overflow clamps to [`Timestamp::MAX`] (never the sentinel);
+/// a `NONE` running/latency propagates to `NONE` ("infinitely late" — only an
+/// interrupt or a seek ends that wait).
+pub(crate) fn deadline(base: i64, running: Timestamp, latency: Timestamp) -> Timestamp {
+    if running.is_none() || latency.is_none() {
+        return Timestamp::NONE;
+    }
+    let d = base as i128 + running.0 as i128 + latency.0 as i128;
+    Timestamp(d.clamp(0, Timestamp::MAX.0 as i128) as u64)
+}
+
 /// Exact rational, for rates and durations that must not accumulate error
 /// (e.g. 30000/1001 fps).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -137,6 +177,29 @@ mod tests {
             Timestamp::from_nanos(2)
         );
         assert!(Timestamp::from_nanos(5).saturating_sub(Timestamp::NONE).is_none());
+    }
+
+    #[test]
+    fn signed_base_helpers() {
+        // Negative base (forward seek beyond elapsed clock): running time folds
+        // it in; deadlines become immediately due when the clock has caught up.
+        let base = -(50_000_000i64); // seek rebased 50ms "into the future"
+        assert_eq!(running_time(0, base), Timestamp::from_millis(50));
+        assert_eq!(
+            deadline(base, Timestamp::from_millis(50), Timestamp::ZERO),
+            Timestamp::ZERO
+        );
+        // Base ahead of the clock: observers clamp at zero, never underflow.
+        assert_eq!(running_time(10, 1_000), Timestamp::ZERO);
+        // NONE propagates through deadlines.
+        assert!(deadline(0, Timestamp::NONE, Timestamp::ZERO).is_none());
+        assert!(deadline(0, Timestamp::ZERO, Timestamp::NONE).is_none());
+        // Overflow clamps to MAX, never the sentinel.
+        assert_eq!(
+            deadline(i64::MAX, Timestamp::MAX, Timestamp::MAX),
+            Timestamp::MAX
+        );
+        assert_eq!(base_from_clock(Timestamp::from_secs(3)), 3_000_000_000);
     }
 
     #[test]

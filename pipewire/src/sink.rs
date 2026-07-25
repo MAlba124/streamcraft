@@ -495,7 +495,15 @@ impl Element for PipeWireAudioSink {
                     producer.flush();
                 }
                 if let Some(t) = ctx.seek_target() {
-                    self.playback.frames.store(t.to_frame, Ordering::Relaxed);
+                    // The seek target is stream time; this sink's play-position
+                    // unit is PCM frames — derive it from the negotiated rate
+                    // (published at configure; zero before then, when there is
+                    // no position to reset anyway).
+                    let rate = self.playback.rate.load(Ordering::Relaxed) as u128;
+                    if let Some(ns) = t.to_time.nanos() {
+                        let frames = (ns as u128 * rate / 1_000_000_000) as u64;
+                        self.playback.frames.store(frames, Ordering::Relaxed);
+                    }
                 }
                 self.playback.flush_stream.store(true, Ordering::Relaxed);
             }

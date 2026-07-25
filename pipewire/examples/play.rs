@@ -24,6 +24,7 @@ use std::time::Duration;
 use sc_flac::{FlacDec, StreamDecoder};
 use sc_pipewire::PipeWireAudioSink;
 use streamcraft_core::pipeline::Pipeline;
+use streamcraft_core::time::Timestamp;
 use streamcraft_elements::io::FileSrc;
 
 /// What the app needs to map a wall-clock seek target to a byte offset and a play position.
@@ -138,16 +139,15 @@ fn main() {
         let ctrl_keys = ctrl.clone();
         // Seek by `delta` seconds relative to the current position (clamped to the track).
         let seek_by = move |delta: f64| {
-            if media.total_secs <= 0.0 || media.rate == 0 {
+            if media.total_secs <= 0.0 {
                 return; // unknown duration → can't map time to a byte offset
             }
             let target = (ctrl.position_secs() + delta).clamp(0.0, media.total_secs);
             let to_byte = (target / media.total_secs * media.file_len as f64) as u64;
-            let to_frame = (target * media.rate as f64) as u64;
             // Seeking while paused stays paused: the interruptible sink push lets the flush
             // propagate through the frozen graph, so it re-primes at the new position and the
             // shown time jumps there, without starting playback (spec: flush/seek).
-            seek.seek(to_byte, to_frame);
+            seek.seek(to_byte, Timestamp::from_nanos((target * 1e9) as u64));
         };
         std::thread::spawn(move || {
             let mut stdin = std::io::stdin();

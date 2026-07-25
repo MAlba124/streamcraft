@@ -66,14 +66,17 @@ pub(crate) struct AddedPad {
 /// Shared app→pipeline seek request (spec: Events, queries, and the bus — flush/seek). The
 /// app publishes a target through a `SeekHandle`; the scheduler and the source/sink elements
 /// each observe `gen` advancing and perform a coordinated flush. `to_byte` drives the source
-/// (where to resume reading), `to_frame` resets the sink's play position. All fields are
-/// relaxed/acquire atomics — reads sit on the flush path, never the per-buffer hot path.
+/// (where to resume reading); `to_time_ns` is the stream-time position the seek targets —
+/// running time is rebased to it, and a device sink derives its own units from it
+/// (frames = time × rate). All fields are relaxed/acquire atomics — reads sit on the flush
+/// path, never the per-buffer hot path.
 #[derive(Default)]
 pub struct SeekState {
     /// Bumped once per seek; every observer compares it to its own last-seen value.
     pub(crate) gen: AtomicU64,
     pub(crate) to_byte: AtomicU64,
-    pub(crate) to_frame: AtomicU64,
+    /// Raw [`Timestamp`] nanoseconds (time targets are unsigned stream time).
+    pub(crate) to_time_ns: AtomicU64,
 }
 
 /// A resolved seek target, read by an element from [`Ctx::seek_target`] when it handles
@@ -82,9 +85,9 @@ pub struct SeekState {
 pub struct SeekTarget {
     /// Byte offset in the source byte stream to resume reading from.
     pub to_byte: u64,
-    /// PCM frame (interchannel sample) index the target corresponds to — the play position
-    /// a sink resets its counter to.
-    pub to_frame: u64,
+    /// Stream-time position the seek targets — what running time was rebased to.
+    /// A device sink derives its own units from it (frames = to_time × rate).
+    pub to_time: Timestamp,
 }
 
 pub struct Ctx {
@@ -181,10 +184,12 @@ pub struct Ctx {
     /// clock. `None` outside a run and for an unclocked byte pipeline, where `now()`
     /// reads `NONE` and `wait_until` returns at once (no pacing).
     clock: Option<Arc<dyn Clock>>,
-    /// Raw ns of the running-time base — the pipeline's shared cell, read per call
-    /// so a pause/resume re-base (spec: Clocking — pause is a clock op) is observed
-    /// by the very next deadline computation. `u64::MAX` until a run samples it.
-    base: Arc<std::sync::atomic::AtomicU64>,
+    /// Signed ns of the running-time base — the pipeline's shared cell, read per
+    /// call so a pause/resume re-base and a seek rebase (spec: Clocking; flush/seek)
+    /// are observed by the very next deadline computation. Signed because a seek's
+    /// `base = reference − target` can be negative (see `time::running_time`).
+    /// [`crate::time::BASE_UNSET`] until a run samples it.
+    base: Arc<std::sync::atomic::AtomicI64>,
     /// This element's computed upstream path latency (spec: Latency — enforced at
     /// sinks): the pipeline installs the worst source→here sum of declared minimum
     /// latencies, and [`wait_until`](Self::wait_until) folds it into the deadline —
@@ -254,7 +259,7 @@ impl Ctx {
             announced: Vec::new(),
             vocabulary: None,
             clock: None,
-            base: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            base: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             seek: None,
             scratch: Arena::default(),
             props: None,
@@ -361,7 +366,7 @@ impl Ctx {
 
     /// Install the pipeline clock and running-time base (pipeline → element at run
     /// setup). See [`now`](Self::now) and [`wait_until`](Self::wait_until).
-    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base: Arc<std::sync::atomic::AtomicU64>) {
+    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>, base: Arc<std::sync::atomic::AtomicI64>) {
         self.clock = Some(clock);
         self.base = base;
     }
@@ -392,10 +397,12 @@ impl Ctx {
         self.pause = Some(pause);
     }
 
-    /// The current running-time base (shared, pause-re-based).
-    fn base_now(&self) -> Timestamp {
+    /// The current signed running-time base (shared; pause-re-based and
+    /// seek-rebased). `BASE_UNSET` reads as 0 — "running time == clock" — the
+    /// pre-run / harness default.
+    fn base_raw(&self) -> i64 {
         let raw = self.base.load(std::sync::atomic::Ordering::Acquire);
-        if raw == u64::MAX { Timestamp::ZERO } else { Timestamp(raw) }
+        if raw == crate::time::BASE_UNSET { 0 } else { raw }
     }
 
     /// Install this element's computed upstream path latency (pipeline → element at
@@ -437,9 +444,10 @@ impl Ctx {
     }
 
     /// The current seek target, if any seek has been requested (spec: flush/seek). A source
-    /// element reads `to_byte` (where to resume reading) and a sink reads `to_frame` (the
-    /// play position to reset to) when the scheduler delivers
-    /// [`Event::FlushStart`](crate::event::Event::FlushStart). `None` until the first seek.
+    /// element reads `to_byte` (where to resume reading) and a sink reads `to_time` (the
+    /// stream-time position, from which it derives its own play-position units) when the
+    /// scheduler delivers [`Event::FlushStart`](crate::event::Event::FlushStart). `None`
+    /// until the first seek.
     pub fn seek_target(&self) -> Option<SeekTarget> {
         let s = self.seek.as_ref()?;
         if s.gen.load(Ordering::Acquire) == 0 {
@@ -447,7 +455,7 @@ impl Ctx {
         }
         Some(SeekTarget {
             to_byte: s.to_byte.load(Ordering::Acquire),
-            to_frame: s.to_frame.load(Ordering::Acquire),
+            to_time: Timestamp(s.to_time_ns.load(Ordering::Acquire)),
         })
     }
 
@@ -542,7 +550,7 @@ impl Ctx {
     /// clock is installed (an unclocked byte pipeline — the milestone-1 default).
     pub fn now(&self) -> Timestamp {
         match &self.clock {
-            Some(c) => c.now().saturating_sub(self.base_now()),
+            Some(c) => crate::time::running_time(c.now().0, self.base_raw()),
             None => Timestamp::NONE,
         }
     }
@@ -559,41 +567,55 @@ impl Ctx {
     /// "infinitely late": only an interrupt ends the wait.
     pub fn wait_until(&self, running: Timestamp) -> WaitOutcome {
         let Some(c) = &self.clock else { return WaitOutcome::Reached };
+        // Bounds how long a parked real-clock wait can miss a seek rebase / gen
+        // bump: each park is capped to one slice, then the deadline re-derives.
+        const WAIT_SLICE_NS: u64 = 10_000_000;
+        let entry_gen = self.seek_gen();
         loop {
-            // Deadline derived per iteration from the *shared* base: a pause/resume
-            // re-bases it, and the loop below re-derives after every resume.
-            let deadline = self
-                .base_now()
-                .saturating_add(running)
-                .saturating_add(self.path_latency);
-            match c.new_wait().wait_until(deadline) {
-                WaitOutcome::Interrupted => return WaitOutcome::Interrupted,
-                WaitOutcome::Reached => {
-                    // Pause gate (spec: Clocking — pause is a clock op): a wait that
-                    // expires while paused must not render — block until resume, then
-                    // re-derive the deadline from the shifted base and wait again.
-                    // One relaxed load on the playing path.
-                    if let Some(p) = &self.pause {
-                        if p.maybe_paused() && p.is_paused() {
-                            if !p.block_while_paused() {
-                                return WaitOutcome::Interrupted; // stop won
-                            }
-                            continue;
+            // A pending seek makes the buffer this wait paces stale: bail as an
+            // interrupt so the group can flush promptly — the same contract sinks
+            // follow between buffers via `seek_gen()`.
+            if self.seek_gen() != entry_gen {
+                return WaitOutcome::Interrupted;
+            }
+            // Deadline derived per iteration from the *shared signed* base: a
+            // pause/resume re-base and a seek rebase both move it.
+            let deadline = crate::time::deadline(self.base_raw(), running, self.path_latency);
+            let now = c.now();
+            if deadline.is_some() && now >= deadline {
+                // Pause gate (spec: Clocking — pause is a clock op): a wait that
+                // expires while paused must not render — block until resume, then
+                // re-derive the deadline from the shifted base and wait again.
+                // One relaxed load on the playing path.
+                if let Some(p) = &self.pause {
+                    if p.maybe_paused() && p.is_paused() {
+                        if !p.block_while_paused() {
+                            return WaitOutcome::Interrupted; // stop won
                         }
+                        continue;
                     }
-                    // Latency tracing (spec: Debuggability): how far past the deadline
-                    // the wait actually returned — scheduling jitter as the sink
-                    // experiences it (deterministic under MockClock).
-                    if running.is_some() {
-                        if let Some((counters, gate)) = &self.trace {
-                            if gate.load(std::sync::atomic::Ordering::Relaxed) {
-                                let late = c.now().saturating_sub(deadline);
-                                counters.wait_lateness_ns.record(late.nanos().unwrap_or(0));
-                            }
-                        }
-                    }
-                    return WaitOutcome::Reached;
                 }
+                // Latency tracing (spec: Debuggability): how far past the deadline
+                // the wait actually returned — scheduling jitter as the sink
+                // experiences it (deterministic under MockClock).
+                if running.is_some() {
+                    if let Some((counters, gate)) = &self.trace {
+                        if gate.load(std::sync::atomic::Ordering::Relaxed) {
+                            let late = now.saturating_sub(deadline);
+                            counters.wait_lateness_ns.record(late.nanos().unwrap_or(0));
+                        }
+                    }
+                }
+                return WaitOutcome::Reached;
+            }
+            // Park at most one slice (min with the true deadline keeps precision;
+            // under MockClock nothing wakes without an `advance`, so determinism
+            // is unchanged). An "infinitely late" running of NONE parks slice by
+            // slice until a seek or an interrupt ends it.
+            let cap = Timestamp(now.0.saturating_add(WAIT_SLICE_NS));
+            let slice = if deadline.is_none() { cap } else { deadline.min(cap) };
+            if c.new_wait().wait_until(slice) == WaitOutcome::Interrupted {
+                return WaitOutcome::Interrupted;
             }
         }
     }
@@ -1027,8 +1049,8 @@ mod tests {
         let clock = MockClock::new();
         ctx.set_clock(
             Arc::new(clock.clone()),
-            Arc::new(std::sync::atomic::AtomicU64::new(
-                Timestamp::from_millis(100).0,
+            Arc::new(std::sync::atomic::AtomicI64::new(
+                Timestamp::from_millis(100).0 as i64,
             )),
         );
         assert_eq!(ctx.now(), Timestamp::ZERO, "at the base instant, running time is 0");
