@@ -41,6 +41,8 @@ use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
 use streamcraft_core::id::PadId;
+use streamcraft_core::log;
+use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
 // `video/raw` family/field/value names. Kept as literals (not a dep on
@@ -149,6 +151,9 @@ pub struct H264Dec {
     /// are pulled; if it underflows (more pictures than fed units, e.g. a gap-fill)
     /// the frame carries `Timestamp::NONE` rather than a stale stamp.
     pts_fifo: VecDeque<(Timestamp, Timestamp)>,
+    /// Whether the last `try_alloc` failed — edge-triggers the `alloc_stall`
+    /// diagnostic log (once per stall, not once per spin).
+    alloc_stalled: bool,
 }
 
 impl H264Dec {
@@ -158,6 +163,7 @@ impl H264Dec {
             announced: false,
             pending: None,
             pts_fifo: VecDeque::new(),
+            alloc_stalled: false,
         }
     }
 
@@ -241,9 +247,27 @@ impl H264Dec {
 
         let need = y.data.len() + u.data.len() + v.data.len();
         let Some(mut buf) = ctx.try_alloc(SRC_PAD) else {
+            // Edge-triggered (first failure after a success): a pool-dry stall is
+            // the classic freeze signature — log *why* (outstanding vs cap), since
+            // a permanently-dry pool here deadlocks the whole graph (we stop
+            // consuming input until this picture emits).
+            if !self.alloc_stalled {
+                self.alloc_stalled = true;
+                let s = ctx.pool_stats();
+                log!(
+                    &*ctx,
+                    Level::Debug,
+                    "alloc_stall",
+                    outstanding = s.outstanding,
+                    max_slots = s.max_slots,
+                    acquires = s.acquires,
+                    recycles = s.recycles,
+                );
+            }
             self.pending = Some(p);
             return Ok(false);
         };
+        self.alloc_stalled = false;
         if buf.memory.capacity() < need {
             // Pool slots are sized by the pipeline; a frame that cannot fit any
             // slot would silently truncate — fail loudly instead (pool sizing is
@@ -259,6 +283,7 @@ impl H264Dec {
             });
         }
         if !self.announced {
+            log!(&*ctx, Level::Debug, "announce", width = width, height = height);
             ctx.announce_format(
                 SRC_PAD,
                 FAMILY,
@@ -278,6 +303,7 @@ impl H264Dec {
         buf.memory.set_len(need);
         buf.pts = p.pts;
         buf.duration = p.duration;
+        log!(&*ctx, Level::Trace, "frame", pts = buf.pts);
         ctx.out(SRC_PAD).push(buf);
         Ok(true)
     }

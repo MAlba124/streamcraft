@@ -73,6 +73,15 @@ fn try_video_decoders(
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--stats`: print per-element counter deltas every 3 s (buffers in/out, ring
+    // high-water, drops) — a poor man's scope; a stalled pipeline shows as every
+    // delta hitting zero while the process lives.
+    let stats = if let Some(i) = args.iter().position(|a| a == "--stats") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
     // `--probe`: demux only — every pad to a drop-sink, no decoder, no window.
     // Isolates container-side behavior (throughput, memory) from decode/display.
     let probe = if let Some(i) = args.iter().position(|a| a == "--probe") {
@@ -135,12 +144,59 @@ fn main() {
         }
     };
 
+    let mut sink_id = None;
     if let Some(dec) = dec {
+        // The decoder gets its OWN pool (spec: pool negotiation, explicit v1 —
+        // set_element_pool): decoded frames must never compete with the shared
+        // default pool that filesrc reads and the demuxer's held input backlog
+        // drink from. With one shared pool the graph deadlocks: the output-blocked
+        // demuxer pins its input slots, the pool hits its cap, and the decoder —
+        // the only element that could unblock the chain — can never allocate the
+        // frame it is carrying (measured: outstanding=24/24, all counters flat).
+        p.set_element_pool(dec, 4 * 1024 * 1024, 24);
         let sink = p.add_boxed(Box::new(Sdl3VideoSink::new().with_title("streamcraft — play_file")));
         p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
+        sink_id = Some(sink);
     }
 
     println!("playing {path} — 'p'⏎ pause/resume, 'q'⏎ quit (or close the window / Ctrl-C)…");
+    if stats {
+        // Watch the graph breathe: named per-element `buffers in→out (+delta)` lines
+        // every 3 s. Reads live tap counters — zero cost to the streaming threads.
+        let tap = p.tap_handle();
+        let watched: Vec<(String, streamcraft_core::id::ElementId)> = [
+            ("filesrc", Some(src)),
+            ("mkvdemux", Some(demux)),
+            ("dec", dec),
+        ]
+        .into_iter()
+        .filter_map(|(n, id)| id.map(|id| (n.to_string(), id)))
+        .chain(sink_id.map(|s| ("sink".to_string(), s)))
+        .collect();
+        std::thread::spawn(move || {
+            let mut prev: Vec<(u64, u64)> = vec![(0, 0); watched.len()];
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let mut line = String::from("stats:");
+                for (i, (name, id)) in watched.iter().enumerate() {
+                    if let Some(c) = tap.snapshot(*id) {
+                        let (pi, po) = prev[i];
+                        line.push_str(&format!(
+                            " {name} {}→{} (+{}/+{}) qhw={} drops={} |",
+                            c.buffers_in,
+                            c.buffers_out,
+                            c.buffers_in - pi,
+                            c.buffers_out - po,
+                            c.queue_high_water,
+                            c.drops,
+                        ));
+                        prev[i] = (c.buffers_in, c.buffers_out);
+                    }
+                }
+                eprintln!("{line}");
+            }
+        });
+    }
     if let Some(secs) = max_secs {
         let stop = p.stop_handle();
         std::thread::spawn(move || {

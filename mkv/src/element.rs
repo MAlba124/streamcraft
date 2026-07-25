@@ -62,6 +62,8 @@ use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
 use streamcraft_core::id::{FormatId, PadId};
+use streamcraft_core::log;
+use streamcraft_core::log::Level;
 use streamcraft_core::memory::Memory;
 use streamcraft_core::time::Timestamp;
 
@@ -1042,6 +1044,14 @@ impl MkvDemux {
     /// Every family rides a byte bridge to a byte-reading peer, so a caps-ignoring decoder still
     /// links on the `bytes`/family offer.
     fn announce(ctx: &mut Ctx, pad: PadId, family: &'static str, track: &Track) {
+        log!(
+            &*ctx,
+            Level::Debug,
+            "announce",
+            family = family,
+            width = track.pixel_width,
+            height = track.pixel_height,
+        );
         if family == FAMILY_FLAC {
             ctx.announce_format(
                 pad,
@@ -1113,6 +1123,15 @@ impl Element for MkvDemux {
             // its codec's family (+ the bytes escape), so link-time negotiation
             // *selects* the right decoder instead of admitting them all.
             let pad = ctx.add_pad(Direction::Src, &name, codec::offers_for(&track.codec_id));
+            log!(
+                &*ctx,
+                Level::Debug,
+                "track",
+                number = track.track_number,
+                family = family,
+                width = track.pixel_width,
+                height = track.pixel_height,
+            );
             self.pad_tracks.push(PadTrack {
                 track_number: track.track_number,
                 pad,

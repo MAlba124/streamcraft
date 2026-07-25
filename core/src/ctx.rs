@@ -485,6 +485,12 @@ impl Ctx {
         Some(self.buffer(memory))
     }
 
+    /// This element's pool statistics (diagnostics — e.g. logging *why* a
+    /// `try_alloc` backpressure stall happened: `outstanding` vs `max_slots`).
+    pub fn pool_stats(&self) -> crate::memory::PoolStats {
+        self.pool.stats()
+    }
+
     /// Allocate a buffer of at least `n` usable bytes: a pooled slot when one is free
     /// and large enough, else an exactly-`n` heap allocation (never a slot-sized
     /// over-allocation — see [`Pool::acquire_exact`]). For bounded cold paths (an EOS

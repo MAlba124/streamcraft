@@ -32,6 +32,8 @@ use streamcraft_core::format::{
     ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc,
 };
 use streamcraft_core::id::PadId;
+use streamcraft_core::log;
+use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
 use crate::video::VideoWindow;
@@ -178,15 +180,27 @@ impl Sdl3VideoSink {
         let Some(fmt) = Self::read_format(ctx, f) else {
             return Ok(()); // not enough fields yet; wait for a fuller announcement
         };
+        log!(
+            &*ctx,
+            Level::Debug,
+            "configured",
+            width = fmt.width,
+            height = fmt.height,
+            frame_dur_ns = fmt.frame_dur_ns,
+        );
         self.format = Some(fmt);
 
         if self.disabled || self.window.is_some() {
             return Ok(());
         }
         match VideoWindow::open(&self.title, fmt.width as u32, fmt.height as u32) {
-            Ok(w) => self.window = Some(w),
+            Ok(w) => {
+                log!(&*ctx, Level::Debug, "window_open");
+                self.window = Some(w);
+            }
             Err(_e) => {
                 // No display (headless / CI): disable silently and drop frames.
+                log!(&*ctx, Level::Debug, "no_display_disabled");
                 self.disabled = true;
             }
         }
@@ -205,6 +219,7 @@ impl Sdl3VideoSink {
             if now.is_some() && now.0 > pts.0 {
                 let lateness = now.0 - pts.0;
                 if lateness > fmt.frame_dur_ns {
+                    log!(&*ctx, Level::Debug, "qos_drop", lateness_ns = lateness);
                     let sink = ctx.element();
                     ctx.post(BusMessage::Qos { sink, lateness_ns: lateness as i64 });
                     return Ok(());
@@ -234,7 +249,9 @@ impl Sdl3VideoSink {
             Pix::Gray8 => window.present_gray8(data, fmt.width, fmt.height),
         };
         match shown {
-            Ok(_drawn) => {} // a short/malformed frame skips the draw, nothing more
+            Ok(drawn) => {
+                log!(&*ctx, Level::Trace, "present", pts = pts, drawn = drawn);
+            }
             Err(e) => {
                 // A render error after a successful open is real: report and degrade.
                 let element = ctx.element();
@@ -247,6 +264,7 @@ impl Sdl3VideoSink {
 
     /// The user closed the window: report once, then drop frames silently.
     fn on_close(&mut self, ctx: &mut Ctx) {
+        log!(&*ctx, Level::Debug, "window_closed");
         if !self.close_reported {
             let element = ctx.element();
             ctx.post(BusMessage::Warning {

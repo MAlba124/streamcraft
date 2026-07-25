@@ -110,16 +110,31 @@ impl Pool {
     /// Hot paths should prefer `try_acquire` + backpressure; this is for bounded
     /// flushes (an EOS drain) where yielding is not an option.
     pub fn acquire_exact(&self, n: usize) -> Memory {
-        if n <= self.inner.slot_size {
+        // A pooled slot serves an exact request only when the request meaningfully
+        // fills it (n ≥ slot_size/4). Handing a whole multi-MiB slot to a tiny
+        // buffer starves the pool's real clients — measured as a mid-movie playback
+        // freeze: the demuxer's ~12 KB compressed AUs pinned every free 4 MiB slot,
+        // the decoder's carried picture could then never allocate its output (and
+        // by design it stops consuming input until it emits), and the demux group
+        // won the race for every slot the sink freed. Small requests take the
+        // exactly-n heap path instead: freed on drop, never competing with frames.
+        // (Spec: Memory — per-link pools are the real fix for slot-size mismatch.)
+        if n <= self.inner.slot_size && n >= self.inner.slot_size / 4 {
             if let Some(m) = self.try_acquire() {
                 return m;
             }
         }
+        // The heap fallback is **unlinked** — it must not consume the pool's slot
+        // budget. A heap-exact buffer counted in `outstanding` starves every
+        // `try_acquire` client: measured as the playback freeze's true root — the
+        // demuxer queued hundreds of heap-exact compressed AUs ahead of the
+        // realtime-paced decoder, `outstanding` sat far above `max_slots`, and the
+        // decoder's carried picture could never allocate its output *even with all
+        // slots free* (it stops consuming input until it emits — deadlock). Heap
+        // buffers are bounded by ring capacities; only slot-backed memory is the
+        // pool's to budget. `slot_allocations` still records the heap alloc.
         self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
-        self.inner.acquires.fetch_add(1, Ordering::Relaxed);
-        let now = self.inner.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
-        self.inner.high_water.fetch_max(now, Ordering::Relaxed);
-        Memory::from_box(vec![0u8; n.max(1)].into_boxed_slice(), &self.inner)
+        Memory::from_heap(vec![0u8; n.max(1)].into_boxed_slice())
     }
 
     /// Take a slot from the free-list, or heap-allocate one on a miss.
@@ -147,6 +162,8 @@ impl Pool {
             acquires: self.inner.acquires.load(Ordering::Relaxed),
             recycles: self.inner.recycles.load(Ordering::Relaxed),
             high_water: self.inner.high_water.load(Ordering::Relaxed),
+            outstanding: self.inner.outstanding.load(Ordering::Relaxed),
+            max_slots: self.inner.max_slots as u64,
         }
     }
 }
@@ -203,6 +220,10 @@ pub struct PoolStats {
     pub acquires: u64,
     pub recycles: u64,
     pub high_water: u64,
+    /// Slot-backed memories currently alive — what `try_acquire`'s cap gates on.
+    pub outstanding: u64,
+    /// The cap itself, so `outstanding == max_slots` reads as "pool exhausted".
+    pub max_slots: u64,
 }
 
 /// The shared backing of one or more [`Memory`] views: the slot bytes plus the pool
@@ -271,6 +292,16 @@ impl Memory {
     fn from_box(buf: Box<[u8]>, pool: &Arc<PoolInner>) -> Memory {
         Memory {
             inner: Some(Arc::new(MemoryInner { buf, pool: Arc::downgrade(pool) })),
+            offset: 0,
+            len: 0,
+        }
+    }
+
+    /// A pool-less heap backing: dropping the last view frees it, nothing recycles,
+    /// and it consumes no pool budget (see `acquire_exact`'s heap fallback).
+    fn from_heap(buf: Box<[u8]>) -> Memory {
+        Memory {
+            inner: Some(Arc::new(MemoryInner { buf, pool: Weak::new() })),
             offset: 0,
             len: 0,
         }
