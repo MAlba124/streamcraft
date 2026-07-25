@@ -16,3 +16,10 @@ streamcraft-core = { path = "../core" }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
+
+[features]
+default = []
+# Test-only: run the download integration tests against the hand-rolled io_uring
+# reactor (elements' `io-uring`), exercising the streaming `Recv` op (offset -1) on a
+# real socket fd. The library itself has no io_uring code — the reactor is injected.
+io-uring = ["streamcraft-elements/io-uring"]

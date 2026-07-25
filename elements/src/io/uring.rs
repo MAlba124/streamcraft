@@ -341,7 +341,9 @@ impl IoUringReactor {
                 Some(rf) => {
                     // Hygiene bookkeeping happens at *submission*, where order still
                     // reflects the element's access pattern (completions reorder):
-                    // fix the watermark origin and check monotonicity.
+                    // fix the watermark origin and check monotonicity. `Recv` (a
+                    // socket/pipe stream) has no page cache and no meaningful offset,
+                    // so it never participates in hygiene.
                     match s.kind {
                         OpKind::Read => {
                             rf.read_wm.origin(s.offset);
@@ -357,6 +359,7 @@ impl IoUringReactor {
                             }
                             rf.write_submit_end = s.offset + s.buf.memory.len() as u64;
                         }
+                        OpKind::Recv => {}
                     }
                     rf.file.as_raw_fd()
                 }
@@ -374,14 +377,25 @@ impl IoUringReactor {
                 }
             };
 
-            let (opcode, addr, len) = match s.kind {
+            let (opcode, addr, len, off) = match s.kind {
                 OpKind::Read => {
                     let slice = s.buf.memory.as_mut_full();
-                    (IORING_OP_READ, slice.as_mut_ptr() as u64, slice.len() as u32)
+                    (IORING_OP_READ, slice.as_mut_ptr() as u64, slice.len() as u32, s.offset)
+                }
+                OpKind::Recv => {
+                    // Streaming read from a non-seekable fd. `IORING_OP_READ` with
+                    // `off == -1` (as u64) tells the kernel "read from the file's
+                    // current position", the io_uring analogue of `read(2)` — the
+                    // required form for a socket/pipe, whose current position is the
+                    // only valid one (`man io_uring_prep_read`: an offset of -1 uses
+                    // and advances the current position; a real offset would fail with
+                    // ESPIPE on a non-seekable fd, same as `pread(2)`).
+                    let slice = s.buf.memory.as_mut_full();
+                    (IORING_OP_READ, slice.as_mut_ptr() as u64, slice.len() as u32, u64::MAX)
                 }
                 OpKind::Write => {
                     let slice = s.buf.memory.data();
-                    (IORING_OP_WRITE, slice.as_ptr() as u64, slice.len() as u32)
+                    (IORING_OP_WRITE, slice.as_ptr() as u64, slice.len() as u32, s.offset)
                 }
             };
 
@@ -391,7 +405,7 @@ impl IoUringReactor {
                 flags: 0,
                 ioprio: 0,
                 fd,
-                off: s.offset,
+                off,
                 addr,
                 len,
                 op_flags: 0,
@@ -455,24 +469,29 @@ impl IoUringReactor {
                     IoResult::Err(IoError::from_raw_os_error(-res).kind())
                 } else {
                     let n = res as usize;
-                    if let OpKind::Read = op.kind {
+                    // Both read forms fill the buffer, so both set its length.
+                    if matches!(op.kind, OpKind::Read | OpKind::Recv) {
                         op.buf.memory.set_len(n);
                     }
                     // Feed the file's hygiene watermark: only spans that became
                     // *contiguously* complete reach StreamHygiene, in file order,
                     // so the DONTNEED/sync windows behave exactly as in the
-                    // ordered SyncReactor despite arbitrary CQE order.
-                    if n > 0 {
+                    // ordered SyncReactor despite arbitrary CQE order. `Recv` is a
+                    // socket/pipe stream — no page cache, no offset — so it is
+                    // excluded here (its watermark/hygiene state is never touched).
+                    if n > 0 && !matches!(op.kind, OpKind::Recv) {
                         if let Some(rf) = self.files.get_mut(&op.file) {
                             let fd = rf.file.as_raw_fd();
                             let wm = match op.kind {
                                 OpKind::Read => &mut rf.read_wm,
                                 OpKind::Write => &mut rf.write_wm,
+                                OpKind::Recv => unreachable!("guarded above"),
                             };
                             if let Some((from, to)) = wm.complete(op.offset, op.offset + n as u64) {
                                 match op.kind {
                                     OpKind::Read => rf.hygiene.on_read(fd, from, (to - from) as usize),
                                     OpKind::Write => rf.hygiene.on_write(fd, from, (to - from) as usize),
+                                    OpKind::Recv => unreachable!("guarded above"),
                                 }
                             }
                         }

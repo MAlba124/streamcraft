@@ -1,13 +1,23 @@
 //! `httpsrc` — downloads a file over plain HTTP into pooled buffers
 //! (spec: Milestone applications §2).
 //!
-//! This version does **blocking** networking directly: `start()` opens a
-//! [`TcpStream`], sends a `GET`, parses the status line + headers, and picks a
-//! **message-body framing mode** from those headers per RFC 9112 (checked in at
-//! `spec/rfc9112.txt`). `process()` decodes the response body into pooled buffers and
-//! pushes them downstream, ending with [`Flow::Eos`] once the body is complete. It is
-//! an `Active` element (owns its group's thread), so blocking in `process()` is legal
-//! and does not stall the rest of the graph.
+//! `start()` opens a [`TcpStream`], sends a `GET`, parses the status line + headers,
+//! and picks a **message-body framing mode** from those headers per RFC 9112 (checked
+//! in at `spec/rfc9112.txt`). The connect + request write + header read are one-time
+//! setup and stay synchronous. It then **hands the socket fd to the reactor** (spec:
+//! IO): the connected `TcpStream` is consumed into a `File` (`into_raw_fd` →
+//! `File::from_raw_fd`, so the fd has exactly one owner) and registered with
+//! `ctx.io()`, exactly like `filesrc` registers its file.
+//!
+//! `process()` then drains completed body reads — submitted as streaming
+//! [`OpKind::Recv`](streamcraft_core::io::OpKind::Recv) ops — decodes them into pooled
+//! buffers and pushes them downstream, ending with [`Flow::Eos`] once the body is
+//! complete. The socket ride is **single-op**: unlike `filesrc`'s positioned reads
+//! (order-independent, pipelined `credits` deep), a streaming socket read consumes the
+//! *next* bytes off the fd, so two in flight could reorder the byte stream. We keep at
+//! most one `Recv` outstanding — sequential by nature — while still being fully async:
+//! under the io_uring reactor the read never blocks the group thread, and completions
+//! are drained across `process()` passes.
 //!
 //! ## Body framing (RFC 9112 §6.3 "Message Body Length")
 //! The framing mode is chosen from the response headers, in order of precedence:
@@ -28,6 +38,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
@@ -38,6 +49,7 @@ use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::OfferDesc;
 use streamcraft_core::id::PadId;
+use streamcraft_core::io::{FileHandle, IoResult};
 use streamcraft_core::time::Timestamp;
 
 /// Cap on the response header block, so a server that never sends `\r\n\r\n` can't
@@ -49,9 +61,6 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// buffer unboundedly (RFC 9112 §7.1: recipients MUST anticipate large chunk-size
 /// numerals and prevent parsing errors — we bound the line instead).
 const MAX_CHUNK_LINE_BYTES: usize = 16 * 1024;
-
-/// How much we pull from the socket per fill when the decoder needs more input.
-const READ_CHUNK: usize = 64 * 1024;
 
 /// Emits the downloaded body as a raw-byte stream (framing is HTTP's concern, not the
 /// pipeline's) — offer the open `bytes` family, no fields.
@@ -170,12 +179,13 @@ enum Framing {
 /// ```
 pub struct HttpSrc {
     url: String,
-    /// Connected + past the response header once `start()` succeeds.
-    stream: Option<TcpStream>,
+    /// The socket fd, registered with the reactor once `start()` succeeds. `None`
+    /// until then (and after `stop`).
+    file: Option<FileHandle>,
     /// Undecoded body bytes already pulled from the socket but not yet consumed by the
     /// framing decoder. Seeded in `start()` with the bytes that arrived in the same
     /// read as the header terminator (a Content-Length/chunked body often begins in
-    /// that read), then refilled from the socket as the decoder needs more.
+    /// that read), then refilled by completed `Recv` ops as the decoder needs more.
     inbuf: Vec<u8>,
     /// Read cursor into `inbuf`: bytes `[..cursor]` are consumed. We advance the
     /// cursor instead of draining so the decoder can work in slices without shifting
@@ -185,18 +195,38 @@ pub struct HttpSrc {
     framing: Framing,
     /// Set once the body is fully delivered, so `process()` reports `Flow::Eos`.
     done: bool,
+    /// A `Recv` op is outstanding — its bytes have not yet arrived. At most one is in
+    /// flight (a socket stream is sequential; see the module docs), so this is a bool,
+    /// not a count. `process()` never submits a second read while this is set.
+    read_in_flight: bool,
+    /// Set once a completed `Recv` returned 0 bytes: the peer closed the socket
+    /// (EOF). The decoder treats an exhausted `inbuf` under this flag as end-of-body.
+    socket_eof: bool,
+    /// Monotonic tag on each submitted `Recv` (rides back as the completion `user`).
+    /// Reads submitted below `valid_from` are stale (a flush landed) and discarded —
+    /// the same seq-floor `filesrc` uses, needed because `discard_buffers` does not
+    /// clear the IO mailbox (an in-flight completion still arrives).
+    seq: u64,
+    /// Completions carrying a `user` below this are dropped. HTTP is not seekable
+    /// without `Range` (not implemented), so a flush cannot reposition the stream;
+    /// this only ever bumps to cancel an in-flight read on flush, never to re-seek.
+    valid_from: u64,
 }
 
 impl HttpSrc {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            stream: None,
+            file: None,
             inbuf: Vec::new(),
             cursor: 0,
             // Overwritten by `start()`; `Eof` is the conservative default.
             framing: Framing::Eof,
             done: false,
+            read_in_flight: false,
+            socket_eof: false,
+            seq: 0,
+            valid_from: 0,
         }
     }
 
@@ -205,39 +235,78 @@ impl HttpSrc {
         &self.inbuf[self.cursor..]
     }
 
-    /// Pull more undecoded body bytes from the socket into `inbuf`. First compacts by
-    /// dropping the already-consumed prefix `[..cursor]` (so the buffer can't grow
-    /// without bound across chunks), then reads one block. Returns the number of bytes
-    /// read; `0` means the socket reached EOF. Blocking is fine — `HttpSrc` is
-    /// `Active`.
-    fn fill_socket(&mut self) -> Result<usize, Error> {
+    /// Submit one streaming socket read if the fd is registered, none is already in
+    /// flight, and the peer has not closed. First compacts `inbuf` by dropping the
+    /// consumed prefix `[..cursor]` (so it can't grow unbounded across chunks). The
+    /// completed bytes are appended to `inbuf` in `process()`; the pooled buffer the
+    /// reactor filled is recycled. Returns whether a read was submitted.
+    fn submit_read(&mut self, ctx: &mut Ctx) -> bool {
+        if self.read_in_flight || self.socket_eof {
+            return false;
+        }
+        let Some(file) = self.file else {
+            return false;
+        };
         if self.cursor > 0 {
             self.inbuf.drain(..self.cursor);
             self.cursor = 0;
         }
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or(Error::Todo("httpsrc not started"))?;
-        let base = self.inbuf.len();
-        self.inbuf.resize(base + READ_CHUNK, 0);
-        let n = stream
-            .read(&mut self.inbuf[base..])
-            .map_err(|e| Error::Resource(format!("httpsrc: read body from {}: {e}", self.url)))?;
-        self.inbuf.truncate(base + n);
-        Ok(n)
+        // A pooled slot to read into; `None` is pool backpressure — retry next pass.
+        let buf = match ctx.try_alloc(PadId(0)) {
+            Some(b) => b,
+            None => return false,
+        };
+        let user = self.seq;
+        self.seq += 1;
+        ctx.io().submit_recv(file, buf, user);
+        self.read_in_flight = true;
+        true
+    }
+
+    /// Drain any completed `Recv`, appending its bytes to `inbuf` (or noting EOF).
+    /// Returns `true` if fresh input landed, so the caller can try the decoder again.
+    /// Stale completions (below the seq floor after a flush) are discarded.
+    fn drain_reads(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
+        let mut got = false;
+        loop {
+            let Some(c) = ctx.io().next_completion() else {
+                break;
+            };
+            self.read_in_flight = false;
+            if c.user < self.valid_from {
+                continue; // read submitted before a flush: discard (buf recycles)
+            }
+            match c.result {
+                IoResult::Ok(0) => self.socket_eof = true, // peer closed; buf recycles
+                IoResult::Ok(_) => {
+                    // The reactor `set_len`'d the buffer to the bytes read, so `data()`
+                    // is exactly those bytes.
+                    self.inbuf.extend_from_slice(c.buf.memory.data());
+                    got = true;
+                }
+                IoResult::Cancelled => {}
+                IoResult::Err(k) => {
+                    return Err(Error::Resource(format!(
+                        "httpsrc: read body from {}: {k:?}",
+                        self.url
+                    )));
+                }
+            }
+        }
+        Ok(got)
     }
 
     /// `Content-Length` body (RFC 9112 §6.2): emit up to `dst.len()` of the remaining
-    /// octets, then signal EOS once the declared count is exhausted — without waiting
-    /// for the socket to close. Buffered leftover is emitted first; otherwise we read
-    /// straight into `dst` to avoid double-buffering a large body.
-    fn fill_length(&mut self, dst: &mut [u8]) -> Result<(usize, bool), Error> {
+    /// octets from buffered input, then signal EOS once the declared count is
+    /// exhausted — without waiting for the socket to close. Consumes only what is
+    /// buffered; when `inbuf` runs dry before the length is met, returns
+    /// [`NeedMore`](FillOutcome::NeedMore) so `process()` submits another read.
+    fn fill_length(&mut self, dst: &mut [u8]) -> Result<FillOutcome, Error> {
         let Framing::Length(remaining) = self.framing else {
             unreachable!("fill_length called for non-length framing");
         };
         if remaining == 0 {
-            return Ok((0, true));
+            return Ok(FillOutcome::Done(0, true));
         }
         // How many octets we may take this step: bounded by both the output buffer and
         // the declared remaining length. `usize::try_from` guards a >usize length on
@@ -246,65 +315,50 @@ impl HttpSrc {
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
 
-        // Prefer buffered leftover bytes (from the header read).
         let buffered = self.avail().len();
-        let n = if buffered > 0 {
-            let take = buffered.min(want);
-            dst[..take].copy_from_slice(&self.avail()[..take]);
-            self.cursor += take;
-            take
-        } else {
-            let stream = self
-                .stream
-                .as_mut()
-                .ok_or(Error::Todo("httpsrc not started"))?;
-            stream.read(&mut dst[..want]).map_err(|e| {
-                Error::Resource(format!("httpsrc: read body from {}: {e}", self.url))
-            })?
-        };
-
-        if n == 0 {
-            // Server closed before the declared length arrived (RFC 9112 §6.3 rule 6:
-            // the message is incomplete).
-            return Err(Error::Resource(format!(
-                "httpsrc: {} closed with {remaining} of Content-Length bytes unread",
-                self.url
-            )));
+        if buffered == 0 {
+            if self.socket_eof {
+                // Server closed before the declared length arrived (RFC 9112 §6.3
+                // rule 6: the message is incomplete).
+                return Err(Error::Resource(format!(
+                    "httpsrc: {} closed with {remaining} of Content-Length bytes unread",
+                    self.url
+                )));
+            }
+            return Ok(FillOutcome::NeedMore);
         }
+        let take = buffered.min(want);
+        dst[..take].copy_from_slice(&self.avail()[..take]);
+        self.cursor += take;
 
-        let left = remaining - n as u64;
+        let left = remaining - take as u64;
         self.framing = Framing::Length(left);
-        Ok((n, left == 0))
+        Ok(FillOutcome::Done(take, left == 0))
     }
 
-    /// Close-delimited body (RFC 9112 §6.3 rule 8): emit buffered leftover first, then
-    /// read the socket until it reports EOF, which ends the download.
-    fn fill_eof(&mut self, dst: &mut [u8]) -> Result<(usize, bool), Error> {
+    /// Close-delimited body (RFC 9112 §6.3 rule 8): emit buffered leftover, ending the
+    /// download when the socket reports EOF and no buffered bytes remain.
+    fn fill_eof(&mut self, dst: &mut [u8]) -> Result<FillOutcome, Error> {
         let buffered = self.avail().len();
         if buffered > 0 {
             let take = buffered.min(dst.len());
             dst[..take].copy_from_slice(&self.avail()[..take]);
             self.cursor += take;
-            return Ok((take, false));
+            return Ok(FillOutcome::Done(take, false));
         }
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or(Error::Todo("httpsrc not started"))?;
-        let n = stream
-            .read(dst)
-            .map_err(|e| Error::Resource(format!("httpsrc: read body from {}: {e}", self.url)))?;
-        Ok((n, n == 0))
+        if self.socket_eof {
+            return Ok(FillOutcome::Done(0, true));
+        }
+        Ok(FillOutcome::NeedMore)
     }
 
     /// `chunked` transfer coding (RFC 9112 §7.1). Runs the chunk state machine over
-    /// buffered input, refilling from the socket as needed, and writes as many decoded
-    /// `chunk-data` octets into `dst` as fit. Returns `(written, eos)`; `eos` is set
+    /// buffered input and writes as many decoded `chunk-data` octets into `dst` as fit.
+    /// Returns [`FillOutcome`]: `Done(written, eos)` when it makes progress or reaches
+    /// the end, or [`NeedMore`](FillOutcome::NeedMore) when the decoder needs bytes
+    /// that are not buffered yet (so `process()` submits another read). `eos` is set
     /// once the zero last-chunk and its terminating CRLF have been consumed.
-    ///
-    /// The step returns as soon as `dst` is full *or* the decoder needs bytes that a
-    /// socket read did not yet provide, so a single `process()` call never spins.
-    fn fill_chunked(&mut self, dst: &mut [u8]) -> Result<(usize, bool), Error> {
+    fn fill_chunked(&mut self, dst: &mut [u8]) -> Result<FillOutcome, Error> {
         let mut written = 0;
         loop {
             let state = match self.framing {
@@ -313,7 +367,7 @@ impl HttpSrc {
             };
 
             match state {
-                ChunkState::Done => return Ok((written, true)),
+                ChunkState::Done => return Ok(FillOutcome::Done(written, true)),
 
                 ChunkState::Size => {
                     // Need a full `chunk-size [ chunk-ext ] CRLF` line before decoding.
@@ -327,12 +381,7 @@ impl HttpSrc {
                             });
                         }
                         LineResult::NeedMore => {
-                            if self.fill_socket()? == 0 {
-                                return Err(Error::Resource(format!(
-                                    "httpsrc: {} closed mid chunk-size line",
-                                    self.url
-                                )));
-                            }
+                            return self.need_more_or_short(written, "chunk-size line");
                         }
                     }
                 }
@@ -341,17 +390,11 @@ impl HttpSrc {
                     // Copy as much chunk-data as fits in `dst` and is buffered.
                     let space = dst.len() - written;
                     if space == 0 {
-                        return Ok((written, false)); // buffer full; resume next step
+                        return Ok(FillOutcome::Done(written, false)); // full; resume next step
                     }
                     let buffered = self.avail().len();
                     if buffered == 0 {
-                        if self.fill_socket()? == 0 {
-                            return Err(Error::Resource(format!(
-                                "httpsrc: {} closed mid chunk-data",
-                                self.url
-                            )));
-                        }
-                        continue;
+                        return self.need_more_or_short(written, "chunk-data");
                     }
                     let take = space
                         .min(buffered)
@@ -378,14 +421,7 @@ impl HttpSrc {
                                 self.url
                             )));
                         }
-                        None => {
-                            if self.fill_socket()? == 0 {
-                                return Err(Error::Resource(format!(
-                                    "httpsrc: {} closed before chunk CRLF",
-                                    self.url
-                                )));
-                            }
-                        }
+                        None => return self.need_more_or_short(written, "chunk CRLF"),
                     }
                 }
 
@@ -398,28 +434,41 @@ impl HttpSrc {
                             if line.is_empty() {
                                 // The empty line terminates the body.
                                 self.framing = Framing::Chunked(ChunkState::Done);
-                                return Ok((written, true));
+                                return Ok(FillOutcome::Done(written, true));
                             }
                             // A trailer field line — skip it and keep reading.
                         }
                         LineResult::NeedMore => {
-                            if self.fill_socket()? == 0 {
-                                return Err(Error::Resource(format!(
-                                    "httpsrc: {} closed in chunked trailer",
-                                    self.url
-                                )));
-                            }
+                            return self.need_more_or_short(written, "chunked trailer");
                         }
                     }
                 }
             }
 
             // If we filled the output buffer, hand it off; otherwise loop to make more
-            // progress (the socket reads above are what bound the loop).
+            // progress (the "need more input" returns above are what bound the loop).
             if written == dst.len() {
-                return Ok((written, false));
+                return Ok(FillOutcome::Done(written, false));
             }
         }
+    }
+
+    /// The decoder needs more bytes than are buffered. If the socket already hit EOF,
+    /// the body was truncated mid-framing (a protocol error naming `what`); otherwise
+    /// return whatever was decoded so far and ask for another read — emitting the
+    /// partial output keeps buffers flowing while the next read is in flight.
+    fn need_more_or_short(&self, written: usize, what: &str) -> Result<FillOutcome, Error> {
+        if self.socket_eof {
+            return Err(Error::Resource(format!(
+                "httpsrc: {} closed mid {what}",
+                self.url
+            )));
+        }
+        Ok(if written > 0 {
+            FillOutcome::Done(written, false)
+        } else {
+            FillOutcome::NeedMore
+        })
     }
 
     /// Try to take one CRLF-terminated line from buffered input, *without* the CRLF.
@@ -465,6 +514,15 @@ enum LineResult {
     /// A complete line (CRLF stripped).
     Line(Vec<u8>),
     /// No complete line buffered yet — read more from the socket and retry.
+    NeedMore,
+}
+
+/// Outcome of a body-fill step (one of `fill_length`/`fill_chunked`/`fill_eof`).
+enum FillOutcome {
+    /// Wrote `usize` decoded octets into `dst`; `bool` is EOS (body complete).
+    Done(usize, bool),
+    /// The decoder needs bytes that are not buffered yet and the socket is not at
+    /// EOF — `process()` must submit another read and try again on a later pass.
     NeedMore,
 }
 
@@ -672,9 +730,12 @@ impl Element for HttpSrc {
         &DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         let url = parse_http_url(&self.url)?;
 
+        // One-time setup stays synchronous (spec: IO — connect + request write are a
+        // `start()`-time act, like `filesrc` opening its file): connect, GET, read the
+        // response head. Only the streaming *body* reads ride the reactor.
         let mut stream = TcpStream::connect((url.host.as_str(), url.port))
             .map_err(|e| Error::Resource(format!("httpsrc: connect {}: {e}", self.url)))?;
 
@@ -694,7 +755,18 @@ impl Element for HttpSrc {
         self.inbuf = head.leftover;
         self.cursor = 0;
         self.done = false;
-        self.stream = Some(stream);
+        self.read_in_flight = false;
+        self.socket_eof = false;
+        self.seq = 0;
+        self.valid_from = 0;
+
+        // Hand the connected socket to the reactor. `into_raw_fd` consumes the
+        // `TcpStream` (releasing sole fd ownership without closing it); `File`
+        // adopts that fd, and the reactor owns/closes it thereafter — the same
+        // registration path `filesrc` uses, so body reads become submitted ops.
+        // SAFETY: the fd came from `into_raw_fd`, which transferred ownership to us.
+        let file = unsafe { std::fs::File::from_raw_fd(stream.into_raw_fd()) };
+        self.file = Some(ctx.io().register(file));
         Ok(())
     }
 
@@ -703,24 +775,44 @@ impl Element for HttpSrc {
             return Ok(Flow::Eos);
         }
 
-        // Grab a pooled buffer; `None` is backpressure — try again next call.
+        // Drain any completed body read into `inbuf` (frees the read-in-flight slot).
+        self.drain_reads(ctx)?;
+
+        // Grab a pooled output buffer; `None` is pool backpressure — but still keep a
+        // read topped up so bytes are on the way when a slot frees. Retry next pass.
         let mut buf = match ctx.try_alloc(PadId(0)) {
             Some(b) => b,
-            None => return Ok(Flow::Ok),
+            None => {
+                self.submit_read(ctx);
+                return Ok(Flow::Ok);
+            }
         };
 
-        // Fill the buffer with decoded body bytes according to the framing. `written`
-        // is how many landed in it; `eos` means the body is complete this step.
+        // Fill the buffer with decoded body bytes according to the framing.
         let cap = buf.memory.capacity();
         let dst = buf.memory.as_mut_full();
-        let (written, eos) = match self.framing {
+        let outcome = match self.framing {
             Framing::Length(_) => self.fill_length(&mut dst[..cap])?,
             Framing::Chunked(_) => self.fill_chunked(&mut dst[..cap])?,
             Framing::Eof => self.fill_eof(&mut dst[..cap])?,
         };
 
+        let (written, eos) = match outcome {
+            FillOutcome::Done(w, e) => (w, e),
+            FillOutcome::NeedMore => {
+                // Decoder is starved: submit another socket read and come back. The
+                // pooled `buf` recycles on drop (nothing was written into it).
+                self.submit_read(ctx);
+                return Ok(Flow::Ok);
+            }
+        };
+
         if eos {
             self.done = true;
+        } else {
+            // Keep one read in flight so the next `process()` finds fresh bytes rather
+            // than starting the read then (single-op streaming — see the module docs).
+            self.submit_read(ctx);
         }
 
         // Push non-empty buffers; skip empty ones so we don't emit a zero-length
@@ -734,15 +826,26 @@ impl Element for HttpSrc {
         Ok(if self.done { Flow::Eos } else { Flow::Ok })
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, _ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // HTTP is not seekable without a `Range` request (not implemented), so a flush
+        // cannot reposition the stream — we intentionally ignore the *target*. But a
+        // flush must not leak an in-flight read: `discard_buffers` does not clear the
+        // IO mailbox, so its completion still arrives. Bump the seq floor so that
+        // completion is discarded on arrival (the same guard `filesrc` uses).
+        if matches!(event, Event::FlushStart) {
+            self.valid_from = self.seq;
+        }
         Ok(())
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {
-        // Drop the connection; the server sees the close.
-        self.stream = None;
+        // The reactor owns and closes the socket fd (registered in `start`). Just drop
+        // our handle and buffered state.
+        self.file = None;
         self.inbuf.clear();
         self.cursor = 0;
+        self.read_in_flight = false;
+        self.socket_eof = false;
     }
 }
 

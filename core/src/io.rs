@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -48,8 +48,18 @@ pub struct FileHandle(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpKind {
+    /// Positioned read at an explicit `offset` (`pread(2)` / `IORING_OP_READ` with
+    /// a real offset). Order-independent, seek-ready — the file/pool source path.
     Read,
+    /// Positioned write at an explicit `offset` (`pwrite(2)`).
     Write,
+    /// **Streaming** read: `offset` is ignored, bytes are pulled from the fd's
+    /// current position (`read(2)` on a socket/pipe; `IORING_OP_READ` with
+    /// `off = -1`). For non-seekable fds — a TCP socket has no meaningful offset,
+    /// and `pread(2)` on one fails with `ESPIPE` (`man 2 pread`). Completions carry
+    /// whatever the kernel returned; there is no page-cache hygiene (a socket has
+    /// no page cache), so `Recv` never feeds [`StreamHygiene`].
+    Recv,
 }
 
 /// The outcome of a completed op.
@@ -146,6 +156,28 @@ impl<'c> Io<'c> {
             kind: OpKind::Read,
             file,
             offset,
+            buf,
+            user,
+        });
+        op
+    }
+
+    /// Submit a **streaming** read of up to `buf.capacity()` bytes from `file`'s
+    /// current position into `buf` — for non-seekable fds (a socket, a pipe). No
+    /// offset: unlike [`submit_read`](Self::submit_read) the bytes come from wherever
+    /// the fd is now, so completions must be consumed in submission order to keep the
+    /// stream contiguous (the scheduler routes an element's completions in the order
+    /// the reactor reaps them; a sync `read(2)` and an in-order uring drain both
+    /// preserve it — see the reactor docs).
+    pub fn submit_recv(&mut self, file: FileHandle, buf: Buffer, user: u64) -> OpId {
+        let op = self.next_op_id();
+        self.reserve_outbox();
+        self.outbox.push(Submission {
+            op,
+            element: self.element,
+            kind: OpKind::Recv,
+            file,
+            offset: 0,
             buf,
             user,
         });
@@ -547,6 +579,19 @@ impl Reactor for SyncReactor {
                             }
                             Err(e) => IoResult::Err(e.kind()),
                         },
+                        // Streaming read from a non-seekable fd (socket/pipe): a plain
+                        // `read(2)` at the fd's current position — behaviorally what
+                        // `HttpSrc` did inline before it rode the reactor. Blocks the
+                        // group thread until bytes arrive, exactly like the old code;
+                        // an async backend (uring) turns this non-blocking. No hygiene:
+                        // a socket has no page cache, and `offset` is meaningless.
+                        OpKind::Recv => match (&rf.file).read(s.buf.memory.as_mut_full()) {
+                            Ok(n) => {
+                                s.buf.memory.set_len(n);
+                                IoResult::Ok(n)
+                            }
+                            Err(e) => IoResult::Err(e.kind()),
+                        },
                         OpKind::Write => {
                             let n = s.buf.memory.len();
                             match rf.file.write_all_at(s.buf.memory.data(), s.offset) {
@@ -566,5 +611,115 @@ impl Reactor for SyncReactor {
             ));
         }
         self.cancelled.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::BufferFlags;
+    use crate::id::FormatId;
+    use crate::memory::Pool;
+    use crate::time::Timestamp;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+    /// A pooled buffer with a fresh slot — the shape the scheduler hands an element.
+    fn buf(pool: &Pool) -> Buffer {
+        Buffer {
+            memory: pool.acquire(),
+            pts: Timestamp::NONE,
+            dts: Timestamp::NONE,
+            duration: Timestamp::NONE,
+            flags: BufferFlags::empty(),
+            format: FormatId(0),
+            sync: None,
+        }
+    }
+
+    /// A connected localhost socket pair, the client side adopted as a `File` (the
+    /// exact move `HttpSrc` makes: `TcpStream::into_raw_fd` → `File::from_raw_fd`,
+    /// which lets the socket fd ride the reactor's `File`-typed registration).
+    /// Returns `(client_as_file, server_side)`; `server_side` is what a test writes.
+    fn socket_pair() -> (File, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        // SAFETY: `into_raw_fd` yields sole ownership of the fd (the TcpStream is
+        // consumed and will not close it); `File::from_raw_fd` adopts that ownership.
+        let file = unsafe { File::from_raw_fd(client.into_raw_fd()) };
+        (file, server)
+    }
+
+    fn submit_recv(op: u64, element: ElementId, file: FileHandle, buf: Buffer, user: u64) -> Submission {
+        Submission { op: OpId(op), element, kind: OpKind::Recv, file, offset: 0, buf, user }
+    }
+
+    /// `Recv` on a socket fd returns bytes at the fd's current position and never
+    /// touches page-cache hygiene. Table-driven over three deliveries the http body
+    /// path must handle: a normal read, a short read, and EOF (peer close → `Ok(0)`).
+    #[test]
+    fn sync_reactor_recv_streams_socket() {
+        struct Case {
+            name: &'static str,
+            /// `Some(bytes)` writes then closes; `None` closes immediately (early EOF).
+            send: Option<&'static [u8]>,
+            want: IoResult,
+        }
+        let cases = [
+            Case { name: "full", send: Some(b"streamcraft body"), want: IoResult::Ok(16) },
+            Case { name: "short", send: Some(b"hi"), want: IoResult::Ok(2) },
+            Case { name: "early-eof", send: None, want: IoResult::Ok(0) },
+        ];
+
+        for c in cases {
+            let (file, mut server) = socket_pair();
+            let elem = ElementId(1);
+            let mut reactor = SyncReactor::new();
+            reactor.set_file(elem, file);
+
+            // Deliver (or close) *before* run_once so the blocking read has bytes /
+            // sees EOF without racing — mirrors the test http server's write-then-drop.
+            match c.send {
+                Some(bytes) => {
+                    server.write_all(bytes).unwrap();
+                    drop(server); // peer close; a subsequent read past `bytes` would be EOF
+                }
+                None => drop(server),
+            }
+
+            let pool = Pool::new(64 * 1024);
+            let mut subs = vec![submit_recv(0, elem, FileHandle(elem.0), buf(&pool), 7)];
+            reactor.submit(&mut subs);
+            assert!(subs.is_empty(), "{}: outbox drained", c.name);
+
+            let mut out = Vec::new();
+            reactor.run_once(&mut out);
+            assert_eq!(out.len(), 1, "{}: one completion", c.name);
+            let (who, comp) = out.into_iter().next().unwrap();
+            assert_eq!(who, elem, "{}: routed to submitter", c.name);
+            assert_eq!(comp.user, 7, "{}: user tag rides back", c.name);
+            assert_eq!(comp.result, c.want, "{}: result", c.name);
+            if let (IoResult::Ok(n), Some(bytes)) = (comp.result, c.send) {
+                assert_eq!(&comp.buf.memory.data()[..n], bytes, "{}: payload", c.name);
+            }
+            assert!(reactor.is_idle(), "{}: idle after draining", c.name);
+        }
+    }
+
+    /// An unregistered file handle fails the op rather than panicking (same path the
+    /// positioned ops take) — a `Recv` for a stale/never-registered fd is `NotFound`.
+    #[test]
+    fn sync_reactor_recv_unregistered_is_notfound() {
+        let mut reactor = SyncReactor::new();
+        let pool = Pool::new(64 * 1024);
+        let mut subs = vec![submit_recv(0, ElementId(9), FileHandle(9), buf(&pool), 0)];
+        reactor.submit(&mut subs);
+        let mut out = Vec::new();
+        reactor.run_once(&mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.result, IoResult::Err(ErrorKind::NotFound));
     }
 }
