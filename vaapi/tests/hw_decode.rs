@@ -181,6 +181,20 @@ fn decode_output_mkv_first_aus() {
         y.iter().any(|&b| b != first),
         "Y plane is constant — surface likely not decoded"
     );
+
+    // Inter-frame sanity on EVERY frame: broken reference handling shows up as
+    // P/B frames collapsing while I frames stay fine (the zeroed
+    // pred_weight_table bug rendered them green: Y≈0, chroma≈0 — mean luma of
+    // a real dark movie frame never sits below the 8-bit limited-range floor).
+    for (i, f) in frames.iter().enumerate() {
+        let y = &f.memory.data()[..(width * height) as usize];
+        let mean = y.iter().map(|&b| b as u64).sum::<u64>() / y.len() as u64;
+        assert!(
+            mean >= 10,
+            "frame {i}: mean luma {mean} ≈ black — inter prediction likely broken \
+             (refs/weights), I-frames-only would pass the constant check"
+        );
+    }
 }
 
 #[test]

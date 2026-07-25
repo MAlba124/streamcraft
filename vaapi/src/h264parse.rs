@@ -521,6 +521,29 @@ pub struct MmcoOp {
     pub arg2: u32,
 }
 
+/// One reference's explicit prediction weights (§7.3.3.2). `None` = the bitstream
+/// flagged them absent — the decoder substitutes the identity default
+/// `weight = 1 << denom`, `offset = 0` (§8.4.2.3.2).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct WeightEntry {
+    /// `(luma_weight, luma_offset)` when `luma_weight_lX_flag` was set.
+    pub luma: Option<(i32, i32)>,
+    /// `[(cb_weight, cb_offset), (cr_weight, cr_offset)]` when the chroma flag was set.
+    pub chroma: Option<[(i32, i32); 2]>,
+}
+
+/// The explicit `pred_weight_table` (§7.3.3.2), present on P/SP slices when the
+/// PPS sets `weighted_pred_flag`, and on B slices when `weighted_bipred_idc == 1`.
+/// Forwarded verbatim to the VA slice parameters — submitting zeros instead makes
+/// the driver multiply every prediction by 0 (green P/B frames).
+#[derive(Clone, Default, Debug)]
+pub struct PredWeightTable {
+    pub luma_log2_weight_denom: u32,
+    pub chroma_log2_weight_denom: u32,
+    pub l0: Vec<WeightEntry>,
+    pub l1: Vec<WeightEntry>,
+}
+
 /// Parsed slice header (§7.3.3) — the subset needed to fill VA slice params + POC.
 #[derive(Clone, Debug)]
 pub struct SliceHeader {
@@ -550,6 +573,9 @@ pub struct SliceHeader {
     pub long_term_reference_flag: bool,
     pub adaptive_ref_pic_marking_mode_flag: bool,
     pub mmco_ops: Vec<MmcoOp>,
+    /// The explicit prediction weight table, when the PPS/slice combination
+    /// carries one (§7.3.3.2).
+    pub pred_weights: Option<PredWeightTable>,
     /// Bit position (within the *de-emulated* RBSP body, after the NAL header) at
     /// the end of the slice header — the caller re-derives the raw-NAL bit offset.
     pub header_bits_in_rbsp: usize,
@@ -661,17 +687,19 @@ pub fn parse_slice_header(
         }
     }
 
-    // pred_weight_table (§7.3.3.2): parse-and-skip (element passes zero weights).
+    // pred_weight_table (§7.3.3.2): parsed and forwarded to VA — the element
+    // announces `weighted_pred_flag` in pic_fields, so the driver *uses* these.
+    let mut pred_weights = None;
     if (pps.weighted_pred_flag && matches!(slice_type, SliceType::P | SliceType::Sp))
         || (pps.weighted_bipred_idc == 1 && slice_type == SliceType::B)
     {
-        skip_pred_weight_table(
+        pred_weights = Some(parse_pred_weight_table(
             &mut r,
             sps.chroma_format_idc,
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
             slice_type,
-        );
+        ));
     }
 
     // dec_ref_pic_marking (§7.3.3.3).
@@ -757,42 +785,46 @@ pub fn parse_slice_header(
         long_term_reference_flag,
         adaptive_ref_pic_marking_mode_flag,
         mmco_ops,
+        pred_weights,
         header_bits_in_rbsp,
     })
 }
 
-/// Parse-and-skip `pred_weight_table` (§7.3.3.2). The element passes zero weights
-/// to VA, so only the bit consumption matters (it precedes `dec_ref_pic_marking`
-/// and the deblocking params, whose positions must be right).
-fn skip_pred_weight_table(
+/// Parse `pred_weight_table` (§7.3.3.2). Both consumers matter: the values are
+/// forwarded to the VA slice params (explicit weighted prediction), and the bit
+/// consumption positions `dec_ref_pic_marking` + the deblocking params after it.
+fn parse_pred_weight_table(
     r: &mut BitReader,
     chroma_format_idc: u32,
     num_ref_l0: u32,
     num_ref_l1: u32,
     slice_type: SliceType,
-) {
-    let _luma_log2_weight_denom = r.ue();
-    if chroma_format_idc != 0 {
-        let _chroma_log2_weight_denom = r.ue();
-    }
-    let read_list = |r: &mut BitReader, count: u32| {
+) -> PredWeightTable {
+    let luma_log2_weight_denom = r.ue();
+    let chroma_log2_weight_denom = if chroma_format_idc != 0 { r.ue() } else { 0 };
+    let read_list = |r: &mut BitReader, count: u32| -> Vec<WeightEntry> {
+        let mut list = Vec::with_capacity((count as usize + 1).min(32));
+        // Consume every bitstream entry (staying in sync even on a malformed
+        // count) but store at most the 32 VA can carry.
         for _ in 0..=count {
+            let mut e = WeightEntry::default();
             if r.flag() {
-                let _lw = r.se();
-                let _lo = r.se();
+                // luma_weight_lX_flag
+                e.luma = Some((r.se(), r.se()));
             }
             if chroma_format_idc != 0 && r.flag() {
-                for _ in 0..2 {
-                    let _cw = r.se();
-                    let _co = r.se();
-                }
+                // chroma_weight_lX_flag — Cb then Cr, each (weight, offset).
+                e.chroma = Some([(r.se(), r.se()), (r.se(), r.se())]);
+            }
+            if list.len() < 32 {
+                list.push(e);
             }
         }
+        list
     };
-    read_list(r, num_ref_l0);
-    if slice_type == SliceType::B {
-        read_list(r, num_ref_l1);
-    }
+    let l0 = read_list(r, num_ref_l0);
+    let l1 = if slice_type == SliceType::B { read_list(r, num_ref_l1) } else { Vec::new() };
+    PredWeightTable { luma_log2_weight_denom, chroma_log2_weight_denom, l0, l1 }
 }
 
 // --- Picture order count (§8.2.1) ------------------------------------------------------

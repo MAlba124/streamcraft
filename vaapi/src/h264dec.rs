@@ -35,7 +35,7 @@ use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
 use crate::ffi;
-use crate::h264parse::{self, MmcoOp, Pps, RefListMod, SliceHeader, SliceType, Sps};
+use crate::h264parse::{self, MmcoOp, Pps, PredWeightTable, RefListMod, SliceHeader, SliceType, Sps};
 use crate::probe;
 use crate::va::{Buffer as VaBuffer, Config, Context, Display, MappedImage, Surfaces};
 
@@ -668,6 +668,17 @@ impl VaapiH264Dec {
         // header within the RBSP body; add the 8 header bits.
         let bit_offset = sh.header_bits_in_rbsp as u16 + 8;
 
+        // Explicit weighted prediction (§7.3.3.2 → va.h): forward the parsed
+        // table. pic_fields announces the PPS's weighted_pred_flag, so the
+        // driver *uses* this table — an all-zero one multiplies every
+        // prediction by 0 (green P/B frames, I frames untouched). References
+        // without explicit weights get the identity default `1 << denom`,
+        // offset 0 (§8.4.2.3.2).
+        let mut w = WeightFill::default();
+        if let Some(t) = &sh.pred_weights {
+            w.fill(t, n0, n1);
+        }
+
         ffi::VASliceParameterBufferH264 {
             slice_data_size: raw_nal.len() as u32,
             slice_data_offset: 0,
@@ -685,22 +696,20 @@ impl VaapiH264Dec {
             slice_beta_offset_div2: sh.slice_beta_offset_div2 as i8,
             RefPicList0: *list0,
             RefPicList1: *list1,
-            // Weights: pass zero (element does not forward pred_weight_table; the
-            // driver applies default weighting when denom==0). A documented subset.
-            luma_log2_weight_denom: 0,
-            chroma_log2_weight_denom: 0,
-            luma_weight_l0_flag: 0,
-            luma_weight_l0: [0; 32],
-            luma_offset_l0: [0; 32],
-            chroma_weight_l0_flag: 0,
-            chroma_weight_l0: [[0; 2]; 32],
-            chroma_offset_l0: [[0; 2]; 32],
-            luma_weight_l1_flag: 0,
-            luma_weight_l1: [0; 32],
-            luma_offset_l1: [0; 32],
-            chroma_weight_l1_flag: 0,
-            chroma_weight_l1: [[0; 2]; 32],
-            chroma_offset_l1: [[0; 2]; 32],
+            luma_log2_weight_denom: w.luma_denom,
+            chroma_log2_weight_denom: w.chroma_denom,
+            luma_weight_l0_flag: w.l0_present,
+            luma_weight_l0: w.luma_weight_l0,
+            luma_offset_l0: w.luma_offset_l0,
+            chroma_weight_l0_flag: w.l0_present,
+            chroma_weight_l0: w.chroma_weight_l0,
+            chroma_offset_l0: w.chroma_offset_l0,
+            luma_weight_l1_flag: w.l1_present,
+            luma_weight_l1: w.luma_weight_l1,
+            luma_offset_l1: w.luma_offset_l1,
+            chroma_weight_l1_flag: w.l1_present,
+            chroma_weight_l1: w.chroma_weight_l1,
+            chroma_offset_l1: w.chroma_offset_l1,
             va_reserved: [0; ffi::VA_PADDING_LOW],
         }
     }
@@ -1086,6 +1095,65 @@ impl VaapiH264Dec {
 }
 
 // --- free-function helpers ------------------------------------------------------------
+
+/// The VA slice-parameter weight arrays, prepared from a parsed
+/// [`PredWeightTable`]. Defaults (all zero, `l0/l1_present = 0`) are what a
+/// slice *without* an explicit table submits — the driver then ignores them
+/// (non-weighted P, or implicit-B, where it derives weights from POC itself).
+#[derive(Default)]
+struct WeightFill {
+    luma_denom: u8,
+    chroma_denom: u8,
+    l0_present: u8,
+    l1_present: u8,
+    luma_weight_l0: [i16; 32],
+    luma_offset_l0: [i16; 32],
+    chroma_weight_l0: [[i16; 2]; 32],
+    chroma_offset_l0: [[i16; 2]; 32],
+    luma_weight_l1: [i16; 32],
+    luma_offset_l1: [i16; 32],
+    chroma_weight_l1: [[i16; 2]; 32],
+    chroma_offset_l1: [[i16; 2]; 32],
+}
+
+impl WeightFill {
+    /// Expand the parsed table over the active reference counts: explicit
+    /// entries verbatim, absent ones as the §8.4.2.3.2 identity default
+    /// (`1 << denom`, offset 0) so untouched references predict unweighted.
+    fn fill(&mut self, t: &PredWeightTable, n0: usize, n1: usize) {
+        self.luma_denom = t.luma_log2_weight_denom as u8;
+        self.chroma_denom = t.chroma_log2_weight_denom as u8;
+        let ld = 1i16 << t.luma_log2_weight_denom.min(7);
+        let cd = 1i16 << t.chroma_log2_weight_denom.min(7);
+
+        self.l0_present = 1;
+        for i in 0..n0.min(32) {
+            let e = t.l0.get(i).copied().unwrap_or_default();
+            let (lw, lo) = e.luma.unwrap_or((ld as i32, 0));
+            self.luma_weight_l0[i] = lw as i16;
+            self.luma_offset_l0[i] = lo as i16;
+            let ch = e.chroma.unwrap_or([(cd as i32, 0); 2]);
+            for c in 0..2 {
+                self.chroma_weight_l0[i][c] = ch[c].0 as i16;
+                self.chroma_offset_l0[i][c] = ch[c].1 as i16;
+            }
+        }
+        if !t.l1.is_empty() {
+            self.l1_present = 1;
+            for i in 0..n1.min(32) {
+                let e = t.l1.get(i).copied().unwrap_or_default();
+                let (lw, lo) = e.luma.unwrap_or((ld as i32, 0));
+                self.luma_weight_l1[i] = lw as i16;
+                self.luma_offset_l1[i] = lo as i16;
+                let ch = e.chroma.unwrap_or([(cd as i32, 0); 2]);
+                for c in 0..2 {
+                    self.chroma_weight_l1[i][c] = ch[c].0 as i16;
+                    self.chroma_offset_l1[i][c] = ch[c].1 as i16;
+                }
+            }
+        }
+    }
+}
 
 /// Peek the pps_id of a slice NAL (first_mb ue, slice_type ue, pps_id ue).
 fn peek_pps_id(nal: &[u8]) -> Option<u32> {
