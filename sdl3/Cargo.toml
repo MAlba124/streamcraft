@@ -1,0 +1,31 @@
+[package]
+name = "sc-sdl3"
+description = "SDL3 video sink (and, later, the scope UI backend) for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_sdl3"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+# The one sanctioned dependency: pure auto-generated SDL3 bindings (no logic —
+# the `ash`/`pipewire` pattern for plugin crates; spec: windowing/graphics ride
+# SDL3, "graphics sucks and we shouldn't waste time on it"). Links the system
+# libSDL3 via pkg-config — never `build-from-source` (this repo's toolchain
+# does not carry SDL's cmake/clang build).
+sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
+streamcraft-video = { path = "../video" }
+# For the play examples: the container + decoder half of
+# `filesrc ! mkvdemux ! <dec> ! sdl3videosink`.
+sc-mkv = { path = "../mkv" }
+sc-vp8 = { path = "../vp8" }
+sc-vp9 = { path = "../vp9" }
+sc-av1 = { path = "../av1" }
+sc-h264 = { path = "../h264" }
+sc-h265 = { path = "../h265" }

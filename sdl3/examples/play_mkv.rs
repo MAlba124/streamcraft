@@ -1,9 +1,9 @@
 //! `play_mkv` — **milestone 5**: play a video file (spec: Milestone applications §5),
-//! `filesrc ! mkvdemux ! vp8dec ! waylandvideosink`, clock-paced to a real window.
+//! `filesrc ! mkvdemux ! vp8dec ! sdl3videosink`, clock-paced to a real window.
 //!
 //! ```text
 //! cargo run --release -p sc-mkv --example make_vp8_sample -- /tmp/sample.mkv 5
-//! cargo run --release -p sc-wayland --example play_mkv -- /tmp/sample.mkv
+//! cargo run --release -p sc-sdl3 --example play_mkv -- /tmp/sample.mkv
 //! ```
 //!
 //! `MkvDemux` discovers its tracks during preroll from constructor-supplied header
@@ -14,7 +14,7 @@
 use sc_mkv::ebml::id;
 use sc_mkv::MkvDemux;
 use sc_vp8::Vp8Dec;
-use sc_wayland::WaylandVideoSink;
+use sc_sdl3::Sdl3VideoSink;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_elements::io::FileSrc;
 
@@ -48,7 +48,7 @@ fn main() {
     println!("track pad: {}", video.name);
 
     let dec = p.add(Vp8Dec::new());
-    let sink = p.add(WaylandVideoSink::new());
+    let sink = p.add(Sdl3VideoSink::new());
     p.link((video.element, &video.name), (dec, "sink")).expect("demux ! dec");
     p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
 

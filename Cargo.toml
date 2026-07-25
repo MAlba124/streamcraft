@@ -19,8 +19,7 @@ members = [
     "opus",
     "mp3",
     "mp4",
-    "wayland",
-    "vk",
+    "sdl3",
     "launch",
 ]
 

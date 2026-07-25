@@ -30,7 +30,5 @@ sc-h265 = { path = "../h265" }
 sc-mkv = { path = "../mkv" }
 sc-mp4 = { path = "../mp4" }
 sc-mp3 = { path = "../mp3" }
-# The shm display sink (hand-written Wayland client — no native library).
-sc-wayland = { path = "../wayland" }
-# The GPU display sink (Vulkan via ash "loaded" — dlopens libvulkan at runtime).
-sc-vk = { path = "../vk" }
+# The display sink (SDL3 window + GPU-accelerated presentation).
+sc-sdl3 = { path = "../sdl3" }

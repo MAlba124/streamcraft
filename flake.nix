@@ -33,18 +33,12 @@
             pkgs.cargo-fuzz
             pkgs.mold
             pkgs.clang # libclang, for the pipewire crate's bindgen
-            # `ash`'s "loaded" feature dlopen()s libvulkan.so.1 at runtime for
-            # the sc-vk renderer; glslang regenerates the checked-in SPIR-V from
-            # the reviewable GLSL sources (vk/shaders/*.glsl → vk/src/shaders.rs).
-            # build.rs never runs a shader compiler — regeneration is a documented
-            # manual step (see vk/REFERENCES.md).
-            pkgs.vulkan-loader
-            pkgs.glslang
           ];
 
-          # PipeWire (libpipewire-0.3 + libspa), found via pkg-config. Only the
-          # sc-pipewire plugin links it; the core stays dependency-free.
-          buildInputs = [ pkgs.pipewire ];
+          # PipeWire (libpipewire-0.3 + libspa) and SDL3, found via pkg-config.
+          # Only sc-pipewire links libpipewire and only sc-sdl3 links SDL3 (spec:
+          # windowing/graphics ride SDL3); the core stays dependency-free.
+          buildInputs = [ pkgs.pipewire pkgs.sdl3 ];
 
           # Self-contained linking: the stdenv `cc` driver with mold, so the shell
           # doesn't depend on a globally-configured linker. Plain RUSTFLAGS is used
@@ -58,16 +52,9 @@
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
-          # So `ash`'s runtime dlopen("libvulkan.so.1") resolves inside the pure
-          # devshell (the loader is not on the default linker search path here).
-          # The loader then discovers the system ICDs via the usual
-          # /run/opengl-driver + /usr/share/vulkan/icd.d manifests.
-          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
-
-          # Baked into sc-vk at *build* time (`option_env!` in vk/src/gpu.rs), so a
-          # binary built in this devshell finds its loader no matter how it is later
-          # launched — LD_LIBRARY_PATH is too fragile an invocation contract.
-          SC_VULKAN_LOADER = "${pkgs.vulkan-loader}/lib/libvulkan.so.1";
+          # So the dynamically-linked libSDL3.so.0 resolves at run time inside the
+          # pure devshell (it is not on the default search path here).
+          LD_LIBRARY_PATH = "${pkgs.sdl3}/lib";
 
           shellHook = ''
             echo "streamcraft devshell — $(rustc --version)"

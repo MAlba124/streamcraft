@@ -1,5 +1,5 @@
 //! `play_file` — play a real-world MKV's video track in a window (spec: Milestone
-//! applications §5). `filesrc ! mkvdemux ! <matching video decoder> ! waylandvideosink`,
+//! applications §5). `filesrc ! mkvdemux ! <matching video decoder> ! sdl3videosink`,
 //! with every other discovered track (audio codecs we don't decode yet, subtitles)
 //! linked to a drop-sink — an unlinked dynamic pad would otherwise accumulate output
 //! without bound (the spec's buffer-then-drop policy for unlinked pads is future core
@@ -11,12 +11,12 @@
 //! decoder's sink offer. First video pad that links gets the window; the rest drop.
 //!
 //! ```text
-//! cargo run --release -p sc-wayland --example play_file -- FILE.mkv
+//! cargo run --release -p sc-sdl3 --example play_file -- FILE.mkv
 //! ```
 
 use sc_mkv::ebml::id;
 use sc_mkv::MkvDemux;
-use sc_wayland::WaylandVideoSink;
+use sc_sdl3::Sdl3VideoSink;
 use streamcraft_core::element::Element;
 use streamcraft_core::error::Error;
 use streamcraft_core::pipeline::Pipeline;
@@ -73,13 +73,6 @@ fn try_video_decoders(
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // `--vk`: present through the GPU sink (sc-vk) instead of the CPU shm path.
-    let use_vk = if let Some(i) = args.iter().position(|a| a == "--vk") {
-        args.remove(i);
-        true
-    } else {
-        false
-    };
     // `--probe`: demux only — every pad to a drop-sink, no decoder, no window.
     // Isolates container-side behavior (throughput, memory) from decode/display.
     let probe = if let Some(i) = args.iter().position(|a| a == "--probe") {
@@ -100,7 +93,7 @@ fn main() {
             v
         });
     let Some(path) = args.first().cloned() else {
-        eprintln!("usage: play_file [--vk|--probe] [--max-secs N] FILE.mkv");
+        eprintln!("usage: play_file [--probe] [--max-secs N] FILE.mkv");
         std::process::exit(2);
     };
 
@@ -143,11 +136,7 @@ fn main() {
     };
 
     if let Some(dec) = dec {
-        let sink = if use_vk {
-            p.add_boxed(Box::new(sc_vk::VkVideoSink::new().with_title("streamcraft — play_file (vk)")))
-        } else {
-            p.add_boxed(Box::new(WaylandVideoSink::new().with_title("streamcraft — play_file")))
-        };
+        let sink = p.add_boxed(Box::new(Sdl3VideoSink::new().with_title("streamcraft — play_file")));
         p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
     }
 
