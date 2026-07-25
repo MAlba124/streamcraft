@@ -805,10 +805,12 @@ dependencies = [
 name = "sc-sdl3"
 version = "0.1.0"
 dependencies = [
+ "sc-aac",
  "sc-av1",
  "sc-h264",
  "sc-h265",
  "sc-mkv",
+ "sc-pipewire",
  "sc-vp8",
  "sc-vp9",
  "sdl3-sys",

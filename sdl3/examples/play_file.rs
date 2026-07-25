@@ -120,6 +120,7 @@ fn main() {
     println!("{} track pad(s) discovered:", added.len());
 
     let mut video_dec = None;
+    let mut audio_dec = None;
     for ap in &added {
         if !probe && video_dec.is_none() {
             if let Some(dec) = try_video_decoders(&mut p, (ap.element, &ap.name)) {
@@ -127,8 +128,25 @@ fn main() {
                 continue;
             }
         }
-        // Everything else — audio codecs without decoders yet, subtitles, extra
-        // video tracks — drains into a drop-sink so nothing backs up.
+        // First audio track that negotiates gets decoded and played (milestone:
+        // play A+V — the audio sink provides the pipeline clock, so video paces
+        // on the DAC; spec: Clock providers, audio-master sync). Same
+        // negotiation-driven autoplug as video: the link only succeeds when the
+        // pad's per-track family matches the decoder's sink offer.
+        if !probe && audio_dec.is_none() {
+            let dec_id = p.add(sc_aac::AacDec::new());
+            match p.link((ap.element, &ap.name), (dec_id, "sink")) {
+                Ok(_) => {
+                    println!("  {} -> aacdec", ap.name);
+                    audio_dec = Some(dec_id);
+                    continue;
+                }
+                Err(Error::Resource(_)) | Err(Error::Todo(_)) => {} // not aac — fall through
+                Err(e) => eprintln!("  audio link error on {}: {e:?}", ap.name),
+            }
+        }
+        // Everything else — codecs without decoders, subtitles, extra tracks —
+        // drains into a drop-sink so nothing backs up.
         let (sink, _stats) = TestSink::new();
         let drop_id = p.add(sink);
         p.link((ap.element, &ap.name), (drop_id, "sink"))
@@ -157,6 +175,14 @@ fn main() {
         let sink = p.add_boxed(Box::new(Sdl3VideoSink::new().with_title("streamcraft — play_file")));
         p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
         sink_id = Some(sink);
+    }
+    if let Some(adec) = audio_dec {
+        // s16 interleaved audio/raw straight into the device sink (the same
+        // chain shape as the flac "play an audio file" milestone). The pipewire
+        // sink provides the AudioDeviceClock — sinks-first selection makes it
+        // the pipeline clock, so the video sink's wait_until paces on the DAC.
+        let asink = p.add(sc_pipewire::PipeWireAudioSink::new());
+        p.link((adec, "src"), (asink, "sink")).expect("aacdec ! audiosink");
     }
 
     println!("playing {path} — 'p'⏎ pause/resume, 'q'⏎ quit (or close the window / Ctrl-C)…");

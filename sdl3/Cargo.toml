@@ -22,7 +22,11 @@ sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
 streamcraft-elements = { path = "../elements" }
 streamcraft-video = { path = "../video" }
 # For the play examples: the container + decoder half of
-# `filesrc ! mkvdemux ! <dec> ! sdl3videosink`.
+# `filesrc ! mkvdemux ! <dec> ! sdl3videosink`, plus the audio chain
+# (`aacdec ! pipewireaudiosink` — the A+V milestone; pipewire is dev-only,
+# the library itself stays free of native deps beyond SDL3).
+sc-aac = { path = "../aac" }
+sc-pipewire = { path = "../pipewire" }
 sc-mkv = { path = "../mkv" }
 sc-vp8 = { path = "../vp8" }
 sc-vp9 = { path = "../vp9" }
