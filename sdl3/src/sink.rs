@@ -49,11 +49,13 @@ const F_PIXFMT: &str = "pixfmt";
 const F_FPS: &str = "fps";
 const PIXFMT_I420: &str = "i420";
 const PIXFMT_GRAY8: &str = "gray8";
+const PIXFMT_NV12: &str = "nv12";
 
 // The sink offers a broad `video/raw` template constrained to the pixel formats we can
 // present (i420 natively; gray8 as flat-chroma IYUV). Dimensions/fps arrive at runtime
 // via the decoder's FormatChange, so the pad is `dynamic`.
-static PIXFMT_VALUES: [ValueDesc; 2] = [ValueDesc::Id(PIXFMT_I420), ValueDesc::Id(PIXFMT_GRAY8)];
+static PIXFMT_VALUES: [ValueDesc; 3] =
+    [ValueDesc::Id(PIXFMT_I420), ValueDesc::Id(PIXFMT_GRAY8), ValueDesc::Id(PIXFMT_NV12)];
 static SINK_FIELDS: [FieldDesc; 4] = [
     FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
@@ -90,6 +92,9 @@ static DESC: ElementDesc = ElementDesc {
 enum Pix {
     I420,
     Gray8,
+    /// Two-plane 4:2:0 (Y + interleaved CbCr) — what hardware decoders emit;
+    /// SDL renders it natively, so this path never converts on the CPU.
+    Nv12,
 }
 
 impl Pix {
@@ -97,6 +102,7 @@ impl Pix {
         match s {
             PIXFMT_I420 => Some(Pix::I420),
             PIXFMT_GRAY8 => Some(Pix::Gray8),
+            PIXFMT_NV12 => Some(Pix::Nv12),
             _ => None,
         }
     }
@@ -259,6 +265,7 @@ impl Sdl3VideoSink {
         let shown = match fmt.pixfmt {
             Pix::I420 => window.present_i420(data, fmt.width, fmt.height),
             Pix::Gray8 => window.present_gray8(data, fmt.width, fmt.height),
+            Pix::Nv12 => window.present_nv12(data, fmt.width, fmt.height),
         };
         match shown {
             Ok(drawn) => {
@@ -374,6 +381,6 @@ mod tests {
     fn pixfmt_names_round_trip() {
         assert!(matches!(Pix::from_name("i420"), Some(Pix::I420)));
         assert!(matches!(Pix::from_name("gray8"), Some(Pix::Gray8)));
-        assert!(Pix::from_name("nv12").is_none());
+        assert!(matches!(Pix::from_name("nv12"), Some(Pix::Nv12)));
     }
 }

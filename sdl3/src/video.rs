@@ -48,6 +48,9 @@ pub struct VideoWindow {
     texture: *mut SDL_Texture,
     tex_w: c_int,
     tex_h: c_int,
+    /// The streaming texture's pixel format (IYUV for i420/gray8, NV12 for
+    /// hardware-decoder output) — a format change recreates the texture.
+    tex_fmt: SDL_PixelFormat,
     /// Constant-128 chroma plane for gray8 presentation, sized `cw*ch` on demand.
     flat_chroma: Vec<u8>,
 }
@@ -91,14 +94,16 @@ impl VideoWindow {
                 texture: std::ptr::null_mut(),
                 tex_w: 0,
                 tex_h: 0,
+                tex_fmt: SDL_PIXELFORMAT_IYUV,
                 flat_chroma: Vec::new(),
             })
         }
     }
 
-    /// (Re)create the streaming texture when the frame geometry changes.
-    fn ensure_texture(&mut self, w: c_int, h: c_int) -> Result<(), Error> {
-        if !self.texture.is_null() && self.tex_w == w && self.tex_h == h {
+    /// (Re)create the streaming texture when the frame geometry or pixel format
+    /// changes (IYUV for i420/gray8, NV12 for hardware-decoder output).
+    fn ensure_texture(&mut self, w: c_int, h: c_int, fmt: SDL_PixelFormat) -> Result<(), Error> {
+        if !self.texture.is_null() && self.tex_w == w && self.tex_h == h && self.tex_fmt == fmt {
             return Ok(());
         }
         // SAFETY: destroying a live texture we own; creating its replacement.
@@ -109,7 +114,7 @@ impl VideoWindow {
             }
             let tex = SDL_CreateTexture(
                 self.renderer,
-                SDL_PIXELFORMAT_IYUV,
+                fmt,
                 SDL_TEXTUREACCESS_STREAMING,
                 w,
                 h,
@@ -122,8 +127,49 @@ impl VideoWindow {
             self.texture = tex;
             self.tex_w = w;
             self.tex_h = h;
+            self.tex_fmt = fmt;
         }
         Ok(())
+    }
+
+    /// Present one tightly-packed NV12 frame (Y `w*h`, then one interleaved CbCr
+    /// plane `2*cw × ch`; `cw = ceil(w/2)`, `ch = ceil(h/2)`) — the layout every
+    /// VA-API/hardware decoder emits. SDL renders NV12 textures natively, so no
+    /// CPU conversion happens on this path.
+    pub fn present_nv12(&mut self, data: &[u8], width: usize, height: usize) -> Result<bool, Error> {
+        if width == 0 || height == 0 {
+            return Ok(true);
+        }
+        let cw = width.div_ceil(2);
+        let ch = height.div_ceil(2);
+        let y_size = width * height;
+        let uv_size = 2 * cw * ch;
+        if data.len() < y_size + uv_size {
+            return Ok(false);
+        }
+        let (w, h) = (width as c_int, height as c_int);
+        self.ensure_texture(w, h, SDL_PIXELFORMAT_NV12)?;
+        // SAFETY: the texture is streaming NV12 of exactly (w, h); the Y and the
+        // interleaved UV plane cover the full rect at the given pitches (length
+        // checked above).
+        unsafe {
+            if !SDL_UpdateNVTexture(
+                self.texture,
+                std::ptr::null(),
+                data.as_ptr(),
+                w,
+                data[y_size..].as_ptr(),
+                (2 * cw) as c_int,
+            ) {
+                return Err(resource("upload frame (nv12)"));
+            }
+            SDL_RenderClear(self.renderer);
+            if !SDL_RenderTexture(self.renderer, self.texture, std::ptr::null(), std::ptr::null()) {
+                return Err(resource("draw frame"));
+            }
+            SDL_RenderPresent(self.renderer);
+        }
+        Ok(true)
     }
 
     /// Present one tightly-packed I420 frame (Y `w*h`, Cb `cw*ch`, Cr `cw*ch`;
@@ -173,7 +219,7 @@ impl VideoWindow {
         v: &[u8],
     ) -> Result<bool, Error> {
         let (w, h) = (width as c_int, height as c_int);
-        self.ensure_texture(w, h)?;
+        self.ensure_texture(w, h, SDL_PIXELFORMAT_IYUV)?;
         let cw = width.div_ceil(2) as c_int;
         // SAFETY: the texture is streaming IYUV of exactly (w, h); the plane
         // pointers cover the full rect at the given pitches (checked by callers).
