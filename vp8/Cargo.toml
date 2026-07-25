@@ -15,7 +15,9 @@ streamcraft-core = { path = "../core" }
 # sc-pipewire): pure Rust, zero transitive deps with default features off, no
 # build.rs, no unsafe, MIT. See lib.rs for the adoption rationale and the
 # planned nativization steps (decode-into-pool-memory, conformance vectors).
-oxideav-vp8 = { version = "0.2", default-features = false }
+# `simd`: std::simd (portable_simd, nightly) paths in the transforms + loop
+# filter — the workspace toolchain is nightly for exactly this.
+oxideav-vp8 = { version = "0.2", default-features = false, features = ["simd"] }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }

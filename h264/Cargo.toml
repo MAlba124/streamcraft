@@ -16,7 +16,10 @@ streamcraft-core = { path = "../core" }
 # adoption rationale, the wire-or-reject evidence, and the dependency situation —
 # unlike sc-vp8, oxideav-h264 0.1.7 pulls oxideav-core + thiserror + serde_json
 # mandatorily (the decoder is consumed via oxideav-core's Decoder trait).
-oxideav-h264 = { version = "0.1", default-features = false }
+# `nightly`: the upstream SIMD gate (its portable path currently defers to the
+# LLVM-autovectorised chunked path; enabling costs nothing and picks the fast
+# path up as the vendored crate grows one).
+oxideav-h264 = { version = "0.1", default-features = false, features = ["nightly"] }
 # Consumed types (Packet / Frame / VideoFrame / Decoder trait / CodecId). Pinned
 # to the same 0.1.x line oxideav-h264 resolves so no duplicate copy is linked.
 oxideav-core = { version = "0.1", default-features = false }

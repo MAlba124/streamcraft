@@ -18,7 +18,11 @@
 
         # Pinned Rust toolchain with the components used across the workspace
         # (clippy, rustfmt, rust-analyzer, and the src for tooling/loom/miri work).
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        # NIGHTLY: the adopted codecs gate their portable_simd paths on nightly
+        # (oxideav-vp8 `simd` uses std::simd in the transforms + loop filter;
+        # vendored oxideav-h264 has a `nightly` feature for the same). The date is
+        # pinned by the rust-overlay input in flake.lock — still reproducible.
+        rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };
       in
