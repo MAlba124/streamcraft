@@ -74,6 +74,10 @@ fn build_registry() -> Registry {
     sc_mp4::register(&mut r);
     sc_mp3::register(&mut r);
     sc_sdl3::register(&mut r);
+    // Capability-gated: registers `vaapih264dec` only when the VA-API driver
+    // advertises the decode profile (and `SC_NO_VAAPI` is unset) — a machine
+    // without the hardware never sees the element.
+    sc_vaapi::register(&mut r);
     r
 }
 

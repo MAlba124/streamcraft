@@ -14,7 +14,19 @@ use std::sync::OnceLock;
 use crate::ffi;
 use crate::va::Display;
 
-/// The decode capabilities of the selected VA-API device.
+/// One profile's entrypoint support, for the diagnostic table.
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileCaps {
+    pub name: &'static str,
+    /// `VAEntrypointVLD` — hardware decode.
+    pub vld: bool,
+    /// `VAEntrypointEncSlice` — full-featured (PAK+ENC) hardware encode.
+    pub enc: bool,
+    /// `VAEntrypointEncSliceLP` — low-power fixed-function encode (Intel VDEnc).
+    pub enc_lp: bool,
+}
+
+/// The decode/encode capabilities of the selected VA-API device.
 #[derive(Debug, Clone)]
 pub struct VaCaps {
     /// The DRM render node the probe opened.
@@ -26,14 +38,23 @@ pub struct VaCaps {
     /// streamcraft decode families the driver advertises a VLD entrypoint for, in a
     /// stable order (e.g. `["h264/annexb", "h265/annexb", "vp9"]`).
     pub decode_families: Vec<&'static str>,
-    /// The raw `(profile_name, has_vld)` table, for the diagnostic example.
-    pub profiles: Vec<(&'static str, bool)>,
+    /// Families the driver advertises an encode entrypoint for (EncSlice or the
+    /// low-power EncSliceLP). Capability report only in this POC — no encoder
+    /// element is registered yet.
+    pub encode_families: Vec<&'static str>,
+    /// The per-profile entrypoint table, for the diagnostic example.
+    pub profiles: Vec<ProfileCaps>,
 }
 
 impl VaCaps {
     /// Whether a decode family is accelerated here.
     pub fn supports(&self, family: &str) -> bool {
         self.decode_families.iter().any(|f| *f == family)
+    }
+
+    /// Whether an encode family is accelerated here (EncSlice or EncSliceLP).
+    pub fn supports_encode(&self, family: &str) -> bool {
+        self.encode_families.iter().any(|f| *f == family)
     }
 }
 
@@ -113,9 +134,11 @@ fn profile_name(profile: ffi::VAProfile) -> &'static str {
 
 fn query_caps(display: &Display, device: PathBuf) -> VaCaps {
     let mut decode_families: Vec<&'static str> = Vec::new();
-    let mut profiles: Vec<(&'static str, bool)> = Vec::new();
+    let mut encode_families: Vec<&'static str> = Vec::new();
+    let mut profiles: Vec<ProfileCaps> = Vec::new();
 
-    // vaQueryConfigProfiles → for each profile, vaQueryConfigEntrypoints → VLD?
+    // vaQueryConfigProfiles → for each profile, vaQueryConfigEntrypoints →
+    // VLD (decode) / EncSlice / EncSliceLP (encode)?
     // SAFETY: display is live; buffers are sized by the driver-declared maxima.
     unsafe {
         let max_profiles = ffi::vaMaxNumProfiles(display.raw()).max(0) as usize;
@@ -129,6 +152,7 @@ fn query_caps(display: &Display, device: PathBuf) -> VaCaps {
                 vendor: display.vendor(),
                 version: display.version(),
                 decode_families,
+                encode_families,
                 profiles,
             };
         }
@@ -139,22 +163,29 @@ fn query_caps(display: &Display, device: PathBuf) -> VaCaps {
             let Some(family) = family_of(profile) else { continue };
             let mut entry_list = vec![0i32; max_entry];
             let mut num_entries: std::ffi::c_int = 0;
-            let has_vld = if ffi::vaQueryConfigEntrypoints(
+            let entries = if ffi::vaQueryConfigEntrypoints(
                 display.raw(),
                 profile,
                 entry_list.as_mut_ptr(),
                 &mut num_entries,
             ) == ffi::VA_STATUS_SUCCESS
             {
-                entry_list[..num_entries.max(0) as usize]
-                    .iter()
-                    .any(|&e| e == ffi::VAEntrypointVLD)
+                &entry_list[..num_entries.max(0) as usize]
             } else {
-                false
+                &[][..]
             };
-            profiles.push((profile_name(profile), has_vld));
-            if has_vld && !decode_families.contains(&family) {
+            let caps = ProfileCaps {
+                name: profile_name(profile),
+                vld: entries.contains(&ffi::VAEntrypointVLD),
+                enc: entries.contains(&ffi::VAEntrypointEncSlice),
+                enc_lp: entries.contains(&ffi::VAEntrypointEncSliceLP),
+            };
+            profiles.push(caps);
+            if caps.vld && !decode_families.contains(&family) {
                 decode_families.push(family);
+            }
+            if (caps.enc || caps.enc_lp) && !encode_families.contains(&family) {
+                encode_families.push(family);
             }
         }
     }
@@ -164,6 +195,7 @@ fn query_caps(display: &Display, device: PathBuf) -> VaCaps {
         vendor: display.vendor(),
         version: display.version(),
         decode_families,
+        encode_families,
         profiles,
     }
 }

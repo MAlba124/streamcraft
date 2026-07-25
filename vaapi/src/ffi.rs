@@ -56,6 +56,10 @@ pub const VAProfileAV1Profile0: VAProfile = 32;
 
 // --- VAEntrypoint (va.h:553) ----------------------------------------------------------
 pub const VAEntrypointVLD: VAEntrypoint = 1;
+/// Full-featured slice-level encode (va.h:558) — the PAK+ENC engine.
+pub const VAEntrypointEncSlice: VAEntrypoint = 6;
+/// Low-power fixed-function encode (va.h:568) — Intel VDEnc.
+pub const VAEntrypointEncSliceLP: VAEntrypoint = 8;
 
 // --- VAConfigAttribType + RTFormat values (va.h:620, 1083) ----------------------------
 pub const VAConfigAttribRTFormat: VAConfigAttribType = 0;

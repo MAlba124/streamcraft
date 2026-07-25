@@ -82,7 +82,11 @@ impl Display {
     /// it. Fails if the node cannot be opened, the driver cannot attach, or
     /// `vaInitialize` reports an error (no usable driver for that node).
     pub fn open(path: &Path) -> VaResult<Display> {
-        let file = File::open(path).map_err(|_| VaError {
+        // Read-*write*: DRM allocation ioctls (GEM buffer creation) need a
+        // writable fd. A read-only node initializes and answers every query,
+        // then fails the first real allocation — vaCreateContext returns
+        // VA_STATUS_ERROR_ALLOCATION_FAILED with nothing else wrong.
+        let file = File::options().read(true).write(true).open(path).map_err(|_| VaError {
             status: -1,
             ctx: "open(drm node)",
         })?;
@@ -172,6 +176,27 @@ impl Config {
             )
         };
         check(st, "vaCreateConfig")?;
+        Ok(Config { dpy: display.raw(), id })
+    }
+
+    /// Create an *encode* config (NV12/YUV420) at the given encode entrypoint
+    /// (`VAEntrypointEncSlice` or the low-power `VAEntrypointEncSliceLP`). Used by
+    /// the encode capability smoke test; no encoder element exists yet.
+    pub fn new_encode(
+        display: &Display,
+        profile: ffi::VAProfile,
+        entrypoint: ffi::VAEntrypoint,
+    ) -> VaResult<Config> {
+        let mut attrib = ffi::VAConfigAttrib {
+            type_: ffi::VAConfigAttribRTFormat,
+            value: ffi::VA_RT_FORMAT_YUV420,
+        };
+        let mut id: ffi::VAConfigID = ffi::VA_INVALID_ID;
+        // SAFETY: display live; attrib is a valid single-element array; id out ptr valid.
+        let st = unsafe {
+            ffi::vaCreateConfig(display.raw(), profile, entrypoint, &mut attrib, 1, &mut id)
+        };
+        check(st, "vaCreateConfig(encode)")?;
         Ok(Config { dpy: display.raw(), id })
     }
 

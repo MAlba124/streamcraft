@@ -87,13 +87,19 @@ fn try_video_decoders(
 ) -> Option<streamcraft_core::id::ElementId> {
     // Constructed fresh per attempt: a failed link leaves an unlinked spare element
     // in the graph, which is harmless (it never runs), so try-in-place is fine.
-    let attempts: Vec<(&str, Box<dyn Element>)> = vec![
+    let mut attempts: Vec<(&str, Box<dyn Element>)> = vec![
         ("h265", Box::new(sc_h265::H265Dec::new())),
         ("h264", Box::new(sc_h264::H264Dec::new())),
         ("vp8", Box::new(sc_vp8::Vp8Dec::new())),
         ("vp9", Box::new(sc_vp9::Vp9Dec::new())),
         ("av1", Box::new(sc_av1::Av1Dec::new())),
     ];
+    // Hardware first: the probe gates construction (no VA-API device or
+    // `SC_NO_VAAPI` set → no attempt), and a non-h264 track simply fails the
+    // link and falls through to the software decoders.
+    if let Some(hw) = sc_vaapi::video_decoder_for("h264/annexb") {
+        attempts.insert(0, ("vaapih264", hw));
+    }
     for (name, dec) in attempts {
         let dec_id = p.add_boxed(dec);
         match p.link(pad, (dec_id, "sink")) {

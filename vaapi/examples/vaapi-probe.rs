@@ -26,9 +26,16 @@ fn main() {
     println!("va-api : {}.{}", caps.version.0, caps.version.1);
     println!("vendor : {}", caps.vendor);
 
-    println!("\ndecode profiles (VLD entrypoint):");
-    for (name, has_vld) in &caps.profiles {
-        println!("  {:<28} VLD={}", name, if *has_vld { "yes" } else { "no" });
+    println!("\nprofiles (decode VLD / encode EncSlice / low-power EncSliceLP):");
+    for p in &caps.profiles {
+        let yn = |b: bool| if b { "yes" } else { "no " };
+        println!(
+            "  {:<28} VLD={}  Enc={}  EncLP={}",
+            p.name,
+            yn(p.vld),
+            yn(p.enc),
+            yn(p.enc_lp)
+        );
     }
 
     println!("\nstreamcraft decode families:");
@@ -36,6 +43,15 @@ fn main() {
         println!("  (none)");
     } else {
         for f in &caps.decode_families {
+            println!("  {f}");
+        }
+    }
+
+    println!("\nstreamcraft encode families (capability only — no encoder element yet):");
+    if caps.encode_families.is_empty() {
+        println!("  (none)");
+    } else {
+        for f in &caps.encode_families {
             println!("  {f}");
         }
     }

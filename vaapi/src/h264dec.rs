@@ -159,9 +159,6 @@ pub struct VaapiH264Dec {
     /// The one picture currently in readback (backpressure carry).
     pending: Option<PendingOut>,
 
-    // pts pairing (feed order → display order; documented reorder caveat).
-    pts_fifo: VecDeque<(Timestamp, Timestamp)>,
-
     announced: bool,
     dims: Option<(u32, u32)>,
     alloc_stalled: bool,
@@ -197,7 +194,6 @@ impl VaapiH264Dec {
             output_queue: VecDeque::new(),
             output_poc: std::collections::HashMap::new(),
             pending: None,
-            pts_fifo: VecDeque::new(),
             announced: false,
             dims: None,
             alloc_stalled: false,
@@ -246,6 +242,13 @@ impl VaapiH264Dec {
     fn ensure_va(&mut self, ctx: &mut Ctx, sps: &Sps) -> bool {
         let width = sps.width().max(16);
         let height = sps.height().max(16);
+        // Surfaces and the context must cover the *coded* picture — whole
+        // macroblocks (§7.4.2.1.1: PicWidthInMbs×16 / FrameHeightInMbs×16);
+        // frame cropping is display metadata, not storage. A 1080-line stream
+        // codes 1088 rows: allocating the cropped size makes iHD's
+        // vaCreateContext fail with VA_STATUS_ERROR_ALLOCATION_FAILED.
+        let coded_w = (sps.width_in_mbs() * 16).max(16);
+        let coded_h = (sps.height_in_mbs() * 16).max(16);
         // Reuse if dimensions match.
         if let Some(va) = &self.va {
             if va.width == width && va.height == height {
@@ -273,14 +276,14 @@ impl VaapiH264Dec {
                 return false;
             }
         };
-        let surfaces = match Surfaces::new_nv12(display, width, height, count) {
+        let surfaces = match Surfaces::new_nv12(display, coded_w, coded_h, count) {
             Ok(s) => s,
             Err(e) => {
                 self.warn(ctx, format!("vaapih264dec: vaCreateSurfaces failed: {e}"));
                 return false;
             }
         };
-        let context = match Context::new(display, &config, width as i32, height as i32, &surfaces) {
+        let context = match Context::new(display, &config, coded_w as i32, coded_h as i32, &surfaces) {
             Ok(c) => c,
             Err(e) => {
                 self.warn(ctx, format!("vaapih264dec: vaCreateContext failed: {e}"));
@@ -307,11 +310,36 @@ impl VaapiH264Dec {
         self.va.as_mut().and_then(|va| va.free.pop())
     }
 
+    /// No surface free for the next picture — `process()` treats this as
+    /// backpressure (emit to free one, or leave input in the ring), so
+    /// `decode_au`'s drop path is only ever the pathological fuse.
+    fn surfaces_exhausted(&self) -> bool {
+        self.va.as_ref().is_some_and(|va| va.free.is_empty())
+    }
+
     fn release_surface(&mut self, id: ffi::VASurfaceID) {
         if let Some(va) = &mut self.va {
             if !va.free.contains(&id) {
                 va.free.push(id);
             }
+        }
+    }
+
+    /// Whether any live holder still needs `id`'s pixels: the DPB (a prediction
+    /// source), the reorder queue, or the readback carry.
+    fn surface_referenced(&self, id: ffi::VASurfaceID) -> bool {
+        self.dpb.iter().any(|e| e.surface == id)
+            || self.output_queue.iter().any(|o| o.surface == id)
+            || self.pending.as_ref().is_some_and(|o| o.surface == id)
+    }
+
+    /// The single return-to-free gate: a surface goes back on the free list only
+    /// once *nothing* references it. Releasing a DPB-evicted surface that is still
+    /// queued for output would hand it out as a decode target while a frame still
+    /// awaits readback from it — aliased pixels and a corrupted free-list ledger.
+    fn release_if_unreferenced(&mut self, id: ffi::VASurfaceID) {
+        if !self.surface_referenced(id) {
+            self.release_surface(id);
         }
     }
 
@@ -459,7 +487,6 @@ impl VaapiH264Dec {
         // reorder the output queue by POC of the just-decoded picture set. We track
         // POC alongside in a parallel field.
         self.reorder_output(target, poc);
-        self.pts_fifo.push_back((pts, duration));
 
         // If this picture is NOT a reference, its surface must be freed after
         // output. If it IS a reference, the surface belongs to the DPB and is freed
@@ -755,7 +782,7 @@ impl VaapiH264Dec {
         }
         if let Some(i) = idx {
             let e = self.dpb.remove(i);
-            self.release_surface(e.surface);
+            self.release_if_unreferenced(e.surface);
         }
     }
 
@@ -766,21 +793,12 @@ impl VaapiH264Dec {
                 1 => {
                     // Unmark a short-term picture: PicNumX = CurrPicNum - (diff+1).
                     let pic_num_x = frame_num - (op.arg1 as i32 + 1);
-                    self.dpb.retain(|e| {
-                        let keep = e.long_term || e.frame_num != pic_num_x;
-                        if !keep {
-                            // freed below via release; collect surfaces after retain
-                        }
-                        keep
-                    });
-                    // Note: released surfaces of unmarked shorts are recovered lazily
-                    // when the pool refills; a small leak-until-rebuild is acceptable
-                    // for this POC (bounded by DPB size).
+                    self.remove_dpb_where(|e| !e.long_term && e.frame_num == pic_num_x);
                 }
                 2 => {
                     // Unmark a long-term picture by LongTermPicNum.
                     let ltpn = op.arg1 as i32;
-                    self.dpb.retain(|e| !(e.long_term && e.long_term_frame_idx == ltpn));
+                    self.remove_dpb_where(|e| e.long_term && e.long_term_frame_idx == ltpn);
                 }
                 3 => {
                     // Short-term → long-term (assign LongTermFrameIdx = arg2).
@@ -796,7 +814,7 @@ impl VaapiH264Dec {
                 4 => {
                     // MaxLongTermFrameIdx = arg1 - 1; drop longs above it.
                     let max_lt = op.arg1 as i32 - 1;
-                    self.dpb.retain(|e| !(e.long_term && e.long_term_frame_idx > max_lt));
+                    self.remove_dpb_where(|e| e.long_term && e.long_term_frame_idx > max_lt);
                 }
                 5 => {
                     // Reset (§8.2.5.4.5): clear DPB, reset POC — IDR-like.
@@ -811,7 +829,27 @@ impl VaapiH264Dec {
     fn reset_dpb(&mut self) {
         let ids: Vec<_> = self.dpb.drain(..).map(|e| e.surface).collect();
         for id in ids {
-            self.release_surface(id);
+            // Not `release_surface`: an IDR resets the DPB while earlier GOP
+            // frames may still sit in the reorder queue awaiting readback.
+            self.release_if_unreferenced(id);
+        }
+    }
+
+    /// Remove every DPB entry matching `pred`, returning each removed surface to
+    /// the free list once nothing else references it (the MMCO unmark ops — a
+    /// bare `retain` would leak the surfaces out of the ledger permanently).
+    fn remove_dpb_where(&mut self, pred: impl Fn(&DpbEntry) -> bool) {
+        let mut removed = Vec::new();
+        self.dpb.retain(|e| {
+            if pred(e) {
+                removed.push(e.surface);
+                false
+            } else {
+                true
+            }
+        });
+        for id in removed {
+            self.release_if_unreferenced(id);
         }
     }
 
@@ -943,10 +981,7 @@ impl VaapiH264Dec {
     /// reference*. Reference surfaces are freed when evicted.
     fn recycle_output_surface(&mut self, surface: ffi::VASurfaceID) {
         self.output_poc.remove(&surface);
-        let is_ref = self.dpb.iter().any(|e| e.surface == surface);
-        if !is_ref {
-            self.release_surface(surface);
-        }
+        self.release_if_unreferenced(surface);
     }
 
 }
@@ -971,6 +1006,20 @@ impl Element for VaapiH264Dec {
             if !self.emit_over_budget(ctx)? {
                 return Ok(Flow::Ok);
             }
+            // A free surface must exist before the next AU is consumed: a
+            // momentarily-exhausted surface pool is *backpressure* (leave the
+            // input in the ring; emitting is what frees surfaces), never a
+            // drop. Under a realtime-pacing sink the DPB + reorder queue pin
+            // every surface — dropping here loses all AUs until the next IDR
+            // and the video freezes while audio plays on.
+            while self.surfaces_exhausted() {
+                if self.pending.is_none() && self.output_queue.is_empty() {
+                    break; // held by the DPB alone — decode_au's drop is the fuse
+                }
+                if !self.emit_pending(ctx)? {
+                    return Ok(Flow::Ok); // pool dry — re-cranked on slot return
+                }
+            }
             let Some(inbuf) = inputs.pop() else { break };
             let au = inbuf.memory.data().to_vec();
             self.decode_au(ctx, &au, inbuf.pts, inbuf.duration);
@@ -981,12 +1030,22 @@ impl Element for VaapiH264Dec {
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             Event::FlushStart => {
-                // Drop refs + carries + pts + POC; keep VA context (dims unchanged).
-                self.reset_dpb();
-                self.output_queue.clear();
+                // Drop refs + carries + POC; keep VA context (dims unchanged).
+                // Output entries drain *first* (so reset_dpb sees their surfaces
+                // unreferenced and actually frees them — clearing the queue after
+                // would leak every queued surface on each seek).
+                let outs: Vec<_> = self
+                    .pending
+                    .take()
+                    .into_iter()
+                    .chain(self.output_queue.drain(..))
+                    .map(|o| o.surface)
+                    .collect();
                 self.output_poc.clear();
-                self.pending = None;
-                self.pts_fifo.clear();
+                for id in outs {
+                    self.release_if_unreferenced(id);
+                }
+                self.reset_dpb();
                 self.poc.reset();
                 self.alloc_stalled = false;
                 // announced stays true: dims don't change across a seek.
