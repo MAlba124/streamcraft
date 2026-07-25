@@ -827,6 +827,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sc-rtsp"
+version = "0.1.0"
+dependencies = [
+ "streamcraft-core",
+]
+
+[[package]]
 name = "sc-sdl3"
 version = "0.1.0"
 dependencies = [
