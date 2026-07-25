@@ -1,0 +1,19 @@
+"Scope 8x8" bitmap font
+=======================
+
+The 8x8 monospace bitmap font embedded in scope/src/ui/font.rs (the GLYPHS array)
+was authored by hand for the streamcraft-scope crate. It is an original work — no
+third-party font data was copied — and is dedicated to the public domain.
+
+CC0 1.0 Universal (Public Domain Dedication)
+--------------------------------------------
+
+To the extent possible under law, the author(s) have waived all copyright and
+related or neighboring rights to the "Scope 8x8" bitmap font. You can copy, modify,
+distribute and perform the work, even for commercial purposes, all without asking
+permission.
+
+See https://creativecommons.org/publicdomain/zero/1.0/ for the full text.
+
+Note: this CC0 dedication covers only the font glyph data. The rest of the
+streamcraft-scope crate is licensed under GPL-3.0-or-later (the workspace licence).
