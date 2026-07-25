@@ -412,6 +412,9 @@ impl Element for H264Dec {
                 self.pending = None;
                 self.pts_fifo.clear();
                 self.dec = H264CodecDecoder::new(CodecId::new("h264"));
+                // A stall diagnostic is per-run state, not decode state: clear it
+                // so the first genuine post-seek pool stall still logs once.
+                self.alloc_stalled = false;
                 // `announced` is intentionally NOT cleared: dimensions do not
                 // change across a seek within one stream, and re-announcing an
                 // identical format is needless churn.

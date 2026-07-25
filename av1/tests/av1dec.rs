@@ -22,6 +22,7 @@ use streamcraft_core::element::{
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
 use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use streamcraft_core::harness::Harness;
 use streamcraft_core::id::PadId;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
@@ -351,4 +352,63 @@ fn ffmpeg_oracle_agrees_on_the_decoded_pixels() {
         output.stdout, reference[0],
         "ffmpeg-decoded pixels must match the in-crate decode byte-for-byte"
     );
+}
+
+/// Seek (spec: flush/seek): decode a KEY+P GOP (the session accrues reference-slot
+/// state and, at `q == 0`, its arithmetic-decoder + reference buffers), deliver
+/// `Event::FlushStart`, then feed a fresh KEY temporal unit (which re-carries the
+/// sequence header). A fresh `SpecDecodeSession` plus a cleared pending queue must let
+/// that KEY unit decode cleanly at the post-flush pts — no stale reference frame, and
+/// no stranded pending frame, leaks across the flush. Driven through the [`Harness`] so
+/// `FlushStart` can be delivered mid-stream (a real pipeline delivers it only
+/// out-of-band on a seek).
+#[test]
+fn flush_start_resets_session_and_no_stale_frame_leaks() {
+    // Pre-flush: a 2-frame GOP (KEY + P) — populates the session's reference slots.
+    let pre = encode_units(2);
+    // Post-flush: an independent single-KEY-frame stream (its own sequence header),
+    // reference-decoded alone as a fresh session would after a seek.
+    let post = encode_units(1);
+    let post_ref = reference_decode(&post);
+    assert_eq!(post_ref.len(), 1, "the post-flush KEY unit decodes to one shown frame");
+
+    let mut h = Harness::new(Av1Dec::new());
+
+    // Feed the pre-flush units with pts on the 33 ms grid, then discard whatever they
+    // staged (a real seek drops these in-flight buffers) — recording their pts so the
+    // post-flush pts can be proven distinct.
+    let mut pre_pts: Vec<Timestamp> = Vec::new();
+    for (i, u) in pre.iter().enumerate() {
+        let mut buf = h.alloc(u);
+        buf.pts = Timestamp::from_nanos(i as u64 * FRAME_NS);
+        h.push("sink", buf).expect("push pre-flush TU");
+    }
+    for b in h.drain_outputs() {
+        pre_pts.push(b.pts);
+    }
+
+    // Seek: flush the session + pending carry.
+    h.push_event(Event::FlushStart).expect("flush");
+    assert!(h.pull("src").is_none(), "flush emits nothing");
+
+    // Post-seek: a fresh KEY unit at a new, far-away pts.
+    let post_pts = Timestamp::from_nanos(1000 * FRAME_NS);
+    let mut buf = h.alloc(&post[0]);
+    buf.pts = post_pts;
+    h.push("sink", buf).expect("push post-flush KEY unit");
+
+    let out = h.drain_outputs();
+    assert_eq!(out.len(), 1, "exactly the post-flush KEY frame — no stale pre-flush frame leaked");
+    assert_eq!(out[0].pts, post_pts, "post-flush pts comes from post-flush input");
+    assert!(
+        !pre_pts.contains(&out[0].pts),
+        "post-flush frame did not inherit a pre-flush pts"
+    );
+    assert_eq!(out[0].memory.data(), post_ref[0].as_slice(), "post-flush KEY unit decodes cleanly");
+
+    let ann = h.announced().expect("format announced");
+    let w = h.vocabulary().field_id("width").unwrap();
+    let ht = h.vocabulary().field_id("height").unwrap();
+    assert_eq!(ann.get(w), Some(Value::Int(W as i64)));
+    assert_eq!(ann.get(ht), Some(Value::Int(H as i64)));
 }
