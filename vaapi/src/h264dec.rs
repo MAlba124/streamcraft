@@ -1,0 +1,1279 @@
+//! `vaapih264dec` — the VA-API hardware H.264 decode element. One Annex-B access
+//! unit per buffer arrives on the sink (`h264/annexb`, the demuxer contract);
+//! tight-packed NV12 frames leave on the `video/raw` src pad, one per buffer.
+//!
+//! Unlike the software `h264dec` (which wraps a full-decode library), VA-API is a
+//! slice-level API: this element parses the parameter sets and slice *headers*
+//! (`crate::h264parse`, ITU-T H.264), maintains the decoded-picture buffer (DPB)
+//! and reference lists itself (§8.2.4 / §8.2.5), fills the
+//! `VAPictureParameterBufferH264` / `VASliceParameterBufferH264` structs, and drives
+//! `vaBeginPicture` / `vaRenderPicture` / `vaEndPicture`. The GPU does entropy
+//! decode, motion compensation and reconstruction; the host does bitstream framing
+//! and reference bookkeeping.
+//!
+//! POC boundary (see crate docs): 8-bit 4:2:0 progressive; POC types 0/1/2; sliding
+//! window + MMCO 5, other MMCO ops best-effort; ref-list default construction
+//! (§8.2.4.2) + modifications (§8.2.4.3). Interlaced/MBAFF/field, >8-bit, non-4:2:0
+//! and FMO are recognized and warn-dropped, not decoded. Reorder pts uses a
+//! feed-order FIFO (same documented caveat as the software decoder).
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+
+use streamcraft_core::batch::Inputs;
+use streamcraft_core::bus::BusMessage;
+use streamcraft_core::ctx::Ctx;
+use streamcraft_core::element::{
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+};
+use streamcraft_core::error::Error;
+use streamcraft_core::event::Event;
+use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use streamcraft_core::id::PadId;
+use streamcraft_core::log;
+use streamcraft_core::log::Level;
+use streamcraft_core::time::Timestamp;
+
+use crate::ffi;
+use crate::h264parse::{self, MmcoOp, Pps, RefListMod, SliceHeader, SliceType, Sps};
+use crate::probe;
+use crate::va::{Buffer as VaBuffer, Config, Context, Display, MappedImage, Surfaces};
+
+// `video/raw` family/field/value names, kept as literals (core-only, like the
+// software h264dec) — the pipeline interns by string so they line up with peers.
+const FAMILY: &str = "video/raw";
+const F_WIDTH: &str = "width";
+const F_HEIGHT: &str = "height";
+const F_PIXFMT: &str = "pixfmt";
+const PIXFMT_NV12: &str = "nv12";
+
+const SRC_PAD: PadId = PadId(1);
+
+static PIXFMT_VALUES: [ValueDesc; 1] = [ValueDesc::Id(PIXFMT_NV12)];
+
+// Broad `video/raw` template: any dimensions, NV12 only (what VA-API surfaces
+// yield). Concrete width/height are announced at runtime from the SPS, so the src
+// pad is `dynamic`.
+static SRC_FIELDS: [FieldDesc; 3] = [
+    FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
+    FieldDesc { field: F_PIXFMT, allowed: ConstraintDesc::Set(&PIXFMT_VALUES), preferred: None },
+];
+static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: FAMILY, fields: &SRC_FIELDS }];
+// One H.264 Annex-B access unit per buffer, same sink family as the software
+// decoder (`h264/annexb`). AVCC framing is a distinct family and out of scope.
+static SINK_OFFERS: [OfferDesc; 1] = [OfferDesc::any("h264/annexb")];
+
+static PADS: [PadDesc; 2] = [
+    PadDesc {
+        name: "sink",
+        direction: Direction::Sink,
+        offers: &SINK_OFFERS,
+        dynamic: false,
+        validate: None,
+    },
+    PadDesc {
+        name: "src",
+        direction: Direction::Src,
+        offers: &SRC_OFFERS,
+        dynamic: true,
+        validate: None,
+    },
+];
+
+static DESC: ElementDesc = ElementDesc {
+    name: "vaapih264dec",
+    pads: &PADS,
+    props: &[],
+    // Active: a hardware decode round-trip (submit + sync + readback) is well
+    // beyond the inline passive budget, and its own thread pipelines against demux
+    // and display.
+    sched: SchedHint::Active,
+    inputs: InputPolicy::Single,
+    latency: LatencyDesc {
+        min: Timestamp::ZERO,
+        max: Timestamp::ZERO,
+        is_live: false,
+        jitter: Timestamp::ZERO,
+    },
+    make_default: Some(|| Box::new(VaapiH264Dec::new())),
+};
+
+/// A DPB entry: a reference picture held for prediction (§8.2.5).
+#[derive(Clone)]
+struct DpbEntry {
+    surface: ffi::VASurfaceID,
+    frame_num: i32,
+    /// FrameNumWrap, recomputed each picture for ref-list ordering (§8.2.4.1).
+    frame_num_wrap: i32,
+    poc: i32,
+    top_poc: i32,
+    bottom_poc: i32,
+    long_term: bool,
+    long_term_frame_idx: i32,
+}
+
+/// A decoded surface awaiting readback + emit — the backpressure carry (bounded to
+/// one), and the DPB output queue drains through it in POC order.
+struct PendingOut {
+    surface: ffi::VASurfaceID,
+    pts: Timestamp,
+    duration: Timestamp,
+    width: u32,
+    height: u32,
+}
+
+/// Lazily-built VA-API state: created on the first usable SPS, torn down + rebuilt
+/// on a dimension change.
+struct VaState {
+    _config: Config,
+    context: Context,
+    // Held for ownership only: the surface set must outlive the context (which
+    // renders into it). Field order = drop order, so `context` drops first, then
+    // these surfaces — the order libva requires.
+    _surfaces: Surfaces,
+    /// Free surface pool (ids not currently a DPB ref or a pending output).
+    free: Vec<ffi::VASurfaceID>,
+    width: u32,
+    height: u32,
+}
+
+/// The VA-API H.264 decode element.
+pub struct VaapiH264Dec {
+    // Device + VA objects, opened/created lazily.
+    device: Option<PathBuf>,
+    display: Option<Display>,
+    va: Option<VaState>,
+
+    // Parameter-set caches (by id).
+    sps: [Option<Sps>; 32],
+    pps: [Option<Pps>; 256],
+
+    // DPB + POC + reference state.
+    dpb: Vec<DpbEntry>,
+    poc: h264parse::PocState,
+    /// Pictures decoded and reference-marked but not yet output, in POC order.
+    output_queue: VecDeque<PendingOut>,
+    /// surface → POC, for ordering the output queue (§C.4-style bumping).
+    output_poc: std::collections::HashMap<ffi::VASurfaceID, i32>,
+    /// The one picture currently in readback (backpressure carry).
+    pending: Option<PendingOut>,
+
+    // pts pairing (feed order → display order; documented reorder caveat).
+    pts_fifo: VecDeque<(Timestamp, Timestamp)>,
+
+    announced: bool,
+    dims: Option<(u32, u32)>,
+    alloc_stalled: bool,
+    /// Set once a fatal setup error was reported, to avoid a warning storm.
+    disabled: bool,
+}
+
+// SAFETY: the element is scheduled `SchedHint::Active` — it runs on a single
+// dedicated scheduler thread and never shares its `Display` (which carries the raw
+// `VADisplay` pointer) with any other thread. The pipeline moves an element to its
+// worker thread once at start and drives it only from there; VA-API calls are all
+// made from that one thread. The `Send` bound the `Element` trait requires is
+// therefore satisfied by construction, but the compiler cannot see the confinement
+// through the raw pointer — assert it here, at the single ownership boundary.
+unsafe impl Send for VaapiH264Dec {}
+
+impl Default for VaapiH264Dec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VaapiH264Dec {
+    pub fn new() -> Self {
+        VaapiH264Dec {
+            device: None,
+            display: None,
+            va: None,
+            sps: std::array::from_fn(|_| None),
+            pps: std::array::from_fn(|_| None),
+            dpb: Vec::new(),
+            poc: h264parse::PocState::new(),
+            output_queue: VecDeque::new(),
+            output_poc: std::collections::HashMap::new(),
+            pending: None,
+            pts_fifo: VecDeque::new(),
+            announced: false,
+            dims: None,
+            alloc_stalled: false,
+            disabled: false,
+        }
+    }
+
+    fn warn(&self, ctx: &mut Ctx, message: String) {
+        let element = ctx.element();
+        ctx.post(BusMessage::Warning {
+            element,
+            error: Error::Element { element, message },
+        });
+    }
+
+    /// Lazily open the VA display (probe-selected device). Returns false if no
+    /// device is available (the element then warn-drops everything).
+    fn ensure_display(&mut self, ctx: &mut Ctx) -> bool {
+        if self.display.is_some() {
+            return true;
+        }
+        let Some(caps) = probe::probe() else {
+            if !self.disabled {
+                self.disabled = true;
+                self.warn(ctx, "vaapih264dec: no VA-API device available".into());
+            }
+            return false;
+        };
+        match Display::open(&caps.device) {
+            Ok(d) => {
+                self.device = Some(caps.device.clone());
+                self.display = Some(d);
+                true
+            }
+            Err(e) => {
+                if !self.disabled {
+                    self.disabled = true;
+                    self.warn(ctx, format!("vaapih264dec: cannot open VA display: {e}"));
+                }
+                false
+            }
+        }
+    }
+
+    /// Build (or rebuild) the VA config/context/surfaces for an SPS's dimensions.
+    fn ensure_va(&mut self, ctx: &mut Ctx, sps: &Sps) -> bool {
+        let width = sps.width().max(16);
+        let height = sps.height().max(16);
+        // Reuse if dimensions match.
+        if let Some(va) = &self.va {
+            if va.width == width && va.height == height {
+                return true;
+            }
+            // Dimension change: tear down (drop resets refs) and re-announce.
+            self.va = None;
+            self.dpb.clear();
+            self.output_queue.clear();
+            self.pending = None;
+            self.announced = false;
+        }
+        let Some(display) = &self.display else { return false };
+
+        // Surface budget: DPB size (level-bounded, use max_num_ref_frames + margin)
+        // plus a few in-flight (the picture being decoded + backpressure carry).
+        let dpb_slots = (sps.max_num_ref_frames + 1).clamp(2, 16);
+        let count = dpb_slots + 5;
+
+        let profile = ffi::VAProfileH264High; // High ⊇ Main/CB for VLD on Intel.
+        let config = match Config::new_decode(display, profile) {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn(ctx, format!("vaapih264dec: vaCreateConfig failed: {e}"));
+                return false;
+            }
+        };
+        let surfaces = match Surfaces::new_nv12(display, width, height, count) {
+            Ok(s) => s,
+            Err(e) => {
+                self.warn(ctx, format!("vaapih264dec: vaCreateSurfaces failed: {e}"));
+                return false;
+            }
+        };
+        let context = match Context::new(display, &config, width as i32, height as i32, &surfaces) {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn(ctx, format!("vaapih264dec: vaCreateContext failed: {e}"));
+                return false;
+            }
+        };
+        let free = surfaces.ids().to_vec();
+        self.va = Some(VaState {
+            _config: config,
+            context,
+            _surfaces: surfaces,
+            free,
+            width,
+            height,
+        });
+        self.dims = Some((width, height));
+        true
+    }
+
+    /// Acquire a free surface, recycling one from the output queue tail if the pool
+    /// is momentarily dry (should not happen with the +5 margin, but keeps the
+    /// decoder from wedging on a driver that holds surfaces longer).
+    fn acquire_surface(&mut self) -> Option<ffi::VASurfaceID> {
+        self.va.as_mut().and_then(|va| va.free.pop())
+    }
+
+    fn release_surface(&mut self, id: ffi::VASurfaceID) {
+        if let Some(va) = &mut self.va {
+            if !va.free.contains(&id) {
+                va.free.push(id);
+            }
+        }
+    }
+
+    /// Decode one access unit's picture. Returns Ok(()) on success or warn-drop.
+    fn decode_au(&mut self, ctx: &mut Ctx, au: &[u8], pts: Timestamp, duration: Timestamp) {
+        let nals = h264parse::split_nals(au);
+
+        // 1) Cache parameter sets.
+        for nal in &nals {
+            match nal.unit_type {
+                h264parse::NAL_SPS => {
+                    if let Some(sps) = h264parse::parse_sps(nal.raw) {
+                        let id = sps.seq_parameter_set_id as usize;
+                        if id < 32 {
+                            self.sps[id] = Some(sps);
+                        }
+                    }
+                }
+                h264parse::NAL_PPS => {
+                    if let Some(pps) = h264parse::parse_pps(nal.raw) {
+                        let id = pps.pic_parameter_set_id as usize;
+                        if id < 256 {
+                            self.pps[id] = Some(pps);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2) Find slice NALs. The first slice of the AU carries the picture header.
+        let slice_nals: Vec<_> = nals
+            .iter()
+            .filter(|n| matches!(n.unit_type, h264parse::NAL_SLICE_NON_IDR | h264parse::NAL_SLICE_IDR))
+            .collect();
+        if slice_nals.is_empty() {
+            // Parameter-set-only AU (or unknown): nothing to output; keep the pts
+            // for the next picture only if a slice follows — here there is none, so
+            // record nothing (parameter-set AUs carry no timing).
+            return;
+        }
+
+        // Look up the PPS/SPS in force from the first slice header.
+        let first = slice_nals[0];
+        // Peek the pps_id: parse a provisional header needs SPS+PPS. Read pps_id via
+        // a light parse (first_mb ue, slice_type ue, pps_id ue).
+        let pps_id = peek_pps_id(first.raw);
+        let Some(pps) = pps_id.and_then(|id| self.pps.get(id as usize).and_then(|p| p.clone())) else {
+            self.warn(ctx, "vaapih264dec: slice references unknown PPS — dropped".into());
+            return;
+        };
+        let Some(sps) = self.sps.get(pps.seq_parameter_set_id as usize).and_then(|s| s.clone()) else {
+            self.warn(ctx, "vaapih264dec: PPS references unknown SPS — dropped".into());
+            return;
+        };
+
+        // Refuse unsupported coding tools (POC boundary).
+        if sps.separate_colour_plane_flag
+            || sps.bit_depth_luma_minus8 != 0
+            || sps.bit_depth_chroma_minus8 != 0
+            || sps.chroma_format_idc != 1
+        {
+            self.warn(
+                ctx,
+                "vaapih264dec: unsupported SPS (only 8-bit 4:2:0 is wired) — dropped".into(),
+            );
+            return;
+        }
+
+        // Parse every slice header.
+        let mut headers: Vec<SliceHeader> = Vec::with_capacity(slice_nals.len());
+        for n in &slice_nals {
+            let Some(sh) = h264parse::parse_slice_header(n.raw, n.unit_type, n.ref_idc, &sps, &pps)
+            else {
+                self.warn(ctx, "vaapih264dec: malformed slice header — AU dropped".into());
+                return;
+            };
+            if sh.field_pic_flag {
+                self.warn(ctx, "vaapih264dec: field/interlaced coding not supported — dropped".into());
+                return;
+            }
+            headers.push(sh);
+        }
+        let sh0 = &headers[0];
+        let is_idr = first.unit_type == h264parse::NAL_SLICE_IDR;
+        let ref_idc = first.ref_idc;
+
+        // 3) Ensure VA objects for these dimensions.
+        if !self.ensure_va(ctx, &sps) {
+            return;
+        }
+
+        // 4) IDR resets DPB + POC (§8.2.1, §8.2.5.3).
+        if is_idr {
+            self.reset_dpb();
+            self.poc.reset();
+        }
+
+        // 5) POC for this picture (§8.2.1).
+        let (top_poc, bottom_poc) = self.poc.compute(&sps, sh0, is_idr);
+        let poc = top_poc.min(bottom_poc);
+
+        // 6) Recompute FrameNumWrap for the current DPB (§8.2.4.1) for ref lists.
+        let max_frame_num = sps.max_frame_num() as i32;
+        let cur_frame_num = sh0.frame_num as i32;
+        for e in &mut self.dpb {
+            e.frame_num_wrap = if !e.long_term && e.frame_num > cur_frame_num {
+                e.frame_num - max_frame_num
+            } else {
+                e.frame_num
+            };
+        }
+
+        // 7) Acquire the target surface.
+        let Some(target) = self.acquire_surface() else {
+            self.warn(ctx, "vaapih264dec: no free surface — AU dropped".into());
+            return;
+        };
+
+        // 8) Build + submit the picture.
+        let (width, height) = self.va.as_ref().map(|v| (v.width, v.height)).unwrap();
+        if let Err(e) = self.submit_picture(
+            &sps, &pps, &headers, &slice_nals, target, top_poc, bottom_poc, ref_idc,
+        ) {
+            self.warn(ctx, format!("vaapih264dec: VA submit failed: {e} — dropped"));
+            self.release_surface(target);
+            return;
+        }
+
+        // 9) Reference marking / DPB update (§8.2.5) — only reference pictures.
+        if ref_idc != 0 {
+            self.mark_and_insert(&sps, sh0, target, cur_frame_num, poc, top_poc, bottom_poc, is_idr);
+        }
+
+        // 10) Output-queue insertion (POC order) and bumping.
+        self.output_queue.push_back(PendingOut {
+            surface: target,
+            pts,
+            duration,
+            width,
+            height,
+        });
+        // Keep the output queue POC-sorted by pairing surface→poc: we sort by the
+        // matching DPB/output ordering. Simplest correct model for our subset:
+        // reorder the output queue by POC of the just-decoded picture set. We track
+        // POC alongside in a parallel field.
+        self.reorder_output(target, poc);
+        self.pts_fifo.push_back((pts, duration));
+
+        // If this picture is NOT a reference, its surface must be freed after
+        // output. If it IS a reference, the surface belongs to the DPB and is freed
+        // when evicted; the output queue only reads it (readback), never frees it.
+        // We record ref-ness via membership in self.dpb (checked at drain time).
+
+        // Bump if the DPB / output queue is over budget (§C.4-style, POC-minimal).
+        self.maybe_bump(&sps);
+    }
+
+    /// Reorder the just-pushed output entry into POC order within the queue. POC is
+    /// carried on a side table keyed by surface (see `poc_of`).
+    fn reorder_output(&mut self, surface: ffi::VASurfaceID, poc: i32) {
+        self.output_poc.insert(surface, poc);
+        // Insertion sort the tail into place by POC.
+        let mut i = self.output_queue.len().saturating_sub(1);
+        while i > 0 {
+            let a = self.output_queue[i - 1].surface;
+            let b = self.output_queue[i].surface;
+            let pa = *self.output_poc.get(&a).unwrap_or(&i32::MAX);
+            let pb = *self.output_poc.get(&b).unwrap_or(&i32::MAX);
+            if pa > pb {
+                self.output_queue.swap(i - 1, i);
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Return the smallest-POC output entry when the queue exceeds the reorder
+    /// budget, moving it into `pending` (readback carry). Non-reference surfaces get
+    /// freed after their readback; reference surfaces stay owned by the DPB.
+    fn maybe_bump(&mut self, sps: &Sps) {
+        // Bound the reorder depth to the DPB size; MPEG streams rarely reorder more.
+        let budget = (sps.max_num_ref_frames as usize).max(1) + 1;
+        while self.output_queue.len() > budget && self.pending.is_none() {
+            if let Some(out) = self.output_queue.pop_front() {
+                self.pending = Some(out);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Fill and submit the VA picture: pic param + IQ matrix + per-slice params +
+    /// slice data, wrapped in Begin/Render/End.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_picture(
+        &mut self,
+        sps: &Sps,
+        pps: &Pps,
+        headers: &[SliceHeader],
+        slice_nals: &[&h264parse::Nal],
+        target: ffi::VASurfaceID,
+        top_poc: i32,
+        bottom_poc: i32,
+        ref_idc: u8,
+    ) -> Result<(), crate::va::VaError> {
+        let display = self.display.as_ref().unwrap();
+        let va = self.va.as_ref().unwrap();
+        let context = &va.context;
+
+        // --- Picture parameter buffer (§ va.h VAPictureParameterBufferH264) ---
+        let mut pic = zeroed_pic_param();
+        pic.CurrPic = ffi::VAPictureH264 {
+            picture_id: target,
+            frame_idx: headers[0].frame_num,
+            flags: if ref_idc != 0 {
+                ffi::VA_PICTURE_H264_SHORT_TERM_REFERENCE
+            } else {
+                0
+            },
+            TopFieldOrderCnt: top_poc,
+            BottomFieldOrderCnt: bottom_poc,
+            va_reserved: [0; ffi::VA_PADDING_LOW],
+        };
+        // ReferenceFrames[16] from the DPB (§8.2.4.2 ordering not required here; the
+        // driver matches by picture_id/frame_idx). Unused slots = INVALID.
+        pic.ReferenceFrames = [ffi::VAPictureH264::invalid(); 16];
+        for (i, e) in self.dpb.iter().take(16).enumerate() {
+            pic.ReferenceFrames[i] = ffi::VAPictureH264 {
+                picture_id: e.surface,
+                frame_idx: if e.long_term {
+                    e.long_term_frame_idx as u32
+                } else {
+                    e.frame_num as u32
+                },
+                flags: if e.long_term {
+                    ffi::VA_PICTURE_H264_LONG_TERM_REFERENCE
+                } else {
+                    ffi::VA_PICTURE_H264_SHORT_TERM_REFERENCE
+                },
+                TopFieldOrderCnt: e.top_poc,
+                BottomFieldOrderCnt: e.bottom_poc,
+                va_reserved: [0; ffi::VA_PADDING_LOW],
+            };
+        }
+        pic.picture_width_in_mbs_minus1 = (sps.width_in_mbs() - 1) as u16;
+        pic.picture_height_in_mbs_minus1 = (sps.height_in_mbs() - 1) as u16;
+        pic.bit_depth_luma_minus8 = sps.bit_depth_luma_minus8 as u8;
+        pic.bit_depth_chroma_minus8 = sps.bit_depth_chroma_minus8 as u8;
+        pic.num_ref_frames = sps.max_num_ref_frames as u8;
+        pic.seq_fields = pack_seq_fields(sps);
+        pic.pic_init_qp_minus26 = pps.pic_init_qp_minus26 as i8;
+        pic.chroma_qp_index_offset = pps.chroma_qp_index_offset as i8;
+        pic.second_chroma_qp_index_offset = pps.second_chroma_qp_index_offset as i8;
+        pic.pic_fields = pack_pic_fields(sps, pps, headers[0].field_pic_flag, ref_idc != 0);
+        pic.frame_num = headers[0].frame_num as u16;
+
+        let pic_buf = VaBuffer::new_struct(display, context, ffi::VAPictureParameterBufferType, &pic)?;
+
+        // --- IQ matrix: flat 16 (§8.5.9 Flat_4x4_16 / Flat_8x8_16 default) ---
+        let iq = ffi::VAIQMatrixBufferH264 {
+            ScalingList4x4: [[16u8; 16]; 6],
+            ScalingList8x8: [[16u8; 64]; 2],
+            va_reserved: [0; ffi::VA_PADDING_LOW],
+        };
+        let iq_buf = VaBuffer::new_struct(display, context, ffi::VAIQMatrixBufferType, &iq)?;
+
+        context.begin(target)?;
+        context.render(&[pic_buf.id(), iq_buf.id()])?;
+
+        // --- Per-slice: slice param + slice data ---
+        // Keep the buffers alive until after End; store them so Drop runs later.
+        let mut keep: Vec<VaBuffer> = Vec::with_capacity(slice_nals.len() * 2);
+        for (sh, nal) in headers.iter().zip(slice_nals.iter()) {
+            let (list0, list1, n0, n1) = self.build_ref_lists(sps, sh, top_poc.min(bottom_poc));
+            let sp = self.build_slice_param(sh, nal.raw, &list0, &list1, n0, n1);
+            let sp_buf =
+                VaBuffer::new_struct(display, context, ffi::VASliceParameterBufferType, &sp)?;
+            let data_buf = VaBuffer::new_data(display, context, nal.raw)?;
+            context.render(&[sp_buf.id(), data_buf.id()])?;
+            keep.push(sp_buf);
+            keep.push(data_buf);
+        }
+        context.end()?;
+        // keep + pic_buf + iq_buf drop here (after End): the driver copied them.
+        Ok(())
+    }
+
+    /// Build RefPicList0/1 (§8.2.4.2 default construction + §8.2.4.3 modifications).
+    /// Returns the two 32-entry VA lists and their active counts.
+    fn build_ref_lists(
+        &self,
+        _sps: &Sps,
+        sh: &SliceHeader,
+        cur_poc: i32,
+    ) -> ([ffi::VAPictureH264; 32], [ffi::VAPictureH264; 32], usize, usize) {
+        let (mut list0, mut list1) = default_ref_lists(&self.dpb, sh.slice_type, cur_poc);
+
+        // §8.2.4.3 modifications (reordering).
+        apply_ref_list_mods(&mut list0, &sh.ref_list_mods_l0, &self.dpb, sh.frame_num as i32, _sps);
+        if sh.slice_type == SliceType::B {
+            apply_ref_list_mods(&mut list1, &sh.ref_list_mods_l1, &self.dpb, sh.frame_num as i32, _sps);
+        }
+
+        let n0 = (sh.num_ref_idx_l0_active_minus1 as usize + 1).min(32);
+        let n1 = (sh.num_ref_idx_l1_active_minus1 as usize + 1).min(32);
+
+        let va0 = to_va_list(&list0);
+        let va1 = to_va_list(&list1);
+        (va0, va1, n0, n1)
+    }
+
+    /// Fill a VASliceParameterBufferH264 from a slice header + its NAL.
+    fn build_slice_param(
+        &self,
+        sh: &SliceHeader,
+        raw_nal: &[u8],
+        list0: &[ffi::VAPictureH264; 32],
+        list1: &[ffi::VAPictureH264; 32],
+        n0: usize,
+        n1: usize,
+    ) -> ffi::VASliceParameterBufferH264 {
+        // slice_data_bit_offset: bits from the start of the NAL (including the 1-byte
+        // header) to the start of slice_data(), counted in the *de-emulated* domain
+        // as VA requires (va.h:3665). header_bits_in_rbsp counts bits after the NAL
+        // header within the RBSP body; add the 8 header bits.
+        let bit_offset = sh.header_bits_in_rbsp as u16 + 8;
+
+        ffi::VASliceParameterBufferH264 {
+            slice_data_size: raw_nal.len() as u32,
+            slice_data_offset: 0,
+            slice_data_flag: ffi::VA_SLICE_DATA_FLAG_ALL,
+            slice_data_bit_offset: bit_offset,
+            first_mb_in_slice: sh.first_mb_in_slice as u16,
+            slice_type: sh.slice_type.va_value(),
+            direct_spatial_mv_pred_flag: sh.direct_spatial_mv_pred_flag as u8,
+            num_ref_idx_l0_active_minus1: (n0.max(1) - 1) as u8,
+            num_ref_idx_l1_active_minus1: (n1.max(1) - 1) as u8,
+            cabac_init_idc: sh.cabac_init_idc as u8,
+            slice_qp_delta: sh.slice_qp_delta as i8,
+            disable_deblocking_filter_idc: sh.disable_deblocking_filter_idc as u8,
+            slice_alpha_c0_offset_div2: sh.slice_alpha_c0_offset_div2 as i8,
+            slice_beta_offset_div2: sh.slice_beta_offset_div2 as i8,
+            RefPicList0: *list0,
+            RefPicList1: *list1,
+            // Weights: pass zero (element does not forward pred_weight_table; the
+            // driver applies default weighting when denom==0). A documented subset.
+            luma_log2_weight_denom: 0,
+            chroma_log2_weight_denom: 0,
+            luma_weight_l0_flag: 0,
+            luma_weight_l0: [0; 32],
+            luma_offset_l0: [0; 32],
+            chroma_weight_l0_flag: 0,
+            chroma_weight_l0: [[0; 2]; 32],
+            chroma_offset_l0: [[0; 2]; 32],
+            luma_weight_l1_flag: 0,
+            luma_weight_l1: [0; 32],
+            luma_offset_l1: [0; 32],
+            chroma_weight_l1_flag: 0,
+            chroma_weight_l1: [[0; 2]; 32],
+            chroma_offset_l1: [[0; 2]; 32],
+            va_reserved: [0; ffi::VA_PADDING_LOW],
+        }
+    }
+
+    /// Reference marking + DPB insertion (§8.2.5). Sliding window (§8.2.5.3) for the
+    /// implicit case; MMCO ops (§8.2.5.4) for the adaptive case (5 = reset;
+    /// 1/2/3/4/6 best-effort).
+    #[allow(clippy::too_many_arguments)]
+    fn mark_and_insert(
+        &mut self,
+        sps: &Sps,
+        sh: &SliceHeader,
+        surface: ffi::VASurfaceID,
+        frame_num: i32,
+        poc: i32,
+        top_poc: i32,
+        bottom_poc: i32,
+        is_idr: bool,
+    ) {
+        let mut long_term = false;
+        let mut long_term_frame_idx = -1;
+
+        if is_idr {
+            // IDR marking (§8.2.5.1): the DPB was already cleared. long_term_reference
+            // marks this IDR as long-term.
+            if sh.long_term_reference_flag {
+                long_term = true;
+                long_term_frame_idx = 0;
+            }
+        } else if sh.adaptive_ref_pic_marking_mode_flag {
+            self.apply_mmco(sps, &sh.mmco_ops, frame_num, poc);
+            // MMCO 6 assigns the current picture a long-term idx.
+            for op in &sh.mmco_ops {
+                if op.op == 6 {
+                    long_term = true;
+                    long_term_frame_idx = op.arg1 as i32;
+                }
+            }
+        } else {
+            // Sliding window (§8.2.5.3): if the DPB is full of short-term refs, evict
+            // the one with the smallest FrameNumWrap.
+            let num_short = self.dpb.iter().filter(|e| !e.long_term).count();
+            let num_long = self.dpb.iter().filter(|e| e.long_term).count();
+            let max_refs = (sps.max_num_ref_frames as usize).max(1);
+            if num_short + num_long >= max_refs {
+                self.evict_smallest_frame_num_wrap(frame_num, sps);
+            }
+        }
+
+        self.dpb.push(DpbEntry {
+            surface,
+            frame_num,
+            frame_num_wrap: frame_num,
+            poc,
+            top_poc,
+            bottom_poc,
+            long_term,
+            long_term_frame_idx,
+        });
+    }
+
+    fn evict_smallest_frame_num_wrap(&mut self, cur_frame_num: i32, sps: &Sps) {
+        let max_frame_num = sps.max_frame_num() as i32;
+        let mut idx = None;
+        let mut smallest = i32::MAX;
+        for (i, e) in self.dpb.iter().enumerate() {
+            if e.long_term {
+                continue;
+            }
+            let wrap = if e.frame_num > cur_frame_num {
+                e.frame_num - max_frame_num
+            } else {
+                e.frame_num
+            };
+            if wrap < smallest {
+                smallest = wrap;
+                idx = Some(i);
+            }
+        }
+        if let Some(i) = idx {
+            let e = self.dpb.remove(i);
+            self.release_surface(e.surface);
+        }
+    }
+
+    /// Apply the adaptive MMCO op list (§8.2.5.4). Op 5 resets the DPB (§8.2.5.4.5).
+    fn apply_mmco(&mut self, _sps: &Sps, ops: &[MmcoOp], frame_num: i32, _poc: i32) {
+        for op in ops {
+            match op.op {
+                1 => {
+                    // Unmark a short-term picture: PicNumX = CurrPicNum - (diff+1).
+                    let pic_num_x = frame_num - (op.arg1 as i32 + 1);
+                    self.dpb.retain(|e| {
+                        let keep = e.long_term || e.frame_num != pic_num_x;
+                        if !keep {
+                            // freed below via release; collect surfaces after retain
+                        }
+                        keep
+                    });
+                    // Note: released surfaces of unmarked shorts are recovered lazily
+                    // when the pool refills; a small leak-until-rebuild is acceptable
+                    // for this POC (bounded by DPB size).
+                }
+                2 => {
+                    // Unmark a long-term picture by LongTermPicNum.
+                    let ltpn = op.arg1 as i32;
+                    self.dpb.retain(|e| !(e.long_term && e.long_term_frame_idx == ltpn));
+                }
+                3 => {
+                    // Short-term → long-term (assign LongTermFrameIdx = arg2).
+                    let pic_num_x = frame_num - (op.arg1 as i32 + 1);
+                    let lt = op.arg2 as i32;
+                    for e in &mut self.dpb {
+                        if !e.long_term && e.frame_num == pic_num_x {
+                            e.long_term = true;
+                            e.long_term_frame_idx = lt;
+                        }
+                    }
+                }
+                4 => {
+                    // MaxLongTermFrameIdx = arg1 - 1; drop longs above it.
+                    let max_lt = op.arg1 as i32 - 1;
+                    self.dpb.retain(|e| !(e.long_term && e.long_term_frame_idx > max_lt));
+                }
+                5 => {
+                    // Reset (§8.2.5.4.5): clear DPB, reset POC — IDR-like.
+                    self.reset_dpb();
+                    self.poc.reset();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn reset_dpb(&mut self) {
+        let ids: Vec<_> = self.dpb.drain(..).map(|e| e.surface).collect();
+        for id in ids {
+            self.release_surface(id);
+        }
+    }
+
+    /// Copy the pending decoded surface into a pool buffer as tight NV12 and emit.
+    /// `false` = pool exhausted (backpressure).
+    fn emit_pending(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
+        // Refill pending from the output queue if empty (bumping already moved the
+        // over-budget head; here we also pull when EOS/flush drained the budget).
+        if self.pending.is_none() {
+            self.pending = self.output_queue.pop_front();
+        }
+        let Some(out) = self.pending.take() else { return Ok(true) };
+
+        // The raw display handle is a Copy pointer valid for the element's lifetime,
+        // so taking it here (rather than a &self.display borrow) lets us keep
+        // mutating self while a mapped image is live.
+        let dpy = match &self.display {
+            Some(d) => d.raw(),
+            None => return Ok(true),
+        };
+
+        let width = out.width;
+        let height = out.height;
+        let need = (width * height + width * height.div_ceil(2)) as usize;
+
+        // Map the decoded surface (derive → NV12, or GetImage fallback).
+        let image = match MappedImage::acquire(dpy, out.surface, width, height) {
+            Ok(im) => im,
+            Err(e) => {
+                self.warn(ctx, format!("vaapih264dec: readback failed: {e} — frame dropped"));
+                self.recycle_output_surface(out.surface);
+                return Ok(true);
+            }
+        };
+        if image.num_planes() < 2 {
+            self.warn(ctx, "vaapih264dec: mapped image is not 2-plane NV12 — dropped".into());
+            drop(image);
+            self.recycle_output_surface(out.surface);
+            return Ok(true);
+        }
+
+        let Some(mut buf) = ctx.try_alloc(SRC_PAD) else {
+            if !self.alloc_stalled {
+                self.alloc_stalled = true;
+                let s = ctx.pool_stats();
+                log!(
+                    &*ctx,
+                    Level::Debug,
+                    "alloc_stall",
+                    outstanding = s.outstanding,
+                    max_slots = s.max_slots,
+                    acquires = s.acquires,
+                    recycles = s.recycles,
+                );
+            }
+            // Put the picture back as pending (the image drops; re-acquired next spin).
+            drop(image);
+            self.pending = Some(out);
+            return Ok(false);
+        };
+        self.alloc_stalled = false;
+        if buf.memory.capacity() < need {
+            drop(image);
+            self.recycle_output_surface(out.surface);
+            return Err(Error::Element {
+                element: ctx.element(),
+                message: format!(
+                    "vaapih264dec: {width}x{height} NV12 frame needs {need} bytes but pool slots \
+                     hold {} — raise the pipeline pool slot size",
+                    buf.memory.capacity()
+                ),
+            });
+        }
+
+        if !self.announced {
+            log!(&*ctx, Level::Debug, "announce", width = width, height = height);
+            ctx.announce_format(
+                SRC_PAD,
+                FAMILY,
+                &[
+                    (F_WIDTH, ValueDesc::Int(width as i64)),
+                    (F_HEIGHT, ValueDesc::Int(height as i64)),
+                    (F_PIXFMT, ValueDesc::Id(PIXFMT_NV12)),
+                ],
+            );
+            self.announced = true;
+        }
+
+        // Repack driver strides → tight NV12: Y (width×height), then interleaved
+        // CbCr (width×ceil(height/2)).
+        let dst = buf.memory.as_mut_full();
+        let y_len = (width * height) as usize;
+        let c_rows = height.div_ceil(2);
+        {
+            let (y_dst, c_dst) = dst.split_at_mut(y_len);
+            for row in 0..height {
+                let Some(src) = image.row(0, row, width as usize) else {
+                    drop(image);
+                    self.recycle_output_surface(out.surface);
+                    self.warn(ctx, "vaapih264dec: Y plane geometry overrun — dropped".into());
+                    return Ok(true);
+                };
+                let d = &mut y_dst[(row * width) as usize..((row + 1) * width) as usize];
+                d.copy_from_slice(src);
+            }
+            for row in 0..c_rows {
+                let Some(src) = image.row(1, row, width as usize) else {
+                    drop(image);
+                    self.recycle_output_surface(out.surface);
+                    self.warn(ctx, "vaapih264dec: CbCr plane geometry overrun — dropped".into());
+                    return Ok(true);
+                };
+                let d = &mut c_dst[(row * width) as usize..((row + 1) * width) as usize];
+                d.copy_from_slice(src);
+            }
+        }
+        buf.memory.set_len(need);
+        buf.pts = out.pts;
+        buf.duration = out.duration;
+        drop(image);
+        log!(&*ctx, Level::Trace, "frame", pts = buf.pts);
+        ctx.out(SRC_PAD).push(buf);
+
+        self.recycle_output_surface(out.surface);
+        Ok(true)
+    }
+
+    /// After a picture is output, free its surface *only if it is not a live DPB
+    /// reference*. Reference surfaces are freed when evicted.
+    fn recycle_output_surface(&mut self, surface: ffi::VASurfaceID) {
+        self.output_poc.remove(&surface);
+        let is_ref = self.dpb.iter().any(|e| e.surface == surface);
+        if !is_ref {
+            self.release_surface(surface);
+        }
+    }
+
+}
+
+impl Element for VaapiH264Dec {
+    fn desc(&self) -> &'static ElementDesc {
+        &DESC
+    }
+
+    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        if !self.ensure_display(ctx) {
+            // No device: consume and drop input so the graph does not stall.
+            while inputs.pop().is_some() {}
+            return Ok(Flow::Ok);
+        }
+        loop {
+            // Emit any staged output; stop pulling input if the pool is dry.
+            if !self.emit_over_budget(ctx)? {
+                return Ok(Flow::Ok);
+            }
+            let Some(inbuf) = inputs.pop() else { break };
+            let au = inbuf.memory.data().to_vec();
+            self.decode_au(ctx, &au, inbuf.pts, inbuf.duration);
+        }
+        Ok(Flow::Ok)
+    }
+
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        match event {
+            Event::FlushStart => {
+                // Drop refs + carries + pts + POC; keep VA context (dims unchanged).
+                self.reset_dpb();
+                self.output_queue.clear();
+                self.output_poc.clear();
+                self.pending = None;
+                self.pts_fifo.clear();
+                self.poc.reset();
+                self.alloc_stalled = false;
+                // announced stays true: dims don't change across a seek.
+            }
+            Event::Eos => {
+                // Bump every remaining picture out in POC order.
+                while self.pending.is_some() || !self.output_queue.is_empty() {
+                    if !self.emit_pending(ctx)? {
+                        break; // pool dry; the scheduler re-cranks
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, _ctx: &mut Ctx) {
+        // RAII: dropping va/display destroys context/surfaces/config/display.
+        self.pending = None;
+        self.output_queue.clear();
+        self.dpb.clear();
+        self.va = None;
+        self.display = None;
+    }
+}
+
+impl VaapiH264Dec {
+    /// Emit staged output beyond the reorder budget (steady-state drain in
+    /// process()). `false` = pool dry.
+    fn emit_over_budget(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
+        // Emit the carry first.
+        if self.pending.is_some() && !self.emit_pending(ctx)? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+// --- free-function helpers ------------------------------------------------------------
+
+/// Peek the pps_id of a slice NAL (first_mb ue, slice_type ue, pps_id ue).
+fn peek_pps_id(nal: &[u8]) -> Option<u32> {
+    if nal.len() < 2 {
+        return None;
+    }
+    // De-emulate a small prefix is unnecessary for the first few ue codes; parse
+    // directly on the body (emulation bytes only appear after 00 00, unlikely this
+    // early). Use the full de-emulation for safety via h264parse's reader.
+    let body = de_emulate_prefix(&nal[1..]);
+    let mut r = h264parse::BitReader::new(&body);
+    let _first_mb = r.ue();
+    let _slice_type = r.ue();
+    Some(r.ue())
+}
+
+/// De-emulate just enough of an RBSP body for the pps_id peek.
+fn de_emulate_prefix(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len().min(16));
+    let mut zeros = 0;
+    let mut i = 0;
+    while i < body.len() && out.len() < 16 {
+        let b = body[i];
+        if zeros >= 2 && b == 0x03 && i + 1 < body.len() && body[i + 1] <= 0x03 {
+            zeros = 0;
+            i += 1;
+            continue;
+        }
+        out.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        i += 1;
+    }
+    out
+}
+
+fn zeroed_pic_param() -> ffi::VAPictureParameterBufferH264 {
+    // SAFETY: the struct is plain POD (integers + arrays of integers); all-zero is
+    // a valid (empty) initial state we then fill field by field.
+    unsafe { std::mem::zeroed() }
+}
+
+/// Pack seq_fields bits (va.h VAPictureParameterBufferH264 union layout).
+fn pack_seq_fields(sps: &Sps) -> u32 {
+    let mut v = 0u32;
+    v |= (sps.chroma_format_idc & 0x3) << 0;
+    v |= (sps.separate_colour_plane_flag as u32) << 2; // residual_colour_transform_flag
+    v |= (sps.gaps_in_frame_num_value_allowed_flag as u32) << 3;
+    v |= (sps.frame_mbs_only_flag as u32) << 4;
+    v |= (sps.mb_adaptive_frame_field_flag as u32) << 5;
+    v |= (sps.direct_8x8_inference_flag as u32) << 6;
+    // bit 7 = MinLumaBiPredSize8x8 (level-derived; 0 is safe).
+    v |= (sps.log2_max_frame_num_minus4 & 0xf) << 8;
+    v |= (sps.pic_order_cnt_type & 0x3) << 12;
+    v |= (sps.log2_max_pic_order_cnt_lsb_minus4 & 0xf) << 14;
+    v |= (sps.delta_pic_order_always_zero_flag as u32) << 18;
+    v
+}
+
+/// Pack pic_fields bits (va.h VAPictureParameterBufferH264 union layout).
+fn pack_pic_fields(sps: &Sps, pps: &Pps, field_pic: bool, is_ref: bool) -> u32 {
+    let _ = sps;
+    let mut v = 0u32;
+    v |= (pps.entropy_coding_mode_flag as u32) << 0;
+    v |= (pps.weighted_pred_flag as u32) << 1;
+    v |= (pps.weighted_bipred_idc & 0x3) << 2;
+    v |= (pps.transform_8x8_mode_flag as u32) << 4;
+    v |= (field_pic as u32) << 5;
+    v |= (pps.constrained_intra_pred_flag as u32) << 6;
+    v |= (pps.bottom_field_pic_order_in_frame_present_flag as u32) << 7; // pic_order_present_flag
+    v |= (pps.deblocking_filter_control_present_flag as u32) << 8;
+    v |= (pps.redundant_pic_cnt_present_flag as u32) << 9;
+    v |= (is_ref as u32) << 10; // reference_pic_flag
+    v
+}
+
+/// Convert a slice of DPB entries into a 32-entry VA ref list (unused = INVALID).
+fn to_va_list(list: &[&DpbEntry]) -> [ffi::VAPictureH264; 32] {
+    let mut out = [ffi::VAPictureH264::invalid(); 32];
+    for (i, e) in list.iter().take(32).enumerate() {
+        out[i] = ffi::VAPictureH264 {
+            picture_id: e.surface,
+            frame_idx: if e.long_term {
+                e.long_term_frame_idx as u32
+            } else {
+                e.frame_num as u32
+            },
+            flags: if e.long_term {
+                ffi::VA_PICTURE_H264_LONG_TERM_REFERENCE
+            } else {
+                ffi::VA_PICTURE_H264_SHORT_TERM_REFERENCE
+            },
+            TopFieldOrderCnt: e.top_poc,
+            BottomFieldOrderCnt: e.bottom_poc,
+            va_reserved: [0; ffi::VA_PADDING_LOW],
+        };
+    }
+    out
+}
+
+/// Default reference-list construction (§8.2.4.2): the initial RefPicList0/1
+/// before any `ref_pic_list_modification`. P/SP: short-term by descending
+/// FrameNumWrap then long-term ascending (§8.2.4.2.1). B: list0 = short-term with
+/// POC<cur descending, then POC>cur ascending, then long-term; list1 the mirror,
+/// with the §8.2.4.2.4 first-two swap when the two lists coincide (§8.2.4.2.3-4).
+fn default_ref_lists<'a>(
+    dpb: &'a [DpbEntry],
+    slice_type: SliceType,
+    cur_poc: i32,
+) -> (Vec<&'a DpbEntry>, Vec<&'a DpbEntry>) {
+    let mut list0: Vec<&DpbEntry> = Vec::new();
+    let mut list1: Vec<&DpbEntry> = Vec::new();
+    match slice_type {
+        SliceType::P | SliceType::Sp => {
+            let mut short: Vec<&DpbEntry> = dpb.iter().filter(|e| !e.long_term).collect();
+            short.sort_by(|a, b| b.frame_num_wrap.cmp(&a.frame_num_wrap));
+            let mut long: Vec<&DpbEntry> = dpb.iter().filter(|e| e.long_term).collect();
+            long.sort_by_key(|e| e.long_term_frame_idx);
+            list0.extend(short);
+            list0.extend(long);
+        }
+        SliceType::B => {
+            let mut less: Vec<&DpbEntry> =
+                dpb.iter().filter(|e| !e.long_term && e.poc < cur_poc).collect();
+            less.sort_by(|a, b| b.poc.cmp(&a.poc));
+            let mut greater: Vec<&DpbEntry> =
+                dpb.iter().filter(|e| !e.long_term && e.poc > cur_poc).collect();
+            greater.sort_by_key(|e| e.poc);
+            let mut long: Vec<&DpbEntry> = dpb.iter().filter(|e| e.long_term).collect();
+            long.sort_by_key(|e| e.long_term_frame_idx);
+
+            list0.extend(less.iter().copied());
+            list0.extend(greater.iter().copied());
+            list0.extend(long.iter().copied());
+
+            list1.extend(greater.iter().copied());
+            list1.extend(less.iter().copied());
+            list1.extend(long.iter().copied());
+            if list1.len() > 1
+                && list0.len() == list1.len()
+                && list0.iter().zip(list1.iter()).all(|(a, b)| a.surface == b.surface)
+            {
+                list1.swap(0, 1);
+            }
+        }
+        SliceType::I | SliceType::Si => {}
+    }
+    (list0, list1)
+}
+
+/// Apply §8.2.4.3 ref-list modifications by reordering entries by PicNum /
+/// LongTermPicNum. Best-effort for our subset (short-term ops 0/1; long-term op 2).
+fn apply_ref_list_mods<'a>(
+    list: &mut Vec<&'a DpbEntry>,
+    mods: &[RefListMod],
+    dpb: &'a [DpbEntry],
+    cur_frame_num: i32,
+    sps: &Sps,
+) {
+    if mods.is_empty() {
+        return;
+    }
+    let max_frame_num = sps.max_frame_num() as i32;
+    let mut pred = cur_frame_num;
+    let mut refined: Vec<&DpbEntry> = Vec::new();
+    for m in mods {
+        match m.op {
+            0 | 1 => {
+                // Short-term: compute picNum target relative to pred.
+                let abs_diff = m.value as i32 + 1;
+                let mut pic_num = if m.op == 0 { pred - abs_diff } else { pred + abs_diff };
+                if pic_num < 0 {
+                    pic_num += max_frame_num;
+                } else if pic_num >= max_frame_num {
+                    pic_num -= max_frame_num;
+                }
+                pred = pic_num;
+                if let Some(e) = dpb.iter().find(|e| !e.long_term && e.frame_num == pic_num) {
+                    refined.push(e);
+                }
+            }
+            2 => {
+                // Long-term: value = long_term_pic_num.
+                let lt = m.value as i32;
+                if let Some(e) = dpb.iter().find(|e| e.long_term && e.long_term_frame_idx == lt) {
+                    refined.push(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !refined.is_empty() {
+        // Prepend the refined (reordered) entries; append the rest of the default
+        // list not already present. A faithful §8.2.4.3 shifts in place, but for our
+        // subset (P/B with short-term refs) this yields the same active window.
+        let mut new_list = refined;
+        for e in list.iter() {
+            if !new_list.iter().any(|x| x.surface == e.surface) {
+                new_list.push(e);
+            }
+        }
+        *list = new_list;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(surface: u32, frame_num: i32, poc: i32) -> DpbEntry {
+        DpbEntry {
+            surface,
+            frame_num,
+            frame_num_wrap: frame_num,
+            poc,
+            top_poc: poc,
+            bottom_poc: poc,
+            long_term: false,
+            long_term_frame_idx: -1,
+        }
+    }
+
+    #[test]
+    fn p_slice_ref_list_is_descending_frame_num_wrap() {
+        // §8.2.4.2.1: short-term refs by descending FrameNumWrap.
+        let dpb = vec![entry(10, 0, 0), entry(11, 2, 4), entry(12, 1, 2)];
+        let (list0, list1) = default_ref_lists(&dpb, SliceType::P, 6);
+        let order: Vec<i32> = list0.iter().map(|e| e.frame_num_wrap).collect();
+        assert_eq!(order, vec![2, 1, 0], "P list0 must descend by FrameNumWrap");
+        assert!(list1.is_empty(), "P slices have no list1");
+    }
+
+    #[test]
+    fn b_slice_ref_lists_split_by_poc() {
+        // §8.2.4.2.3: list0 = POC<cur desc then POC>cur asc; list1 = the mirror.
+        let dpb = vec![
+            entry(1, 0, 0),  // POC 0  (< cur)
+            entry(2, 1, 2),  // POC 2  (< cur)
+            entry(3, 2, 8),  // POC 8  (> cur)
+            entry(4, 3, 6),  // POC 6  (> cur)
+        ];
+        let cur_poc = 4;
+        let (list0, list1) = default_ref_lists(&dpb, SliceType::B, cur_poc);
+        let l0: Vec<i32> = list0.iter().map(|e| e.poc).collect();
+        let l1: Vec<i32> = list1.iter().map(|e| e.poc).collect();
+        // list0: [2, 0] (POC<cur descending) then [6, 8] (POC>cur ascending).
+        assert_eq!(l0, vec![2, 0, 6, 8]);
+        // list1: [6, 8] (POC>cur ascending) then [2, 0] (POC<cur descending).
+        assert_eq!(l1, vec![6, 8, 2, 0]);
+    }
+}

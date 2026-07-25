@@ -838,6 +838,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sc-vaapi"
+version = "0.1.0"
+dependencies = [
+ "sc-mkv",
+ "streamcraft-core",
+]
+
+[[package]]
 name = "sc-vp8"
 version = "0.1.0"
 dependencies = [

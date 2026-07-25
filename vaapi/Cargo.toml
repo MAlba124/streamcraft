@@ -1,0 +1,28 @@
+[package]
+name = "sc-vaapi"
+description = "VA-API hardware-accelerated video decode plugin for streamcraft (hand-rolled libva FFI; vaapih264dec)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Links the system libva/libva-drm shared libraries — declared so cargo can flag a
+# double-link and so a future -sys crate can coexist (`links` is a global key).
+links = "va"
+
+[lib]
+name = "sc_vaapi"
+
+[dependencies]
+# The only hard dependency is the framework core (buffers, batches, the element
+# contract, dynamic-caps announcement). The VA-API surface itself is hand-rolled
+# FFI against the system libva (the device boundary, like sc-pipewire wraps
+# libpipewire) — no -sys crate, no bindgen; see src/ffi.rs.
+streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+# End-to-end decode gate: pull the first access units of a real H.264-in-MKV file
+# through the element and assert plausible NV12 frames. sc-mkv gives us the
+# incremental reader + the AVCC→Annex-B reframer + the parameter-set head; no
+# dependency cycle (sc-mkv does not depend on sc-vaapi). Skipped when the fixture
+# is absent.
+sc-mkv = { path = "../mkv" }
