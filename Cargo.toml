@@ -28,6 +28,7 @@ members = [
     "mp4",
     "sdl3",
     "vaapi",
+    "rtp",
     "launch",
 ]
 

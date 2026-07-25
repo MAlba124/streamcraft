@@ -1,0 +1,19 @@
+[package]
+name = "sc-rtp"
+description = "Hand-written, dependency-free RTP/RTCP (RFC 3550) plugin for streamcraft: packets, jitter buffer, payload formats, and the session/depayload elements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_rtp"
+
+[dependencies]
+# std-only networking — no RTP/networking crate. The protocol modules
+# (packet/seq/jitter/rtcp/depay/pay) are pure and framework-free; only the
+# element wiring uses streamcraft-core.
+streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }

@@ -819,6 +819,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sc-rtp"
+version = "0.1.0"
+dependencies = [
+ "streamcraft-core",
+ "streamcraft-elements",
+]
+
+[[package]]
 name = "sc-sdl3"
 version = "0.1.0"
 dependencies = [
