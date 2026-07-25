@@ -20,6 +20,7 @@
 
 #![allow(dead_code)]
 
+pub mod layout;
 pub mod ui;
 
 use streamcraft_core::pipeline::Pipeline;
