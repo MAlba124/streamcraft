@@ -12,6 +12,8 @@
 
 #![allow(dead_code)]
 
+pub mod layout;
+
 use streamcraft_core::pipeline::Pipeline;
 
 /// In-process inspector handle (embed mode).
