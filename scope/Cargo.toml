@@ -26,6 +26,5 @@ streamcraft-core = { path = "../core", features = ["introspect"] }
 # pattern; never `build-from-source` — the repo toolchain has no SDL cmake/clang
 # build). All `unsafe` FFI is confined to `ui::backend`.
 sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
-# TODO: an MCP server implementation is added when the protocol client lands.
-# Both scope halves are optional to the framework — apps that don't attach pay
-# nothing.
+# TODO: an MCP server implementation rides the same protocol client (deferred).
+# Scope is optional to the framework — apps that don't attach pay nothing.

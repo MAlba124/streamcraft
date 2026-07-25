@@ -13,13 +13,15 @@
 //! `SDL_RenderGeometryRaw`, per-frame bump arena, embedded bitmap-font text, core
 //! widgets) and `src/bin/ui_demo.rs` for a fake-data inspector demo.
 //!
-//! Shows (all live): graph view, latency panel, event/log feeds, debugging
-//! (pause/step, counters, property editing, buffer-metadata peeking), and an MCP
-//! server exposing the same protocol as agent tools. Wiring the protocol client and
-//! those panels onto this UI layer is a later integration phase.
+//! v1 shows, all live: the graph view ([`layout`] + per-edge negotiated formats +
+//! per-node counters), per-element throughput, the merged events-and-logs feed, and
+//! pause/resume. Latency histograms, property editing, buffer peeking, and the MCP
+//! server ride the same protocol in later phases.
 
 #![allow(dead_code)]
 
+pub mod app;
+pub mod client;
 pub mod layout;
 pub mod ui;
 
@@ -27,13 +29,37 @@ use streamcraft_core::pipeline::Pipeline;
 
 /// In-process inspector handle (embed mode).
 pub struct Scope {
-    _priv: (),
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Scope {
     /// Spawn the inspector UI in-process on its own thread, attached to `pipeline`
-    /// via the introspection protocol.
-    pub fn spawn(_pipeline: &Pipeline) -> Self {
-        todo!("spec: scraft-scope — embed mode")
+    /// via the introspection protocol on a private temp socket.
+    ///
+    /// Call after the topology is built (the same convention as
+    /// `Pipeline::serve_introspection`). Embed and attach modes share the whole
+    /// client + UI path, so the two cannot drift. Note: some platforms restrict
+    /// window creation to the main thread; attach mode is the primary path, embed
+    /// is best-effort for dev builds.
+    pub fn spawn(pipeline: &mut Pipeline) -> std::io::Result<Scope> {
+        let path = std::env::temp_dir().join(format!("scraft-scope-{}.sock", std::process::id()));
+        pipeline
+            .serve_introspection(&path)
+            .map_err(|e| std::io::Error::other(format!("serve_introspection: {e:?}")))?;
+        let thread = std::thread::Builder::new()
+            .name("scraft-scope".into())
+            .spawn(move || {
+                if let Err(e) = app::run(&path, app::AppOpts::default()) {
+                    eprintln!("scraft-scope (embed): {e}");
+                }
+            })?;
+        Ok(Scope { thread: Some(thread) })
+    }
+
+    /// Block until the inspector window is closed.
+    pub fn join(mut self) {
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
