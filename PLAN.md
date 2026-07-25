@@ -266,6 +266,21 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > pts (B-frame reorder caveat — sink saw pts go backwards), and mkvdemux
 > announces no fps so sink QoS is disarmed.
 
+> **Update — session 4k (2026-07-25): AAC decode adopted.** `sc-aac`/`AacDec`
+> over oxideav-aac 0.1.6 (raw `decode_raw_data_block` + ASC API — the Decoder
+> trait is ADTS/LOAS-only), MkvDemux A_AAC wiring (family/offers/ASC-head/
+> announce), launch registration, `decode_adts` diagnostic example. Gates:
+> ffmpeg oracle 72.8 dB @44.1k / 69.5 dB @48k (committed ADTS fixture); the
+> movie's real track = timeline-exact (failed AUs substitute silence, AU-indexed
+> warnings) but **~15 dB systematic fidelity + 21/1300 `ElementDecodeInvalid`
+> clusters** — real-content tools (M/S/TNS/PNS/short windows) are wrong or
+> unsupported upstream. **Next AAC step: vendored upstream fix** (the h264-leak
+> pattern): failing AU indices are logged, `/tmp/movie_audio.adts` +
+> `decode_adts` reproduce, diff per-frame error vs ffmpeg to isolate the tool.
+> Also queued: play A+V together (aacdec ! audioconvert? ! pipewireaudiosink
+> beside the video chain — clock + latency infra is ready); mp4demux still has
+> the shared-offer-menu autoplug weakness mkv got fixed for (d2a2440).
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
