@@ -242,6 +242,30 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > workspace 102 result lines green. **Next: scope** — protocol first
 > (feature-gated core, length-prefixed POD frames), then the SDL UI.
 
+> **Update — session 4j (2026-07-25): the playback freeze + the 4 GiB leak.**
+> Real-window movie playback froze nondeterministically (~5-30 s) then, once
+> cured, leaked to OOM. Two root causes, both found by instrumentation added
+> along the way (mkvdemux/h264dec/sdl3videosink log coverage; `play_file
+> --stats` 3 s counter deltas; `Ctx::pool_stats` + h264dec's edge-triggered
+> `alloc_stall` log; gdb thread dumps): (1) **shared-pool deadlock** —
+> `acquire_exact` handed whole 4 MiB slots to ~12 KB AUs *and* its heap
+> fallback still counted against `outstanding`, so the output-blocked demuxer's
+> queue starved the decoder's `try_alloc` forever (`outstanding=24/24`, all
+> counters flat; three groups spin-yielding). Fixed in `ec3c135`: slots only
+> for requests ≥ slot_size/4, heap fallback fully **unlinked** from pool
+> accounting, plus a per-decoder pool in play_file (`set_element_pool`, the
+> pool-negotiation v1). (2) **oxideav-h264 leaks every reference picture** —
+> upstream `RefPicStore` has insert and no eviction (~35 MB/s growth; heaptrack
+> peak 89.8% in `finalize_in_progress_picture`). Fixed in `c69bed0` by
+> vendoring 0.1.7 (`vendor/oxideav-h264`, `[patch.crates-io]`) with a
+> documented `retain_keys` sweep (STREAMCRAFT-PATCHES.md, upstream-PR
+> candidate); crate's 1288-test suite green, RSS flat 177→188 MiB over 2 min.
+> Movie now plays smoothly. **Known follow-ups**: the decoder's internal churn
+> (51.8M allocs / 35 s — CABAC temporaries; nativization debt), spin-yield
+> groups should park (3 cores busy while stalled), h264dec emits feed-order
+> pts (B-frame reorder caveat — sink saw pts go backwards), and mkvdemux
+> announces no fps so sink QoS is disarmed.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
