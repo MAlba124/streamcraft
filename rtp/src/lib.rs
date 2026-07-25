@@ -14,6 +14,7 @@
 //! its section at the point of use.
 
 pub mod depay;
+pub mod elements;
 pub mod jitter;
 pub mod packet;
 pub mod pay;

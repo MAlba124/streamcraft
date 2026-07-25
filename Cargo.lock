@@ -822,6 +822,8 @@ dependencies = [
 name = "sc-rtp"
 version = "0.1.0"
 dependencies = [
+ "sc-mkv",
+ "sc-rtsp",
  "streamcraft-core",
  "streamcraft-elements",
 ]
@@ -844,6 +846,8 @@ dependencies = [
  "sc-h265",
  "sc-mkv",
  "sc-pipewire",
+ "sc-rtp",
+ "sc-rtsp",
  "sc-vaapi",
  "sc-vp8",
  "sc-vp9",

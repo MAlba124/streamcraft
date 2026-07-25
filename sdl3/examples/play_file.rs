@@ -117,6 +117,173 @@ fn try_video_decoders(
     None
 }
 
+/// Live RTSP playback (spec: Milestone applications — network streaming).
+///
+/// The app is the controller (spec: no-bins): it runs the RTSP client dance —
+/// DESCRIBE (RFC 2326 §10.2) for the SDP, SETUP (§10.4) per media with a
+/// locally bound RTP/RTCP port pair, PLAY (§10.5) once the pipeline is
+/// prerolled — then keeps the session alive from a helper thread and tears it
+/// down on exit. The pipeline itself is the plain receive chain; the video
+/// track feeds the same decoder autoplug (hardware-first) as file playback.
+///
+/// v1 scope: the first H.264 video media, UDP transport. Audio media are
+/// skipped (no Opus decoder in-tree yet); other codecs fail loudly.
+fn play_rtsp(url: &str, stats: bool, max_secs: Option<u64>) {
+    use sc_rtp::elements::{RtpH264Depay, RtpSession, RtpStreamDesc, UdpSrc};
+    use sc_rtsp::client::RtspClient;
+    use sc_rtsp::sdp::{decode_base64, MediaKind};
+
+    let mut client = RtspClient::connect(url).expect("rtsp connect");
+    let described = client.describe().expect("DESCRIBE");
+    let base = client.base_url().to_string();
+
+    // The first H.264 video media (RFC 6184 §8.2.2: media subtype "H264").
+    let media = described
+        .sdp
+        .media
+        .iter()
+        .find(|m| {
+            m.kind == MediaKind::Video
+                && m.payload_types.iter().any(|pt| {
+                    m.rtpmap.get(pt).is_some_and(|r| r.encoding.eq_ignore_ascii_case("H264"))
+                })
+        })
+        .expect("no H.264 video media in the SDP");
+    let pt = *media
+        .payload_types
+        .iter()
+        .find(|pt| media.rtpmap.get(pt).is_some_and(|r| r.encoding.eq_ignore_ascii_case("H264")))
+        .unwrap();
+    let clock_rate = media.rtpmap[&pt].clock_rate;
+    // Out-of-band parameter sets (RFC 6184 §8.1 sprop-parameter-sets):
+    // comma-separated base64 NAL units in the fmtp line.
+    let sprop: Vec<Vec<u8>> = media
+        .fmtp
+        .get(&pt)
+        .and_then(|f| f.params.get("sprop-parameter-sets"))
+        .map(|v| v.split(',').filter_map(decode_base64).collect())
+        .unwrap_or_default();
+
+    // An even/odd local port pair (RFC 3550 §11: RTP on the even port, RTCP
+    // one above). Bind ephemeral until the kernel hands us an even port.
+    let (rtp_sock, _rtcp_sock, rtp_port) = loop {
+        let a = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind rtp");
+        let port = a.local_addr().unwrap().port();
+        if port % 2 == 0 && port < u16::MAX {
+            if let Ok(b) = std::net::UdpSocket::bind(("0.0.0.0", port + 1)) {
+                break (a, b, port);
+            }
+        }
+    };
+
+    let control = sc_rtsp::client::resolve_control(&base, media.control.as_deref().unwrap_or(""));
+    let transport = client.setup(&control, rtp_port).expect("SETUP");
+    println!(
+        "rtsp: {} pt={pt} rate={clock_rate} sprop_nals={} transport={}",
+        url,
+        sprop.len(),
+        transport.raw.trim()
+    );
+
+    // The receive pipeline. Decoded 720p NV12 ≈ 1.4 MiB — same pool shape as
+    // file playback, RTP-side buffers are small.
+    let mut p = Pipeline::new();
+    p.set_pool(4 * 1024 * 1024, 24);
+    let src = p.add(UdpSrc::from_socket(rtp_sock));
+    let session = p.add(RtpSession::new(vec![RtpStreamDesc { payload_type: pt, clock_rate }]));
+    p.link((src, "src"), (session, "sink")).expect("udpsrc ! session");
+    let added = p.preroll().expect("preroll");
+    let session_pad = added.first().expect("session stream pad");
+
+    let depay = p.add(RtpH264Depay::new(sprop));
+    p.link((session_pad.element, &session_pad.name), (depay, "sink")).expect("session ! depay");
+    let dec = try_video_decoders(&mut p, (depay, "src")).expect("no decoder linked for h264");
+    p.set_element_pool(dec, 4 * 1024 * 1024, 24);
+    p.set_queue_capacity(dec, 16);
+    let sink = p.add_boxed(Box::new(Sdl3VideoSink::new().with_title("streamcraft — rtsp")));
+    p.link((dec, "src"), (sink, "sink")).expect("dec ! sink");
+
+    // Everything is linked: start the media flowing, then run.
+    client.play().expect("PLAY");
+    println!("playing {url} — 'q'⏎ quits (or close the window / Ctrl-C)…");
+
+    // Keepalive from a helper thread (RFC 2326 §12.37: the session times out —
+    // 60 s default — without liveness); TEARDOWN when the pipeline stops.
+    let stop = p.stop_handle();
+    let keepalive_secs = client.session().map(|s| s.timeout_secs).unwrap_or(60).max(2) / 2;
+    let ka = std::thread::spawn(move || {
+        let mut last = std::time::Instant::now();
+        while !stop.is_stopped() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if last.elapsed().as_secs() >= keepalive_secs {
+                if client.keepalive().is_err() {
+                    eprintln!("rtsp: keepalive failed — server gone?");
+                    stop.stop();
+                    return;
+                }
+                last = std::time::Instant::now();
+            }
+        }
+        let _ = client.teardown();
+    });
+
+    if stats {
+        let tap = p.tap_handle();
+        let watched = vec![("udpsrc", src), ("session", session), ("depay", depay), ("dec", dec), ("sink", sink)];
+        std::thread::spawn(move || {
+            let mut prev = vec![(0u64, 0u64); watched.len()];
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let mut line = String::from("stats:");
+                for (i, (name, id)) in watched.iter().enumerate() {
+                    if let Some(c) = tap.snapshot(*id) {
+                        let (pi, po) = prev[i];
+                        line.push_str(&format!(
+                            " {name} {}→{} (+{}/+{}) drops={} |",
+                            c.buffers_in,
+                            c.buffers_out,
+                            c.buffers_in - pi,
+                            c.buffers_out - po,
+                            c.drops,
+                        ));
+                        prev[i] = (c.buffers_in, c.buffers_out);
+                    }
+                }
+                eprintln!("{line}");
+            }
+        });
+    }
+    if let Some(secs) = max_secs {
+        let stop = p.stop_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.stop();
+        });
+    }
+    {
+        let stop = p.stop_handle();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if std::io::BufRead::read_line(&mut stdin.lock(), &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line.trim() == "q" {
+                    stop.stop();
+                    return;
+                }
+            }
+        });
+    }
+
+    if let Err(e) = p.run() {
+        eprintln!("pipeline error: {e:?}");
+    }
+    let _ = ka.join();
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // `--stats`: print per-element counter deltas every 3 s (buffers in/out, ring
@@ -148,9 +315,17 @@ fn main() {
             v
         });
     let Some(path) = args.first().cloned() else {
-        eprintln!("usage: play_file [--probe] [--max-secs N] FILE.mkv");
+        eprintln!("usage: play_file [--probe] [--max-secs N] FILE.mkv | rtsp://HOST[:554]/PATH");
         std::process::exit(2);
     };
+
+    // A network stream: the RTSP control dance is app policy (spec: no-bins —
+    // controllers live in the application), the pipeline is
+    // `udpsrc ! rtpsession ! rtph264depay ! <decoder> ! sdl3videosink`.
+    if path.starts_with("rtsp://") {
+        play_rtsp(&path, stats, max_secs);
+        return;
+    }
 
     let header = header_prefix(&path).expect("read header");
 

@@ -17,3 +17,6 @@ streamcraft-core = { path = "../core" }
 
 [dev-dependencies]
 streamcraft-elements = { path = "../elements" }
+# The rtsp_serve example: MKV in, RTSP-controlled RTP out (pure-sc e2e).
+sc-mkv = { path = "../mkv" }
+sc-rtsp = { path = "../rtsp" }
