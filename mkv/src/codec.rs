@@ -20,6 +20,8 @@
 //! [`Err`], never a panic or an out-of-range slice. The demuxer warns-and-drops on such an
 //! error rather than killing the pipeline.
 
+use streamcraft_core::format::OfferDesc;
+
 /// The demuxer announce family for a video (or audio) track, keyed by CodecID (RFC 9559 §12
 /// codec mappings). The families match the sink offers of the streamcraft decoders so a
 /// dynamic pad linking `mkvdemux.video_N ! vp8dec.sink` negotiates:
@@ -38,6 +40,32 @@ pub fn family_for(codec_id: &str) -> &'static str {
         "V_MPEG4/ISO/AVC" => "h264/annexb",
         "V_MPEGH/ISO/HEVC" => "h265/annexb",
         _ => "bytes",
+    }
+}
+
+/// The offer menu for a track's dynamic src pad: exactly [`family_for`]'s announce
+/// family, plus the `bytes` escape so a generic byte sink can still tap the track.
+/// **Per-track menus are what make negotiation-driven autoplug select**: one shared
+/// all-families menu let `h265dec` link an h264 track (link-time intersection admits
+/// any family on the menu; the mismatch only surfaced at runtime as every access unit
+/// dropping). Unconstrained `any` offers — the concrete width/height ride the runtime
+/// announcement, and their field names are interned by the consumer's offers.
+pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
+    static FLAC: [OfferDesc; 2] = [OfferDesc::any("flac"), OfferDesc::any("bytes")];
+    static VP8: [OfferDesc; 2] = [OfferDesc::any("vp8"), OfferDesc::any("bytes")];
+    static VP9: [OfferDesc; 2] = [OfferDesc::any("vp9"), OfferDesc::any("bytes")];
+    static AV1: [OfferDesc; 2] = [OfferDesc::any("av1"), OfferDesc::any("bytes")];
+    static H264: [OfferDesc; 2] = [OfferDesc::any("h264/annexb"), OfferDesc::any("bytes")];
+    static H265: [OfferDesc; 2] = [OfferDesc::any("h265/annexb"), OfferDesc::any("bytes")];
+    static BYTES: [OfferDesc; 1] = [OfferDesc::any("bytes")];
+    match codec_id {
+        "A_FLAC" => &FLAC,
+        "V_VP8" => &VP8,
+        "V_VP9" => &VP9,
+        "V_AV1" => &AV1,
+        "V_MPEG4/ISO/AVC" => &H264,
+        "V_MPEGH/ISO/HEVC" => &H265,
+        _ => &BYTES,
     }
 }
 

@@ -39,15 +39,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "ash"
-version = "0.38.0+1.3.281"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
-dependencies = [
- "libloading",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.69.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -794,11 +785,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "sc-vk"
+name = "sc-sdl3"
 version = "0.1.0"
 dependencies = [
- "ash",
- "sc-wayland",
+ "sc-av1",
+ "sc-h264",
+ "sc-h265",
+ "sc-mkv",
+ "sc-vp8",
+ "sc-vp9",
+ "sdl3-sys",
  "streamcraft-core",
  "streamcraft-elements",
  "streamcraft-video",
@@ -825,27 +821,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "sc-wayland"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sc-av1",
- "sc-h264",
- "sc-h265",
- "sc-mkv",
- "sc-vk",
- "sc-vp8",
- "sc-vp9",
- "streamcraft-core",
- "streamcraft-elements",
- "streamcraft-video",
-]
-
-[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
+name = "sdl3-sys"
+version = "0.6.7+SDL-3.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e89cde1ff23eb110e348da9b5be904381235163272a424938a2c99c86ea33041"
+dependencies = [
+ "pkg-config",
+ "vcpkg",
+]
 
 [[package]]
 name = "serde"
@@ -952,10 +941,9 @@ dependencies = [
  "sc-mp3",
  "sc-mp4",
  "sc-ogg",
- "sc-vk",
+ "sc-sdl3",
  "sc-vp8",
  "sc-vp9",
- "sc-wayland",
  "streamcraft-audio",
  "streamcraft-core",
  "streamcraft-elements",
@@ -1194,6 +1182,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version-compare"

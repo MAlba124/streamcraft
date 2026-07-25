@@ -698,25 +698,6 @@ const CODEC_A_FLAC: &str = "A_FLAC";
 /// caps-ignoring byte peer just reads the reconstructed native FLAC stream (spec: Formats —
 /// dynamic caps; the same tolerant install `flacdec`'s `audio/raw`→`bytes` uses).
 const FAMILY_FLAC: &str = "flac";
-/// The fallback announce family for an unknown/other CodecID: a raw `bytes` stream (spec:
-/// dynamic caps — "bytes fallback for unknown codec ids").
-const FAMILY_BYTES: &str = "bytes";
-
-/// Every announce family a demux src pad may carry, so the pad's offer menu contains the
-/// family it will announce (a pad can only announce a family it already offered — the
-/// vocabulary is interned from these offers at link time). The video families match the
-/// codec decoders' sink offers so `mkvdemux.src_track<N> ! vp8dec.sink` (etc.) negotiates
-/// (spec: RFC 9559 §12 codec mappings; [`codec::family_for`]). All are unconstrained byte
-/// families — the concrete `width`/`height` ride the runtime announcement, not the offer.
-static DEMUX_SRC_OFFERS: [OfferDesc; 7] = [
-    OfferDesc::any(FAMILY_FLAC),
-    OfferDesc::any(FAMILY_BYTES),
-    OfferDesc::any("vp8"),
-    OfferDesc::any("vp9"),
-    OfferDesc::any("av1"),
-    OfferDesc::any("h264/annexb"),
-    OfferDesc::any("h265/annexb"),
-];
 
 static DEMUX_PADS: [PadDesc; 1] = [PadDesc {
     name: "sink",
@@ -1128,7 +1109,10 @@ impl Element for MkvDemux {
             let family = codec::family_for(&track.codec_id);
             let (codec_head, reframer) = Self::head_and_reframer(track);
             let name = format!("src_track{}", track.track_number);
-            let pad = ctx.add_pad(Direction::Src, &name, &DEMUX_SRC_OFFERS);
+            // Per-track offer menu (see `codec::offers_for`): the pad admits exactly
+            // its codec's family (+ the bytes escape), so link-time negotiation
+            // *selects* the right decoder instead of admitting them all.
+            let pad = ctx.add_pad(Direction::Src, &name, codec::offers_for(&track.codec_id));
             self.pad_tracks.push(PadTrack {
                 track_number: track.track_number,
                 pad,
