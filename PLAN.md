@@ -489,6 +489,42 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > EncSlice/EncSliceLP (this box: h264+h265), `Config::new_encode` + hw tests
 > prove an encode context allocates — `vaapih264enc` element is the follow-up.
 
+> **Update — session 4s (2026-07-25/26): RTP/RTSP network streaming + the
+> scheduler finally parks.** The network milestone, receive-first, three
+> parallel agents + inline elements. **sc-rtp** (RFCs 3550/3551/6184/7587 in
+> tree): packet view (frozen first, scaffold commit `2529eef` — agents built
+> against pinned stubs, zero merge conflicts), A.1 extended seq, jitter buffer
+> (pure state machine, latency-held gaps, late-uncounts-loss), RTCP SR/RR,
+> H.264 depay/pay (single NAL/STAP-A/FU-A; ffmpeg fixtures byte-exact vs the
+> encoder's own stream) + Opus; elements: udpsrc (reactor Recv; **SO_RCVTIMEO
+> 100 ms — a quiet sender otherwise wedges the group in read(2), stop
+> unobservable**: the hard-interrupt reactor-cancel follow-up's first real
+> bite), rtpsession (SDP-declared streams → preroll pads; **fan-in elements
+> must consume BOTH `inputs` and `take_input_on`** — single-linked-pad heads
+> get batches via the param, the MkvMuxN lesson re-learned), depay/pay
+> (payloaders **Active** — a demuxer branches only from its group tail),
+> clock-paced udpsink (`wait_until(pts)` = ffmpeg's `-re` by construction).
+> **sc-rtsp** (RFC 2326/8866/2617 + hand-rolled MD5/base64): SDP parser,
+> client (digest auth, control-URL append-not-RFC1808, interleaved demuxer)
+> live-validated vs mediamtx; server (Transport parse, 454/455/459/461 paths,
+> session timeout) loopback-tested against our own client. **play_file
+> rtsp://** runs the client dance app-side (no-bins) into the hw-first decode
+> chain: 25 fps vaapi, zero drops, vs mediamtx AND vs **rtsp_serve** (our
+> server example, avcC→sprop SDP, per-viewer Play/Teardown pipelines) — the
+> pure-sc e2e; ffprobe as the independent second implementation. Also this
+> session: vaapi green-frame fix (pred_weight_table forwarded, `0a45d95`) +
+> display-order fixes ((gop,poc) key + pigeonhole surface budget, `6aeac39`);
+> **aac O(N log N) IMDCT** (vendored patch #2, `2b943ac`: DCT-IV + quarter-FFT,
+> imdct was 50.5% of playback cycles → gone, ~28% less total CPU); av1
+> assessed (scalar oxideav ≈ 10–15 fps @720p; MC+CDEF are the SIMD targets,
+> entropy decode is NOT the wall); and the long-standing **spin→park**
+> scheduler fix (agent, `370ef39`: eventcount on the pause gate's plumbing,
+> ring-push/pass-end/seek/pause bumps + 10 ms tick backstop; **13.2× less
+> playback CPU** — 1.06 cores → 0.08, sys time ÷50, loom green, park_cpu
+> regression test). Follow-ups: RTCP RR sending + SR-based A/V sync apply,
+> AAC depay (RFC 3640), TCP-interleaved element wiring, RTSP server
+> multi-client/PAUSE-resume, av1 SIMD campaign, reactor hard-cancel.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
