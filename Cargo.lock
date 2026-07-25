@@ -508,6 +508,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "oxideav-aac"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9246dc98ce532f45d3f8d0193996f7947cf06691ea533804641b27e9ee5b2f73"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
 name = "oxideav-av1"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -678,6 +687,16 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "sc-aac"
+version = "0.1.0"
+dependencies = [
+ "oxideav-aac",
+ "sc-mp4",
+ "streamcraft-core",
+ "streamcraft-elements",
+]
 
 [[package]]
 name = "sc-av1"
@@ -931,6 +950,7 @@ dependencies = [
 name = "streamcraft-cli"
 version = "0.1.0"
 dependencies = [
+ "sc-aac",
  "sc-av1",
  "sc-flac",
  "sc-h264",

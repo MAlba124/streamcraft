@@ -838,6 +838,9 @@ impl MkvDemux {
     fn head_and_reframer(track: &Track) -> (Vec<u8>, Reframer) {
         match track.codec_id.as_str() {
             CODEC_A_FLAC => (track.codec_private.clone(), Reframer::Passthrough),
+            // A_AAC: CodecPrivate is the raw AudioSpecificConfig (RFC 9559 §12),
+            // delivered as the in-band head; each Block is one raw AU as-is.
+            "A_AAC" => (track.codec_private.clone(), Reframer::Passthrough),
             "V_MPEG4/ISO/AVC" | "V_MPEGH/ISO/HEVC" => {
                 let is_hevc = track.codec_id == "V_MPEGH/ISO/HEVC";
                 match codec::nal_head_from_config(&track.codec_private, is_hevc) {
@@ -1060,6 +1063,17 @@ impl MkvDemux {
                     ("rate", ValueDesc::Int(track.sampling_frequency as i64)),
                     ("channels", ValueDesc::Int(track.channels as i64)),
                     ("sample", ValueDesc::Id(sample_name(track.bit_depth))),
+                ],
+            );
+        } else if family == "aac" && track.sampling_frequency > 0.0 {
+            // Container-declared rate/channels seed negotiation (a muxer reads
+            // them); the decoder reads its authoritative config from the ASC head.
+            ctx.announce_format(
+                pad,
+                "aac",
+                &[
+                    ("rate", ValueDesc::Int(track.sampling_frequency as i64)),
+                    ("channels", ValueDesc::Int(track.channels as i64)),
                 ],
             );
         } else if is_video_family(family) && track.pixel_width != 0 && track.pixel_height != 0 {

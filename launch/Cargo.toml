@@ -17,6 +17,7 @@ streamcraft-core = { path = "../core" }
 # native libpipewire dependency the launch tool has no need for.
 streamcraft-elements = { path = "../elements" }
 streamcraft-audio = { path = "../audio" }
+sc-aac = { path = "../aac" }
 sc-flac = { path = "../flac" }
 sc-ogg = { path = "../ogg" }
 # The raw-video path (videotestsrc / rawvideoparse / videocksink) plus the five

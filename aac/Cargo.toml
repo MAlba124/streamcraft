@@ -1,0 +1,25 @@
+[package]
+name = "sc-aac"
+description = "AAC decoder plugin for streamcraft, backed by the pure-Rust oxideav-aac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_aac"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+# The sanctioned codec dependency (see lib.rs for the adoption rubric verdict):
+# pure Rust, zero unsafe, no build.rs, spec-annotated (ISO/IEC 14496-3 §4
+# citations at point of use). Single dep on oxideav-core, already in-tree via
+# sc-h264. We use the raw `StreamDecoder::decode_raw_data_block` +
+# `asc::AudioSpecificConfig` API directly — not the oxideav-core `Decoder`
+# trait, whose 0.1.6 impl only accepts ADTS/LOAS transports while our
+# containers deliver raw access units + AudioSpecificConfig.
+oxideav-aac = "0.1"
+
+[dev-dependencies]
+streamcraft-elements = { path = "../elements" }
+sc-mp4 = { path = "../mp4" }

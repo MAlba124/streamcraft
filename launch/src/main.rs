@@ -61,6 +61,7 @@ fn build_registry() -> Registry {
     let mut r = Registry::new();
     streamcraft_elements::register(&mut r);
     streamcraft_audio::register(&mut r);
+    sc_aac::register(&mut r);
     sc_flac::register(&mut r);
     sc_ogg::register(&mut r);
     streamcraft_video::register(&mut r);

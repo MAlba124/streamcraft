@@ -9,6 +9,7 @@ members = [
     "core",
     "elements",
     "http",
+    "aac",
     "flac",
     "ogg",
     "mkv",

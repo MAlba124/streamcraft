@@ -34,6 +34,7 @@ use streamcraft_core::format::OfferDesc;
 pub fn family_for(codec_id: &str) -> &'static str {
     match codec_id {
         "A_FLAC" => "flac",
+        "A_AAC" => "aac",
         "V_VP8" => "vp8",
         "V_VP9" => "vp9",
         "V_AV1" => "av1",
@@ -52,6 +53,7 @@ pub fn family_for(codec_id: &str) -> &'static str {
 /// announcement, and their field names are interned by the consumer's offers.
 pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
     static FLAC: [OfferDesc; 2] = [OfferDesc::any("flac"), OfferDesc::any("bytes")];
+    static AAC: [OfferDesc; 2] = [OfferDesc::any("aac"), OfferDesc::any("bytes")];
     static VP8: [OfferDesc; 2] = [OfferDesc::any("vp8"), OfferDesc::any("bytes")];
     static VP9: [OfferDesc; 2] = [OfferDesc::any("vp9"), OfferDesc::any("bytes")];
     static AV1: [OfferDesc; 2] = [OfferDesc::any("av1"), OfferDesc::any("bytes")];
@@ -60,6 +62,7 @@ pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
     static BYTES: [OfferDesc; 1] = [OfferDesc::any("bytes")];
     match codec_id {
         "A_FLAC" => &FLAC,
+        "A_AAC" => &AAC,
         "V_VP8" => &VP8,
         "V_VP9" => &VP9,
         "V_AV1" => &AV1,
