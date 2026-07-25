@@ -27,6 +27,7 @@ members = [
     "mp3",
     "mp4",
     "sdl3",
+    "vaapi",
     "launch",
 ]
 
