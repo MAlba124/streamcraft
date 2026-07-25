@@ -223,6 +223,25 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > both ways — ffmpeg exits with ~1 GB dirty; its extra index is ~24 KB (not
 > the speed story).
 
+> **Update — session 4i (2026-07-25): graphics ride SDL3.** Spec update executed:
+> **`wayland/` + `vk/` deleted**, replaced by `sdl3/` (**sc-sdl3**) binding
+> `sdl3-sys` (pure bindings, the ash/pipewire pattern; system SDL3 via
+> pkg-config, flake provides 3.4.8). `Sdl3VideoSink` keeps the WaylandVideoSink
+> contract verbatim; presentation is one streaming `SDL_PIXELFORMAT_IYUV`
+> texture (== our tight I420, chroma ceil/2) — YUV→RGB on the GPU, the CPU
+> conversion pass and ~150 KB of protocol/renderer plumbing gone. gray8 = IYUV
+> with constant-128 chroma. Headless: `SDL_VIDEODRIVER=dummy`. The scope UI
+> backend lands in this crate next: **immediate mode** (user-confirmed) over
+> `SDL_RenderGeometryRaw`, per-frame vertex arenas. Also fixed en route: the
+> demuxer's dynamic pads now carry **per-track offer menus**
+> (`codec::offers_for`) — the shared all-families menu let link-time
+> intersection admit every decoder, so play_file's try-in-order autoplug put
+> h265dec on an h264 track (all AUs dropped at runtime; never seen before
+> because the test movies were HEVC). Gate: the remuxed movie plays
+> `mkvdemux ! h264dec ! sdl3videosink` in a real window, zero warnings;
+> workspace 102 result lines green. **Next: scope** — protocol first
+> (feature-gated core, length-prefixed POD frames), then the SDL UI.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
