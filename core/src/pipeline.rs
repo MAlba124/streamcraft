@@ -9,7 +9,7 @@
 //! all-active chain (e.g. `filesrc ! filesink`) this yields one thread per element
 //! with a ring between them.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -114,6 +114,23 @@ pub(crate) struct PauseShared {
     base: Arc<AtomicI64>,
     /// The pipeline stop flag, so a pause-parked wait still honours shutdown.
     stop: Arc<AtomicBool>,
+    /// The idle-park eventcount (spec: Scheduling — a group with nothing to do
+    /// parks, it never spins). `idle_epoch` counts "work may now exist for some
+    /// group" events: a batch pushed into a boundary ring, any pass that made
+    /// progress (it may have freed pool slots or drained a backlog another group
+    /// is gated on — the inline-livelock rule), a seek, a group exiting (its ring
+    /// closes). A group samples the epoch at the top of a pass and, when the whole
+    /// pass found no work, parks in [`park_idle`](Self::park_idle) until the epoch
+    /// moves — the classic eventcount: read, re-check (the pass *is* the re-check),
+    /// park only if unchanged. Lives here, on the pause transport, because the
+    /// gate condvar/mutex and the seek/stop wiring already exist on it — one wake
+    /// station instead of two (see `park_while_paused`).
+    idle_epoch: AtomicU64,
+    /// How many groups are currently inside [`park_idle`](Self::park_idle) — the
+    /// producer-side gate that keeps [`bump_idle`](Self::bump_idle) off the mutex
+    /// (two lock-free atomics) whenever nobody is parked, which is the common
+    /// streaming state.
+    idle_waiters: AtomicU32,
 }
 
 struct PauseInner {
@@ -138,7 +155,67 @@ impl PauseShared {
             cond: Condvar::new(),
             base,
             stop,
+            idle_epoch: AtomicU64::new(0),
+            idle_waiters: AtomicU32::new(0),
         })
+    }
+
+    // --- Idle-park eventcount (spec: Scheduling — park, don't spin) -----------
+    //
+    // Protocol (both sides SeqCst so the two store→load pairs form one total
+    // order — the same Dekker reasoning as the ring's per-publish fence, and for
+    // the same lost-wakeup failure mode):
+    //
+    //   parker:  sample epoch → run a full pass → (no work found)
+    //            waiters += 1 → lock → re-check epoch → cond-wait ≤ one tick
+    //   bumper:  publish the work (ring push / pool free / …)
+    //            epoch += 1 → load waiters → (≥1) lock + notify_all
+    //
+    // If the bumper reads waiters == 0, its epoch increment is ordered before the
+    // parker's waiters increment, so the parker's under-lock epoch re-check sees
+    // the new epoch and never sleeps. If it reads ≥ 1, the notify is taken under
+    // the same mutex the parker re-checks under, so it can't slip between the
+    // re-check and the wait. The tick timeout is a belt for wake sources that
+    // deliberately do NOT bump (stop, live property sets, pause, pool slots freed
+    // on non-group threads such as a device callback) — nothing can hang on a
+    // missed wake, worst case a group re-checks one tick late.
+
+    /// Sample the idle eventcount — the first thing a scheduler pass does, so any
+    /// bump published *during* the pass makes the trailing [`park_idle`]
+    /// (Self::park_idle) return immediately instead of sleeping.
+    pub(crate) fn idle_epoch(&self) -> u64 {
+        self.idle_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Publish "work may now exist for some parked group" (see the protocol
+    /// above). Two lock-free atomics when nobody is parked.
+    pub(crate) fn bump_idle(&self) {
+        self.idle_epoch.fetch_add(1, Ordering::SeqCst);
+        if self.idle_waiters.load(Ordering::SeqCst) > 0 {
+            // Serialize against a parker's under-lock re-check (same rule as the
+            // ring's `wake`): notify while holding the gate so it cannot land
+            // between "re-check epoch" and "wait".
+            let _g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.cond.notify_all();
+        }
+    }
+
+    /// Park an idle group until the epoch moves past the value it sampled at the
+    /// top of its pass, or one coarse tick elapses (the missed-wake bound — see
+    /// the protocol above; the tick mirrors `park_while_paused`'s). Event-driven
+    /// wakes stay exact and immediate; the tick only bounds the sources that
+    /// never bump. Returns after at most one wait — the caller's next pass is the
+    /// re-check, exactly like `ParkWake::Tick` in the pause gate.
+    pub(crate) fn park_idle(&self, epoch: u64) {
+        self.idle_waiters.fetch_add(1, Ordering::SeqCst);
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if self.idle_epoch.load(Ordering::SeqCst) == epoch && !self.stop.load(Ordering::Acquire) {
+            let _ = self
+                .cond
+                .wait_timeout(guard, std::time::Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        self.idle_waiters.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// The hot-path check: one relaxed load while playing.
@@ -162,6 +239,11 @@ impl PauseShared {
             i.paused = true;
             self.hint.store(true, Ordering::Release);
         }
+        drop(i);
+        // Wake idle-parked groups (after releasing the gate — bump re-takes it to
+        // notify) so `Event::Paused` reaches their elements promptly — a device
+        // sink holds its hardware on it — rather than a park tick later.
+        self.bump_idle();
     }
 
     fn resume(&self) {
@@ -252,8 +334,13 @@ impl PauseShared {
     }
 
     /// Wake gate-parked groups so a seek published while paused is acted on
-    /// immediately (called by `SeekHandle::seek` after the gen bump).
+    /// immediately (called by `SeekHandle::seek` after the gen bump). Also bumps
+    /// the idle eventcount: an *idle*-parked group (upstream-starved, pool-
+    /// starved) must flush now too, not a park tick later. Notifying under the
+    /// gate closes the re-check→wait window for both park kinds.
     pub(crate) fn notify_seek(&self) {
+        self.idle_epoch.fetch_add(1, Ordering::SeqCst);
+        let _g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.cond.notify_all();
     }
 
@@ -1362,14 +1449,22 @@ impl Pipeline {
             let seek = Arc::clone(&seek);
             let vocabulary = Arc::clone(&vocabulary);
             let clock = Arc::clone(&clock);
-            handles.push(std::thread::spawn(move || {
-                run_group(
-                    elems, ids, group_formats, group_logs, upstream, downstream, factory,
-                    group_pools, bus, credits, group_counters, group_props, stop, seek,
-                    vocabulary, clock,
-                    base, group_pad_infos, group_latencies, tracing, pause, group_linked,
-                )
-            }));
+            // Named so a profiler attributes cycles to the group (spec:
+            // Debuggability); ≤ 15 bytes, the Linux thread-name cap.
+            let handle = std::thread::Builder::new()
+                .name(format!("sc-group-{gi}"))
+                .spawn(move || {
+                    run_group(
+                        elems, ids, group_formats, group_logs, upstream, downstream, factory,
+                        group_pools, bus, credits, group_counters, group_props, stop, seek,
+                        vocabulary, clock,
+                        base, group_pad_infos, group_latencies, tracing, pause, group_linked,
+                    )
+                })
+                // Panic like `std::thread::spawn` did here before naming: an early
+                // return would leak the already-spawned groups unjoined.
+                .expect("spawn group thread");
+            handles.push(handle);
         }
 
         // Join all groups; keep the first error.
@@ -2488,6 +2583,12 @@ fn run_group(
     let mut last_progressed = true;
 
     let result: Result<(), Error> = 'group: loop {
+        // Sample the idle eventcount before observing ANY work source: a wake
+        // published after this line — a push into one of our rings, a pool slot
+        // freed by a consumer's pass, a seek — makes the park at the bottom of a
+        // no-progress pass return immediately (spec: Scheduling — park, don't
+        // spin; see `PauseShared::park_idle` for the full protocol).
+        let idle_epoch = pause.idle_epoch();
         // Cooperative cancellation: break, then stop + drop downstream, which closes
         // the ring and cascades the stop to the next group.
         if stop.load(Ordering::Acquire) {
@@ -2864,6 +2965,15 @@ fn run_group(
             if down.push(out).is_err() {
                 break 'group Ok(()); // this downstream is gone
             }
+            // Wake the consuming group if it is idle-parked. A consumer blocked in
+            // its ring `pop` is woken by the ring itself; this covers the ones that
+            // park at their pass gate instead — a fan-in head, a head sitting on
+            // its backlog cap. Bumping *here*, not only at the end of the pass,
+            // matters: the next `down.push` below may block for a long time (a
+            // paced sibling ring), and a gate-parked fan-in consumer holding this
+            // batch might be exactly what drains that sibling — deferring the wake
+            // to pass end would stall both until the park tick.
+            pause.bump_idle();
             if down.dropped() > dropped_before {
                 counters[m - 1].record_drops(nbuf);
             }
@@ -2915,11 +3025,36 @@ fn run_group(
             break Ok(());
         }
 
-        // Safety net against a pathological busy-spin (the pool is sized so the ring
-        // is the real backpressure, so this should be rare): yield if a whole pass
-        // made no progress.
         last_progressed = progressed;
-        if !progressed {
+        if progressed {
+            // This pass consumed, produced, or completed IO — it may have freed
+            // pool slots (buffers dropped while processing) or drained a backlog
+            // some *other* group is parked on: the producer side of the
+            // inline-livelock rule (a producer gated on its successor's backlog
+            // must be woken by the drain), and the pool side of `try_alloc`-based
+            // backpressure. Publish it.
+            pause.bump_idle();
+        } else if reactor.is_idle() {
+            // A whole pass found no work and no IO is in flight: park until an
+            // event that can create work lands (push into our ring, a progressing
+            // pass elsewhere, seek, group exit) or one coarse tick elapses —
+            // instead of spinning through empty passes. (Measured on paced A+V
+            // playback: the spin burned ~a full core across the group threads,
+            // ~30% of process cycles in `run_group`+yield+idle batch churn.) The
+            // blocking single-ring `pop` in the feed step stays the precise path
+            // for a plain empty-input head; this catches everything else: fan-in
+            // heads, heads holding a gated backlog, pool-starved producers.
+            // MockClock safety: the park is event-driven (a virtual-time advance
+            // creates work only through some element's ClockWait, whose wake runs
+            // that group's pass, whose progress bumps this eventcount), so
+            // virtual-time tests never wait out real ticks in steady state.
+            pause.park_idle(idle_epoch);
+        } else {
+            // In-flight async IO: the uring backend's `run_once` blocks for ≥ 1
+            // completion when ops are outstanding, so the loop is already gated on
+            // progress; the yield only covers a backend that neither blocks nor
+            // completes inline (and the dependency-free SyncReactor never leaves
+            // ops in flight across a pass).
             std::thread::yield_now();
         }
     };
@@ -2930,5 +3065,9 @@ fn run_group(
         elements[i].stop(&mut ctxs[i]);
     }
     drop(downstream);
+    // A closing ring is work for its consumer (the EOS path). The ring drop wakes
+    // a pop-blocked consumer itself; this wakes a gate-parked one (a fan-in head
+    // whose other pads are still open, a head holding a backlog).
+    pause.bump_idle();
     result
 }
