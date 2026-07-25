@@ -372,6 +372,25 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > bars replace titles). 68 scope tests green; workspace green; launcher e2e
 > headless OK. Dock persistence (save/restore layout) deferred.
 
+> **Update — session 4p (2026-07-25): scope fix round** (`28ac090`). (1) The
+> vanishing-pane dock bug: my collapse moved the sibling node into the parent
+> slot, orphaning the sibling's index — dropping a panel onto its own split
+> sibling then inserted into an unreachable slot. Fixed the simprof way:
+> **repoint the grandparent/root at the sibling, never move nodes**;
+> `all_panels()` walks reachable-only. (2) Fan-out overlap: attach slots were
+> port-ordered while barycenter stacked targets differently → edges crossed at
+> the boundary; now ordered by edge *direction* (first-waypoint y, port as
+> tiebreak), one slot per edge. (3) Group hulls overlapped: `Opts.group_gap`
+> adds clearance between different-group neighbours in a layer (seed +
+> separation). (4) Tab faces get 1px dividers on a darker strip; progress bar
+> centred on the top-bar mid-line. 72 scope tests. **Click-to-seek was asked
+> for and is NOT wired**: honest seek for A+V mkv needs (a) mkv Cues parsing /
+> cluster resync in the demuxer+reader, (b) a time→byte mapping the server can
+> use (SeekHandle is byte+frame based, mapping is the caller's job), and (c) a
+> clock story for post-seek pts (sinks wait at base+pts — a forward seek stalls
+> them; flush/seek was validated on the flac path). That is its own milestone —
+> next session candidate.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
