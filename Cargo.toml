@@ -29,6 +29,7 @@ members = [
     "sdl3",
     "vaapi",
     "rtp",
+    "rtsp",
     "launch",
 ]
 
