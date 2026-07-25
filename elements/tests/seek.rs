@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use streamcraft_core::clock::MockClock;
+use streamcraft_core::id::ElementId;
 use streamcraft_core::pipeline::Pipeline;
 use streamcraft_core::time::Timestamp;
 use streamcraft_elements::testing::{TimedTestSink, TimedTestSrc};
@@ -167,13 +168,28 @@ fn seek_while_paused_resumes_from_target() {
     p.set_clock(Arc::new(clock.clone()));
     let seek = p.seek_handle();
     let pause = p.pause_handle();
+    let tap = p.tap_handle();
 
     let run = std::thread::spawn(move || p.run());
     assert!(settle(|| stats.count() >= 1), "first buffer rendered");
 
     pause.pause();
+    // Let the source drain its backpressure headroom so the re-prime is visible.
+    std::thread::sleep(Duration::from_millis(10));
+    let produced_before = tap.snapshot(ElementId(0)).unwrap().buffers_out;
+
     let target = Timestamp::from_millis(150);
     seek.seek(0, target);
+
+    // The flush must run NOW, while paused (spec: flush/seek): the seek wake
+    // flushes at the gate and one re-prime pass produces post-seek buffers —
+    // that is what lets a display sink preroll the seeked frame.
+    assert!(
+        settle(|| tap.snapshot(ElementId(0)).unwrap().buffers_out > produced_before),
+        "source re-primes while paused (flush not deferred to resume)"
+    );
+    // And the position reads the target while paused (frozen at the rebase).
+    assert_eq!(tap.now(), target, "position shows the seek target while paused");
     let held = stats.count();
 
     // Blow the clock past every deadline while paused: the gate must hold.

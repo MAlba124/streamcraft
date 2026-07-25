@@ -444,13 +444,16 @@ impl Conn {
                     None => target_ns,
                 });
                 let g = shared.handles.lock().unwrap_or_else(|e| e.into_inner());
-                let byte = g
+                let resolved = g
                     .seek_index
                     .as_ref()
-                    .and_then(|idx| idx.byte_for(target, duration));
-                match byte {
-                    Some(b) => {
-                        g.seek.seek(b, target);
+                    .and_then(|idx| idx.resolve(target, duration));
+                match resolved {
+                    // Seek to the RESOLVED time (the cue point the byte lands on),
+                    // not the request — see SeekIndex::resolve for the frozen-video
+                    // failure mode a requested-time rebase causes.
+                    Some((b, landed)) => {
+                        g.seek.seek(b, landed);
                         drop(g);
                         self.send(kind::ACK, seq, &[])
                     }

@@ -222,6 +222,15 @@ pub struct ClockWait {
     kind: WaitKind,
 }
 
+/// Outcome of [`ClockWait::wait_ticked`] (core-internal): like [`WaitOutcome`]
+/// plus `Tick` — "still waiting; the caller re-checks and re-enters".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TickedOutcome {
+    Reached,
+    Interrupted,
+    Tick,
+}
+
 enum WaitKind {
     /// Virtual time: park until `advance` pushes `now_ns` past the deadline (or an
     /// interrupt lands). No timeout — mock time only moves via `advance`.
@@ -332,6 +341,77 @@ impl ClockWait {
             }
             let (guard, _timed_out) = wake.cvar.wait_timeout(state, period).unwrap();
             state = guard;
+        }
+    }
+
+    /// Park **at most one `tick`** toward `deadline`, then hand control back —
+    /// the caller owns the outer loop (`Ctx::wait_until` re-checks its seek
+    /// generation, stop, and re-derives the deadline from the shared base each
+    /// time; spec: flush/seek). Unlike [`wait_until`](Self::wait_until), this
+    /// bounds how long a parked waiter can miss a rebase — including under
+    /// [`MockClock`], whose virtual time may stand still across a seek.
+    ///
+    /// Returns `Reached`/`Interrupted` exactly like `wait_until`; `Tick` means
+    /// "still waiting, re-check" and promises only that ≥ one tick (or a wake)
+    /// elapsed.
+    pub(crate) fn wait_ticked(&self, deadline: Timestamp, tick: Duration) -> TickedOutcome {
+        let deadline_ns = deadline.0;
+        match &self.kind {
+            WaitKind::Mock { wake } => {
+                let state = wake.state.lock().unwrap();
+                if state.interrupted {
+                    return TickedOutcome::Interrupted;
+                }
+                if state.now_ns >= deadline_ns {
+                    return TickedOutcome::Reached;
+                }
+                let (state, _) = wake.cvar.wait_timeout(state, tick).unwrap();
+                if state.interrupted {
+                    TickedOutcome::Interrupted
+                } else if state.now_ns >= deadline_ns {
+                    TickedOutcome::Reached
+                } else {
+                    TickedOutcome::Tick
+                }
+            }
+            WaitKind::Instant { base, wake } => {
+                let state = wake.state.lock().unwrap();
+                if state.interrupted {
+                    return TickedOutcome::Interrupted;
+                }
+                let now_ns = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if now_ns >= deadline_ns {
+                    return TickedOutcome::Reached;
+                }
+                let remaining = Duration::from_nanos(deadline_ns - now_ns).min(tick);
+                let (state, _) = wake.cvar.wait_timeout(state, remaining).unwrap();
+                if state.interrupted {
+                    TickedOutcome::Interrupted
+                } else if u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                    >= deadline_ns
+                {
+                    TickedOutcome::Reached
+                } else {
+                    TickedOutcome::Tick
+                }
+            }
+            WaitKind::Poll { clock, wake, period } => {
+                let state = wake.state.lock().unwrap();
+                if state.interrupted {
+                    return TickedOutcome::Interrupted;
+                }
+                if clock.now().0 >= deadline_ns {
+                    return TickedOutcome::Reached;
+                }
+                let (state, _) = wake.cvar.wait_timeout(state, (*period).min(tick)).unwrap();
+                if state.interrupted {
+                    TickedOutcome::Interrupted
+                } else if clock.now().0 >= deadline_ns {
+                    TickedOutcome::Reached
+                } else {
+                    TickedOutcome::Tick
+                }
+            }
         }
     }
 

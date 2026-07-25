@@ -567,16 +567,22 @@ impl Ctx {
     /// "infinitely late": only an interrupt ends the wait.
     pub fn wait_until(&self, running: Timestamp) -> WaitOutcome {
         let Some(c) = &self.clock else { return WaitOutcome::Reached };
-        // Bounds how long a parked real-clock wait can miss a seek rebase / gen
-        // bump: each park is capped to one slice, then the deadline re-derives.
-        const WAIT_SLICE_NS: u64 = 10_000_000;
+        // Bounds how long a parked wait can miss a seek rebase / gen bump / stop:
+        // each park is capped to one tick, then everything re-derives.
+        const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
         let entry_gen = self.seek_gen();
         loop {
             // A pending seek makes the buffer this wait paces stale: bail as an
             // interrupt so the group can flush promptly — the same contract sinks
-            // follow between buffers via `seek_gen()`.
+            // follow between buffers via `seek_gen()`. Stop likewise ends the wait:
+            // a clock frozen while paused would otherwise never reach any deadline.
             if self.seek_gen() != entry_gen {
                 return WaitOutcome::Interrupted;
+            }
+            if let Some(p) = &self.pause {
+                if p.stopped() {
+                    return WaitOutcome::Interrupted;
+                }
             }
             // Deadline derived per iteration from the *shared signed* base: a
             // pause/resume re-base and a seek rebase both move it.
@@ -608,14 +614,14 @@ impl Ctx {
                 }
                 return WaitOutcome::Reached;
             }
-            // Park at most one slice (min with the true deadline keeps precision;
-            // under MockClock nothing wakes without an `advance`, so determinism
-            // is unchanged). An "infinitely late" running of NONE parks slice by
-            // slice until a seek or an interrupt ends it.
-            let cap = Timestamp(now.0.saturating_add(WAIT_SLICE_NS));
-            let slice = if deadline.is_none() { cap } else { deadline.min(cap) };
-            if c.new_wait().wait_until(slice) == WaitOutcome::Interrupted {
-                return WaitOutcome::Interrupted;
+            // Park at most one tick, then re-check (gen/stop above, deadline from
+            // the freshly-read base). `wait_ticked` honours the tick on every
+            // clock kind — including MockClock, whose virtual time can stand
+            // still across a seek. An "infinitely late" running of NONE parks
+            // tick by tick until a seek, stop, or interrupt ends it.
+            match c.new_wait().wait_ticked(deadline, WAIT_SLICE) {
+                crate::clock::TickedOutcome::Interrupted => return WaitOutcome::Interrupted,
+                crate::clock::TickedOutcome::Reached | crate::clock::TickedOutcome::Tick => {}
             }
         }
     }

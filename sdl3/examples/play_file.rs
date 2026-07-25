@@ -15,7 +15,7 @@
 //! ```
 
 use sc_mkv::ebml::id;
-use sc_mkv::MkvDemux;
+use sc_mkv::{parse_cues, parse_seek_head, MkvDemux};
 
 // The adopted h264 decoder allocates ~1.5M times/s internally (upstream churn,
 // see PLAN); glibc malloc makes that the decode bottleneck (one pegged core at
@@ -26,7 +26,8 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use sc_sdl3::Sdl3VideoSink;
 use streamcraft_core::element::Element;
 use streamcraft_core::error::Error;
-use streamcraft_core::pipeline::Pipeline;
+use streamcraft_core::pipeline::{Pipeline, SeekIndex};
+use streamcraft_core::time::Timestamp;
 use streamcraft_elements::io::FileSrc;
 use streamcraft_elements::testing::TestSink;
 
@@ -34,6 +35,38 @@ use std::io::Read;
 
 /// The stream head: everything before the first Cluster (EBML Header + Segment
 /// metadata — SeekHead/Info/Tracks/Tags/…). 8 MiB is generous for real files.
+/// Build the time→byte seek index for `path`: SeekHead (from the already-read
+/// header) → pread the Cues range → parse. Returns the index (entries empty when
+/// the file has no Cues — the proportional fallback then applies) and the
+/// declared duration.
+fn build_seek_index(path: &str, header: &[u8], file_len: u64) -> (SeekIndex, Option<u64>) {
+    use std::os::unix::fs::FileExt;
+    let mut index = SeekIndex { entries: Vec::new(), file_len: Some(file_len) };
+    // Duration comes from the header's Segment Info (same probe the demuxer runs).
+    let mut probe = sc_mkv::MatroskaReader::new();
+    let _ = probe.push(header);
+    let duration = probe.duration_ns();
+    let Some(info) = parse_seek_head(header) else {
+        return (index, duration);
+    };
+    if let Some(cues_pos) = info.cues_pos {
+        let abs = info.segment_data_start + cues_pos;
+        if abs < file_len {
+            // The Cues master is small (a few bytes per keyframe cluster); read a
+            // bounded chunk from its offset — parse_cues reads the element's own
+            // declared size and ignores the tail.
+            let want = ((file_len - abs) as usize).min(4 * 1024 * 1024);
+            let mut buf = vec![0u8; want];
+            if let Ok(f) = std::fs::File::open(path) {
+                if f.read_exact_at(&mut buf, abs).is_ok() {
+                    index.entries = parse_cues(&buf, info.segment_data_start, info.timestamp_scale);
+                }
+            }
+        }
+    }
+    (index, duration)
+}
+
 fn header_prefix(path: &str) -> std::io::Result<Vec<u8>> {
     let mut f = std::fs::File::open(path)?;
     let mut head = vec![0u8; 8 * 1024 * 1024];
@@ -115,9 +148,24 @@ fn main() {
 
     let header = header_prefix(&path).expect("read header");
 
+    // Time→byte seek index (spec: flush/seek — mapping time to a byte is the seek
+    // issuer's job): SeekHead in the header points at the Cues (written after the
+    // last Cluster); pread that range and parse. A cue-less file still seeks via
+    // the proportional file_len fallback + the demuxer's cluster-scan resync.
+    let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let (seek_index, duration_ns) = build_seek_index(&path, &header, file_len);
+    println!(
+        "seek index: {} cue points{}, duration {}",
+        seek_index.entries.len(),
+        if seek_index.entries.is_empty() { " (proportional fallback)" } else { "" },
+        duration_ns.map(|ns| format!("{:.1}s", ns as f64 / 1e9)).unwrap_or_else(|| "unknown".into()),
+    );
+
     let mut p = Pipeline::new();
     // 1080p I420 is ~3.1 MiB/frame; 4 MiB slots leave headroom up to ~1600x1300.
     p.set_pool(4 * 1024 * 1024, 24);
+
+    p.set_seek_index(seek_index.clone());
 
     let src = p.add(FileSrc::new(&path));
     let demux = p.add(MkvDemux::new(header));
@@ -277,6 +325,10 @@ fn main() {
     {
         let pause = p.pause_handle();
         let stop = p.stop_handle();
+        let seek = p.seek_handle();
+        let tap = p.tap_handle();
+        let index = seek_index;
+        let duration = duration_ns.map(Timestamp).unwrap_or(Timestamp::NONE);
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut line = String::new();
@@ -293,6 +345,32 @@ fn main() {
                     "q" => {
                         stop.stop();
                         return;
+                    }
+                    // Digits seek to n×10% of the duration (spec: flush/seek) —
+                    // the scope-free test hook for time seeking.
+                    d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
+                        let Some(dur) = duration.nanos() else {
+                            println!("seek: unknown duration");
+                            continue;
+                        };
+                        let frac = (d.as_bytes()[0] - b'0') as u64;
+                        let target = Timestamp(dur / 10 * frac);
+                        match index.resolve(target, duration) {
+                            Some((byte, landed)) => {
+                                // Seek to the RESOLVED cue time, not the request —
+                                // rebasing to the request while content resumes at
+                                // the earlier cue leaves video permanently late
+                                // (frozen picture over playing audio).
+                                seek.seek(byte, landed);
+                                println!(
+                                    "⇥ seek to {:.1}s → landed {:.1}s (byte {byte}); position now {:.1}s",
+                                    target.0 as f64 / 1e9,
+                                    landed.0 as f64 / 1e9,
+                                    tap.now().nanos().map(|n| n as f64 / 1e9).unwrap_or(-1.0),
+                                );
+                            }
+                            None => println!("seek: no mapping available"),
+                        }
                     }
                     _ => {}
                 }

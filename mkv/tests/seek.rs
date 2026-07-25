@@ -74,7 +74,7 @@ impl Element for SeekSrc {
         // this call, so no post-seek bytes leak ahead of the FlushStart the scheduler is about
         // to deliver (it observes the generation bump at the next group-loop boundary).
         if !self.seeked && self.pos >= self.trigger_byte {
-            self.seek.seek(self.seek_byte as u64, 0);
+            self.seek.seek(self.seek_byte as u64, streamcraft_core::time::Timestamp::ZERO);
             self.pos = self.seek_byte;
             self.seeked = true;
             return Ok(Flow::Ok);

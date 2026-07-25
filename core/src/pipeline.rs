@@ -188,23 +188,73 @@ impl PauseShared {
     }
 
     /// Seek rebase (spec: flush/seek): make running time read `target` *now* —
-    /// `base := reference − target`, signed, where `reference` is `pause_at` while
-    /// paused (so the resume shift composes to `target + post-resume elapsed`) and
-    /// `clock.now()` while playing. Serialized under the same mutex as pause/resume
-    /// so the two base writers never interleave. No-op before the first run (no
-    /// clock installed yet — `run()` samples a fresh base anyway). Assumes a clock
-    /// provided by a device that pauses *privately* (outside `PauseShared`) freezes
-    /// while so paused — true of `AudioDeviceClock`.
+    /// `base := clock.now() − target`, signed. The reference is always the clock's
+    /// **current** reading, not `pause_at`: a device clock keeps advancing for the
+    /// short drain after a pause latches (the sink plays out its in-flight push
+    /// before `Event::Paused` freezes it), and anchoring to the stale `pause_at`
+    /// would land running time `drain` past the target — video then trails audio by
+    /// exactly that gap after resume. While paused, `pause_at` is re-anchored to the
+    /// same reading so the resume excision measures from the seek instant — the
+    /// composition `running = target + post-resume elapsed` then holds exactly for
+    /// both frozen device clocks and free-running wall clocks. Serialized under the
+    /// same mutex as pause/resume so the base writers never interleave. No-op before
+    /// the first run (no clock installed yet — `run()` samples a fresh base anyway).
     pub(crate) fn rebase_to(&self, target: Timestamp) {
-        let i = self.inner.lock().unwrap();
+        let mut i = self.inner.lock().unwrap();
         let Some(c) = &i.clock else { return };
-        let reference = if i.paused { i.pause_at } else { c.now() };
+        let reference = c.now();
+        if i.paused {
+            i.pause_at = reference;
+        }
         let base = reference.0.min(i64::MAX as u64) as i128
             - target.0.min(i64::MAX as u64) as i128;
         self.base.store(
             base.clamp((i64::MIN + 1) as i128, i64::MAX as i128) as i64,
             Ordering::Release,
         );
+    }
+
+    /// Park while paused, waking for a resume, a seek, or stop (the group gate;
+    /// spec: flush/seek — a seek while paused must flush and re-prime *now*, not
+    /// after resume, so the UI can show the seeked frame). The seek wake is what
+    /// lets the group run its flush + one re-prime pass without leaving pause.
+    pub(crate) fn park_while_paused(&self, wake_on_seek: impl Fn() -> bool) -> ParkWake {
+        let i = self.inner.lock().unwrap();
+        if !i.paused {
+            return ParkWake::Resumed;
+        }
+        if self.stop.load(Ordering::Acquire) {
+            return ParkWake::Stop;
+        }
+        if wake_on_seek() {
+            return ParkWake::Seek;
+        }
+        let (guard, _) = self
+            .cond
+            .wait_timeout(i, std::time::Duration::from_millis(100))
+            .unwrap();
+        let i = guard;
+        if self.stop.load(Ordering::Acquire) {
+            ParkWake::Stop
+        } else if wake_on_seek() {
+            ParkWake::Seek
+        } else if !i.paused {
+            ParkWake::Resumed
+        } else {
+            ParkWake::Tick
+        }
+    }
+
+    /// The pipeline stop flag (for waits that can otherwise never expire — e.g. a
+    /// clock frozen while paused).
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Wake gate-parked groups so a seek published while paused is acted on
+    /// immediately (called by `SeekHandle::seek` after the gen bump).
+    pub(crate) fn notify_seek(&self) {
+        self.cond.notify_all();
     }
 
     /// Block while paused (a sink's expired clock wait lands here; also the group
@@ -224,6 +274,19 @@ impl PauseShared {
         }
         true
     }
+}
+
+/// Why a pause park returned (spec: flush/seek — the gate distinguishes a real
+/// resume from a seek that must flush without leaving pause).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ParkWake {
+    Resumed,
+    Seek,
+    Stop,
+    /// Still paused after one park interval — the gate runs one (cheap, usually
+    /// idle) pass so a post-seek re-prime progresses across groups: pool slots
+    /// free as stale data drains, and a fixed single pass could starve on them.
+    Tick,
 }
 
 /// Cloneable pause/resume control (spec: Clocking — "pause is a clock op, not a
@@ -277,7 +340,7 @@ impl StopHandle {
 /// time to a byte offset is the seek issuer's job; a byte source has no notion of time).
 /// Built by the application from container metadata (e.g. mkv Cues) and installed with
 /// [`Pipeline::set_seek_index`]; the introspection server uses it to serve time-based
-/// `Seek` requests. With no entries but a known `file_len`, [`byte_for`](Self::byte_for)
+/// `Seek` requests. With no entries but a known `file_len`, [`resolve`](Self::resolve)
 /// falls back to a proportional estimate — safe when the demuxer re-syncs by scanning.
 #[derive(Debug, Default, Clone)]
 pub struct SeekIndex {
@@ -289,10 +352,16 @@ pub struct SeekIndex {
 }
 
 impl SeekIndex {
-    /// The byte offset to resume reading from for a seek to `target`: the last index
-    /// entry at or before `target`, else a proportional estimate over `duration`,
-    /// else `None` (time seeking unavailable).
-    pub fn byte_for(&self, target: Timestamp, duration: Timestamp) -> Option<u64> {
+    /// Resolve a seek to `target`: the byte offset to resume reading from **and the
+    /// stream time that byte actually lands on**. Callers must seek to the *resolved*
+    /// time, not the requested one — the index floors to the preceding keyframe
+    /// cluster, and rebasing running time to the requested target while content
+    /// resumes earlier leaves every video frame permanently late by the gap (the
+    /// device clock keeps advancing), which a QoS sink then drops forever: a frozen
+    /// picture over playing audio. Floor lookup over the entries; else a proportional
+    /// estimate over `duration` (resolved == requested — approximate, the demuxer
+    /// re-syncs by scanning); else `None` (time seeking unavailable).
+    pub fn resolve(&self, target: Timestamp, duration: Timestamp) -> Option<(u64, Timestamp)> {
         let ns = target.nanos()?;
         // Floor lookup over the (ascending) entries.
         let floor = self
@@ -300,16 +369,23 @@ impl SeekIndex {
             .iter()
             .take_while(|(t, _)| *t <= ns)
             .last()
-            .map(|(_, b)| *b);
+            .map(|(t, b)| (*b, Timestamp(*t)));
         if floor.is_some() {
             return floor;
         }
         match (self.file_len, duration.nanos()) {
-            (Some(len), Some(dur)) if dur > 0 => {
-                Some(((ns as u128).saturating_mul(len as u128) / dur as u128) as u64)
-            }
+            (Some(len), Some(dur)) if dur > 0 => Some((
+                ((ns as u128).saturating_mul(len as u128) / dur as u128) as u64,
+                target,
+            )),
             _ => None,
         }
+    }
+
+    /// The byte offset alone — see [`resolve`](Self::resolve) for why seek callers
+    /// should use the resolved pair instead.
+    pub fn byte_for(&self, target: Timestamp, duration: Timestamp) -> Option<u64> {
+        self.resolve(target, duration).map(|(b, _)| b)
     }
 }
 
@@ -341,6 +417,9 @@ impl SeekHandle {
         self.seek.to_time_ns.store(to_time.0, Ordering::Release);
         self.pause.rebase_to(to_time);
         self.seek.gen.fetch_add(1, Ordering::Release);
+        // Wake gate-parked groups: a seek while paused flushes and re-primes now
+        // (the pipeline stays paused; the seeked frame prerolls to the sinks).
+        self.pause.notify_seek();
     }
 }
 
@@ -402,6 +481,10 @@ pub struct Pipeline {
     /// observers can window counter deltas over running time (spec: Taps — bitrate is
     /// Δbytes/Δt). Signed: a seek rebase can push it negative (`time::running_time`).
     base_shared: Arc<AtomicI64>,
+    /// The *selected* clock, shared with [`TapHandle`]s so an observer taken before
+    /// `run()` still reads the run's actual timeline (run() replaces the default
+    /// with a sink-provided device clock).
+    clock_shared: Arc<Mutex<Arc<dyn Clock>>>,
     /// The pause transport (spec: Clocking — pause is a clock op). See [`PauseHandle`].
     pause: Arc<PauseShared>,
     /// Start the next [`run`](Self::run) paused (preroll-and-hold: everything spins
@@ -445,6 +528,7 @@ impl Pipeline {
         // stop flag (a paused wait must still honour shutdown).
         let stop = Arc::new(AtomicBool::new(false));
         let base_shared = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
+        let default_clock: Arc<dyn Clock> = Arc::new(InstantClock::new());
         Self {
             elements: Vec::new(),
             descs: Vec::new(),
@@ -469,7 +553,8 @@ impl Pipeline {
             last_report: None,
             log_level: None,
             log_queue_cap: 1024,
-            clock: Arc::new(InstantClock::new()),
+            clock: Arc::clone(&default_clock),
+            clock_shared: Arc::new(Mutex::new(default_clock)),
             clock_explicit: false,
             base_shared: Arc::clone(&base_shared),
             pause: PauseShared::new(base_shared, stop),
@@ -510,6 +595,7 @@ impl Pipeline {
     /// [`Element::provide_clock`](crate::element::Element::provide_clock)); without
     /// it, `run()` prefers the most downstream provider — the audio-master case.
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        *self.clock_shared.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&clock);
         self.clock = clock;
         self.clock_explicit = true;
     }
@@ -909,6 +995,10 @@ impl Pipeline {
         // Clocking — running time = clock.now() - base_time). The clock and base are
         // shared into every group so all elements share one timeline.
         let clock = Arc::clone(&self.clock);
+        // Publish the *selected* clock so TapHandles taken before run() read this
+        // run's actual timeline (mixing the default clock with a device-rebased
+        // base would read a timeline that exists nowhere).
+        *self.clock_shared.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&clock);
         let base_time = clock.now();
         // Publish the base so TapHandles can window counter deltas over running time.
         self.base_shared.store(crate::time::base_from_clock(base_time), Ordering::Release);
@@ -1534,7 +1624,7 @@ impl Pipeline {
                 .zip(&self.counters)
                 .map(|(d, c)| (d.name, Arc::clone(c)))
                 .collect(),
-            Arc::clone(&self.clock),
+            Arc::clone(&self.clock_shared),
             Arc::clone(&self.base_shared),
         )
     }
@@ -2247,6 +2337,13 @@ fn run_group(
     // The seek generation this group has flushed up to. A `SeekHandle::seek` bumps the
     // shared generation; observing the change here drives the out-of-band flush.
     let mut seek_gen = seek.gen.load(Ordering::Acquire);
+    // Whether `Event::Paused` has been delivered for the current pause (the gate
+    // re-enters every tick while paused; elements are notified once per transition).
+    let mut paused_announced = false;
+    // Whether the previous pass made progress. While paused, the gate lets passes
+    // run back-to-back as long as they progress (a post-seek re-prime completes in
+    // milliseconds instead of one buffer per park tick), parking only at quiescence.
+    let mut last_progressed = true;
 
     let result: Result<(), Error> = 'group: loop {
         // Cooperative cancellation: break, then stop + drop downstream, which closes
@@ -2282,19 +2379,53 @@ fn run_group(
         let mut progressed = false;
 
         // Pause gate (spec: Clocking — pause is a clock op): notify every element
-        // (a device sink holds its hardware on `Paused`), park until resume or stop,
-        // notify again. One relaxed load while playing.
+        // once per pause (a device sink holds its hardware on `Paused`), then park.
+        // A **seek wake** flushes right here — while still paused — and falls
+        // through to a pass so the chain re-primes and a display sink prerolls the
+        // seeked frame (spec: flush/seek). Each 100 ms `Tick` also falls through
+        // to one pass: re-priming needs several passes across groups (pool slots
+        // free as stale data drains), and an idle pass costs ~nothing. A resume
+        // delivers `Resumed`; stop exits at the loop top.
         if pause.maybe_paused() && pause.is_paused() {
-            for i in 0..m {
-                if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Paused) {
-                    break 'group Err(e);
+            if !paused_announced {
+                for i in 0..m {
+                    if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Paused) {
+                        break 'group Err(e);
+                    }
                 }
+                paused_announced = true;
             }
-            let _ = pause.block_while_paused(); // false = stop; the stop check below exits
-            for i in 0..m {
-                if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Resumed) {
-                    break 'group Err(e);
+            // Burst while re-priming: only park once a whole pass was quiescent.
+            match if last_progressed {
+                ParkWake::Tick
+            } else {
+                pause.park_while_paused(|| seek.gen.load(Ordering::Acquire) != seek_gen)
+            } {
+                ParkWake::Seek => {
+                    for i in 0..m {
+                        if let Err(e) = elements[i].event(&mut ctxs[i], &Event::FlushStart) {
+                            break 'group Err(e);
+                        }
+                    }
+                    for c in ctxs.iter_mut() {
+                        c.discard_buffers();
+                    }
+                    source_eos = false;
+                    upstream_closed = false;
+                    eos_next = 0;
+                    seek_gen = seek.gen.load(Ordering::Acquire);
+                    // Fall through: a re-prime pass runs while paused.
                 }
+                ParkWake::Tick => {} // fall through: one idle/re-prime pass
+                ParkWake::Resumed => {
+                    for i in 0..m {
+                        if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Resumed) {
+                            break 'group Err(e);
+                        }
+                    }
+                    paused_announced = false;
+                }
+                ParkWake::Stop => {} // the stop check at the loop top exits
             }
         }
 
@@ -2620,6 +2751,7 @@ fn run_group(
         // Safety net against a pathological busy-spin (the pool is sized so the ring
         // is the real backpressure, so this should be rare): yield if a whole pass
         // made no progress.
+        last_progressed = progressed;
         if !progressed {
             std::thread::yield_now();
         }

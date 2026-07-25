@@ -40,6 +40,10 @@ repository = "https://github.com/MAlba124/streamcraft"
 # Thin LTO: the adopted decoders (oxideav-*) are allocation- and call-heavy;
 # cross-crate inlining buys real throughput on the playback path.
 lto = "thin"
+# Enough DWARF for profilers to symbolize release captures (heaptrack, perf,
+# simprof): function names + line tables, without the full-variable debuginfo
+# that balloons build time and binary size. Runtime cost: none.
+debug = "line-tables-only"
 
 [profile.bench]
 debug = true

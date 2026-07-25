@@ -465,6 +465,13 @@ impl Element for PipeWireAudioSink {
         // flush promptly rather than after the whole batch has drained (spec: flush/seek).
         // The partial data already pushed is dropped by the sink's `FlushStart` handler.
         const SLICE: usize = 8 * 1024; // ~46 ms at 44.1 kHz stereo s16 — well under the ring
+        // While paused, consume nothing (spec: Clocking + flush/seek): the RT
+        // callback holds the ring, so pushing would park this group *inside*
+        // process where a resume's `Event::Resumed` can never reach it. Input
+        // stays staged; the re-prime happens on the first pass after resume.
+        if self.playback.paused.load(Ordering::Relaxed) {
+            return Ok(Flow::Ok);
+        }
         let start_gen = ctx.seek_gen();
         while let Some(buf) = inputs.pop() {
             let Some(producer) = &self.producer else { break };

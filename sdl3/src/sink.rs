@@ -124,6 +124,11 @@ pub struct Sdl3VideoSink {
     disabled: bool,
     /// Whether we already posted the "window closed" warning (post once).
     close_reported: bool,
+    /// Render the next frame immediately — no QoS, no clock wait (spec: flush/seek).
+    /// Set on `FlushStart` so the first post-seek frame *prerolls* to the screen:
+    /// while paused the user sees the seeked frame; while playing the picture
+    /// updates instantly instead of waiting out the first deadline.
+    preroll_next: bool,
 }
 
 impl Sdl3VideoSink {
@@ -134,6 +139,7 @@ impl Sdl3VideoSink {
             format: None,
             disabled: false,
             close_reported: false,
+            preroll_next: false,
         }
     }
 
@@ -212,9 +218,13 @@ impl Sdl3VideoSink {
     fn render(&mut self, ctx: &mut Ctx, data: &[u8], pts: Timestamp) -> Result<(), Error> {
         let Some(fmt) = self.format else { return Ok(()) };
 
+        // Preroll (spec: flush/seek): the first frame after a flush presents
+        // immediately — no QoS, no wait — so a paused seek shows its new frame.
+        let preroll = std::mem::take(&mut self.preroll_next);
+
         // QoS: if the deadline is already behind us by more than one frame, drop it —
         // tested *before* the wait, so a late frame costs no upload (spec: QoS).
-        if fmt.frame_dur_ns > 0 && pts.is_some() {
+        if !preroll && fmt.frame_dur_ns > 0 && pts.is_some() {
             let now = ctx.now();
             if now.is_some() && now.0 > pts.0 {
                 let lateness = now.0 - pts.0;
@@ -228,9 +238,11 @@ impl Sdl3VideoSink {
         }
 
         // Pace on the clock. An interrupt (flush/shutdown) returns cleanly.
-        match ctx.wait_until(pts) {
-            WaitOutcome::Reached => {}
-            WaitOutcome::Interrupted => return Ok(()),
+        if !preroll {
+            match ctx.wait_until(pts) {
+                WaitOutcome::Reached => {}
+                WaitOutcome::Interrupted => return Ok(()),
+            }
         }
 
         if self.disabled {
@@ -334,6 +346,9 @@ impl Element for Sdl3VideoSink {
             // drain window events so a close is answered promptly while no frames
             // flow; on EOS the last frame stays on screen until stop().
             Event::FlushStart | Event::Eos => {
+                if matches!(event, Event::FlushStart) {
+                    self.preroll_next = true;
+                }
                 if let Some(w) = self.window.as_mut() {
                     if w.pump().closed {
                         self.on_close(ctx);

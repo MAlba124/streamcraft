@@ -193,7 +193,11 @@ impl ElementCounters {
 #[derive(Clone)]
 pub struct TapHandle {
     entries: Arc<[(&'static str, Arc<ElementCounters>)]>,
-    clock: Arc<dyn Clock>,
+    /// The pipeline's *selected* clock, read through a shared cell: `run()` may
+    /// replace the default with a sink-provided device clock after this handle was
+    /// taken, and mixing the old clock with the (device-rebased) base would read a
+    /// timeline that exists nowhere (an observer-only lock; never a streaming path).
+    clock: Arc<std::sync::Mutex<Arc<dyn Clock>>>,
     /// Signed ns of the current run's base time; [`crate::time::BASE_UNSET`] until
     /// the first `run()`. Signed: a seek rebase can push it negative.
     base: Arc<AtomicI64>,
@@ -202,7 +206,7 @@ pub struct TapHandle {
 impl TapHandle {
     pub(crate) fn new(
         entries: Vec<(&'static str, Arc<ElementCounters>)>,
-        clock: Arc<dyn Clock>,
+        clock: Arc<std::sync::Mutex<Arc<dyn Clock>>>,
         base: Arc<AtomicI64>,
     ) -> Self {
         Self { entries: entries.into(), clock, base }
@@ -248,7 +252,8 @@ impl TapHandle {
         if base == crate::time::BASE_UNSET {
             return Timestamp::NONE;
         }
-        crate::time::running_time(self.clock.now().0, base)
+        let clock = Arc::clone(&self.clock.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::time::running_time(clock.now().0, base)
     }
 }
 
@@ -317,7 +322,7 @@ mod tests {
         let base = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
         let tap = TapHandle::new(
             vec![("testsrc", Arc::clone(&counters))],
-            Arc::new(clock.clone()),
+            Arc::new(std::sync::Mutex::new(Arc::new(clock.clone()) as Arc<dyn Clock>)),
             Arc::clone(&base),
         );
 
