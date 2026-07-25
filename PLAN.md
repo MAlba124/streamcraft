@@ -347,6 +347,31 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > + tested (58 scope tests). Known gap: position is *running time* — drifts from
 > media time after a seek; honest fix needs a position query (backlog).
 
+> **Update — session 4o (2026-07-25): scope feedback round 2** (`12ab0ca`,
+> `38de9c9`). (1) **Duration end-to-end**: new `BusMessage::DurationChanged`
+> (ordinal 13, critical) — mkvdemux posts once from `process()` when the
+> streaming reader parses `Info\Duration` (preroll is too early: play_file
+> prerolls before `run()` starts the server); the server keeps an
+> always-attached internal sticky bus tap + new `GetInfo`/`Info` frames
+> (0x0025/0x0026, **SCIP v1.1**) so late-attaching clients poll what they
+> missed. Verified: 1:29:45 on a 90-min mkv, attach 2s after start. Lesson:
+> announced format fields survive fixation only when the consumer's offers
+> declare them — a playback path drops `duration` at interning, hence the bus.
+> (2) **Rotated-quad lines**: `DrawList::line` diagonals were filled bounding
+> rects (the "gray rectangle" fan-out bug) — `Prim.corners` now carries real
+> rotated geometry. (3) Graph: **minimap** (bottom-right overview, draggable
+> viewport rectangle), group hulls reserve a label strip (nodes no longer
+> cover the name), edge labels draw above nodes. (4) **Launcher mode**:
+> `scraft-scope <command> [args…]` spawns the target with
+> `STREAMCRAFT_INTROSPECT` on a private socket, attaches, kills the child on
+> exit (attach mode now requires an actual socket file type). (5) **Dockable
+> panes** (`ui/dock.rs`, simprof's dock model): generic tree of splits with
+> tabbed leaves → flat layout geometry; drag a tab → ghost + VS Code drop
+> zones (center = join tab group, edge = split), dividers drag-resize,
+> emptied leaves collapse; `Ui::begin_region` = title-less panel body (tab
+> bars replace titles). 68 scope tests green; workspace green; launcher e2e
+> headless OK. Dock persistence (save/restore layout) deferred.
+
 Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 0):
 
 - **Core**: opaque `Buffer` + pool-backed `Memory`; SoA `Batch` that also carries in-band
