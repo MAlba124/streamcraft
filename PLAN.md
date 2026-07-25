@@ -424,6 +424,34 @@ one-liners and debugging.
 - ✅ **audioresample** (`audio/`): DONE — polyphase FIR with a Kaiser-windowed-sinc
   anti-aliasing low-pass (`audio/src/resample.rs` + `resample_element.rs`), arbitrary
   rational L/M, streaming state, announces its output rate via dynamic caps. Tests + bench.
+- **Kill the last tiny allocations** (`mkv/src/reader.rs` mainly; isolated, good
+  subagent scope). After `6d2fd91` the transport is ~zero-alloc; the movie remux's
+  remaining **12.2K** allocs (heaptrack + simprof `min_size`/`max_size` bands — rerun
+  `heaptrack --record-only …/remux_to_mkv` to re-measure) break down as:
+  1. **~67% — `MatroskaReader` copies** (`step` `to_vec`s every EBML element payload —
+     the ≤16B wall: flags/track numbers/timestamps are 1–2B leaves; `push_frame` /
+     `decode_block` `to_vec` each frame payload, the 257B–4KB band). Hit here via the
+     example's verify pass, but it equally taxes `MkvDemux` playback. Fix = the
+     **retained-slice conversion**, mirroring what `mp4/src/reader.rs` got (session
+     4c, `SamplePayload::Slice`): (a) feed via `push(Memory)` retaining input chunks
+     in a rope (keep a byte-slice entry point that wraps into one owned chunk for
+     tests); (b) decode **leaf values in place** — an EBML uint/float should parse
+     straight off the window to a scalar, never materialize as a `Vec<u8>` (this
+     alone kills the ≤16B band); copy only blobs that must outlive the window
+     (CodecPrivate — once, small); (c) frames become `Memory::slice` of the retained
+     chunk, with an Owned fallback only when lacing/reads split a frame across
+     chunks (mp4's `CarryPayload` pattern); (d) `MkvDemux` then emits those slices
+     direct-to-out (ZERO-COPY Stage 2 style). Gate: bit-exact frames vs today's
+     reader on the existing mkv fixtures + the movie verify pass.
+  2. **~13% — `Mp4Reader::next_sample` Owned copies** for samples straddling retained
+     chunks: plan reads to **end on stsc/stco chunk boundaries** so samples never
+     straddle (local to the read planner; simpler than teaching downstream about
+     two-piece payloads).
+  3. **~10% — EOS finalize** (`drain_out_exact` gathers + their `Arc`s, Cues master):
+     cold path, once per stream — leave unless it shows up again.
+  Re-measure after (1); expect low-single-digit K. The tools: capture must exit
+  cleanly, analyze via `simprof --mcp=PORT` + curl only (see
+  `memory/profiling-and-backpressure.md`).
 - **Performance** (`core/`, `elements/`): a benchmark-regression **CI gate**, plus the two
   known soft spots — a fenceless fast-path variant of the SPSC ring (the SeqCst Dekker
   fence dominates the ~51 ns/item hop) and a deeper-queue / batched-submission io_uring
