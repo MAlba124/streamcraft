@@ -372,6 +372,56 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > bars replace titles). 68 scope tests green; workspace green; launcher e2e
 > headless OK. Dock persistence (save/restore layout) deferred.
 
+> **Update — session 5 (2026-07-25): time-based seeking, end to end** (`a00dfbb`
+> core, `a86627a` decoders, `421f90f` http, `d560c08` protocol/UI, `2093bd5`
+> mkv + merges). Five tracks, three parallel Opus agents + two inline. **(1)
+> Core clock rebase**: `SeekHandle::seek(to_byte, to_time)` rebases running
+> time to the target under the pause mutex (`PauseShared::rebase_to`;
+> seek-while-paused composes with the resume shift). The base cell went
+> **signed** (`Arc<AtomicI64>`, `BASE_UNSET=i64::MIN`; helpers in time.rs) —
+> a device clock starts near 0, so `base = now − target` is negative on
+> forward seeks. `SeekState.to_frame` → `to_time_ns` (sinks derive their own
+> units; pipewire sink computes frames = time × rate). `Ctx::wait_until`
+> re-derives per iteration, returns Interrupted on a seek-gen change, and
+> parks in 10 ms slices (found gap: parked waits never re-derived; nothing
+> called ClockWait::interrupt). `elements/tests/seek.rs`: forward-no-stall,
+> on-time backward replay, pause composition, tap position jump, rapid
+> seeks. **(2) mkv**: `parse_seek_head`/`parse_cues` (Cues live after the
+> last Cluster, found via the front SeekHead; positions Segment-relative),
+> `MatroskaReader::resync_streaming()` with a bounded Cluster-id scan (a
+> proportional-estimate landing anywhere recovers), demux FlushStart =
+> resync + re-emit codec heads + per-video-track keyframe gating. **(3)
+> Video decoders** already reset on FlushStart since adoption — verified +
+> flush tests added per crate. **(4) Protocol v1.2 + UI**: `SeekIndex`
+> (cues floor-lookup, proportional file_len fallback) +
+> `Pipeline::set_seek_index`; SEEK frame 0x0027 (clamp→map→rebase→Ack, or
+> Error(6) without an index); scope progress bar scrubs (drag marker,
+> release seeks); play_file builds the index at open (SeekHead → pread Cues)
+> and stdin digits 0-9 seek to n×10%. **(5) HttpSrc rides the Reactor**
+> (user request): `OpKind::Recv` streaming reads in SyncReactor (blocking
+> read) and io_uring (`IORING_OP_READ` @ offset −1), HttpSrc drains the Io
+> mailbox with one sequential read in flight + a `valid_from` stale floor;
+> trickle/early-EOF/uring tests. **Fix round (`7b52f4b`), from live testing:**
+> (a) *frozen video after seek* — the rebase used the REQUESTED time while
+> content resumed at the preceding cue cluster, leaving video permanently
+> late by the gap (QoS dropped everything; audio free-runs): seeks now use
+> the RESOLVED cue time (`SeekIndex::resolve` returns `(byte, landed)`).
+> (b) The rebase anchors to the clock's *current* reading, not `pause_at` —
+> a device clock advances during the post-pause drain. (c) **Seek-while-
+> paused reworked**: the pause gate parks seek-aware (`park_while_paused`,
+> notify on seek), flushes while paused, and bursts passes while they
+> progress (re-prime in ms, 100 ms idle ticks after); `ClockWait::
+> wait_ticked` bounds every parked wait (incl. MockClock) and waits honour
+> stop; sdl3videosink **prerolls the first post-flush frame** (paused seek
+> shows its frame); pipewire sink consumes nothing while paused (blocking
+> would strand its group across a resume). (d) `TapHandle` reads the clock
+> through a shared cell `run()` updates at selection — pre-run handles mixed
+> the default clock with the device-rebased base. (e) release profile:
+> `debug=\"line-tables-only\"` for heaptrack/perf. E2E exact: playing seek
+> lands 2690.0s, paused seek lands 1075.0s, stays paused, resumes clean.
+> Known limit: http has no Range-based seek; plain pause/resume still
+> excises the device drain (pre-existing, noted).
+
 > **Update — session 4p (2026-07-25): scope fix round** (`28ac090`). (1) The
 > vanishing-pane dock bug: my collapse moved the sibling node into the parent
 > slot, orphaning the sibling's index — dropping a panel onto its own split
