@@ -338,8 +338,17 @@ fn relayout_if_needed(cache: &mut GraphCache, m: &Model, font: &Font) {
     let mut nodes = Vec::with_capacity(topo.elements.len());
     cache.nodes.clear();
     for e in &topo.elements {
-        let (tw, _) = font.measure(&e.name);
-        nodes.push(layout::Node { id: e.id, w: tw + 20.0, h: 46.0, group: e.group });
+        // The box holds two lines: the name (14 px) and the live stats line
+        // (11 px, e.g. "27.1 Mb/s q4"). Size for the wider of the two — short
+        // names ("tee") otherwise overflow their box with the stats text.
+        let (name_w, _) = font.measure_px(&e.name, 14.0);
+        let (stats_w, _) = font.measure_px("999.9 Mb/s q99", 11.0);
+        nodes.push(layout::Node {
+            id: e.id,
+            w: name_w.max(stats_w) + 16.0,
+            h: 46.0,
+            group: e.group,
+        });
         cache.nodes.push(NodeMeta { id: e.id, name: e.name.clone() });
     }
     let name_of = |id: u32| {
@@ -375,7 +384,15 @@ fn relayout_if_needed(cache: &mut GraphCache, m: &Model, font: &Font) {
         })
         .collect();
 
-    let opts = layout::Opts { layer_gap: 70.0, node_gap: 26.0, ..layout::Opts::default() };
+    // Gaps sized against the hull chrome: horizontally each hull adds
+    // GROUP_PAD on both sides (24 px between neighbours), vertically
+    // pad + pad + label strip (42 px) — the defaults left 6 px of daylight.
+    let opts = layout::Opts {
+        layer_gap: 84.0,
+        node_gap: 26.0,
+        group_gap: 64.0,
+        ..layout::Opts::default()
+    };
     cache.laid = Some(layout::layout(&nodes, &edges, &opts));
     cache.gen = m.topo_gen;
 }
@@ -673,11 +690,17 @@ fn draw_graph_panel(
     // top of it, never underneath (full caps live on hover/click).
     if 11.0 * zoom >= 7.5 {
         for (i, e) in laid.edges.iter().enumerate() {
-            if let (Some(info), Some(&a), Some(&b)) =
-                (cache.edges.get(i), e.points.first(), e.points.get(1))
-            {
-                let (ax, ay) = to_screen(a);
-                let (bx2, by2) = to_screen(b);
+            // Label the LONGEST polyline segment's midpoint: the first segment
+            // hugs the source port, so labels there pile onto node boxes and
+            // hull borders (the cramped-graph render bug).
+            let longest = e.points.windows(2).max_by(|a, b| {
+                let la = (a[1].0 - a[0].0).hypot(a[1].1 - a[0].1);
+                let lb = (b[1].0 - b[0].0).hypot(b[1].1 - b[0].1);
+                la.total_cmp(&lb)
+            });
+            if let (Some(info), Some(w)) = (cache.edges.get(i), longest) {
+                let (ax, ay) = to_screen(w[0]);
+                let (bx2, by2) = to_screen(w[1]);
                 let (mx, my) = ((ax + bx2) * 0.5, (ay + by2) * 0.5);
                 ui.text_px(mx + 4.0, my - 12.0 * zoom, &info.family, 11.0 * zoom, dim);
             }
