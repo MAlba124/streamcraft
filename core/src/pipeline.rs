@@ -1454,12 +1454,35 @@ impl Pipeline {
             let handle = std::thread::Builder::new()
                 .name(format!("sc-group-{gi}"))
                 .spawn(move || {
-                    run_group(
-                        elems, ids, group_formats, group_logs, upstream, downstream, factory,
-                        group_pools, bus, credits, group_counters, group_props, stop, seek,
-                        vocabulary, clock,
-                        base, group_pad_infos, group_latencies, tracing, pause, group_linked,
-                    )
+                    let stop_flag = Arc::clone(&stop);
+                    let pause_wake = Arc::clone(&pause);
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_group(
+                            elems, ids, group_formats, group_logs, upstream, downstream, factory,
+                            group_pools, bus, credits, group_counters, group_props, stop, seek,
+                            vocabulary, clock,
+                            base, group_pad_infos, group_latencies, tracing, pause, group_linked,
+                        )
+                    }));
+                    // A failed group (element error or panic) stops the PIPELINE, not
+                    // just its own chain. Without this, a sibling with no data path to
+                    // the failure runs — or wedges — forever, and `run()`'s in-order
+                    // join never reaches the handle carrying the error (measured: the
+                    // failed group's closed ring pinned the shared pool's slots, its
+                    // upstream could then never build the batch whose `push` would
+                    // have revealed the closure, and it parked on the tick with the
+                    // error invisible). Ok exits (EOS) deliberately do NOT stop
+                    // siblings — a finished file chain must not kill a live one; the
+                    // downstream ring-close cascade owns that ordering.
+                    if !matches!(r, Ok(Ok(()))) {
+                        stop_flag.store(true, Ordering::Release);
+                        pause_wake.bump_idle();
+                    }
+                    match r {
+                        Ok(res) => res,
+                        // Re-raise so `join` reports the panic exactly as before.
+                        Err(p) => std::panic::resume_unwind(p),
+                    }
                 })
                 // Panic like `std::thread::spawn` did here before naming: an early
                 // return would leak the already-spawned groups unjoined.
@@ -2903,8 +2926,29 @@ fn run_group(
             // no atomics, and `batches_*` counts real batches, not scheduler passes.
             if nbuf > 0 {
                 counters[i].record_out(nbuf, nbytes);
+                // Production IS progress. A non-tail member's output moves via the
+                // inline hand-off below and never reaches step C's `progressed`
+                // mark — without this, a source feeding an inline tail that
+                // *buffers* without emitting (a demuxer accumulating its head, a
+                // parser mid-frame) parks the whole group every pass, and the
+                // stream advances one buffer per 10 ms park tick (measured on the
+                // mp4 ragged-chunking sweep: 12999 one-byte chunks ≈ 130 s of
+                // near-idle crawling that read as a hang; the pre-parking
+                // spin-yield scheduler hid exactly this).
+                progressed = true;
             }
             reactor.submit(ctxs[i].submissions_mut());
+            // A file registered *during* `process()` (an element that rotates
+            // files at runtime — a segmented recorder swapping to its next
+            // segment) reaches the reactor here, exactly like the start-time
+            // hand-off; `set_file` replaces the element's registration, closing
+            // the previous file. Ordered before this pass's `run_once`, so
+            // submissions made in the same call already target the new file
+            // (the element's own protocol must drain old-file ops first — the
+            // handle is one per element).
+            if let Some(f) = ctxs[i].take_registration() {
+                reactor.set_file(ids[i], f);
+            }
             if i + 1 < m {
                 if nbuf > 0 {
                     counters[i + 1].record_in(nbuf, nbytes);
@@ -3058,6 +3102,29 @@ fn run_group(
             std::thread::yield_now();
         }
     };
+
+    // Settle IO before stopping elements: submissions can strand in an outbox
+    // when the loop exits between their creation and step B's forward — an EOS
+    // event's finalize writes (event deliveries never reach the per-process
+    // forward), or a stop racing the pass. An element's `stop()` must observe a
+    // quiet reactor whose completions are delivered, or it patches its file
+    // from accounting the disk never saw (measured: a recording sink's
+    // teardown finalize appended past 4 stranded writes — a 26 KB hole of
+    // zeros mid-file, caught by the external-player tail gate).
+    for i in 0..m {
+        reactor.submit(ctxs[i].submissions_mut());
+        if let Some(f) = ctxs[i].take_registration() {
+            reactor.set_file(ids[i], f);
+        }
+    }
+    while !reactor.is_idle() {
+        reactor.run_once(&mut completions_buf);
+        for (elem, c) in completions_buf.drain(..) {
+            if let Some(idx) = ids.iter().position(|e| *e == elem) {
+                ctxs[idx].deliver_completion(c);
+            }
+        }
+    }
 
     // Stop elements (reverse). Dropping `downstream` here closes the ring, signalling
     // EOS to the next group.
