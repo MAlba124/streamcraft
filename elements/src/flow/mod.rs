@@ -6,6 +6,8 @@
 
 mod passthrough;
 mod queue;
+mod tee;
 
 pub use passthrough::PassThrough;
 pub use queue::Queue;
+pub use tee::Tee;
