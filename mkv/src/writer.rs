@@ -254,6 +254,13 @@ pub struct MatroskaWriter {
     /// Cue tracking (RFC 9559 §5.1.5), opt-in via [`enable_cues`](Self::enable_cues) —
     /// `None` keeps the writer strictly single-pass and seek-free (the default).
     cues: Option<CueState>,
+    /// [`reserve_duration`](Self::reserve_duration) was called: the header writes a
+    /// placeholder `Info\Duration` whose stream offset lands in `duration_at`.
+    duration_reserved: bool,
+    /// Stream offset of the reserved Duration *element* (ID byte), set by the header
+    /// write. Same origin as [`SeekHeadPatch::offset`]: the first byte the writer ever
+    /// produced (== the file offset when the stream is written from 0).
+    duration_at: Option<u64>,
 }
 
 /// Cue/SeekHead bookkeeping (RFC 9559 §5.1.1, §5.1.5) — filled while writing, spent at
@@ -307,6 +314,8 @@ impl MatroskaWriter {
             anchor_track,
             duration_ns: None,
             cues: None,
+            duration_reserved: false,
+            duration_at: None,
         }
     }
 
@@ -344,6 +353,30 @@ impl MatroskaWriter {
         if !self.header_written {
             self.duration_ns = Some(ns);
         }
+    }
+
+    /// Reserve a back-patchable `Info\Duration` (RFC 9559 §5.1.2) for streams whose
+    /// length is unknown until they end — a live recording writes its header at the
+    /// first frame but only learns the duration at the cut. Must be called before
+    /// [`write_header`]; the header then carries a placeholder (0.0) the caller
+    /// replaces via [`duration_patch`](Self::duration_patch)'s positioned write. A
+    /// known-upfront duration ([`set_duration_ns`](Self::set_duration_ns)) wins over
+    /// the reservation.
+    pub fn reserve_duration(&mut self) {
+        if !self.header_written {
+            self.duration_reserved = true;
+        }
+    }
+
+    /// The positioned write replacing the reserved Duration placeholder with `ns`
+    /// (in TimestampScale ticks, as a float — RFC 9559 §5.1.2). `None` without a
+    /// reservation or before the header. Offsets share [`SeekHeadPatch`]'s origin
+    /// (the stream's first byte), so a file written from offset 0 applies it as-is.
+    pub fn duration_patch(&self, ns: u64) -> Option<SeekHeadPatch> {
+        let offset = self.duration_at?;
+        let mut bytes = Vec::with_capacity(16);
+        ebml::write_f64(&mut bytes, id::DURATION, ns as f64 / self.timestamp_scale.max(1) as f64);
+        Some(SeekHeadPatch { offset, bytes })
     }
 
     pub fn timestamp_scale(&self) -> u64 {
@@ -423,7 +456,7 @@ impl MatroskaWriter {
     }
 
     /// The Segment `Info` master (spec `§ID-tree`), back-patched.
-    fn write_info(&self, out: &mut Vec<u8>) {
+    fn write_info(&mut self, out: &mut Vec<u8>) {
         ebml::write_id(out, id::INFO);
         let size_at = ebml::reserve_size(out);
         let body_start = out.len();
@@ -432,6 +465,13 @@ impl MatroskaWriter {
         // player treats the unknown-size Segment as a live, duration-less stream.
         if let Some(ns) = self.duration_ns {
             ebml::write_f64(out, id::DURATION, ns as f64 / self.timestamp_scale.max(1) as f64);
+        } else if self.duration_reserved {
+            // A fixed-width (8-octet float) placeholder; `write_f64` is byte-stable, so
+            // [`duration_patch`](Self::duration_patch) re-encodes the whole element at
+            // this offset once the true duration is known. Recorded `out`-relative here;
+            // the scatter path rebases to the absolute stream offset (like the cues).
+            self.duration_at = Some(out.len() as u64);
+            ebml::write_f64(out, id::DURATION, 0.0);
         }
         ebml::write_string(out, id::MUXING_APP, APP_NAME);
         ebml::write_string(out, id::WRITING_APP, APP_NAME);
@@ -609,6 +649,10 @@ impl MatroskaWriter {
                 // earlier runs). The Info/Tracks positions are Segment-relative and
                 // need no rebasing.
                 cues.segment_data_start = stream_at + (cues.segment_data_start - local_start);
+            }
+            if let Some(at) = &mut self.duration_at {
+                // Same rebase for the Duration reservation (see `write_info`).
+                *at = stream_at + (*at - local_start);
             }
         }
         r
@@ -1093,6 +1137,50 @@ mod tests {
             times.push(time);
         }
         assert_eq!(times, vec![0, 80], "both keyframe Clusters cued (1 ms ticks)");
+    }
+
+    /// The live-recording shape (RFC 9559 §5.1.2 Duration): duration unknown at header
+    /// time → [`MatroskaWriter::reserve_duration`] emits a placeholder; after
+    /// [`MatroskaWriter::finalize_scatter`] the caller applies the SeekHead patch AND
+    /// the [`MatroskaWriter::duration_patch`] as positioned writes. The flattened
+    /// stream must then parse with the patched duration and intact cues.
+    #[test]
+    fn reserved_duration_patches_in_scatter_stream() {
+        use streamcraft_core::memory::Pool;
+        let video = TrackConfig::video(1, "V_VP8", Vec::new(), 320, 240);
+        let mut w = MatroskaWriter::new(vec![video]);
+        w.enable_cues();
+        w.reserve_duration();
+        let pool = Pool::new(16);
+        let mut out = MuxOut::new();
+        w.write_header_scatter(&mut out).unwrap();
+        for (ns, key) in [(0u64, true), (40_000_000, false), (2_000_000_000, true)] {
+            let mut mem = pool.acquire_exact(3);
+            mem.as_mut_full()[..3].copy_from_slice(&[7, 8, 9]);
+            mem.set_len(3);
+            w.write_frame_scatter(&mut out, 1, ns, mem, key).unwrap();
+        }
+        let sh_patch = w.finalize_scatter(&mut out).expect("cue-worthy clusters → patch");
+        let dur_patch = w.duration_patch(2_040_000_000).expect("reserved → patch");
+
+        // Flatten the scatter stream as a file sink would, then apply both patches.
+        let mut file = Vec::new();
+        while let Some(piece) = out.pop_front() {
+            match piece {
+                MuxPiece::Bytes { start, end } => file.extend_from_slice(&out.header_bytes()[start..end]),
+                MuxPiece::Payload(mem) => file.extend_from_slice(mem.data()),
+            }
+        }
+        for p in [&sh_patch, &dur_patch] {
+            file[p.offset as usize..p.offset as usize + p.bytes.len()].copy_from_slice(&p.bytes);
+        }
+
+        let mut r = crate::MatroskaReader::new();
+        r.push(&file).expect("patched stream parses");
+        assert_eq!(r.duration_ns(), Some(2_040_000_000), "patched Duration read back");
+        // The duration patch must not have clobbered its neighbours: the SeekHead's
+        // Cues entry still resolves (the reader saw Tracks past the Info master).
+        assert_eq!(r.tracks().len(), 1, "Tracks parse past the patched Info");
     }
 
     #[test]
