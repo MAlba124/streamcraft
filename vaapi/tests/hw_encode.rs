@@ -2,12 +2,13 @@
 //! real device and skip cleanly (print + return) without one, so the suite stays
 //! green on machines with no hardware.
 //!
-//! There is no encoder element yet — these tests verify the capability layer the
-//! future `vaapih264enc` will stand on: the probe reports encode entrypoints
-//! honestly, and the driver can actually *allocate* an encode pipeline (config +
-//! NV12 surfaces + context). Allocation is the step queries cannot vouch for — a
-//! read-only DRM fd, for instance, answers every query and then fails exactly
-//! here (the decode-path lesson).
+//! These tests verify the capability layer the encoder elements
+//! (`vaapih264enc`/`vaapih265enc`/`vaapivp8enc`) stand on: the probe reports
+//! encode entrypoints honestly, and the driver can actually *allocate* an encode
+//! pipeline (config + NV12 surfaces + context). Allocation is the step queries
+//! cannot vouch for — a read-only DRM fd, for instance, answers every query and
+//! then fails exactly here (the decode-path lesson). The full encode round trips
+//! live in `hw_encode_roundtrip.rs`.
 
 use sc_vaapi::ffi;
 use sc_vaapi::va::{Config, Context, Display, Surfaces};

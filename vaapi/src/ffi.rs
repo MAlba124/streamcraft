@@ -48,6 +48,8 @@ pub const VAProfileNone: VAProfile = -1;
 pub const VAProfileH264Main: VAProfile = 6;
 pub const VAProfileH264High: VAProfile = 7;
 pub const VAProfileH264ConstrainedBaseline: VAProfile = 13;
+/// `VAProfileVP8Version0_3 = 14` (va.h:519) — the single VP8 profile (versions 0–3).
+pub const VAProfileVP8Version0_3: VAProfile = 14;
 pub const VAProfileHEVCMain: VAProfile = 17;
 pub const VAProfileHEVCMain10: VAProfile = 18;
 pub const VAProfileVP9Profile0: VAProfile = 19;
@@ -63,13 +65,59 @@ pub const VAEntrypointEncSliceLP: VAEntrypoint = 8;
 
 // --- VAConfigAttribType + RTFormat values (va.h:620, 1083) ----------------------------
 pub const VAConfigAttribRTFormat: VAConfigAttribType = 0;
+/// `VAConfigAttribRateControl = 5` (va.h:625) — encode rate-control modes bitmask.
+pub const VAConfigAttribRateControl: VAConfigAttribType = 5;
+/// `VAConfigAttribEncPackedHeaders = 10` (va.h:694) — which packed headers the app
+/// may/must submit alongside encode parameter buffers.
+pub const VAConfigAttribEncPackedHeaders: VAConfigAttribType = 10;
+/// `VAConfigAttribEncMaxRefFrames = 13` (va.h:714) — max L0/L1 references
+/// (L0 in the low 16 bits, L1 in the high 16).
+pub const VAConfigAttribEncMaxRefFrames: VAConfigAttribType = 13;
 pub const VA_RT_FORMAT_YUV420: u32 = 0x0000_0001;
+/// `#define VA_ATTRIB_NOT_SUPPORTED 0x80000000` (va.h) — vaGetConfigAttributes'
+/// "driver does not support this attribute" sentinel.
+pub const VA_ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
 
-// --- VABufferType (va.h:2045–2050) ----------------------------------------------------
+// Attribute values for VAConfigAttribRateControl (va.h:1105–1118).
+pub const VA_RC_CBR: u32 = 0x0000_0002;
+pub const VA_RC_VBR: u32 = 0x0000_0004;
+pub const VA_RC_CQP: u32 = 0x0000_0010;
+
+// Attribute values for VAConfigAttribEncPackedHeaders (va.h:1196–1230).
+pub const VA_ENC_PACKED_HEADER_NONE: u32 = 0x0000_0000;
+pub const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 0x0000_0001;
+pub const VA_ENC_PACKED_HEADER_PICTURE: u32 = 0x0000_0002;
+pub const VA_ENC_PACKED_HEADER_SLICE: u32 = 0x0000_0004;
+pub const VA_ENC_PACKED_HEADER_MISC: u32 = 0x0000_0008;
+pub const VA_ENC_PACKED_HEADER_RAW_DATA: u32 = 0x0000_0010;
+
+// --- VABufferType (va.h:2045–2067) ----------------------------------------------------
 pub const VAPictureParameterBufferType: VABufferType = 0;
 pub const VAIQMatrixBufferType: VABufferType = 1;
 pub const VASliceParameterBufferType: VABufferType = 4;
 pub const VASliceDataBufferType: VABufferType = 5;
+/// `VAQMatrixBufferType = 11` (va.h:2056) — codec-specific quantization matrices
+/// (the VP8 encoder's `VAQMatrixBufferVP8` rides this type).
+pub const VAQMatrixBufferType: VABufferType = 11;
+// Encode buffer types (va.h:2061–2067).
+pub const VAEncCodedBufferType: VABufferType = 21;
+pub const VAEncSequenceParameterBufferType: VABufferType = 22;
+pub const VAEncPictureParameterBufferType: VABufferType = 23;
+pub const VAEncSliceParameterBufferType: VABufferType = 24;
+pub const VAEncPackedHeaderParameterBufferType: VABufferType = 25;
+pub const VAEncPackedHeaderDataBufferType: VABufferType = 26;
+pub const VAEncMiscParameterBufferType: VABufferType = 27;
+
+// --- VAEncPackedHeaderType (va.h:2421–2434) -------------------------------------------
+pub const VAEncPackedHeaderSequence: u32 = 1;
+pub const VAEncPackedHeaderPicture: u32 = 2;
+pub const VAEncPackedHeaderSlice: u32 = 3;
+pub const VAEncPackedHeaderRawData: u32 = 4;
+
+// --- VAEncMiscParameterType (va.h:2380–2387) ------------------------------------------
+pub const VAEncMiscParameterTypeFrameRate: u32 = 0;
+pub const VAEncMiscParameterTypeRateControl: u32 = 1;
+pub const VAEncMiscParameterTypeHRD: u32 = 5;
 
 // --- VAGenericValueType (va.h:1652) ---------------------------------------------------
 pub const VAGenericValueTypeInteger: VAGenericValueType = 1;
@@ -100,6 +148,8 @@ pub const VA_PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x0000_0010;
 pub const VA_PADDING_LOW: usize = 4;
 /// `#define VA_PADDING_MEDIUM 8` (va.h:361).
 pub const VA_PADDING_MEDIUM: usize = 8;
+/// `#define VA_PADDING_HIGH 16` (va.h:362).
+pub const VA_PADDING_HIGH: usize = 16;
 
 // --- Structs (#[repr(C)], exact field order from va.h) --------------------------------
 
@@ -280,6 +330,348 @@ pub struct VASliceParameterBufferH264 {
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
+// --- Encode structs (va.h / va_enc_h264.h / va_enc_hevc.h / va_enc_vp8.h) -------------
+//
+// Same transcription rules as the decode structs above: field order verbatim from the
+// devshell's libva 2.23 headers, bitfield unions modelled as their `uint32_t value`
+// arm (the individual flags are packed by hand in the encoder elements), layouts
+// locked by the size assertions at the bottom.
+
+/// `VACodedBufferSegment` (va.h:3940) — one link of the coded-output list a mapped
+/// `VAEncCodedBufferType` buffer points at. 16 (4×u32) + 16 (2 ptrs) + 16 (reserved).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VACodedBufferSegment {
+    pub size: u32,
+    pub bit_offset: u32,
+    pub status: u32,
+    pub reserved: u32,
+    pub buf: *mut c_void,
+    pub next: *mut c_void,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncPackedHeaderParameterBuffer` (va.h:2447) — describes the packed-header
+/// *data* buffer that follows it (type, bit length, whether emulation-prevention
+/// bytes are already inserted).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncPackedHeaderParameterBuffer {
+    pub type_: u32,
+    pub bit_length: u32,
+    pub has_emulation_bytes: u8,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncMiscParameterRateControl` (va.h:2500) — the RC misc payload (bitrate,
+/// target %, window, QP bounds). Rides inside a `VAEncMiscParameterBuffer` whose
+/// leading u32 is `VAEncMiscParameterTypeRateControl`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncMiscParameterRateControl {
+    pub bits_per_second: u32,
+    pub target_percentage: u32,
+    pub window_size: u32,
+    pub initial_qp: u32,
+    pub min_qp: u32,
+    pub basic_unit_size: u32,
+    pub rc_flags: u32,
+    pub ICQ_quality_factor: u32,
+    pub max_qp: u32,
+    pub quality_factor: u32,
+    pub target_frame_size: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncMiscParameterFrameRate` (va.h:2617) — fps as `den << 16 | num`
+/// (denominator zero means 1, i.e. the low half is integer fps).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncMiscParameterFrameRate {
+    pub framerate: u32,
+    pub framerate_flags: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncSequenceParameterBufferH264` (va_enc_h264.h:187). `seq_fields`/`vui_fields`
+/// are the u32 union arms; see the header for the bit order (packed by the element).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncSequenceParameterBufferH264 {
+    pub seq_parameter_set_id: u8,
+    pub level_idc: u8,
+    pub intra_period: u32,
+    pub intra_idr_period: u32,
+    pub ip_period: u32,
+    pub bits_per_second: u32,
+    pub max_num_ref_frames: u32,
+    pub picture_width_in_mbs: u16,
+    pub picture_height_in_mbs: u16,
+    pub seq_fields: u32,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub num_ref_frames_in_pic_order_cnt_cycle: u8,
+    pub offset_for_non_ref_pic: i32,
+    pub offset_for_top_to_bottom_field: i32,
+    pub offset_for_ref_frame: [i32; 256],
+    pub frame_cropping_flag: u8,
+    pub frame_crop_left_offset: u32,
+    pub frame_crop_right_offset: u32,
+    pub frame_crop_top_offset: u32,
+    pub frame_crop_bottom_offset: u32,
+    pub vui_parameters_present_flag: u8,
+    pub vui_fields: u32,
+    pub aspect_ratio_idc: u8,
+    pub sar_width: u32,
+    pub sar_height: u32,
+    pub num_units_in_tick: u32,
+    pub time_scale: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncPictureParameterBufferH264` (va_enc_h264.h:344).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncPictureParameterBufferH264 {
+    pub CurrPic: VAPictureH264,
+    pub ReferenceFrames: [VAPictureH264; 16],
+    pub coded_buf: VABufferID,
+    pub pic_parameter_set_id: u8,
+    pub seq_parameter_set_id: u8,
+    pub last_picture: u8,
+    pub frame_num: u16,
+    pub pic_init_qp: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub chroma_qp_index_offset: i8,
+    pub second_chroma_qp_index_offset: i8,
+    pub pic_fields: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncSliceParameterBufferH264` (va_enc_h264.h:501) — including the (unused by
+/// us, but ABI-load-bearing) explicit weighted-prediction tables.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncSliceParameterBufferH264 {
+    pub macroblock_address: u32,
+    pub num_macroblocks: u32,
+    pub macroblock_info: VABufferID,
+    pub slice_type: u8,
+    pub pic_parameter_set_id: u8,
+    pub idr_pic_id: u16,
+    pub pic_order_cnt_lsb: u16,
+    pub delta_pic_order_cnt_bottom: i32,
+    pub delta_pic_order_cnt: [i32; 2],
+    pub direct_spatial_mv_pred_flag: u8,
+    pub num_ref_idx_active_override_flag: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub RefPicList0: [VAPictureH264; 32],
+    pub RefPicList1: [VAPictureH264; 32],
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    pub cabac_init_idc: u8,
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAPictureHEVC` (va.h:5280) — surface + POC + RPS-membership flags.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAPictureHEVC {
+    pub picture_id: VASurfaceID,
+    pub pic_order_cnt: i32,
+    pub flags: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+// VAPictureHEVC flags (va.h:5305–5331).
+pub const VA_PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
+pub const VA_PICTURE_HEVC_LONG_TERM_REFERENCE: u32 = 0x0000_0008;
+pub const VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE: u32 = 0x0000_0010;
+pub const VA_PICTURE_HEVC_RPS_ST_CURR_AFTER: u32 = 0x0000_0020;
+pub const VA_PICTURE_HEVC_RPS_LT_CURR: u32 = 0x0000_0040;
+
+impl VAPictureHEVC {
+    /// An "empty slot" entry: invalid surface + INVALID flag, the fill value every
+    /// unused `reference_frames`/`ref_pic_list` element must carry.
+    pub fn invalid() -> Self {
+        VAPictureHEVC {
+            picture_id: VA_INVALID_SURFACE,
+            pic_order_cnt: 0,
+            flags: VA_PICTURE_HEVC_INVALID,
+            va_reserved: [0; VA_PADDING_LOW],
+        }
+    }
+}
+
+/// `VAEncSequenceParameterBufferHEVC` (va_enc_hevc.h:107).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncSequenceParameterBufferHEVC {
+    pub general_profile_idc: u8,
+    pub general_level_idc: u8,
+    pub general_tier_flag: u8,
+    pub intra_period: u32,
+    pub intra_idr_period: u32,
+    pub ip_period: u32,
+    pub bits_per_second: u32,
+    pub pic_width_in_luma_samples: u16,
+    pub pic_height_in_luma_samples: u16,
+    pub seq_fields: u32,
+    pub log2_min_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_luma_coding_block_size: u8,
+    pub log2_min_transform_block_size_minus2: u8,
+    pub log2_diff_max_min_transform_block_size: u8,
+    pub max_transform_hierarchy_depth_inter: u8,
+    pub max_transform_hierarchy_depth_intra: u8,
+    pub pcm_sample_bit_depth_luma_minus1: u32,
+    pub pcm_sample_bit_depth_chroma_minus1: u32,
+    pub log2_min_pcm_luma_coding_block_size_minus3: u32,
+    pub log2_max_pcm_luma_coding_block_size_minus3: u32,
+    pub vui_parameters_present_flag: u8,
+    pub vui_fields: u32,
+    pub aspect_ratio_idc: u8,
+    pub sar_width: u32,
+    pub sar_height: u32,
+    pub vui_num_units_in_tick: u32,
+    pub vui_time_scale: u32,
+    pub min_spatial_segmentation_idc: u16,
+    pub max_bytes_per_pic_denom: u8,
+    pub max_bits_per_min_cu_denom: u8,
+    pub scc_fields: u32,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM - 1],
+}
+
+/// `VAEncPictureParameterBufferHEVC` (va_enc_hevc.h:295).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncPictureParameterBufferHEVC {
+    pub decoded_curr_pic: VAPictureHEVC,
+    pub reference_frames: [VAPictureHEVC; 15],
+    pub coded_buf: VABufferID,
+    pub collocated_ref_pic_index: u8,
+    pub last_picture: u8,
+    pub pic_init_qp: u8,
+    pub diff_cu_qp_delta_depth: u8,
+    pub pps_cb_qp_offset: i8,
+    pub pps_cr_qp_offset: i8,
+    pub num_tile_columns_minus1: u8,
+    pub num_tile_rows_minus1: u8,
+    pub column_width_minus1: [u8; 19],
+    pub row_height_minus1: [u8; 21],
+    pub log2_parallel_merge_level_minus2: u8,
+    pub ctu_max_bitsize_allowed: u8,
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    pub slice_pic_parameter_set_id: u8,
+    pub nal_unit_type: u8,
+    pub pic_fields: u32,
+    pub hierarchical_level_plus1: u8,
+    pub va_byte_reserved: u8,
+    pub scc_fields: u16,
+    pub va_reserved: [u32; VA_PADDING_HIGH - 1],
+}
+
+/// `VAEncSliceParameterBufferHEVC` (va_enc_hevc.h:472).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncSliceParameterBufferHEVC {
+    pub slice_segment_address: u32,
+    pub num_ctu_in_slice: u32,
+    pub slice_type: u8,
+    pub slice_pic_parameter_set_id: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub ref_pic_list0: [VAPictureHEVC; 15],
+    pub ref_pic_list1: [VAPictureHEVC; 15],
+    pub luma_log2_weight_denom: u8,
+    pub delta_chroma_log2_weight_denom: i8,
+    pub delta_luma_weight_l0: [i8; 15],
+    pub luma_offset_l0: [i8; 15],
+    pub delta_chroma_weight_l0: [[i8; 2]; 15],
+    pub chroma_offset_l0: [[i8; 2]; 15],
+    pub delta_luma_weight_l1: [i8; 15],
+    pub luma_offset_l1: [i8; 15],
+    pub delta_chroma_weight_l1: [[i8; 2]; 15],
+    pub chroma_offset_l1: [[i8; 2]; 15],
+    pub max_num_merge_cand: u8,
+    pub slice_qp_delta: i8,
+    pub slice_cb_qp_offset: i8,
+    pub slice_cr_qp_offset: i8,
+    pub slice_beta_offset_div2: i8,
+    pub slice_tc_offset_div2: i8,
+    pub slice_fields: u32,
+    pub pred_weight_table_bit_offset: u32,
+    pub pred_weight_table_bit_length: u32,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM - 2],
+}
+
+/// `VAEncSequenceParameterBufferVP8` (va_enc_vp8.h:51).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncSequenceParameterBufferVP8 {
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub frame_width_scale: u32,
+    pub frame_height_scale: u32,
+    pub error_resilient: u32,
+    pub kf_auto: u32,
+    pub kf_min_dist: u32,
+    pub kf_max_dist: u32,
+    pub bits_per_second: u32,
+    pub intra_period: u32,
+    pub reference_frames: [VASurfaceID; 4],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAEncPictureParameterBufferVP8` (va_enc_vp8.h:106). `ref_flags`/`pic_flags` are
+/// the u32 union arms (bit order in the header, packed by the element).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncPictureParameterBufferVP8 {
+    pub reconstructed_frame: VASurfaceID,
+    pub ref_last_frame: VASurfaceID,
+    pub ref_gf_frame: VASurfaceID,
+    pub ref_arf_frame: VASurfaceID,
+    pub coded_buf: VABufferID,
+    pub ref_flags: u32,
+    pub pic_flags: u32,
+    pub loop_filter_level: [i8; 4],
+    pub ref_lf_delta: [i8; 4],
+    pub mode_lf_delta: [i8; 4],
+    pub sharpness_level: u8,
+    pub clamp_qindex_high: u8,
+    pub clamp_qindex_low: u8,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
+/// `VAQMatrixBufferVP8` (va_enc_vp8.h:306) — per-segment base quantizer indices +
+/// the five per-coefficient-class deltas (VP8 RFC 6386 §9.6).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAQMatrixBufferVP8 {
+    pub quantization_index: [u16; 4],
+    pub quantization_index_delta: [i16; 5],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
 // --- extern fns (va.h / va_drm.h) -----------------------------------------------------
 #[link(name = "va")]
 #[link(name = "va-drm")]
@@ -396,6 +788,22 @@ extern "C" {
     pub fn vaMapBuffer(dpy: VADisplay, buf_id: VABufferID, pbuf: *mut *mut c_void) -> VAStatus;
     pub fn vaUnmapBuffer(dpy: VADisplay, buf_id: VABufferID) -> VAStatus;
     pub fn vaDestroyImage(dpy: VADisplay, image: VAImageID) -> VAStatus;
+
+    // va.h — raster upload (the encode input path's PutImage fallback when the
+    // driver refuses vaDeriveImage on an input surface).
+    pub fn vaPutImage(
+        dpy: VADisplay,
+        surface: VASurfaceID,
+        image: VAImageID,
+        src_x: c_int,
+        src_y: c_int,
+        src_width: u32,
+        src_height: u32,
+        dest_x: c_int,
+        dest_y: c_int,
+        dest_width: u32,
+        dest_height: u32,
+    ) -> VAStatus;
 }
 
 // --- Layout guards: documented LP64 sizes; a libva reshuffle fails compilation --------
@@ -437,5 +845,96 @@ mod layout {
             "VASliceParameterBufferH264"
         );
         assert_eq!(align_of::<VASliceParameterBufferH264>(), 4);
+    }
+
+    #[test]
+    fn encode_struct_sizes_match_libva_2_23() {
+        // 16 (4×u32) + 16 (2 ptrs, 8-aligned) + 16 (va_reserved) = 48.
+        assert_eq!(size_of::<VACodedBufferSegment>(), 48, "VACodedBufferSegment");
+        assert_eq!(align_of::<VACodedBufferSegment>(), 8);
+        // 4+4+1 → pad to 12 for va_reserved[4] = 28.
+        assert_eq!(
+            size_of::<VAEncPackedHeaderParameterBuffer>(),
+            28,
+            "VAEncPackedHeaderParameterBuffer"
+        );
+        // 11×u32 + va_reserved[4] = 60.
+        assert_eq!(
+            size_of::<VAEncMiscParameterRateControl>(),
+            60,
+            "VAEncMiscParameterRateControl"
+        );
+        assert_eq!(size_of::<VAEncMiscParameterFrameRate>(), 24, "VAEncMiscParameterFrameRate");
+        // 2 u8 → pad 4; 5×u32 (4..24); 2×u16 (24..28); seq_fields (28..32); 3 u8
+        // (32..35) → pad 36; 2×i32 (36..44); [i32;256] (44..1068); crop flag u8 →
+        // pad 1072; 4×u32 (1072..1088); vui flag u8 → pad 1092; vui_fields
+        // (1092..1096); aspect u8 → pad 1100; 4×u32 (1100..1116); va_reserved[4]
+        // (1116..1132).
+        assert_eq!(
+            size_of::<VAEncSequenceParameterBufferH264>(),
+            1132,
+            "VAEncSequenceParameterBufferH264"
+        );
+        // 36 + 576 = 612 (pics); coded_buf (612..616); 3 u8 (616..619) → pad 620;
+        // frame_num u16 (620..622); 3 u8 + 2 i8 (622..627) → pad 628; pic_fields
+        // (628..632); va_reserved[4] (632..648).
+        assert_eq!(
+            size_of::<VAEncPictureParameterBufferH264>(),
+            648,
+            "VAEncPictureParameterBufferH264"
+        );
+        // 12 (3×u32); 2 u8 + 2×u16 (12..18) → pad 20; i32×3 (20..32); 4 u8
+        // (32..36); RefPicLists 2×1152 (36..2340); 3 u8 (2340..2343) → pad 2344;
+        // [i16;32]×2 (2344..2472); flag u8 → pad 2474; [[i16;2];32]×2 (2474..2730);
+        // flag u8 → pad 2732; ×2 (2732..2860); flag u8 → pad 2862; ×2 (2862..3118);
+        // 5 u8/i8 (3118..3123) → pad 3124; va_reserved[4] (3124..3140).
+        assert_eq!(
+            size_of::<VAEncSliceParameterBufferH264>(),
+            3140,
+            "VAEncSliceParameterBufferH264"
+        );
+        assert_eq!(size_of::<VAPictureHEVC>(), 28, "VAPictureHEVC");
+        // 3 u8 → pad 4; 4×u32 (4..20); 2×u16 (20..24); seq_fields (24..28); 6 u8
+        // (28..34) → pad 36; 4×u32 (36..52); vui flag u8 → pad 56; vui_fields
+        // (56..60); aspect u8 → pad 64; 4×u32 (64..80); u16 + 2 u8 (80..84);
+        // scc_fields (84..88); va_reserved[7] (88..116).
+        assert_eq!(
+            size_of::<VAEncSequenceParameterBufferHEVC>(),
+            116,
+            "VAEncSequenceParameterBufferHEVC"
+        );
+        // 28 + 15×28 = 448 (pics); coded_buf (448..452); 8 u8/i8 (452..460);
+        // [u8;19]+[u8;21] (460..500); 6 u8 (500..506) → pad 508; pic_fields
+        // (508..512); 2 u8 (512..514); scc u16 (514..516); va_reserved[15]
+        // (516..576).
+        assert_eq!(
+            size_of::<VAEncPictureParameterBufferHEVC>(),
+            576,
+            "VAEncPictureParameterBufferHEVC"
+        );
+        // 8 (2×u32); 4 u8 (8..12); lists 2×420 (12..852); 2 (852..854); weight
+        // arrays 15+15+30+30 ×2 = 180 (854..1034); 6 u8/i8 (1034..1040);
+        // slice_fields (1040..1044); 2×u32 (1044..1052); va_reserved[6]
+        // (1052..1076).
+        assert_eq!(
+            size_of::<VAEncSliceParameterBufferHEVC>(),
+            1076,
+            "VAEncSliceParameterBufferHEVC"
+        );
+        // 10×u32 + [u32;4] + va_reserved[4] = 72.
+        assert_eq!(
+            size_of::<VAEncSequenceParameterBufferVP8>(),
+            72,
+            "VAEncSequenceParameterBufferVP8"
+        );
+        // 5×u32 + 2×u32 flags + 12 i8 + 3 u8 (40..43) → pad 44; va_reserved[4]
+        // (44..60).
+        assert_eq!(
+            size_of::<VAEncPictureParameterBufferVP8>(),
+            60,
+            "VAEncPictureParameterBufferVP8"
+        );
+        // [u16;4] (8) + [i16;5] (8..18) → pad 20; va_reserved[4] (20..36).
+        assert_eq!(size_of::<VAQMatrixBufferVP8>(), 36, "VAQMatrixBufferVP8");
     }
 }

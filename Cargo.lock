@@ -626,8 +626,6 @@ dependencies = [
 [[package]]
 name = "oxideav-vp8"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "043a9d81b6c0cb1d7abb3653c53a8463063637836ed469f260bb4cc60f7ab917"
 
 [[package]]
 name = "oxideav-vp9"
@@ -959,8 +957,13 @@ dependencies = [
 name = "sc-vaapi"
 version = "0.1.0"
 dependencies = [
+ "sc-h264",
+ "sc-h265",
  "sc-mkv",
+ "sc-vp8",
  "streamcraft-core",
+ "streamcraft-elements",
+ "streamcraft-video",
 ]
 
 [[package]]

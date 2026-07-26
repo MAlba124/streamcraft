@@ -47,7 +47,7 @@ fn main() {
         }
     }
 
-    println!("\nstreamcraft encode families (capability only — no encoder element yet):");
+    println!("\nstreamcraft encode families:");
     if caps.encode_families.is_empty() {
         println!("  (none)");
     } else {
@@ -62,7 +62,7 @@ fn main() {
     println!("\nregistered elements:");
     let names = registry.names();
     if names.is_empty() {
-        println!("  (none registered — no supported decode family)");
+        println!("  (none registered — no supported decode/encode family)");
     } else {
         for n in names {
             println!("  {n}");

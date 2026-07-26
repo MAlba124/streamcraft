@@ -5,6 +5,7 @@ exclude = [
     # vendor/oxideav-h264/STREAMCRAFT-PATCHES.md); wired via [patch.crates-io].
     "vendor/oxideav-h264",
     "vendor/oxideav-aac",
+    "vendor/oxideav-vp8",
 ]
 members = [
     "core",
@@ -62,3 +63,8 @@ oxideav-h264 = { path = "vendor/oxideav-h264" }
 # per term (~40% of a playback process's CPU; audio couldn't hold realtime).
 # Vendored with a Chebyshev-recurrence patch (STREAMCRAFT-PATCHES.md).
 oxideav-aac = { path = "vendor/oxideav-aac" }
+# Upstream 0.2.6's bool decoder errors instead of feeding the implicit zero
+# bytes real encoders' partition tails rely on (libvpx bool_decoder_fill
+# semantics) — ~30% of Intel-iHD-encoded frames failed at the last macroblock.
+# Vendored with a bounded virtual-zero-padding patch (STREAMCRAFT-PATCHES.md).
+oxideav-vp8 = { path = "vendor/oxideav-vp8" }

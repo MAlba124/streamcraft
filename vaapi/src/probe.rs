@@ -111,6 +111,7 @@ fn family_of(profile: ffi::VAProfile) -> Option<&'static str> {
             Some("h264/annexb")
         }
         ffi::VAProfileHEVCMain | ffi::VAProfileHEVCMain10 => Some("h265/annexb"),
+        ffi::VAProfileVP8Version0_3 => Some("vp8"),
         ffi::VAProfileVP9Profile0 | ffi::VAProfileVP9Profile2 => Some("vp9"),
         ffi::VAProfileAV1Profile0 => Some("av1"),
         _ => None,
@@ -123,6 +124,7 @@ fn profile_name(profile: ffi::VAProfile) -> &'static str {
         ffi::VAProfileH264ConstrainedBaseline => "H264ConstrainedBaseline",
         ffi::VAProfileH264Main => "H264Main",
         ffi::VAProfileH264High => "H264High",
+        ffi::VAProfileVP8Version0_3 => "VP8Version0_3",
         ffi::VAProfileHEVCMain => "HEVCMain",
         ffi::VAProfileHEVCMain10 => "HEVCMain10",
         ffi::VAProfileVP9Profile0 => "VP9Profile0",
