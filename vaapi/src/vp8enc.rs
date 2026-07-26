@@ -84,13 +84,18 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
-static PROPS: [PropDesc; 3] = [
+static PROPS: [PropDesc; 5] = [
     // VP8 quantizer index (0..127, RFC 6386 §9.6); used when bitrate == 0.
     PropDesc { name: "qp", allowed: Constraint::Any, live: false },
-    // Target bitrate in kbit/s; 0 (default) = constant quantizer.
-    PropDesc { name: "bitrate", allowed: Constraint::Any, live: false },
+    // Target bitrate in kbit/s; 0 (default) = constant quantizer. **Live**
+    // within a rate-controlled session (see vaapih264enc); mode is fixed at build.
+    PropDesc { name: "bitrate", allowed: Constraint::Any, live: true },
     // Keyframe period in frames.
     PropDesc { name: "gop", allowed: Constraint::Any, live: false },
+    // **Live trigger**: any nonzero write forces the next frame to be a keyframe.
+    PropDesc { name: "force-keyframe", allowed: Constraint::Any, live: true },
+    // HRD decoder-buffer size in ms at the current bitrate (0 = driver default).
+    PropDesc { name: "hrd", allowed: Constraint::Any, live: true },
 ];
 
 static DESC: ElementDesc = ElementDesc {
@@ -135,6 +140,12 @@ pub struct VaapiVp8Enc {
     qindex: u8,
     bitrate_kbps: u32,
     gop_len: u32,
+    /// HRD buffer depth in ms (0 = no HRD misc buffer sent).
+    hrd_ms: u32,
+    /// A live bitrate/hrd change arrived: resubmit RC/HRD misc with the next frame.
+    rc_dirty: bool,
+    /// Warned once about a live bitrate write into a constant-quantizer session.
+    warned_rc_mode: bool,
 
     in_fmt: Option<InFormat>,
     /// The link fixated the `bytes` escape — announce bare `bytes`.
@@ -163,6 +174,9 @@ impl VaapiVp8Enc {
             qindex: 40,
             bitrate_kbps: 0,
             gop_len: 60,
+            hrd_ms: 0,
+            rc_dirty: false,
+            warned_rc_mode: false,
             in_fmt: None,
             bytes_out: false,
             announced: false,
@@ -187,6 +201,13 @@ impl VaapiVp8Enc {
     /// overrides.
     pub fn with_bitrate(mut self, kbps: u32) -> Self {
         self.bitrate_kbps = kbps;
+        self
+    }
+
+    /// HRD decoder-buffer depth in milliseconds at the target bitrate (0 = off).
+    /// The `hrd` prop overrides.
+    pub fn with_hrd_ms(mut self, ms: u32) -> Self {
+        self.hrd_ms = ms.min(10_000);
         self
     }
 
@@ -292,7 +313,8 @@ impl VaapiVp8Enc {
                 return Ok(());
             };
             let is_kf = s.gop_pos == 0;
-            encode_one(display, s, fmt, self.qindex, self.bitrate_kbps, self.gop_len, is_kf, data)
+            let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms };
+            encode_one(display, s, fmt, self.qindex, self.bitrate_kbps, self.gop_len, is_kf, rc, data)
                 .map(|bytes| (bytes, is_kf))
         };
         let (bytes, is_kf) = match result {
@@ -302,6 +324,7 @@ impl VaapiVp8Enc {
                 return Ok(());
             }
         };
+        self.rc_dirty = false; // the RC/HRD update rode this frame's submission
 
         if !self.announced {
             if self.bytes_out {
@@ -331,6 +354,13 @@ impl VaapiVp8Enc {
     }
 }
 
+/// A pending rate-control reconfiguration (see `vaapih264enc`'s twin).
+#[derive(Clone, Copy)]
+struct RcUpdate {
+    dirty: bool,
+    hrd_ms: u32,
+}
+
 /// Upload + submit + sync + drain one VP8 frame; the coded-buffer bytes are the
 /// complete frame (the driver writes all VP8 headers).
 #[allow(clippy::too_many_arguments)]
@@ -342,6 +372,7 @@ fn encode_one(
     bitrate_kbps: u32,
     gop_len: u32,
     is_kf: bool,
+    rc: RcUpdate,
     data: &[u8],
 ) -> va::VaResult<Vec<u8>> {
     s.engine.upload(display, data, fmt.pixfmt)?;
@@ -371,17 +402,19 @@ fn encode_one(
         let b = VaBuffer::new_struct(display, ctxva, ffi::VAEncSequenceParameterBufferType, &seq)?;
         ids.push(b.id());
         hold.push(b);
-        if bitrate_kbps > 0 {
-            for payload in [rc_misc_bytes(bitrate_kbps), framerate_misc_bytes(fmt.fps)] {
-                let b = VaBuffer::new_typed_bytes(
-                    display,
-                    ctxva,
-                    ffi::VAEncMiscParameterBufferType,
-                    &payload,
-                )?;
-                ids.push(b.id());
-                hold.push(b);
-            }
+    }
+
+    // RC/HRD misc buffers ride every keyframe and any frame carrying a live
+    // update (VA accepts misc parameters on any picture).
+    if bitrate_kbps > 0 && (is_kf || rc.dirty) {
+        let mut payloads = vec![rc_misc_bytes(bitrate_kbps), framerate_misc_bytes(fmt.fps)];
+        if rc.hrd_ms > 0 {
+            payloads.push(hrd_misc_bytes(bitrate_kbps, rc.hrd_ms));
+        }
+        for payload in payloads {
+            let b = VaBuffer::new_typed_bytes(display, ctxva, ffi::VAEncMiscParameterBufferType, &payload)?;
+            ids.push(b.id());
+            hold.push(b);
         }
     }
 
@@ -500,6 +533,19 @@ fn framerate_misc_bytes(fps: (u32, u32)) -> Vec<u8> {
     misc_bytes(ffi::VAEncMiscParameterTypeFrameRate, &fr)
 }
 
+/// HRD buffer model sized as `hrd_ms` milliseconds at the target bitrate,
+/// starting half full (the conventional low-latency initial fullness).
+fn hrd_misc_bytes(bitrate_kbps: u32, hrd_ms: u32) -> Vec<u8> {
+    let bits = (bitrate_kbps as u64 * 1000).saturating_mul(hrd_ms as u64) / 1000;
+    let buffer_size = bits.min(u32::MAX as u64) as u32;
+    let hrd = ffi::VAEncMiscParameterHRD {
+        initial_buffer_fullness: buffer_size / 2,
+        buffer_size,
+        va_reserved: [0; ffi::VA_PADDING_LOW],
+    };
+    misc_bytes(ffi::VAEncMiscParameterTypeHRD, &hrd)
+}
+
 impl Element for VaapiVp8Enc {
     fn desc(&self) -> &'static ElementDesc {
         &DESC
@@ -514,6 +560,9 @@ impl Element for VaapiVp8Enc {
         }
         if let Some(Value::Int(v)) = ctx.prop("gop") {
             self.gop_len = v.clamp(1, 1024) as u32;
+        }
+        if let Some(Value::Int(v)) = ctx.prop("hrd") {
+            self.hrd_ms = v.clamp(0, 10_000) as u32;
         }
         self.bytes_out = ctx
             .negotiated(SRC_PAD)
@@ -571,6 +620,36 @@ impl Element for VaapiVp8Enc {
             Event::FormatChange(f) => {
                 if let Some(fmt) = enc::read_in_format(ctx, f) {
                     self.in_fmt = Some(fmt);
+                }
+            }
+            // Live congestion-control knobs (see vaapih264enc for the rationale).
+            Event::PropChanged { name: "bitrate", value: Value::Int(v) } => {
+                let v = *v;
+                if self.session.is_some() && self.bitrate_kbps == 0 {
+                    if !self.warned_rc_mode {
+                        self.warned_rc_mode = true;
+                        self.warn(
+                            ctx,
+                            "vaapivp8enc: live bitrate change ignored — session is \
+                             constant-quantizer (start with bitrate > 0 for a \
+                             rate-controlled session)"
+                                .into(),
+                        );
+                    }
+                } else if v > 0 {
+                    self.bitrate_kbps = v.clamp(1, 500_000) as u32;
+                    self.rc_dirty = true;
+                } else {
+                    self.warn(ctx, "vaapivp8enc: live bitrate 0 ignored (cannot switch to CQP)".into());
+                }
+            }
+            Event::PropChanged { name: "hrd", value: Value::Int(v) } => {
+                self.hrd_ms = (*v).clamp(0, 10_000) as u32;
+                self.rc_dirty = true;
+            }
+            Event::PropChanged { name: "force-keyframe", value: Value::Int(v) } if *v != 0 => {
+                if let Some(s) = &mut self.session {
+                    s.gop_pos = 0; // next frame is a keyframe (refreshes all refs)
                 }
             }
             Event::FlushStart => {

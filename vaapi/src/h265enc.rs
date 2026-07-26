@@ -100,13 +100,18 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
-static PROPS: [PropDesc; 3] = [
+static PROPS: [PropDesc; 5] = [
     // Constant-QP quantizer (0..51); used when bitrate == 0.
     PropDesc { name: "qp", allowed: Constraint::Any, live: false },
-    // Target bitrate in kbit/s; 0 (default) = CQP mode.
-    PropDesc { name: "bitrate", allowed: Constraint::Any, live: false },
+    // Target bitrate in kbit/s; 0 (default) = CQP mode. **Live** within a
+    // rate-controlled session (see vaapih264enc); mode itself is fixed at build.
+    PropDesc { name: "bitrate", allowed: Constraint::Any, live: true },
     // Keyframe (IDR) period in frames, 1..=256 (MaxPicOrderCntLsb bound).
     PropDesc { name: "gop", allowed: Constraint::Any, live: false },
+    // **Live trigger**: any nonzero write forces the next frame to be an IDR.
+    PropDesc { name: "force-keyframe", allowed: Constraint::Any, live: true },
+    // HRD decoder-buffer size in ms at the current bitrate (0 = driver default).
+    PropDesc { name: "hrd", allowed: Constraint::Any, live: true },
 ];
 
 static DESC: ElementDesc = ElementDesc {
@@ -183,6 +188,12 @@ pub struct VaapiH265Enc {
     qp: u8,
     bitrate_kbps: u32,
     gop_len: u32,
+    /// HRD buffer depth in ms (0 = no HRD misc buffer sent).
+    hrd_ms: u32,
+    /// A live bitrate/hrd change arrived: resubmit RC/HRD misc with the next frame.
+    rc_dirty: bool,
+    /// Warned once about a live bitrate write into a CQP session.
+    warned_rc_mode: bool,
 
     in_fmt: Option<InFormat>,
     hvcc: bool,
@@ -212,6 +223,9 @@ impl VaapiH265Enc {
             qp: 26,
             bitrate_kbps: 0,
             gop_len: 60,
+            hrd_ms: 0,
+            rc_dirty: false,
+            warned_rc_mode: false,
             in_fmt: None,
             hvcc: false,
             bytes_out: false,
@@ -236,6 +250,13 @@ impl VaapiH265Enc {
     /// Target bitrate in kbit/s (0 = CQP). The `bitrate` prop overrides.
     pub fn with_bitrate(mut self, kbps: u32) -> Self {
         self.bitrate_kbps = kbps;
+        self
+    }
+
+    /// HRD decoder-buffer depth in milliseconds at the target bitrate (0 = off).
+    /// The `hrd` prop overrides.
+    pub fn with_hrd_ms(mut self, ms: u32) -> Self {
+        self.hrd_ms = ms.min(10_000);
         self
     }
 
@@ -376,7 +397,8 @@ impl VaapiH265Enc {
                 return Ok(());
             };
             let is_idr = s.gop_pos == 0;
-            encode_one(display, s, fmt, self.qp, self.bitrate_kbps, self.gop_len, is_idr, data)
+            let rc = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms };
+            encode_one(display, s, fmt, self.qp, self.bitrate_kbps, self.gop_len, is_idr, rc, data)
                 .map(|annexb| (annexb, is_idr))
         };
         let (annexb, is_idr) = match result {
@@ -386,6 +408,7 @@ impl VaapiH265Enc {
                 return Ok(());
             }
         };
+        self.rc_dirty = false; // the RC/HRD update rode this frame's submission
 
         if !self.announced {
             if self.bytes_out {
@@ -427,6 +450,13 @@ impl VaapiH265Enc {
     }
 }
 
+/// A pending rate-control reconfiguration (see `vaapih264enc`'s twin).
+#[derive(Clone, Copy)]
+struct RcUpdate {
+    dirty: bool,
+    hrd_ms: u32,
+}
+
 /// Upload + submit + sync + drain one frame → assembled Annex-B access unit.
 #[allow(clippy::too_many_arguments)]
 fn encode_one(
@@ -437,6 +467,7 @@ fn encode_one(
     bitrate_kbps: u32,
     gop_len: u32,
     is_idr: bool,
+    rc: RcUpdate,
     data: &[u8],
 ) -> va::VaResult<Vec<u8>> {
     s.engine.upload(display, data, fmt.pixfmt)?;
@@ -456,18 +487,23 @@ fn encode_one(
         let b = VaBuffer::new_struct(display, ctxva, ffi::VAEncSequenceParameterBufferType, &seq)?;
         ids.push(b.id());
         hold.push(b);
-        if brc {
-            for payload in [rc_misc_bytes(bitrate_kbps), framerate_misc_bytes(fmt.fps)] {
-                let b = VaBuffer::new_typed_bytes(
-                    display,
-                    ctxva,
-                    ffi::VAEncMiscParameterBufferType,
-                    &payload,
-                )?;
-                ids.push(b.id());
-                hold.push(b);
-            }
+    }
+
+    // RC/HRD misc buffers ride every IDR and any frame carrying a live update
+    // (VA accepts misc parameters on any picture; sequence param stays IDR-only).
+    if brc && (is_idr || rc.dirty) {
+        let mut payloads = vec![rc_misc_bytes(bitrate_kbps), framerate_misc_bytes(fmt.fps)];
+        if rc.hrd_ms > 0 {
+            payloads.push(hrd_misc_bytes(bitrate_kbps, rc.hrd_ms));
         }
+        for payload in payloads {
+            let b = VaBuffer::new_typed_bytes(display, ctxva, ffi::VAEncMiscParameterBufferType, &payload)?;
+            ids.push(b.id());
+            hold.push(b);
+        }
+    }
+
+    if is_idr {
         if s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SEQUENCE != 0 {
             // One packed sequence header carrying VPS+SPS+PPS (the ffmpeg/gst
             // layout — the driver inserts the bytes verbatim before the frame).
@@ -738,6 +774,19 @@ fn framerate_misc_bytes(fps: (u32, u32)) -> Vec<u8> {
     misc_bytes(ffi::VAEncMiscParameterTypeFrameRate, &fr)
 }
 
+/// HRD buffer model sized as `hrd_ms` milliseconds at the target bitrate,
+/// starting half full (the conventional low-latency initial fullness).
+fn hrd_misc_bytes(bitrate_kbps: u32, hrd_ms: u32) -> Vec<u8> {
+    let bits = (bitrate_kbps as u64 * 1000).saturating_mul(hrd_ms as u64) / 1000;
+    let buffer_size = bits.min(u32::MAX as u64) as u32;
+    let hrd = ffi::VAEncMiscParameterHRD {
+        initial_buffer_fullness: buffer_size / 2,
+        buffer_size,
+        va_reserved: [0; ffi::VA_PADDING_LOW],
+    };
+    misc_bytes(ffi::VAEncMiscParameterTypeHRD, &hrd)
+}
+
 // --- Bitstream authoring (ITU-T H.265 §7.3) -------------------------------------------
 
 /// The 2-byte H.265 NAL header (§7.3.1.2): type, layer 0, temporal id 0.
@@ -1000,6 +1049,9 @@ impl Element for VaapiH265Enc {
         if let Some(Value::Int(v)) = ctx.prop("gop") {
             self.gop_len = v.clamp(1, 256) as u32;
         }
+        if let Some(Value::Int(v)) = ctx.prop("hrd") {
+            self.hrd_ms = v.clamp(0, 10_000) as u32;
+        }
         let family = ctx
             .negotiated(SRC_PAD)
             .and_then(|f| ctx.family_name(f.family))
@@ -1058,6 +1110,35 @@ impl Element for VaapiH265Enc {
             Event::FormatChange(f) => {
                 if let Some(fmt) = enc::read_in_format(ctx, f) {
                     self.in_fmt = Some(fmt);
+                }
+            }
+            // Live congestion-control knobs (see vaapih264enc for the rationale).
+            Event::PropChanged { name: "bitrate", value: Value::Int(v) } => {
+                let v = *v;
+                if self.session.is_some() && self.bitrate_kbps == 0 {
+                    if !self.warned_rc_mode {
+                        self.warned_rc_mode = true;
+                        self.warn(
+                            ctx,
+                            "vaapih265enc: live bitrate change ignored — session is CQP \
+                             (start with bitrate > 0 for a rate-controlled session)"
+                                .into(),
+                        );
+                    }
+                } else if v > 0 {
+                    self.bitrate_kbps = v.clamp(1, 500_000) as u32;
+                    self.rc_dirty = true;
+                } else {
+                    self.warn(ctx, "vaapih265enc: live bitrate 0 ignored (cannot switch to CQP)".into());
+                }
+            }
+            Event::PropChanged { name: "hrd", value: Value::Int(v) } => {
+                self.hrd_ms = (*v).clamp(0, 10_000) as u32;
+                self.rc_dirty = true;
+            }
+            Event::PropChanged { name: "force-keyframe", value: Value::Int(v) } if *v != 0 => {
+                if let Some(s) = &mut self.session {
+                    s.gop_pos = 0; // next frame is an IDR (POC resets with it)
                 }
             }
             Event::FlushStart => {

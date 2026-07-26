@@ -393,6 +393,18 @@ pub struct VAEncMiscParameterFrameRate {
     pub va_reserved: [u32; VA_PADDING_LOW],
 }
 
+/// `VAEncMiscParameterHRD` (va.h:2633) — the hypothetical-reference-decoder
+/// buffer model: `buffer_size` bits of decoder buffer, starting at
+/// `initial_buffer_fullness`. Bounding this bounds worst-case frame burst (and
+/// so end-to-end latency) under bitrate control.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAEncMiscParameterHRD {
+    pub initial_buffer_fullness: u32,
+    pub buffer_size: u32,
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
 /// `VAEncSequenceParameterBufferH264` (va_enc_h264.h:187). `seq_fields`/`vui_fields`
 /// are the u32 union arms; see the header for the bit order (packed by the element).
 #[repr(C)]
@@ -865,6 +877,7 @@ mod layout {
             "VAEncMiscParameterRateControl"
         );
         assert_eq!(size_of::<VAEncMiscParameterFrameRate>(), 24, "VAEncMiscParameterFrameRate");
+        assert_eq!(size_of::<VAEncMiscParameterHRD>(), 24, "VAEncMiscParameterHRD");
         // 2 u8 → pad 4; 5×u32 (4..24); 2×u16 (24..28); seq_fields (28..32); 3 u8
         // (32..35) → pad 36; 2×i32 (36..44); [i32;256] (44..1068); crop flag u8 →
         // pad 1072; 4×u32 (1072..1088); vui flag u8 → pad 1092; vui_fields

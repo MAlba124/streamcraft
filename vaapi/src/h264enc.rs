@@ -101,15 +101,24 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
-static PROPS: [PropDesc; 4] = [
+static PROPS: [PropDesc; 6] = [
     // Constant-QP quantizer (0..51, H.264 §7.4.2.2 range); used when bitrate == 0.
     PropDesc { name: "qp", allowed: Constraint::Any, live: false },
-    // Target bitrate in kbit/s; 0 (default) = CQP mode.
-    PropDesc { name: "bitrate", allowed: Constraint::Any, live: false },
+    // Target bitrate in kbit/s; 0 (default) = CQP mode. **Live** within a
+    // bitrate-controlled session: the new target reaches the driver's rate
+    // controller with the next frame (the congestion-feedback path). The RC
+    // *mode* is fixed at session build — a live change cannot flip CQP↔VBR.
+    PropDesc { name: "bitrate", allowed: Constraint::Any, live: true },
     // Keyframe (IDR) period in frames, 1..=256.
     PropDesc { name: "gop", allowed: Constraint::Any, live: false },
     // Prefer the low-power (VDEnc) entrypoint when available (0/1).
     PropDesc { name: "low-power", allowed: Constraint::Any, live: false },
+    // **Live trigger**: any nonzero write forces the next frame to open a new
+    // GOP (IDR) — packet-loss recovery without waiting out the GOP.
+    PropDesc { name: "force-keyframe", allowed: Constraint::Any, live: true },
+    // HRD decoder-buffer size in milliseconds at the current bitrate (0 = driver
+    // default). Bounds worst-case frame burst, so end-to-end latency. Live.
+    PropDesc { name: "hrd", allowed: Constraint::Any, live: true },
 ];
 
 static DESC: ElementDesc = ElementDesc {
@@ -197,11 +206,19 @@ pub struct VaapiH264Enc {
     display: Option<Display>,
     session: Option<Session>,
 
-    // Props, read at start().
+    // Props, read at start(); `bitrate`/`hrd` also update live via PropChanged.
     qp: u8,
     bitrate_kbps: u32,
     gop_len: u32,
     low_power: bool,
+    /// HRD buffer depth in ms (0 = no HRD misc buffer sent).
+    hrd_ms: u32,
+    /// A live bitrate/hrd change arrived: resubmit the RC/HRD misc buffers with
+    /// the next frame (cleared after a successful submit).
+    rc_dirty: bool,
+    /// Warned once about a live bitrate write into a CQP session (mode is fixed
+    /// at session build; the write is ignored).
+    warned_rc_mode: bool,
 
     in_fmt: Option<InFormat>,
     /// Output framing, from the family the link fixated: Annex-B (also the
@@ -237,6 +254,9 @@ impl VaapiH264Enc {
             bitrate_kbps: 0,
             gop_len: 60,
             low_power: false,
+            hrd_ms: 0,
+            rc_dirty: false,
+            warned_rc_mode: false,
             in_fmt: None,
             avcc: false,
             bytes_out: false,
@@ -261,6 +281,13 @@ impl VaapiH264Enc {
     /// Target bitrate in kbit/s (0 = CQP). The `bitrate` prop overrides.
     pub fn with_bitrate(mut self, kbps: u32) -> Self {
         self.bitrate_kbps = kbps;
+        self
+    }
+
+    /// HRD decoder-buffer depth in milliseconds at the target bitrate (0 = off).
+    /// The `hrd` prop overrides.
+    pub fn with_hrd_ms(mut self, ms: u32) -> Self {
+        self.hrd_ms = ms.min(10_000);
         self
     }
 
@@ -426,7 +453,8 @@ impl VaapiH264Enc {
             if is_idr {
                 s.frame_num = 0;
             }
-            encode_one(display, s, fmt, self.qp, self.bitrate_kbps, self.gop_len, is_idr, data)
+            let cfg = RcUpdate { dirty: self.rc_dirty, hrd_ms: self.hrd_ms };
+            encode_one(display, s, fmt, self.qp, self.bitrate_kbps, self.gop_len, is_idr, cfg, data)
                 .map(|annexb| (annexb, is_idr))
         };
         let (annexb, is_idr) = match result {
@@ -436,6 +464,7 @@ impl VaapiH264Enc {
                 return Ok(());
             }
         };
+        self.rc_dirty = false; // the RC/HRD update rode this frame's submission
 
         // --- Announce + stage output --------------------------------------------
         if !self.announced {
@@ -484,6 +513,16 @@ impl VaapiH264Enc {
     }
 }
 
+/// A pending rate-control reconfiguration riding into `encode_one`.
+#[derive(Clone, Copy)]
+struct RcUpdate {
+    /// A live bitrate/HRD change is pending — resubmit the misc buffers even on
+    /// a non-IDR frame (VA accepts misc parameters on any picture).
+    dirty: bool,
+    /// HRD buffer depth in ms (0 = none).
+    hrd_ms: u32,
+}
+
 /// Upload + submit + sync + drain for one frame, returning the assembled Annex-B
 /// access unit. Free function so the caller's `self` borrows stay disjoint.
 #[allow(clippy::too_many_arguments)]
@@ -495,6 +534,7 @@ fn encode_one(
     bitrate_kbps: u32,
     gop_len: u32,
     is_idr: bool,
+    rc: RcUpdate,
     data: &[u8],
 ) -> va::VaResult<Vec<u8>> {
     s.engine.upload(display, data, fmt.pixfmt)?;
@@ -514,18 +554,24 @@ fn encode_one(
         let b = VaBuffer::new_struct(display, ctxva, ffi::VAEncSequenceParameterBufferType, &seq)?;
         ids.push(b.id());
         hold.push(b);
-        if bitrate_kbps > 0 {
-            for payload in [rc_misc_bytes(bitrate_kbps), framerate_misc_bytes(fmt.fps)] {
-                let b = VaBuffer::new_typed_bytes(
-                    display,
-                    ctxva,
-                    ffi::VAEncMiscParameterBufferType,
-                    &payload,
-                )?;
-                ids.push(b.id());
-                hold.push(b);
-            }
+    }
+
+    // RC/HRD misc buffers ride every IDR and any frame carrying a live update —
+    // the driver's rate controller retargets from the very next picture (VA
+    // accepts misc parameters on any picture; sequence param stays IDR-only).
+    if bitrate_kbps > 0 && (is_idr || rc.dirty) {
+        let mut payloads = vec![rc_misc_bytes(bitrate_kbps), framerate_misc_bytes(fmt.fps)];
+        if rc.hrd_ms > 0 {
+            payloads.push(hrd_misc_bytes(bitrate_kbps, rc.hrd_ms));
         }
+        for payload in payloads {
+            let b = VaBuffer::new_typed_bytes(display, ctxva, ffi::VAEncMiscParameterBufferType, &payload)?;
+            ids.push(b.id());
+            hold.push(b);
+        }
+    }
+
+    if is_idr {
         if s.packed_mask & ffi::VA_ENC_PACKED_HEADER_SEQUENCE != 0 {
             let (hdr, data) = packed_header(ffi::VAEncPackedHeaderSequence, &s.sps_nal, true);
             let b =
@@ -614,7 +660,10 @@ fn seq_param(
         | 1 << 2  // frame_mbs_only_flag
         | 1 << 5  // direct_8x8_inference_flag
         | 4 << 6  // log2_max_frame_num_minus4 = 4 (MaxFrameNum 256)
-        | 2 << 10; // pic_order_cnt_type = 2
+        // pic_order_cnt_type = 0 (bits 10-11), log2_max_poc_lsb_minus4 = 4
+        // (bits 12-15) — matching the authored SPS (see write_sps: type 0 is
+        // the ecosystem-safe POC path).
+        | 4 << 12;
     let crop_r = (engine.coded_w - engine.width) / 2;
     let crop_b = (engine.coded_h - engine.height) / 2;
     ffi::VAEncSequenceParameterBufferH264 {
@@ -806,6 +855,19 @@ fn framerate_misc_bytes(fps: (u32, u32)) -> Vec<u8> {
     misc_bytes(ffi::VAEncMiscParameterTypeFrameRate, &fr)
 }
 
+/// HRD buffer model sized as `hrd_ms` milliseconds at the target bitrate,
+/// starting half full — the conventional low-latency initial fullness.
+fn hrd_misc_bytes(bitrate_kbps: u32, hrd_ms: u32) -> Vec<u8> {
+    let bits = (bitrate_kbps as u64 * 1000).saturating_mul(hrd_ms as u64) / 1000;
+    let buffer_size = bits.min(u32::MAX as u64) as u32;
+    let hrd = ffi::VAEncMiscParameterHRD {
+        initial_buffer_fullness: buffer_size / 2,
+        buffer_size,
+        va_reserved: [0; ffi::VA_PADDING_LOW],
+    };
+    misc_bytes(ffi::VAEncMiscParameterTypeHRD, &hrd)
+}
+
 // --- Bitstream authoring (ITU-T H.264 §7.3) -------------------------------------------
 
 /// SPS as a complete Annex-B NAL (§7.3.2.1.1; High profile, 4:2:0, 8-bit,
@@ -828,7 +890,12 @@ fn write_sps(engine: &EncEngine, fmt: InFormat, _qp: u8, level: u8) -> Vec<u8> {
     w.flag(false); // qpprime_y_zero_transform_bypass_flag
     w.flag(false); // seq_scaling_matrix_present_flag
     w.ue(4); // log2_max_frame_num_minus4 → MaxFrameNum = 256
-    w.ue(2); // pic_order_cnt_type = 2 (§8.2.1.3: POC from frame_num)
+    // POC type 0 with an 8-bit lsb (§8.2.1.1) — type 2 would be the compact
+    // choice for a no-reorder stream, but it is the ecosystem's least-travelled
+    // path (x264 always emits type 0) and real decoders mishandle it; one byte
+    // per slice buys the battle-hardened path.
+    w.ue(0); // pic_order_cnt_type
+    w.ue(4); // log2_max_pic_order_cnt_lsb_minus4 → MaxPicOrderCntLsb = 256
     w.ue(1); // max_num_ref_frames
     w.flag(false); // gaps_in_frame_num_value_allowed_flag
     w.ue(mbs_w - 1); // pic_width_in_mbs_minus1
@@ -843,24 +910,36 @@ fn write_sps(engine: &EncEngine, fmt: InFormat, _qp: u8, level: u8) -> Vec<u8> {
         w.ue(0); // frame_crop_top_offset
         w.ue(crop_b); // frame_crop_bottom_offset (already in CropUnitY)
     }
-    // VUI with timing when the upstream announced an fps (players and muxers can
-    // then derive a frame rate without container hints).
+    // VUI is always present: timing info when the upstream announced an fps, and
+    // — load-bearing — `bitstream_restriction` declaring **zero reorder depth**
+    // (§E.2.1: max_num_reorder_frames = 0, max_dec_frame_buffering = 1). This
+    // stream is IDR+P in decode order; without the declaration a conformant
+    // decoder must assume worst-case DPB reordering and buffer many frames
+    // before outputting — added latency everywhere, and oxideav-h264 in
+    // particular holds pictures until its inferred bound.
+    w.flag(true); // vui_parameters_present_flag
+    w.flag(false); // aspect_ratio_info_present_flag
+    w.flag(false); // overscan_info_present_flag
+    w.flag(false); // video_signal_type_present_flag
+    w.flag(false); // chroma_loc_info_present_flag
     let have_fps = fmt.fps.0 > 0;
-    w.flag(have_fps); // vui_parameters_present_flag
+    w.flag(have_fps); // timing_info_present_flag
     if have_fps {
-        w.flag(false); // aspect_ratio_info_present_flag
-        w.flag(false); // overscan_info_present_flag
-        w.flag(false); // video_signal_type_present_flag
-        w.flag(false); // chroma_loc_info_present_flag
-        w.flag(true); // timing_info_present_flag
         w.u(fmt.fps.1, 32); // num_units_in_tick
         w.u(fmt.fps.0 * 2, 32); // time_scale (§E.2.1: two ticks per frame)
         w.flag(true); // fixed_frame_rate_flag
-        w.flag(false); // nal_hrd_parameters_present_flag
-        w.flag(false); // vcl_hrd_parameters_present_flag
-        w.flag(false); // pic_struct_present_flag
-        w.flag(false); // bitstream_restriction_flag
     }
+    w.flag(false); // nal_hrd_parameters_present_flag
+    w.flag(false); // vcl_hrd_parameters_present_flag
+    w.flag(false); // pic_struct_present_flag
+    w.flag(true); // bitstream_restriction_flag
+    w.flag(true); // motion_vectors_over_pic_boundaries_flag
+    w.ue(0); // max_bytes_per_pic_denom (unlimited)
+    w.ue(0); // max_bits_per_mb_denom (unlimited)
+    w.ue(15); // log2_max_mv_length_horizontal
+    w.ue(15); // log2_max_mv_length_vertical
+    w.ue(0); // max_num_reorder_frames — decode order == output order
+    w.ue(1); // max_dec_frame_buffering (≥ max_num_ref_frames)
     w.rbsp_trailing_bits();
     // NAL header: forbidden_zero=0, nal_ref_idc=3, type=7 (SPS) → 0x67.
     annexb_nal(&[0x67], &w.into_bytes())
@@ -908,7 +987,10 @@ fn write_slice_header(is_idr: bool, frame_num: u32, idr_pic_id: u16) -> (Vec<u8>
     if is_idr {
         w.ue(idr_pic_id as u32); // idr_pic_id
     }
-    // POC type 2: no POC syntax. No ref-pic-list reordering:
+    // POC type 0 (§7.3.3): pic_order_cnt_lsb, 8 bits (log2 max = 8). POC counts
+    // 2 per frame in decode order; lsb wrapping is the decoder's §8.2.1.1 job.
+    w.u((frame_num * 2) & 0xFF, 8);
+    // No ref-pic-list reordering:
     if !is_idr {
         w.flag(false); // num_ref_idx_active_override_flag
         w.flag(false); // ref_pic_list_modification_flag_l0 (§7.3.3.1)
@@ -983,6 +1065,9 @@ impl Element for VaapiH264Enc {
         if let Some(Value::Int(v)) = ctx.prop("low-power") {
             self.low_power = v != 0;
         }
+        if let Some(Value::Int(v)) = ctx.prop("hrd") {
+            self.hrd_ms = v.clamp(0, 10_000) as u32;
+        }
         // Which output family did the link fixate? (mkvmuxn only takes avcc; the
         // decoders only annexb; byte sinks the escape.) Default annexb.
         let family = ctx
@@ -1047,6 +1132,41 @@ impl Element for VaapiH264Enc {
             Event::FormatChange(f) => {
                 if let Some(fmt) = enc::read_in_format(ctx, f) {
                     self.in_fmt = Some(fmt);
+                }
+            }
+            // Live knobs (delivered at batch boundaries): bitrate retarget, HRD
+            // resize, forced keyframe — the congestion-control trio.
+            Event::PropChanged { name: "bitrate", value: Value::Int(v) } => {
+                let v = *v;
+                if self.session.is_some() && self.bitrate_kbps == 0 {
+                    // The session was built as CQP; the RC mode is a config-time
+                    // attribute — a live write cannot flip it.
+                    if !self.warned_rc_mode {
+                        self.warned_rc_mode = true;
+                        self.warn(
+                            ctx,
+                            "vaapih264enc: live bitrate change ignored — session is CQP \
+                             (start with bitrate > 0 for a rate-controlled session)"
+                                .into(),
+                        );
+                    }
+                } else if v > 0 {
+                    self.bitrate_kbps = v.clamp(1, 500_000) as u32;
+                    self.rc_dirty = true;
+                } else {
+                    self.warn(ctx, "vaapih264enc: live bitrate 0 ignored (cannot switch to CQP)".into());
+                }
+            }
+            Event::PropChanged { name: "hrd", value: Value::Int(v) } => {
+                self.hrd_ms = (*v).clamp(0, 10_000) as u32;
+                self.rc_dirty = true;
+            }
+            Event::PropChanged { name: "force-keyframe", value: Value::Int(v) } if *v != 0 => {
+                if let Some(s) = &mut self.session {
+                    s.gop_pos = 0; // next frame opens a new GOP (IDR)
+                    // §7.4.3: consecutive IDRs must differ in idr_pic_id; the
+                    // GOP-wrap bump won't have run for a forced IDR.
+                    s.idr_pic_id = s.idr_pic_id.wrapping_add(1) & 0xF;
                 }
             }
             Event::FlushStart => {
