@@ -489,6 +489,49 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > EncSlice/EncSliceLP (this box: h264+h265), `Config::new_encode` + hw tests
 > prove an encode context allocates — `vaapih264enc` element is the follow-up.
 
+> **Update — session 5n (2026-07-26): the NVR milestone app + three core
+> liveness bugs it flushed out.** The chosen stress-test application (breadth
+> over depth: live clocks, fan-out, fan-in, segmented muxing, long-run memory)
+> is LIVE end-to-end, pure-sc: `scraft-nvr` (new `nvr/` crate) records N RTSP
+> cameras into rotated **self-contained MKV segments** (Cues + SeekHead + a new
+> `MatroskaWriter::reserve_duration`/`duration_patch` back-patch) while a
+> **mosaic wall** (fan-in `InputPolicy::Any` latest-frame compositor,
+> nearest-neighbour per-plane, cites Wolberg §5.1) renders all cams through one
+> `sdl3videosink`. Per cam: `udpsrc ! rtpsession ! rtph264depay ! tee`
+> (`elements::flow::Tee` — new, wildcard-offer, refcount fan-out) `!
+> mkvsegmentsink` + `! h264dec ! mosaic.sink_i`. `mkvsegmentsink` is
+> **reactor-native** (drain-then-swap rotation; one file per element;
+> `stop()` teardown finalize via dup'ed fd is the one sanctioned blocking
+> exception — now lint-enforced: root `clippy.toml` disallowed-methods bans
+> blocking IO in elements). Camera sim: `rtsp_serve --loop` (`CamSrc`: reactor
+> reads, pts += loops×duration, in-band SPS/PPS per IDR).
+> **Numbers (this box, 4×640x360@25fps sw-decode + record + wall, 120 s):**
+> ~2.35 cores, RSS flat ~160 MB, **12000/12000 frames** recorded (zero drops
+> at every element), 48/48 segments pass ffprobe + headless mpv + `--start=95%`
+> tail, per-cam durations sum to **exactly 120.000 s** (no gaps, stop-path
+> finals included). **Core bugs found & fixed:** (1) *production-is-progress* —
+> the inline hand-off never set `progressed`, so a source feeding an inline
+> buffering tail parked every pass and crawled one buffer per 10 ms tick
+> (mp4 ragged_chunking: 4+ min "hang" → 0.07 s); (2) *runtime registration* —
+> `take_registration → set_file` was start-only, mid-stream registrations
+> (segment rotation) wrote into `Err(NotFound)`; (3) *settle-IO-before-stop* —
+> submissions stranded in an outbox by event-path finalize (EOS during stop)
+> left a 26 KB hole of zeros mid-file; run_group now flushes outboxes and runs
+> the reactor to idle before `stop()`. **Sender-side pool lesson**: the paced
+> `udpsink` holding 1.4 KB packets that each pinned a 4 MiB shared slot
+> deadlocked `camsrc ! pay ! udpsink` (racy 1–25 packets then all groups park);
+> fix is the established per-element pool (`set_element_pool(pay, 2048, 256)`)
+> — mpv/ffmpeg "truncated keyframe" symptoms were THIS, not receiver buffers.
+> **(4) — closed same session:** *error cascades stop* — a failed group
+> (element `Err` or panic, via `catch_unwind` in the group-thread closure) now
+> sets the shared stop flag + `bump_idle` before its thread dies, so siblings
+> with no data path to the failure (independent cameras) unwind within a tick
+> and `run()` surfaces the error instead of joining a healthy endless group
+> forever; Ok/EOS exits deliberately do not cascade. Regression test
+> `elements/tests/error_stop.rs` (negative-checked: disabling the cascade
+> hangs it into its 30 s watchdog). Workspace: **132 result blocks green,
+> rc=0**.
+
 > **Update — session 4s (2026-07-25/26): RTP/RTSP network streaming + the
 > scheduler finally parks.** The network milestone, receive-first, three
 > parallel agents + inline elements. **sc-rtp** (RFCs 3550/3551/6184/7587 in
