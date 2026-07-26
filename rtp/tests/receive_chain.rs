@@ -5,6 +5,10 @@
 //! normalized to 4-byte start codes, since RFC 6184 transports NAL units, not
 //! start-code framing.
 
+// Test-side fixture IO, sanctioned: files load on the test thread, not in an
+// element (clippy.toml: disallowed-methods).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

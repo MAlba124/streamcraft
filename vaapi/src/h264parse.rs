@@ -55,16 +55,13 @@ pub fn split_nals(au: &[u8]) -> Vec<Nal<'_>> {
         } else {
             au.len()
         };
-        while end > s && au[end - 1] == 0 {
-            // Only trim the zeros that belong to the *next* start code (at most the
-            // trailing run); a slice can legally end in 0x00 too, but for framing
-            // into VA this is harmless (the driver reads slice_data_size, and the
-            // trailing zero is cabac_zero_word / rbsp trailing — safe to keep or
-            // drop). Trim conservatively: at most 1 (the 4-byte start-code lead-in).
-            if k + 1 < starts.len() {
-                end -= 1;
-            }
-            break;
+        // Only trim the zero that belongs to the *next* start code; a slice can
+        // legally end in 0x00 too, but for framing into VA this is harmless (the
+        // driver reads slice_data_size, and the trailing zero is cabac_zero_word /
+        // rbsp trailing — safe to keep or drop). Trim conservatively: at most 1
+        // (the 4-byte start-code lead-in), never on the final NAL.
+        if end > s && au[end - 1] == 0 && k + 1 < starts.len() {
+            end -= 1;
         }
         if end <= s {
             continue;

@@ -530,6 +530,10 @@ impl Default for SyncReactor {
     }
 }
 
+// The reactor IS the sanctioned implementation of the IO abstraction — the
+// blocking calls the workspace lint bans in *elements* bottom out here, on the
+// reactor's own thread-facing edge (clippy.toml: disallowed-methods).
+#[allow(clippy::disallowed_methods)]
 impl Reactor for SyncReactor {
     fn set_file(&mut self, element: ElementId, file: File) {
         // Registered files stream (`man 2 posix_fadvise`): double the readahead

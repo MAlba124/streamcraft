@@ -1,0 +1,25 @@
+# Elements never block on data (spec: IO — built for the io_uring era): the
+# reactor (`ctx.io()` → submit_read/submit_recv/submit_write + completions) is
+# the only sanctioned data path inside `Element` code. Blocking calls hold a
+# whole scheduler group hostage and hide backpressure from the pool/credit
+# accounting, so the methods below are lint-banned workspace-wide.
+#
+# App-side setup code (a `main()` probing a header before any pipeline exists,
+# tests writing fixtures, a `start()` opening a file to *register* it) is the
+# legitimate exception: annotate the item with
+# `#[allow(clippy::disallowed_methods)]` and a one-line justification.
+disallowed-methods = [
+    { path = "std::io::Read::read", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::io::Read::read_exact", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::io::Read::read_to_end", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::io::Read::read_to_string", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::io::Write::write", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::io::Write::write_all", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::os::unix::fs::FileExt::read_at", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::os::unix::fs::FileExt::read_exact_at", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::os::unix::fs::FileExt::write_at", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::os::unix::fs::FileExt::write_all_at", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::fs::read", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::fs::write", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+    { path = "std::fs::read_to_string", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+]

@@ -46,6 +46,11 @@
 //! [`teardown`]: RtspClient::teardown
 //! [`keepalive`]: RtspClient::keepalive
 
+// Protocol-layer blocking sockets, sanctioned: the RTSP control connection
+// runs on app/controller threads (spec: no-bins), never inside an element's
+// scheduler group — the workspace element-IO lint does not apply here.
+#![allow(clippy::disallowed_methods)]
+
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::TcpStream;

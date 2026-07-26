@@ -50,6 +50,11 @@
 //! session expiry and [`RtspServer::shutdown`] are noticed without any
 //! signaling machinery.
 
+// Protocol-layer blocking sockets, sanctioned: the RTSP control connection
+// runs on app/controller threads (spec: no-bins), never inside an element's
+// scheduler group — the workspace element-IO lint does not apply here.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

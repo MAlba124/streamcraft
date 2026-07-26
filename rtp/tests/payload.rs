@@ -62,6 +62,10 @@
 //! packet — RFC 3551 §4.1 wants it zero without silence suppression — so the
 //! Opus test deliberately does not assert marker semantics.
 
+// Test-side fixture IO, sanctioned: files load on the test thread, not in an
+// element (clippy.toml: disallowed-methods).
+#![allow(clippy::disallowed_methods)]
+
 use sc_rtp::depay::h264::{H264Depay, H264DepayError};
 use sc_rtp::depay::opus::depay as opus_depay;
 use sc_rtp::packet::RtpPacket;
