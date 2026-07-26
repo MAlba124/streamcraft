@@ -33,13 +33,28 @@
 //! Only the `chunked` transfer coding is decoded; any other transfer coding (e.g.
 //! `gzip`) is rejected, as this element does not implement content decoders.
 //!
+//! ## `https://` (TLS)
+//! TLS rides the same architecture (see [`crate::tls`]): the handshake happens in
+//! `start()` alongside the connect + header read, and afterwards the
+//! [`rustls::ClientConnection`] stays behind as a **sans-IO decrypt stage** — the
+//! reactor's `Recv` completions carry *ciphertext*, which `process()` feeds through
+//! the state machine into `inbuf`; from there the framing decoder is oblivious to
+//! the transport. End-of-body over TLS is authenticated: a close-delimited (EOF)
+//! body requires the peer's `close_notify` (RFC 8446 §6.1) — a bare TCP FIN is an
+//! attacker-forgeable truncation and errors. Length/chunk-framed bodies terminate
+//! on their own framing, so a missing `close_notify` after a complete body is
+//! tolerated (as common servers omit it).
+//!
 //! ## v1 limitations
-//! - **`http://` only** — no TLS, so no `https`. (Follow-up: a TLS transport.)
+//! - **No client writes after the request**: a server-initiated TLS 1.3 KeyUpdate
+//!   or rekey mid-download gets its response queued but never flushed (the reactor
+//!   has no streaming send yet); receive-direction decryption is unaffected.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 
+use crate::tls;
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::ctx::Ctx;
 use streamcraft_core::element::{
@@ -89,20 +104,28 @@ static DESC: ElementDesc = ElementDesc {
     make_default: None,
 };
 
-/// The pieces of an `http://` URL this element needs.
+/// The pieces of an `http://`/`https://` URL this element needs.
 struct Url {
     host: String,
     port: u16,
     path: String,
+    /// `https://` — wrap the connection in TLS (see [`crate::tls`]).
+    tls: bool,
 }
 
-/// Parse a plain-`http` URL by hand (core is dependency-free; so are its elements).
-/// Extracts host, port (default 80), and path (default `/`). Rejects any non-`http`
-/// scheme — TLS/`https` is a documented v1 limitation.
+/// Parse an `http`/`https` URL by hand (the HTTP layer stays dependency-free).
+/// Extracts host, port (default 80 for `http`, 443 for `https`), and path (default
+/// `/`). Any other scheme is rejected.
 fn parse_http_url(url: &str) -> Result<Url, Error> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| Error::Resource(format!("httpsrc: only http:// URLs supported: {url}")))?;
+    let (rest, tls) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, false)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (rest, true)
+    } else {
+        return Err(Error::Resource(format!(
+            "httpsrc: only http:// and https:// URLs supported: {url}"
+        )));
+    };
 
     // Split authority from the path (everything from the first '/'); also stop the
     // authority at '?' or '#' for a bare `http://host?q` form.
@@ -125,7 +148,7 @@ fn parse_http_url(url: &str) -> Result<Url, Error> {
                 .map_err(|_| Error::Resource(format!("httpsrc: invalid port in {url}")))?;
             (h, port)
         }
-        None => (hostport, 80u16),
+        None => (hostport, if tls { 443u16 } else { 80u16 }),
     };
 
     if host.is_empty() {
@@ -136,6 +159,7 @@ fn parse_http_url(url: &str) -> Result<Url, Error> {
         host: host.to_string(),
         port,
         path,
+        tls,
     })
 }
 
@@ -211,6 +235,15 @@ pub struct HttpSrc {
     /// without `Range` (not implemented), so a flush cannot reposition the stream;
     /// this only ever bumps to cancel an in-flight read on flush, never to re-seek.
     valid_from: u64,
+    /// `https://` only: the TLS state machine, handshaken in `start()` (see
+    /// [`crate::tls`]). After that it never touches the socket — completed `Recv`
+    /// ciphertext is fed through it and the plaintext lands in `inbuf`. `None` for
+    /// plain `http://`.
+    tls: Option<rustls::ClientConnection>,
+    /// The peer sent `close_notify` (RFC 8446 §6.1): the TLS stream ended
+    /// *authenticated*. Without this, a socket EOF under TLS is just a TCP FIN
+    /// anyone on the path could have forged — fatal for an EOF-delimited body.
+    tls_closed: bool,
 }
 
 impl HttpSrc {
@@ -227,6 +260,8 @@ impl HttpSrc {
             socket_eof: false,
             seq: 0,
             valid_from: 0,
+            tls: None,
+            tls_closed: false,
         }
     }
 
@@ -280,9 +315,14 @@ impl HttpSrc {
                 IoResult::Ok(0) => self.socket_eof = true, // peer closed; buf recycles
                 IoResult::Ok(_) => {
                     // The reactor `set_len`'d the buffer to the bytes read, so `data()`
-                    // is exactly those bytes.
-                    self.inbuf.extend_from_slice(c.buf.memory.data());
-                    got = true;
+                    // is exactly those bytes. Over TLS those bytes are ciphertext and
+                    // go through the decrypt stage; plain HTTP appends them directly.
+                    if self.tls.is_some() {
+                        got |= self.decrypt_into_inbuf(c.buf.memory.data())?;
+                    } else {
+                        self.inbuf.extend_from_slice(c.buf.memory.data());
+                        got = true;
+                    }
                 }
                 IoResult::Cancelled => {}
                 IoResult::Err(k) => {
@@ -291,6 +331,60 @@ impl HttpSrc {
                         self.url
                     )));
                 }
+            }
+        }
+        Ok(got)
+    }
+
+    /// Feed reactor-completed **ciphertext** through the TLS state machine, appending
+    /// decrypted plaintext to `inbuf`. Returns whether any plaintext landed. Sans-IO:
+    /// `read_tls` consumes from the in-memory slice, `process_new_packets` advances
+    /// the session, and the `reader()` hands out exactly the plaintext it reports —
+    /// the socket itself is never touched here. A `close_notify` alert marks the TLS
+    /// stream authenticated-ended (`tls_closed`), which the EOF-framed decoder
+    /// requires before trusting a socket EOF; bytes after it are ignored (RFC 8446
+    /// §6.1: data after close_notify must be disregarded).
+    // `Read::read_exact` here drains rustls's in-memory plaintext buffer — no fd, no
+    // syscall, cannot block — not the element streaming IO the workspace lint bans.
+    #[allow(clippy::disallowed_methods)]
+    fn decrypt_into_inbuf(&mut self, mut src: &[u8]) -> Result<bool, Error> {
+        let Self {
+            tls,
+            inbuf,
+            tls_closed,
+            socket_eof,
+            url,
+            ..
+        } = self;
+        let conn = tls.as_mut().expect("decrypt_into_inbuf without a TLS session");
+        let mut got = false;
+        while !src.is_empty() && !*tls_closed {
+            // Reading from a slice cannot fail; `Ok(0)` would mean the deframer
+            // buffer is full, which cannot persist since every pass below drains all
+            // plaintext — bail rather than spin if it ever happens.
+            let n = conn
+                .read_tls(&mut src)
+                .map_err(|e| Error::Resource(format!("httpsrc: TLS read from {url}: {e}")))?;
+            if n == 0 {
+                return Err(Error::Resource(format!(
+                    "httpsrc: TLS deframer stalled on {url}"
+                )));
+            }
+            let state = conn
+                .process_new_packets()
+                .map_err(|e| Error::Resource(format!("httpsrc: TLS error from {url}: {e}")))?;
+            let plain = state.plaintext_bytes_to_read();
+            if plain > 0 {
+                let start = inbuf.len();
+                inbuf.resize(start + plain, 0);
+                conn.reader()
+                    .read_exact(&mut inbuf[start..])
+                    .map_err(|e| Error::Resource(format!("httpsrc: TLS read from {url}: {e}")))?;
+                got = true;
+            }
+            if state.peer_has_closed() {
+                *tls_closed = true;
+                *socket_eof = true; // the TLS stream is over, whatever TCP does next
             }
         }
         Ok(got)
@@ -337,7 +431,10 @@ impl HttpSrc {
     }
 
     /// Close-delimited body (RFC 9112 §6.3 rule 8): emit buffered leftover, ending the
-    /// download when the socket reports EOF and no buffered bytes remain.
+    /// download when the socket reports EOF and no buffered bytes remain. Over TLS the
+    /// EOF must be the peer's `close_notify` (RFC 8446 §6.1) — a bare TCP FIN is not
+    /// authenticated, and for a body whose *only* length signal is EOF, accepting it
+    /// would let an on-path attacker silently truncate the download.
     fn fill_eof(&mut self, dst: &mut [u8]) -> Result<FillOutcome, Error> {
         let buffered = self.avail().len();
         if buffered > 0 {
@@ -347,6 +444,13 @@ impl HttpSrc {
             return Ok(FillOutcome::Done(take, false));
         }
         if self.socket_eof {
+            if self.tls.is_some() && !self.tls_closed {
+                return Err(Error::Resource(format!(
+                    "httpsrc: {} TLS stream truncated (connection closed without \
+                     close_notify on a close-delimited body)",
+                    self.url
+                )));
+            }
             return Ok(FillOutcome::Done(0, true));
         }
         Ok(FillOutcome::NeedMore)
@@ -598,7 +702,12 @@ struct Head {
 /// Read from `stream` until the CRLF-CRLF header terminator, validate the status line,
 /// and pick the body framing (RFC 9112 §6.3) from the header fields. Returns the
 /// framing plus any bytes that arrived past the terminator (the start of the body).
-fn read_headers(stream: &mut TcpStream, url: &str) -> Result<Head, Error> {
+/// Generic over the transport: a plain [`TcpStream`], or a [`rustls::Stream`] running
+/// the TLS session over it.
+// Blocking reads are `start()`-time setup (the response head), not element streaming
+// IO — the sanctioned exception to the workspace blocking-IO lint.
+#[allow(clippy::disallowed_methods)]
+fn read_headers(stream: &mut impl Read, url: &str) -> Result<Head, Error> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -730,35 +839,92 @@ impl Element for HttpSrc {
         &DESC
     }
 
+    // One-time synchronous setup (connect, TLS handshake, request write, header
+    // read) — the sanctioned exception to the workspace blocking-IO lint; the
+    // streaming body rides the reactor.
+    #[allow(clippy::disallowed_methods)]
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         let url = parse_http_url(&self.url)?;
 
         // One-time setup stays synchronous (spec: IO — connect + request write are a
-        // `start()`-time act, like `filesrc` opening its file): connect, GET, read the
-        // response head. Only the streaming *body* reads ride the reactor.
+        // `start()`-time act, like `filesrc` opening its file): connect, TLS
+        // handshake for `https` ([`crate::tls`]), GET, read the response head. Only
+        // the streaming *body* reads ride the reactor.
         let mut stream = TcpStream::connect((url.host.as_str(), url.port))
             .map_err(|e| Error::Resource(format!("httpsrc: connect {}: {e}", self.url)))?;
 
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: streamcraft\r\n\r\n",
-            url.path, url.host
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|e| Error::Resource(format!("httpsrc: send request to {}: {e}", self.url)))?;
-
-        // Read + validate the response head, pick the body framing (RFC 9112 §6.3),
-        // and seed the decoder's input with any body bytes that arrived in the same
-        // read as the header terminator.
-        let head = read_headers(&mut stream, &self.url)?;
-        self.framing = head.framing;
-        self.inbuf = head.leftover;
         self.cursor = 0;
         self.done = false;
         self.read_in_flight = false;
         self.socket_eof = false;
         self.seq = 0;
         self.valid_from = 0;
+        self.tls_closed = false;
+        self.tls = if url.tls {
+            Some(tls::connect(&url.host, &mut stream, &self.url)?)
+        } else {
+            None
+        };
+
+        // `Host` carries the port when it isn't the scheme default (RFC 9112 §3.2:
+        // Host is the target URI's authority) — virtual hosts on nonstandard ports
+        // route on it.
+        let default_port = if url.tls { 443 } else { 80 };
+        let host_header = if url.port == default_port {
+            url.host.clone()
+        } else {
+            format!("{}:{}", url.host, url.port)
+        };
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: streamcraft\r\n\r\n",
+            url.path, host_header
+        );
+
+        // Write the request, then read + validate the response head, pick the body
+        // framing (RFC 9112 §6.3), and seed the decoder's input with any body bytes
+        // that arrived in the same read as the header terminator — through the TLS
+        // session when there is one ([`rustls::Stream`] runs the state machine over
+        // the socket synchronously), else straight over TCP.
+        let head = match self.tls.as_mut() {
+            Some(conn) => {
+                let mut s = rustls::Stream::new(conn, &mut stream);
+                s.write_all(request.as_bytes()).map_err(|e| {
+                    Error::Resource(format!("httpsrc: send request to {}: {e}", self.url))
+                })?;
+                let mut head = read_headers(&mut s, &self.url)?;
+                // `read_headers` stopped at the header terminator, but the TLS record
+                // that carried it may have decrypted *more* plaintext than the header
+                // read consumed — still buffered in the session. Move it into the
+                // leftover now: `process()` only feeds the session ciphertext from
+                // new completions and would never see these bytes.
+                let state = s.conn.process_new_packets().map_err(|e| {
+                    Error::Resource(format!("httpsrc: TLS error from {}: {e}", self.url))
+                })?;
+                let plain = state.plaintext_bytes_to_read();
+                if plain > 0 {
+                    let start = head.leftover.len();
+                    head.leftover.resize(start + plain, 0);
+                    // In-memory drain of already-decrypted bytes — no fd, no
+                    // blocking (see `decrypt_into_inbuf`).
+                    s.conn.reader().read_exact(&mut head.leftover[start..]).map_err(
+                        |e| Error::Resource(format!("httpsrc: TLS read from {}: {e}", self.url)),
+                    )?;
+                }
+                if state.peer_has_closed() {
+                    self.tls_closed = true;
+                    self.socket_eof = true;
+                }
+                head
+            }
+            None => {
+                stream.write_all(request.as_bytes()).map_err(|e| {
+                    Error::Resource(format!("httpsrc: send request to {}: {e}", self.url))
+                })?;
+                read_headers(&mut stream, &self.url)?
+            }
+        };
+        self.framing = head.framing;
+        self.inbuf = head.leftover;
 
         // Hand the connected socket to the reactor. `into_raw_fd` consumes the
         // `TcpStream` (releasing sole fd ownership without closing it); `File`
@@ -840,12 +1006,15 @@ impl Element for HttpSrc {
 
     fn stop(&mut self, _ctx: &mut Ctx) {
         // The reactor owns and closes the socket fd (registered in `start`). Just drop
-        // our handle and buffered state.
+        // our handle and buffered state. Dropping the TLS session without close_notify
+        // is fine: we are the reader, with nothing left to authenticate to the peer.
         self.file = None;
         self.inbuf.clear();
         self.cursor = 0;
         self.read_in_flight = false;
         self.socket_eof = false;
+        self.tls = None;
+        self.tls_closed = false;
     }
 }
 
@@ -880,8 +1049,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_https() {
-        assert!(parse_http_url("https://example.com/").is_err());
+    fn https_default_port_and_flag() {
+        let u = parse_http_url("https://example.com/file").unwrap();
+        assert!(u.tls);
+        assert_eq!(u.host, "example.com");
+        assert_eq!(u.port, 443);
+        assert_eq!(u.path, "/file");
+
+        let u = parse_http_url("https://example.com:8443/").unwrap();
+        assert!(u.tls);
+        assert_eq!(u.port, 8443);
+
+        let u = parse_http_url("http://example.com/").unwrap();
+        assert!(!u.tls, "plain http is not TLS");
+    }
+
+    #[test]
+    fn rejects_other_schemes() {
+        assert!(parse_http_url("ftp://example.com/").is_err());
+        assert!(parse_http_url("example.com/").is_err());
     }
 
     #[test]

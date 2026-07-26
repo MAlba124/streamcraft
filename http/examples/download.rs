@@ -1,7 +1,8 @@
-//! Download a file over HTTP: `HttpSrc ! FileSink`.
+//! Download a file over HTTP(S): `HttpSrc ! FileSink`.
 //!
-//! Usage: `cargo run -p sc-http --example download -- <http-url> [out-path]`
-//! (plain `http://` only; https needs the future TLS transport.)
+//! Usage: `cargo run -p sc-http --example download -- <url> [out-path]`
+//! (`http://` or `https://` — TLS is rustls on graviola, roots from the system
+//! CA bundle.)
 
 use sc_http::HttpSrc;
 use streamcraft_core::pipeline::Pipeline;
