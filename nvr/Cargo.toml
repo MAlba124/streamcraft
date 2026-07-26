@@ -1,0 +1,30 @@
+[package]
+name = "streamcraft-nvr"
+description = "NVR milestone app: N RTSP cameras → segmented MKV recording + live mosaic (the framework's broadest stress test)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "streamcraft_nvr"
+
+[[bin]]
+name = "scraft-nvr"
+path = "src/main.rs"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+streamcraft-elements = { path = "../elements" }
+sc-mkv = { path = "../mkv" }
+# H.264 bitstream helpers (Annex-B NAL split, SPS dimensions) — shared with the
+# hardware decoder the mosaic branch prefers.
+sc-vaapi = { path = "../vaapi" }
+sc-rtp = { path = "../rtp" }
+sc-rtsp = { path = "../rtsp" }
+sc-h264 = { path = "../h264" }
+sc-sdl3 = { path = "../sdl3" }
+# The app pins mimalloc for the adopted decoder's allocation churn (the
+# play_file lesson); the library targets stay allocator-agnostic.
+mimalloc = "0.1.52"
+

@@ -1033,6 +1033,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamcraft-nvr"
+version = "0.1.0"
+dependencies = [
+ "mimalloc",
+ "sc-h264",
+ "sc-mkv",
+ "sc-rtp",
+ "sc-rtsp",
+ "sc-sdl3",
+ "sc-vaapi",
+ "streamcraft-core",
+ "streamcraft-elements",
+]
+
+[[package]]
 name = "streamcraft-scope"
 version = "0.1.0"
 dependencies = [
