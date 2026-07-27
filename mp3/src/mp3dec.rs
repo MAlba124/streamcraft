@@ -450,7 +450,6 @@ impl Mp3Dec {
         // Interleave the planar S16 output (`a.data[ch]` is i16 LE for channel `ch`).
         let per: Vec<&[u8]> = a.data.iter().map(Vec::as_slice).collect();
         let n = per[0].len() / 2;
-        eprintln!("DBG take_audio nch={} n={} pending_before={}", nch, n, self.pending.len());
         self.pending.reserve(n * nch);
         for i in 0..n {
             for pl in &per {
@@ -490,10 +489,8 @@ impl Element for Mp3Dec {
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
-        eprintln!("DBG process ENTER buf.len={} pending={} ch={}", self.buf.len(), self.pending.len(), self.channels);
         // Flush any carry from a prior backpressured call before decoding more.
         if !self.emit_pending(ctx, true)? {
-            eprintln!("DBG process EARLY-YIELD (pool full)");
             return Ok(Flow::Ok);
         }
         let mut emitted = 0u32;
@@ -517,7 +514,6 @@ impl Element for Mp3Dec {
                 false => match inputs.pop() {
                     Some(inbuf) => self.buf.extend_from_slice(inbuf.memory.data()),
                     None => {
-                        eprintln!("DBG process EXIT no-more-input buf.len={} emitted={}", self.buf.len(), emitted);
                         return Ok(Flow::Ok); // no whole frame and no more input
                     }
                 },
@@ -542,7 +538,6 @@ impl Element for Mp3Dec {
             // unbounded pool, so the tail is emitted even if we were backpressured here.
             // A truncated trailing frame (and any ID3v1/APE trailer) is left in `buf`.
             Event::Eos => {
-                eprintln!("DBG EOS ENTER buf.len={} pending={} ch={}", self.buf.len(), self.pending.len(), self.channels);
                 self.emit_pending(ctx, false)?;
                 loop {
                     self.announce_if_needed(ctx)?;
@@ -554,7 +549,6 @@ impl Element for Mp3Dec {
                     }
                 }
                 let _ = self.dec.flush();
-                eprintln!("DBG EOS EXIT buf.len={}", self.buf.len());
             }
             _ => {}
         }

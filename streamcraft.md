@@ -1102,6 +1102,95 @@ hot-path waste, more moving parts). Leaning toward the side-arena, since keeping
 small and cache-dense matters more than a little drain-side bookkeeping — but this is unsettled.
 </experimental>
 
+### Taps: reading live stats without perturbing the stream
+
+Watching A/V bitrate, queue depth, drop counts, or per-element throughput on a running
+pipeline (the observe-a-24/7-encoder case) follows straight from the counters-vs-bus-vs-logs
+boundary above: **a tap is a pull of data the pipeline already keeps, never a push callback on
+a streaming thread.** Three tiers, cheapest first — you pay only for the fidelity you ask for:
+
+1. **Counters — free, always on.** The framework wrapper already keeps per-element cumulative
+   counts (buffers, bytes, queue high-water, processing vs. waiting time) as relaxed atomics
+   updated once per batch (§debuggability), read via `pipeline.counters(el)` as a
+   `CounterSnapshot`. Most "stats" derive from these, off the hot path: **bitrate is
+   `Δbytes / Δrunning_time` between two snapshots**, throughput is `Δbuffers`, backpressure is
+   the queue high-water. The pipeline stores *cumulative counts, not rates*, on purpose — the
+   window and the arithmetic are the observer's policy, so no element pays for a metric nobody
+   reads, and two observers can window the same counter differently. A tap is a snapshot read,
+   or a periodic poll, on the app's thread, at zero streaming-path cost.
+
+2. **Aggregate taps — a passive probe element.** When the number isn't a byte count the wrapper
+   already has (an audio level/RMS meter, per-GOP bitrate, a black-frame detector), insert a
+   passive element on the pad: it reads the batch by reference (`BatchRef`, no copy), computes
+   its aggregate, and publishes it as counters — or, if the app must *act* on it, a bus message.
+   Passive and inline, so it never blocks the flow and costs nothing when absent. This is
+   GStreamer's pad-probe use case as a first-class element with a static schedule slot, not a
+   callback on a random streaming thread.
+
+3. **Data taps — an explicit fan-out.** Only when the observer needs the *buffers* themselves
+   (a waveform scope, a thumbnailer, a shadow encoder) do you pay to copy: link a `tee` src pad
+   to the observer chain (branching is a scheduler primitive, §scheduling). The cost — one pool
+   buffer per tapped buffer — is visible in the graph and the counters, never hidden in a probe.
+
+The single push exception is the one the bus already makes: a stat the app *acts on* —
+`Qos { lateness_ns }` driving a bitrate ladder — rides the bus (must-not-drop), because that is
+control, not observation. Everything passive is pulled. Streaming these numbers to a live GUI or
+agent is not a new mechanism: it is the **introspection protocol** (below) polling the same
+counters and tailing the same bus off-thread.
+
+<experimental>
+Open granularity call: counters are currently per *element* (aggregate in/out). Per-stream
+bitrate on a demuxer or muxer wants them per *pad* (or per edge), now that fan-out/fan-in exist.
+Leaning toward per-pad counters on src/sink pads (still SoA, still one atomic add per batch, just
+indexed by pad) rather than making every element hand-roll it — but the extra atomics on the hot
+path need measuring against the budget before it's settled.
+</experimental>
+
+### Dynamic element properties: config, not caps, not signals
+
+Changing a knob on a running element — volume, a filter cutoff, an encoder bitrate, a source's
+URL — is clean once the three things GStreamer conflates are kept apart. A property is **not a
+pad** (pads carry data and negotiate *formats*; a property is scalar config), **not a
+signal/GObject system** (there are none here — §events), and **not a new value universe**: a
+property value is a `Value` from the format algebra, and a `PropDesc.allowed` is a `Constraint`
+from that same algebra. So `pipeline.set(el, "bitrate", Value::Int(320_000))` **validates against
+`allowed` at the call site** and fails loudly on an out-of-range value — the same closed,
+no-backtracking check that fixes a format on a link, reused rather than reinvented. (The "element
+created but a mandatory knob never set" failure already can't occur — typed constructors,
+§elements; this is purely for *changing* a knob afterward.)
+
+Two classes, declared per property (`PropDesc.live`), each riding a mechanism that already exists
+(§runtime configuration):
+
+- **Live** — the continuous knobs (volume, thresholds). The set is validated on the app's thread
+  and parked in a **per-element `Ctx` mailbox**; the element observes it at the next **batch
+  boundary**, the safe point the scheduler already halts at between `process()` calls — so there
+  is no hot-path lock and no mid-buffer change. Ordering is defined by that boundary: a set
+  issued while buffer N is in flight takes effect no earlier than N+1, deterministically.
+- **Structural** — device, file path, a rate that re-drives negotiation. The value can't merely
+  be read next batch; it re-opens a resource or re-fixes a format, so setting it restarts *the
+  element* (`stop`/`start`, pool/format re-registration) as a **subgraph-local micro-transition**
+  — drain that element, apply, re-preroll it — while the rest of the graph keeps playing. Never a
+  pipeline teardown; the cost surfaces on the bus (latency recompute), never as a discovered
+  glitch.
+
+App→element crosses the way *all* app→element communication does: a synchronous call on the
+app's thread, applied by the scheduler at a safe point — so the callback-deadlock class doesn't
+exist (§events). Bulk edits ride the group label — `set` across a group is one atomic op over a
+label query (§no-bins). And timeline automation ("ramp volume over 200 ms" — GStreamer's
+`GstController`) is deliberately **not** in core: it is a **controller** (a library object, like
+the autoplug and supervisor controllers, §no-bins) that issues ordinary `set` calls against the
+clock, reading the public `PropDesc` table. Core stays the minimal validated-mailbox mechanism;
+automation policy layers on top. So: yes, needed — but this small, and no larger.
+
+<experimental>
+Unsettled impl detail: how a *continuously*-read live property is stored for a lock-free
+per-batch read. A seqlock over the `Value` is fully general (one slot, any property) but adds a
+read-side retry loop; typed atomic cells (an `AtomicU64` carrying `f64`/`i64` bits the element
+reads directly) are faster but per-type. Leaning toward the seqlock for uniformity, dropping to a
+typed atomic only where a bench shows the per-batch read matters.
+</experimental>
+
 ### Introspection protocol and scraft-scope (the inspector)
 
 Everything the debuggability sections describe — dumps, counters, latency reports,
@@ -1112,8 +1201,15 @@ core. Serving it costs nothing until a client connects, and observation stays
 observation: reads are snapshots of data the pipeline already maintains, never
 locks on streaming paths.
 
+Must be super super super fast and low overhead.
+
 **scraft-scope** is the flagship client: a GUI written in Slint (Rust-native,
 lightweight — fits the ethos; no GTK/Electron) that can run two ways:
+
+<update> We should use SDL3 with a custom UI library on top. We should also swap our custom wayland
+and vulkan stuff to use sdl3 instead. Graphics sucks and we shouldn't waste time on it. SDL3 is
+light weight enough for us. Also, the UI must be the same philosophy as the rest of SC, (i.e. very
+performant, per frame arenas).  </update>
 
 - **Attach**: a standalone binary connecting to any running streamcraft app by
   socket — zero code in the target beyond the feature flag.
@@ -1131,10 +1227,11 @@ What it shows, all live:
   lateness stream.
 - **Events and logs**: the bus feed and the log stream, filterable per element
   (the interned-id vocabulary makes filtering cheap and exact, not regex-over-text).
-- **Debugging**: pause (clock freeze), single-`step()`, per-element counter
-  inspection, live property editing (the `PropDesc` table makes the UI free),
-  buffer metadata peeking (sample a batch's POD rows — pts/flags/meta — without
-  copying payloads), watchdog and drop alerts surfaced as annotations on the graph.
+- **Debugging**: pause (clock freeze), single-`step()`, per-element counter inspection, live
+  property editing (the `PropDesc` table makes the UI free), buffer metadata peeking (sample a
+  batch's POD rows — pts/flags/meta — without copying payloads), watchdog and drop alerts surfaced
+  as annotations on the graph.  Should it be possible to view the data in buffers passing around the
+  graph when debugging? (e.g. view video frames)
 - **MCP server**: the same protocol exposed as Model Context Protocol tools —
   `get_topology`, `get_latency_report`, `get_counters`, `tail_bus`, `tail_logs`,
   `set_property`, `pause`/`step`, `dump_dot` — so an agent can attach to a live

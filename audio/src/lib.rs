@@ -10,15 +10,17 @@
 
 pub mod convert;
 pub mod convert_element;
+pub mod downmix_element;
 pub mod format;
 pub mod resample;
 pub mod resample_element;
 pub mod wav;
 
 pub use convert::{
-    convert_interleaved, convert_interleaved_vec, converted_len, remap_channels,
+    convert_interleaved, convert_interleaved_vec, converted_len, downmix_to_stereo, remap_channels,
 };
 pub use convert_element::AudioConvert;
+pub use downmix_element::AudioDownmix;
 pub use resample::{gcd, output_len, ChannelResampler, PolyphaseFilter};
 pub use resample_element::AudioResample;
 pub use format::{
@@ -39,4 +41,5 @@ pub fn register(registry: &mut Registry) {
     registry.register(WavParse::new().desc());
     registry.register(AudioConvert::new(SampleFormat::S16).desc());
     registry.register(AudioResample::new(48_000).desc());
+    registry.register(AudioDownmix::new().desc());
 }

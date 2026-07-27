@@ -129,9 +129,98 @@ pub const VASurfaceAttribMemoryType: VASurfaceAttribType = 6;
 pub const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x0000_0002;
 pub const VA_SURFACE_ATTRIB_MEM_TYPE_VA: u32 = 0x0000_0001;
 
+// --- DMA-BUF surface export (va_drmcommon.h) ------------------------------------------
+// The zero-copy display path (`h265dec::VaapiH265Dec::new_zerocopy` / the player's EGL
+// backend): instead of reading the decoded NV12 surface back to the CPU, export it as a
+// set of DMA-BUF fds the GUI's GLES context imports with `EGL_LINUX_DMA_BUF_EXT`. The
+// descriptor + `vaExportSurfaceHandle` are transcribed from libva's `va/va_drmcommon.h`
+// (the `VADRMPRIMESurfaceDescriptor` / `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` family,
+// libva ≥ 1.1 / the "PRIME 2" export added in 2.1). Layouts locked by the asserts at the
+// bottom, exactly like the decode/encode structs.
+
+/// `#define VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 0x40000000` (va_drmcommon.h) — the
+/// memory type `vaExportSurfaceHandle` fills a [`VADRMPRIMESurfaceDescriptor`] for. (The
+/// older `..._DRM_PRIME` = 0x20000000 fills the legacy `VADRMPRIMESurfaceDescriptor`
+/// without per-layer DRM format modifiers; we use PRIME_2, the modern form iHD/radeonsi
+/// both implement.)
+pub const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
+
+/// `#define VA_EXPORT_SURFACE_READ_ONLY 0x0001` (va.h) — the exported fds are only read
+/// (the GUI samples them; it never writes the surface).
+pub const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
+/// `#define VA_EXPORT_SURFACE_WRITE_ONLY 0x0002` (va.h).
+pub const VA_EXPORT_SURFACE_WRITE_ONLY: u32 = 0x0002;
+/// `#define VA_EXPORT_SURFACE_SEPARATE_LAYERS 0x0004` (va.h) — one layer per plane (Y in
+/// layer 0, CbCr in layer 1 for NV12), each with its own `drm_format`.
+pub const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
+/// `#define VA_EXPORT_SURFACE_COMPOSED_LAYERS 0x0008` (va.h) — a single layer whose
+/// `drm_format` is the whole surface's FourCC (`DRM_FORMAT_NV12`) and whose `num_planes`
+/// covers every plane. This is what an `EGL_LINUX_DMA_BUF_EXT` NV12 import wants (one
+/// image with per-plane fd/offset/pitch), so it is the flag the export path passes.
+pub const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = 0x0008;
+
+/// The max objects/layers/planes `VADRMPRIMESurfaceDescriptor` statically sizes its arrays
+/// to (va_drmcommon.h `#define VA_DRM_PRIME_SURFACE_MAX_...`). 4 comfortably covers NV12
+/// (1–2 objects, 1 composed layer, 2 planes) and any 4:2:0/4:4:4 planar layout.
+pub const VA_DRM_PRIME_MAX_OBJECTS: usize = 4;
+pub const VA_DRM_PRIME_MAX_LAYERS: usize = 4;
+pub const VA_DRM_PRIME_MAX_PLANES: usize = 4;
+
+/// One exported DMA-BUF object: `{ int fd; uint32_t size; uint64_t drm_format_modifier; }`
+/// (va_drmcommon.h). The `u64` modifier forces 8-byte alignment → a 4-byte pad after
+/// `size`, so the struct is 24 bytes on LP64 (locked below). `fd` is owned by the caller
+/// after export and must be `close()`d (or handed to an importer that `dup`s / closes it).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VADRMPRIMESurfaceDescriptorObject {
+    pub fd: c_int,
+    pub size: u32,
+    pub drm_format_modifier: u64,
+}
+
+/// One exported layer: `{ uint32_t drm_format; uint32_t num_planes; uint32_t
+/// object_index[4]; uint32_t offset[4]; uint32_t pitch[4]; }` (va_drmcommon.h). For a
+/// COMPOSED NV12 export there is one layer whose `drm_format` is `DRM_FORMAT_NV12`, with
+/// `num_planes == 2` (Y then CbCr) indexing into the descriptor's `objects[]`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VADRMPRIMESurfaceDescriptorLayer {
+    pub drm_format: u32,
+    pub num_planes: u32,
+    pub object_index: [u32; VA_DRM_PRIME_MAX_PLANES],
+    pub offset: [u32; VA_DRM_PRIME_MAX_PLANES],
+    pub pitch: [u32; VA_DRM_PRIME_MAX_PLANES],
+}
+
+/// `VADRMPRIMESurfaceDescriptor` (va_drmcommon.h) — the whole export: the surface FourCC +
+/// coded geometry, the DMA-BUF `objects[]` (the GPU-memory handles), and the `layers[]`
+/// (which object/offset/pitch each plane lives at). `vaExportSurfaceHandle` fills this when
+/// asked for `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VADRMPRIMESurfaceDescriptor {
+    /// The surface FourCC (`VA_FOURCC_NV12`), NOT the DRM fourcc (that is per-layer).
+    pub fourcc: u32,
+    pub width: u32,
+    pub height: u32,
+    pub num_objects: u32,
+    pub objects: [VADRMPRIMESurfaceDescriptorObject; VA_DRM_PRIME_MAX_OBJECTS],
+    pub num_layers: u32,
+    pub layers: [VADRMPRIMESurfaceDescriptorLayer; VA_DRM_PRIME_MAX_LAYERS],
+}
+
 // --- FourCC / picture flags / slice-data flags ----------------------------------------
 /// `#define VA_FOURCC_NV12 0x3231564E` (va.h:4420).
 pub const VA_FOURCC_NV12: u32 = 0x3231_564E;
+/// `#define DRM_FORMAT_NV12 fourcc_code('N','V','1','2')` (drm/drm_fourcc.h) — the DRM
+/// FourCC an EGL NV12 import declares. Byte-identical to `VA_FOURCC_NV12` (both `'N','V',
+/// '1','2'` little-endian), but named separately at its point of use (the DRM/EGL side).
+pub const DRM_FORMAT_NV12: u32 = 0x3231_564E;
+/// `#define DRM_FORMAT_MOD_INVALID` (drm/drm_fourcc.h) — "the driver did not report a
+/// modifier"; a COMPOSED export from a linear/tiled surface may leave the modifier at this
+/// sentinel, in which case the EGL import must omit the `EGL_DMA_BUF_PLANE*_MODIFIER_*`
+/// attributes (passing INVALID is an error on some drivers).
+pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 /// `#define VA_PROGRESSIVE 0x1` (va.h:1920) — the flag passed to vaCreateContext.
 pub const VA_PROGRESSIVE: c_int = 0x1;
 /// `#define VA_SLICE_DATA_FLAG_ALL 0x00` (va.h:3080) — whole slice in the buffer.
@@ -533,6 +622,170 @@ impl VAPictureHEVC {
     }
 }
 
+/// `VAPictureParameterBufferHEVC` (va_dec_hevc.h:57) — the once-per-frame HEVC
+/// **decode** picture parameters: SPS/PPS-derived geometry + coding-tool flags, the
+/// DPB `ReferenceFrames[15]`, and the fields the driver needs to parse slice segment
+/// headers itself (the *long slice format*). `pic_fields` and `slice_parsing_fields`
+/// are the two `uint32_t value` bitfield-union arms (packed by hand in
+/// [`crate::h265dec`], exactly like the H.264 `seq_fields`/`pic_fields`).
+///
+/// Range-extension / screen-content decode uses the wider `…HEVCExtension` variant
+/// that embeds this as `base`; Main 8-bit 4:2:0 (all this crate wires) uses this
+/// struct alone with buffer type `VAPictureParameterBufferType`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAPictureParameterBufferHEVC {
+    pub CurrPic: VAPictureHEVC,
+    pub ReferenceFrames: [VAPictureHEVC; 15],
+    pub pic_width_in_luma_samples: u16,
+    pub pic_height_in_luma_samples: u16,
+    /// `pic_fields` union arm (va_dec_hevc.h:71–100).
+    pub pic_fields: u32,
+    pub sps_max_dec_pic_buffering_minus1: u8,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub pcm_sample_bit_depth_luma_minus1: u8,
+    pub pcm_sample_bit_depth_chroma_minus1: u8,
+    pub log2_min_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_luma_coding_block_size: u8,
+    pub log2_min_transform_block_size_minus2: u8,
+    pub log2_diff_max_min_transform_block_size: u8,
+    pub log2_min_pcm_luma_coding_block_size_minus3: u8,
+    pub log2_diff_max_min_pcm_luma_coding_block_size: u8,
+    pub max_transform_hierarchy_depth_intra: u8,
+    pub max_transform_hierarchy_depth_inter: u8,
+    pub init_qp_minus26: i8,
+    pub diff_cu_qp_delta_depth: u8,
+    pub pps_cb_qp_offset: i8,
+    pub pps_cr_qp_offset: i8,
+    pub log2_parallel_merge_level_minus2: u8,
+    pub num_tile_columns_minus1: u8,
+    pub num_tile_rows_minus1: u8,
+    pub column_width_minus1: [u16; 19],
+    pub row_height_minus1: [u16; 21],
+    /// `slice_parsing_fields` union arm (va_dec_hevc.h:139–164).
+    pub slice_parsing_fields: u32,
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    pub num_short_term_ref_pic_sets: u8,
+    pub num_long_term_ref_pic_sps: u8,
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    pub pps_beta_offset_div2: i8,
+    pub pps_tc_offset_div2: i8,
+    pub num_extra_slice_header_bits: u8,
+    pub st_rps_bits: u32,
+    pub va_reserved: [u32; VA_PADDING_MEDIUM],
+}
+
+// VAPictureParameterBufferHEVC.pic_fields bit positions (LSB-first; va_dec_hevc.h:71).
+pub const HEVC_PIC_CHROMA_FORMAT_IDC_SHIFT: u32 = 0; // 2 bits
+pub const HEVC_PIC_SEPARATE_COLOUR_PLANE_FLAG: u32 = 1 << 2;
+pub const HEVC_PIC_PCM_ENABLED_FLAG: u32 = 1 << 3;
+pub const HEVC_PIC_SCALING_LIST_ENABLED_FLAG: u32 = 1 << 4;
+pub const HEVC_PIC_TRANSFORM_SKIP_ENABLED_FLAG: u32 = 1 << 5;
+pub const HEVC_PIC_AMP_ENABLED_FLAG: u32 = 1 << 6;
+pub const HEVC_PIC_STRONG_INTRA_SMOOTHING_ENABLED_FLAG: u32 = 1 << 7;
+pub const HEVC_PIC_SIGN_DATA_HIDING_ENABLED_FLAG: u32 = 1 << 8;
+pub const HEVC_PIC_CONSTRAINED_INTRA_PRED_FLAG: u32 = 1 << 9;
+pub const HEVC_PIC_CU_QP_DELTA_ENABLED_FLAG: u32 = 1 << 10;
+pub const HEVC_PIC_WEIGHTED_PRED_FLAG: u32 = 1 << 11;
+pub const HEVC_PIC_WEIGHTED_BIPRED_FLAG: u32 = 1 << 12;
+pub const HEVC_PIC_TRANSQUANT_BYPASS_ENABLED_FLAG: u32 = 1 << 13;
+pub const HEVC_PIC_TILES_ENABLED_FLAG: u32 = 1 << 14;
+pub const HEVC_PIC_ENTROPY_CODING_SYNC_ENABLED_FLAG: u32 = 1 << 15;
+pub const HEVC_PIC_PPS_LOOP_FILTER_ACROSS_SLICES_ENABLED_FLAG: u32 = 1 << 16;
+pub const HEVC_PIC_LOOP_FILTER_ACROSS_TILES_ENABLED_FLAG: u32 = 1 << 17;
+pub const HEVC_PIC_PCM_LOOP_FILTER_DISABLED_FLAG: u32 = 1 << 18;
+pub const HEVC_PIC_NO_PIC_REORDERING_FLAG: u32 = 1 << 19;
+pub const HEVC_PIC_NO_BI_PRED_FLAG: u32 = 1 << 20;
+
+// VAPictureParameterBufferHEVC.slice_parsing_fields bit positions (va_dec_hevc.h:139).
+pub const HEVC_SLP_LISTS_MODIFICATION_PRESENT_FLAG: u32 = 1 << 0;
+pub const HEVC_SLP_LONG_TERM_REF_PICS_PRESENT_FLAG: u32 = 1 << 1;
+pub const HEVC_SLP_SPS_TEMPORAL_MVP_ENABLED_FLAG: u32 = 1 << 2;
+pub const HEVC_SLP_CABAC_INIT_PRESENT_FLAG: u32 = 1 << 3;
+pub const HEVC_SLP_OUTPUT_FLAG_PRESENT_FLAG: u32 = 1 << 4;
+pub const HEVC_SLP_DEPENDENT_SLICE_SEGMENTS_ENABLED_FLAG: u32 = 1 << 5;
+pub const HEVC_SLP_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT_FLAG: u32 = 1 << 6;
+pub const HEVC_SLP_SAMPLE_ADAPTIVE_OFFSET_ENABLED_FLAG: u32 = 1 << 7;
+pub const HEVC_SLP_DEBLOCKING_FILTER_OVERRIDE_ENABLED_FLAG: u32 = 1 << 8;
+pub const HEVC_SLP_PPS_DISABLE_DEBLOCKING_FILTER_FLAG: u32 = 1 << 9;
+pub const HEVC_SLP_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT_FLAG: u32 = 1 << 10;
+pub const HEVC_SLP_RAP_PIC_FLAG: u32 = 1 << 11;
+pub const HEVC_SLP_IDR_PIC_FLAG: u32 = 1 << 12;
+pub const HEVC_SLP_INTRA_PIC_FLAG: u32 = 1 << 13;
+
+/// `VASliceParameterBufferHEVC` (va_dec_hevc.h:358) — the once-per-slice **decode**
+/// parameters for the *long slice format*: reference-list indices into
+/// `VAPictureParameterBufferHEVC.ReferenceFrames[]`, the `LongSliceFlags` union arm,
+/// QP/deblock/weight fields. Accompanied by a `VASliceDataBufferType` buffer holding
+/// the raw slice NAL (start-code + emulation bytes intact).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VASliceParameterBufferHEVC {
+    pub slice_data_size: u32,
+    pub slice_data_offset: u32,
+    pub slice_data_flag: u32,
+    pub slice_data_byte_offset: u32,
+    pub slice_segment_address: u32,
+    /// `RefPicList[list][idx]` — index into `ReferenceFrames[]`, `0xFF` = invalid.
+    pub RefPicList: [[u8; 15]; 2],
+    /// `LongSliceFlags` union arm (va_dec_hevc.h:390–419).
+    pub long_slice_flags: u32,
+    pub collocated_ref_idx: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub slice_qp_delta: i8,
+    pub slice_cb_qp_offset: i8,
+    pub slice_cr_qp_offset: i8,
+    pub slice_beta_offset_div2: i8,
+    pub slice_tc_offset_div2: i8,
+    pub luma_log2_weight_denom: u8,
+    pub delta_chroma_log2_weight_denom: i8,
+    pub delta_luma_weight_l0: [i8; 15],
+    pub luma_offset_l0: [i8; 15],
+    pub delta_chroma_weight_l0: [[i8; 2]; 15],
+    pub ChromaOffsetL0: [[i8; 2]; 15],
+    pub delta_luma_weight_l1: [i8; 15],
+    pub luma_offset_l1: [i8; 15],
+    pub delta_chroma_weight_l1: [[i8; 2]; 15],
+    pub ChromaOffsetL1: [[i8; 2]; 15],
+    pub five_minus_max_num_merge_cand: u8,
+    pub num_entry_point_offsets: u16,
+    pub entry_offset_to_subset_array: u16,
+    pub slice_data_num_emu_prevn_bytes: u16,
+    pub va_reserved: [u32; VA_PADDING_LOW - 2],
+}
+
+// VASliceParameterBufferHEVC.long_slice_flags bit positions (va_dec_hevc.h:390).
+pub const HEVC_LSF_LAST_SLICE_OF_PIC: u32 = 1 << 0;
+pub const HEVC_LSF_DEPENDENT_SLICE_SEGMENT_FLAG: u32 = 1 << 1;
+pub const HEVC_LSF_SLICE_TYPE_SHIFT: u32 = 2; // 2 bits
+pub const HEVC_LSF_COLOR_PLANE_ID_SHIFT: u32 = 4; // 2 bits
+pub const HEVC_LSF_SLICE_SAO_LUMA_FLAG: u32 = 1 << 6;
+pub const HEVC_LSF_SLICE_SAO_CHROMA_FLAG: u32 = 1 << 7;
+pub const HEVC_LSF_MVD_L1_ZERO_FLAG: u32 = 1 << 8;
+pub const HEVC_LSF_CABAC_INIT_FLAG: u32 = 1 << 9;
+pub const HEVC_LSF_SLICE_TEMPORAL_MVP_ENABLED_FLAG: u32 = 1 << 10;
+pub const HEVC_LSF_SLICE_DEBLOCKING_FILTER_DISABLED_FLAG: u32 = 1 << 11;
+pub const HEVC_LSF_COLLOCATED_FROM_L0_FLAG: u32 = 1 << 12;
+pub const HEVC_LSF_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED_FLAG: u32 = 1 << 13;
+
+/// `VAIQMatrixBufferHEVC` (va_dec_hevc.h:561) — scaling lists, sent once per frame
+/// only when `scaling_list_enabled_flag == 1`. For streams that do not signal custom
+/// scaling lists the driver applies the flat default and no IQ buffer is submitted.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAIQMatrixBufferHEVC {
+    pub ScalingList4x4: [[u8; 16]; 6],
+    pub ScalingList8x8: [[u8; 64]; 6],
+    pub ScalingList16x16: [[u8; 64]; 6],
+    pub ScalingList32x32: [[u8; 64]; 2],
+    pub ScalingListDC16x16: [u8; 6],
+    pub ScalingListDC32x32: [u8; 2],
+    pub va_reserved: [u32; VA_PADDING_LOW],
+}
+
 /// `VAEncSequenceParameterBufferHEVC` (va_enc_hevc.h:107).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -816,6 +1069,20 @@ extern "C" {
         dest_width: u32,
         dest_height: u32,
     ) -> VAStatus;
+
+    // va.h — DMA-BUF surface export (the zero-copy display path). `mem_type` is
+    // `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`, `flags` an OR of the
+    // `VA_EXPORT_SURFACE_*` bits, and `descriptor` a `*mut VADRMPRIMESurfaceDescriptor`
+    // the driver fills (the surface must be synced first — `vaSyncSurface`). On success
+    // the caller owns each `objects[i].fd` and must `close()` it (directly, or via an
+    // importer that dups then closes).
+    pub fn vaExportSurfaceHandle(
+        dpy: VADisplay,
+        surface_id: VASurfaceID,
+        mem_type: u32,
+        flags: u32,
+        descriptor: *mut c_void,
+    ) -> VAStatus;
 }
 
 // --- Layout guards: documented LP64 sizes; a libva reshuffle fails compilation --------
@@ -907,6 +1174,28 @@ mod layout {
             "VAEncSliceParameterBufferH264"
         );
         assert_eq!(size_of::<VAPictureHEVC>(), 28, "VAPictureHEVC");
+        // HEVC decode buffers (va_dec_hevc.h). CurrPic 28 + ReferenceFrames 15×28=420
+        // → 448; 2×u16 (448..452); pic_fields (452..456); 20 u8/i8 (456..476);
+        // column_width[19] u16 (476..514); row_height[21] u16 (514..556);
+        // slice_parsing_fields (556..560); 8 u8/i8 (560..568); st_rps_bits (568..572);
+        // va_reserved[8] (572..604).
+        assert_eq!(
+            size_of::<VAPictureParameterBufferHEVC>(),
+            604,
+            "VAPictureParameterBufferHEVC"
+        );
+        // 5×u32 (0..20); RefPicList[2][15] (20..50); long_slice_flags 4-aligned
+        // (52..56); 10 u8/i8 (56..66); weight arrays 15+15+30+30 ×2 = 180 (66..246);
+        // five_minus_max_num_merge_cand u8 (246..247); 3 u16 2-aligned (248..254);
+        // va_reserved[2] 4-aligned (256..264).
+        assert_eq!(
+            size_of::<VASliceParameterBufferHEVC>(),
+            264,
+            "VASliceParameterBufferHEVC"
+        );
+        // 6×16 + 6×64 + 6×64 + 2×64 + 6 + 2 = 96+384+384+128+6+2 = 1000;
+        // va_reserved[4] (1000..1016).
+        assert_eq!(size_of::<VAIQMatrixBufferHEVC>(), 1016, "VAIQMatrixBufferHEVC");
         // 3 u8 → pad 4; 4×u32 (4..20); 2×u16 (20..24); seq_fields (24..28); 6 u8
         // (28..34) → pad 36; 4×u32 (36..52); vui flag u8 → pad 56; vui_fields
         // (56..60); aspect u8 → pad 64; 4×u32 (64..80); u16 + 2 u8 (80..84);
@@ -949,5 +1238,34 @@ mod layout {
         );
         // [u16;4] (8) + [i16;5] (8..18) → pad 20; va_reserved[4] (20..36).
         assert_eq!(size_of::<VAQMatrixBufferVP8>(), 36, "VAQMatrixBufferVP8");
+    }
+
+    #[test]
+    fn drm_prime_export_struct_sizes_match_va_drmcommon() {
+        // Object: fd i32 (0..4) + size u32 (4..8) → pad 8 for the u64 modifier (8..16).
+        assert_eq!(
+            size_of::<VADRMPRIMESurfaceDescriptorObject>(),
+            16,
+            "VADRMPRIMESurfaceDescriptorObject"
+        );
+        assert_eq!(align_of::<VADRMPRIMESurfaceDescriptorObject>(), 8);
+        // Layer: drm_format + num_planes (8) + object_index[4] + offset[4] + pitch[4]
+        // (3×16 = 48) = 56, all u32 → align 4.
+        assert_eq!(
+            size_of::<VADRMPRIMESurfaceDescriptorLayer>(),
+            56,
+            "VADRMPRIMESurfaceDescriptorLayer"
+        );
+        assert_eq!(align_of::<VADRMPRIMESurfaceDescriptorLayer>(), 4);
+        // Descriptor: fourcc/width/height/num_objects (16); objects[4] 8-aligned
+        // (16 already 8-aligned) → 16 + 4×16 = 80; num_layers u32 (80..84); layers[4]
+        // 4-aligned → 84 + 4×56 = 84 + 224 = 308. Whole struct align 8 (the u64 in
+        // objects), 308 rounds up to 312.
+        assert_eq!(
+            size_of::<VADRMPRIMESurfaceDescriptor>(),
+            312,
+            "VADRMPRIMESurfaceDescriptor"
+        );
+        assert_eq!(align_of::<VADRMPRIMESurfaceDescriptor>(), 8);
     }
 }

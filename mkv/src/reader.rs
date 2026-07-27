@@ -83,6 +83,14 @@ pub struct Frame {
     pub track_number: u64,
     /// Absolute presentation timestamp in nanoseconds.
     pub pts_ns: u64,
+    /// Presentation duration in nanoseconds (`BlockGroup\BlockDuration` × TimestampScale),
+    /// when the block declared one — `None` otherwise (RFC 9559 §5.1.3.6). Only a
+    /// `BlockGroup` can carry it; a bare `SimpleBlock` never does, so a `SimpleBlock` frame
+    /// is always `None`. This is load-bearing for **duration-bearing sparse tracks** —
+    /// subtitles above all (S_TEXT/*), where the cue's on-screen span is `[pts, pts+dur)`
+    /// and there is no next-frame delta to infer it from; the demuxer stamps it onto the
+    /// output buffer's `duration` so the overlay has the interval.
+    pub duration_ns: Option<u64>,
     /// True if the block flagged keyframe (SimpleBlock only; a BlockGroup Block with no
     /// ReferenceBlock is a keyframe, RFC 9559 §12.8 — see [`MatroskaReader`] for the rule).
     pub keyframe: bool,
@@ -589,9 +597,12 @@ fn parse_colour(data: &[u8], track: &mut Track) -> Result<(), ReadError> {
 }
 
 /// Decode a `BlockGroup` master (RFC 9559 §5.1.3.5): its single `Block` carries the frames
-/// (same body layout as SimpleBlock but with no keyframe flag). A Block with no
-/// `ReferenceBlock` is a keyframe (RFC 9559 §12.8); a `ReferenceBlock` marks it as referencing
-/// another block, hence not a keyframe. Pushes decoded frames into `out`.
+/// (same body layout as SimpleBlock but with no keyframe flag), optionally with a
+/// `BlockDuration` (§5.1.3.6) and a `ReferenceBlock`. A Block with no `ReferenceBlock` is a
+/// keyframe (RFC 9559 §12.8); a `ReferenceBlock` marks it as referencing another block, hence
+/// not a keyframe. `BlockDuration` is in TimestampScale ticks — scaled to ns and attached to
+/// every frame the block yields (the on-screen span for a subtitle cue). Pushes decoded
+/// frames into `out`.
 fn decode_block_group(
     data: &[u8],
     cluster_base_tick: i64,
@@ -601,6 +612,7 @@ fn decode_block_group(
     let mut at = 0;
     let mut has_reference = false;
     let mut block: Option<(usize, usize)> = None;
+    let mut duration_ticks: Option<u64> = None;
     while at < data.len() {
         let h = ebml::read_element_header(data, at)?;
         let end = h.data_end()?.ok_or(ReadError::Malformed("unknown-size child in BlockGroup"))?;
@@ -611,13 +623,19 @@ fn decode_block_group(
             block = Some((h.data_start, end));
         } else if h.id == id::REFERENCE_BLOCK {
             has_reference = true;
+        } else if h.id == id::BLOCK_DURATION {
+            // Unsigned integer, in TimestampScale ticks (RFC 9559 §5.1.3.6).
+            duration_ticks = Some(read_uint(&data[h.data_start..end]));
         }
         at = end;
     }
     if let Some((s, e)) = block {
+        // Scale the tick duration to ns (saturating on adversarial input). Kept `None` when
+        // the group declared none, so a downstream consumer can tell "unknown" from "zero".
+        let duration_ns = duration_ticks.map(|t| t.saturating_mul(scale));
         // Keyframe status comes from the group (no ReferenceBlock => keyframe), not a flag in
         // the block body — pass it in.
-        decode_block(&data[s..e], !has_reference, cluster_base_tick, scale, out)?;
+        decode_block(&data[s..e], !has_reference, cluster_base_tick, scale, duration_ns, out)?;
     }
     Ok(())
 }
@@ -633,17 +651,22 @@ fn decode_simple_block(
 ) -> Result<(), ReadError> {
     let (_track, _rel, flags, _start) = parse_block_header(data)?;
     let keyframe = flags & 0x80 != 0;
-    decode_block(data, keyframe, cluster_base_tick, scale, out)
+    // A SimpleBlock has no BlockDuration (only a BlockGroup carries one) — duration unknown.
+    decode_block(data, keyframe, cluster_base_tick, scale, None, out)
 }
 
 /// Decode a Block/SimpleBlock body with an already-decided `keyframe` (from the flags byte for
-/// a SimpleBlock, or from the enclosing BlockGroup's ReferenceBlock for a plain Block). Parses
-/// the header, splits the lace, and pushes one [`Frame`] per laced frame into `out`.
+/// a SimpleBlock, or from the enclosing BlockGroup's ReferenceBlock for a plain Block) and an
+/// optional `duration_ns` (a BlockGroup's scaled BlockDuration; `None` for a SimpleBlock).
+/// Parses the header, splits the lace, and pushes one [`Frame`] per laced frame into `out`. The
+/// block duration applies to the block as a whole; every laced frame carries it (a laced
+/// subtitle block is degenerate — the common single-cue case is unlaced anyway).
 fn decode_block(
     data: &[u8],
     keyframe: bool,
     cluster_base_tick: i64,
     scale: u64,
+    duration_ns: Option<u64>,
     out: &mut VecDeque<Frame>,
 ) -> Result<(), ReadError> {
     let (track, rel_ts, flags, frames_start) = parse_block_header(data)?;
@@ -653,7 +676,7 @@ fn decode_block(
     let sizes = match lacing {
         0b00 => {
             // No lacing: the whole payload is one frame (RFC 9559 §10.3.1).
-            push_frame(out, track, pts_ns, keyframe, payload);
+            push_frame(out, track, pts_ns, duration_ns, keyframe, payload);
             return Ok(());
         }
         0b01 => xiph_lace_sizes(payload)?,
@@ -666,12 +689,12 @@ fn decode_block(
     for &sz in &sizes.frames {
         let end = off.checked_add(sz).ok_or(ReadError::Malformed("laced frame size overflow"))?;
         let frame = payload.get(off..end).ok_or(ReadError::Malformed("laced frame runs past the block"))?;
-        push_frame(out, track, pts_ns, keyframe, frame);
+        push_frame(out, track, pts_ns, duration_ns, keyframe, frame);
         off = end;
     }
     // The last frame's size is whatever remains after the coded ones (§10.3.2/3/4).
     let last = payload.get(off..).ok_or(ReadError::Malformed("last laced frame runs past the block"))?;
-    push_frame(out, track, pts_ns, keyframe, last);
+    push_frame(out, track, pts_ns, duration_ns, keyframe, last);
     Ok(())
 }
 
@@ -698,10 +721,18 @@ fn block_pts_ns(cluster_base_tick: i64, rel_ts: i16, scale: u64) -> u64 {
 }
 
 /// Queue one decoded frame (copying its bytes out of the shared buffer window into `out`).
-fn push_frame(out: &mut VecDeque<Frame>, track: u64, pts_ns: u64, keyframe: bool, data: &[u8]) {
+fn push_frame(
+    out: &mut VecDeque<Frame>,
+    track: u64,
+    pts_ns: u64,
+    duration_ns: Option<u64>,
+    keyframe: bool,
+    data: &[u8],
+) {
     out.push_back(Frame {
         track_number: track,
         pts_ns,
+        duration_ns,
         keyframe,
         data: data.to_vec(),
     });
@@ -1119,6 +1150,68 @@ mod tests {
         r.push(&stream).unwrap();
         let pts: Vec<u64> = std::iter::from_fn(|| r.next_frame().map(|f| f.pts_ns)).collect();
         assert_eq!(pts, vec![0, 1_000_000, 2_000_000], "pts in ns = tick * scale");
+    }
+
+    /// A subtitle-shaped stream: the writer emits SimpleBlocks, which carry no BlockDuration,
+    /// so a SimpleBlock frame has `duration_ns == None` — the honest "unknown".
+    #[test]
+    fn simple_block_has_no_duration() {
+        let frames: Vec<&[u8]> = vec![b"Hello", b"World"];
+        let (stream, _) = build_single(&frames);
+        let mut r = MatroskaReader::new();
+        r.push(&stream).unwrap();
+        while let Some(f) = r.next_frame() {
+            assert_eq!(f.duration_ns, None, "a SimpleBlock never declares a duration");
+        }
+    }
+
+    /// A `BlockGroup` with a `BlockDuration` (RFC 9559 §5.1.3.6) — the duration-bearing shape a
+    /// subtitle (S_TEXT/*) track uses — parses to a `Frame` whose `duration_ns` is the scaled
+    /// span. Hand-build a Cluster with one such group appended after a real header (the writer
+    /// only emits SimpleBlocks, so BlockGroup is hand-rolled here).
+    #[test]
+    fn block_group_carries_scaled_block_duration() {
+        use crate::ebml;
+        // Header/Tracks from the writer (default 1 ms TimestampScale), no frames.
+        let track = TrackConfig::flac(1, vec![b'f', b'L', b'a', b'C', 0, 0, 0, 0x22], 48_000.0, 2, 16);
+        let mut w = MatroskaWriter::new(vec![track]);
+        let mut stream = Vec::new();
+        w.write_header(&mut stream).unwrap();
+
+        // A Block body: track VINT (1 → 0x81), 16-bit signed rel timestamp, flags byte, payload.
+        let cue_text = b"a subtitle cue";
+        let mut block_body = Vec::new();
+        block_body.push(0x81); // TrackNumber 1 as a 1-octet VINT
+        block_body.extend_from_slice(&0i16.to_be_bytes()); // rel ts 0
+        block_body.push(0x00); // flags: no keyframe/lacing (BlockGroup decides keyframe)
+        block_body.extend_from_slice(cue_text);
+
+        // BlockGroup { Block, BlockDuration = 1500 ticks }.
+        let mut group = Vec::new();
+        ebml::write_binary(&mut group, id::BLOCK, &block_body);
+        ebml::write_uint(&mut group, id::BLOCK_DURATION, 1500);
+
+        // Cluster { Timestamp = 2 ticks, BlockGroup }.
+        let mut cluster_body = Vec::new();
+        ebml::write_uint(&mut cluster_body, id::TIMESTAMP, 2);
+        ebml::write_id(&mut cluster_body, id::BLOCK_GROUP);
+        ebml::write_size(&mut cluster_body, group.len() as u64);
+        cluster_body.extend_from_slice(&group);
+
+        ebml::write_id(&mut stream, id::CLUSTER);
+        ebml::write_size(&mut stream, cluster_body.len() as u64);
+        stream.extend_from_slice(&cluster_body);
+
+        let mut r = MatroskaReader::new();
+        r.push(&stream).unwrap();
+        let f = r.next_frame().expect("one cue frame");
+        assert_eq!(f.track_number, 1);
+        assert_eq!(f.data, cue_text);
+        assert!(f.keyframe, "no ReferenceBlock → keyframe");
+        // pts = (cluster base 2 + rel 0) * 1 ms; duration = 1500 * 1 ms.
+        assert_eq!(f.pts_ns, 2_000_000, "pts scaled by TimestampScale");
+        assert_eq!(f.duration_ns, Some(1_500_000_000), "BlockDuration scaled to ns");
+        assert!(r.next_frame().is_none(), "exactly one frame");
     }
 
     #[test]

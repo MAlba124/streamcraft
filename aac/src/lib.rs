@@ -15,8 +15,10 @@
 //!   out (announced via dynamic caps from decoded geometry).
 
 pub mod aacdec;
+pub mod adtsparse;
 
 pub use aacdec::AacDec;
+pub use adtsparse::AdtsParse;
 
 use streamcraft_core::element::Element;
 use streamcraft_core::registry::Registry;
@@ -24,4 +26,5 @@ use streamcraft_core::registry::Registry;
 /// Register this crate's elements for name-based construction (spec: Plugins).
 pub fn register(registry: &mut Registry) {
     registry.register(AacDec::new().desc());
+    registry.register(AdtsParse::new().desc());
 }

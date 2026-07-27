@@ -317,6 +317,117 @@ pub fn remap_channels(
     }
 }
 
+/// The −3 dB matrix coefficient (`1/√2`) applied to the centre and surround feeds in an
+/// ITU-R BS.775-3 stereo downmix. Cited at each use below.
+const M3DB: f32 = std::f32::consts::FRAC_1_SQRT_2; // 0.70710677
+
+/// Fold a multichannel interleaved stream down to **stereo** with the ITU-R BS.775-3
+/// "Lo/Ro" matrix (Recommendation ITU-R BS.775-3 §3, *Downmixing to fewer channels*), the
+/// same coefficients ffmpeg/libav and every AV receiver use: the centre and the surrounds
+/// are mixed into the front pair at −3 dB ([`M3DB`]), the LFE is dropped (BS.775 leaves LFE
+/// out of a 2-channel fold — it carries no directional information and would only muddy a
+/// stereo mix). This is what lets a 5.1 AC-3/E-AC-3 track (which has no stereo companion,
+/// unlike the AAC movie tracks that ship an explicit 2-channel mix) play on a stereo device.
+///
+/// **Channel order is assumed canonical SMPTE/ITU order** — the order the streamcraft AC-3 /
+/// E-AC-3 decoder emits: `L, R, C, LFE, Ls, Rs` (and, for 7.1, `…, Lb, Rb`). Decoders that
+/// emit a different interleave (e.g. raw AAC's `C, L, R, …`) must reorder to this canonical
+/// order *before* the downmix, or route their explicit stereo track instead. The layout is
+/// inferred from the channel count; the supported folds:
+///
+/// | in | assumed layout            | Lo                         | Ro                         |
+/// |----|---------------------------|----------------------------|----------------------------|
+/// | 3  | L R C                     | L + .707·C                 | R + .707·C                 |
+/// | 4  | L R Ls Rs (quad)          | L + .707·Ls                | R + .707·Rs                |
+/// | 5  | L R C Ls Rs (5.0)         | L + .707·C + .707·Ls       | R + .707·C + .707·Rs       |
+/// | 6  | L R C LFE Ls Rs (5.1)     | L + .707·C + .707·Ls       | R + .707·C + .707·Rs       |
+/// | 8  | L R C LFE Ls Rs Lb Rb(7.1)| L + .707·C + .707·(Ls+Lb)  | R + .707·C + .707·(Rs+Rb)  |
+///
+/// Any other channel count `> 2` falls back to taking the first two channels verbatim (a
+/// safe, if lossy, default that never desyncs the front pair). `in_channels <= 2` is a
+/// caller error here — the [`crate::convert_element::AudioDownmix`] element passes those
+/// through without calling this. Mixing is done at float precision and **clamped** on
+/// encode, so the BS.775 sum (peak up to ~2.4×) saturates cleanly rather than wrapping;
+/// clipping is rare with real content and matches the ffmpeg default (which also does not
+/// auto-normalise). Returns the number of output bytes written, or `None` on a ragged input
+/// or too-small `output`.
+pub fn downmix_to_stereo(
+    fmt: SampleFormat,
+    in_channels: usize,
+    input: &[u8],
+    output: &mut [u8],
+) -> Option<usize> {
+    let bps = fmt.bytes();
+    let in_stride = bps.checked_mul(in_channels)?;
+    if in_stride == 0 || in_channels < 2 || input.len() % in_stride != 0 {
+        return None;
+    }
+    let frames = input.len() / in_stride;
+    let out_len = frames.checked_mul(bps.checked_mul(2)?)?;
+    if output.len() < out_len {
+        return None;
+    }
+
+    // Read channel `c` of frame `f` as a float in the canonical [-1, 1) domain (integer
+    // formats are lifted to 32-bit scale first, exactly as the sample-format converter does).
+    let sample = |input: &[u8], f: usize, c: usize| -> f32 {
+        let b = &input[f * in_stride + c * bps..][..bps];
+        if fmt.is_float() {
+            decode_f32(b)
+        } else {
+            decode_i32_scale32(fmt, b) as f32 / 2_147_483_648.0
+        }
+    };
+    // Write a downmixed float sample back into output channel `oc` of frame `f`, clamped.
+    let put = |output: &mut [u8], f: usize, oc: usize, v: f32| {
+        let d = &mut output[(f * 2 + oc) * bps..][..bps];
+        if fmt.is_float() {
+            d.copy_from_slice(&v.clamp(-1.0, 1.0).to_le_bytes());
+        } else {
+            // Back to 32-bit scale, clamp, and narrow to the target depth via the shared
+            // encoder (which rounds + clamps per format).
+            let scaled = (v * 2_147_483_648.0).clamp(i32::MIN as f32, i32::MAX as f32);
+            encode_i32_scale32(fmt, scaled as i32, d);
+        }
+    };
+
+    for f in 0..frames {
+        let (lo, ro) = match in_channels {
+            // L R C — BS.775 §3: centre at −3 dB into both fronts.
+            3 => {
+                let (l, r, c) = (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2));
+                (l + M3DB * c, r + M3DB * c)
+            }
+            // L R Ls Rs (quad) — surrounds at −3 dB into the same-side front.
+            4 => {
+                let (l, r, ls, rs) =
+                    (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2), sample(input, f, 3));
+                (l + M3DB * ls, r + M3DB * rs)
+            }
+            // L R C Ls Rs (5.0) and L R C LFE Ls Rs (5.1): centre + same-side surround at
+            // −3 dB; LFE (index 3, present only for 5.1) is dropped per BS.775.
+            5 | 6 => {
+                let (ls_i, rs_i) = if in_channels == 6 { (4, 5) } else { (3, 4) };
+                let (l, r, c) = (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2));
+                let (ls, rs) = (sample(input, f, ls_i), sample(input, f, rs_i));
+                (l + M3DB * (c + ls), r + M3DB * (c + rs))
+            }
+            // L R C LFE Ls Rs Lb Rb (7.1): both surround pairs fold to their side; LFE dropped.
+            8 => {
+                let (l, r, c) = (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2));
+                let (ls, rs, lb, rb) =
+                    (sample(input, f, 4), sample(input, f, 5), sample(input, f, 6), sample(input, f, 7));
+                (l + M3DB * (c + ls + lb), r + M3DB * (c + rs + rb))
+            }
+            // Unknown layout: pass the first two channels through unmodified.
+            _ => (sample(input, f, 0), sample(input, f, 1)),
+        };
+        put(output, f, 0, lo);
+        put(output, f, 1, ro);
+    }
+    Some(out_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,5 +847,57 @@ mod tests {
         let src = vec![0u8; 4 * f.channels as usize]; // 4 frames? no: 4 bytes/frame here
         let out = convert_interleaved_vec(f.format, SampleFormat::S32, f.channels as usize, &src);
         assert!(out.is_some());
+    }
+
+    // --- BS.775 stereo downmix -------------------------------------------------------
+
+    /// One 5.1 S16 frame (canonical order L,R,C,LFE,Ls,Rs) folds to the expected Lo/Ro,
+    /// with the LFE (index 3) dropped and centre+surround mixed in at −3 dB.
+    #[test]
+    fn downmix_51_to_stereo_matrix() {
+        let frame: [i16; 6] = [1000, 2000, 3000, 32000 /*LFE, dropped*/, 400, 500];
+        let mut input = Vec::new();
+        for s in frame {
+            input.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut out = vec![0u8; 4]; // 1 frame × 2 ch × 2 bytes
+        assert_eq!(downmix_to_stereo(SampleFormat::S16, 6, &input, &mut out), Some(4));
+        let lo = i16::from_le_bytes([out[0], out[1]]);
+        let ro = i16::from_le_bytes([out[2], out[3]]);
+        // Lo = L + .707·(C + Ls) = 1000 + 0.7071·3400 ≈ 3404; Ro = R + .707·(C + Rs) ≈ 4475.
+        let m = std::f32::consts::FRAC_1_SQRT_2;
+        let exp_lo = (1000.0 + m * (3000.0 + 400.0)).round() as i16;
+        let exp_ro = (2000.0 + m * (3000.0 + 500.0)).round() as i16;
+        assert!((lo - exp_lo).abs() <= 1, "Lo {lo} vs {exp_lo}");
+        assert!((ro - exp_ro).abs() <= 1, "Ro {ro} vs {exp_ro}");
+    }
+
+    /// Full-scale surround content saturates cleanly (BS.775 peak ~2.4×) rather than wrapping.
+    #[test]
+    fn downmix_clamps_instead_of_wrapping() {
+        let frame: [i16; 6] = [i16::MAX, i16::MAX, i16::MAX, 0, i16::MAX, i16::MAX];
+        let mut input = Vec::new();
+        for s in frame {
+            input.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut out = vec![0u8; 4];
+        downmix_to_stereo(SampleFormat::S16, 6, &input, &mut out).unwrap();
+        assert_eq!(i16::from_le_bytes([out[0], out[1]]), i16::MAX); // clamped, not wrapped
+        assert_eq!(i16::from_le_bytes([out[2], out[3]]), i16::MAX);
+    }
+
+    /// An unknown channel count > 2 passes the first two channels through unmodified.
+    #[test]
+    fn downmix_unknown_layout_takes_front_pair() {
+        // 5 channels handled explicitly; use 7 (unhandled) to hit the fallback arm.
+        let frame: [i16; 7] = [111, 222, 333, 444, 555, 666, 777];
+        let mut input = Vec::new();
+        for s in frame {
+            input.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut out = vec![0u8; 4];
+        downmix_to_stereo(SampleFormat::S16, 7, &input, &mut out).unwrap();
+        assert_eq!(i16::from_le_bytes([out[0], out[1]]), 111);
+        assert_eq!(i16::from_le_bytes([out[2], out[3]]), 222);
     }
 }

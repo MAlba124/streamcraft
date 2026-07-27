@@ -33,6 +33,12 @@ members = [
     "rtsp",
     "launch",
     "nvr",
+    "text",
+    "play",
+    "player-ui",
+    "ac3",
+    "avi",
+    "mpeg4p2",
 ]
 
 [workspace.package]

@@ -10,7 +10,7 @@
 //! pointer arm of the display makes that automatic. All `unsafe` in the crate is
 //! confined to this module and [`crate::ffi`].
 
-use std::ffi::CStr;
+use std::ffi::{c_int, CStr};
 use std::fmt;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
@@ -700,6 +700,184 @@ impl Drop for MappedImage {
             ffi::vaDestroyImage(self.dpy, self.image.image_id);
         }
     }
+}
+
+/// One exported DMA-BUF plane: which object (fd) it lives in, its byte offset in that
+/// object, and its row pitch. Copied out of the driver's [`ffi::VADRMPRIMESurfaceDescriptor`]
+/// so the descriptor (with its raw fds) never has to travel downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportedPlane {
+    /// Index into [`ExportedSurface::fds`] — which DMA-BUF this plane's bytes are in.
+    pub object_index: u32,
+    /// Byte offset of the plane's first row within that object.
+    pub offset: u32,
+    /// Row stride in bytes.
+    pub pitch: u32,
+}
+
+/// A decoded VA surface exported as DMA-BUF(s) via `vaExportSurfaceHandle`
+/// (`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`, COMPOSED layers). This is the zero-copy
+/// display hand-off: the decoded pixels stay in GPU memory; only these fds + plane geometry
+/// travel to the GUI, which imports them with `EGL_LINUX_DMA_BUF_EXT`.
+///
+/// **fd ownership.** The driver hands one fd per DMA-BUF object; this wrapper owns them and
+/// `close()`s each on drop. The producer serializes the frame by [`dup`](Self::dup_fds)ing
+/// the fds into the outgoing buffer (so the importer owns *its* copies and closes them after
+/// `eglCreateImageKHR`), and drops this wrapper — closing the originals — right after. The
+/// surface's *pixels* are kept alive by the decoder's surface-pool refcount (the "in-flight"
+/// marking), independent of these fds: an fd pins the GEM object, but the decoder must still
+/// not reuse the surface for a new decode until the GUI signals it presented (see
+/// `h265dec`'s in-flight release channel).
+pub struct ExportedSurface {
+    /// One fd per DMA-BUF object (owned; closed on drop).
+    pub fds: Vec<std::os::unix::io::RawFd>,
+    /// The surface FourCC (`VA_FOURCC_NV12`).
+    pub fourcc: u32,
+    /// The DRM FourCC of the composed layer (`DRM_FORMAT_NV12`).
+    pub drm_format: u32,
+    /// The DRM format modifier of object 0 (`DRM_FORMAT_MOD_INVALID` when the driver
+    /// reported none — the importer then omits the modifier attributes).
+    pub drm_modifier: u64,
+    /// Coded surface width/height (the descriptor reports the full coded size; the display
+    /// crop is applied by the importer via the sampled texture rect).
+    pub coded_w: u32,
+    pub coded_h: u32,
+    /// One entry per plane of the composed layer (NV12 → 2: Y then interleaved CbCr).
+    pub planes: Vec<ExportedPlane>,
+}
+
+impl ExportedSurface {
+    /// Sync `surface`, then export it as DMA-BUF(s) (COMPOSED NV12, read-only). The caller
+    /// must keep the *surface* alive (pool refcount) until the importer is done sampling —
+    /// this only governs the fd lifetime, not the GPU memory's reuse.
+    // `dpy` is the raw `VADisplay` handle every VA-API entry point in this module takes; the
+    // element owns it on its single scheduler thread and guarantees it outlives the call
+    // (same invariant as `sync_surface`/`MappedImage::acquire`). Clippy's raw-ptr-arg lint
+    // fires on the whole module for this; kept confined here rather than making the type
+    // `unsafe` (which would infect the safe RAII surface).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn export(dpy: ffi::VADisplay, surface: ffi::VASurfaceID) -> VaResult<ExportedSurface> {
+        // The decode into this surface may still be in flight; fence it first (same barrier
+        // the readback path takes before mapping).
+        // SAFETY: surface is a live decode target on this display.
+        check(unsafe { ffi::vaSyncSurface(dpy, surface) }, "vaSyncSurface(export)")?;
+
+        let mut desc: ffi::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+        // COMPOSED_LAYERS: one layer whose drm_format is the whole-surface FourCC
+        // (DRM_FORMAT_NV12) with one plane per component — the shape an EGL NV12
+        // `EGL_LINUX_DMA_BUF_EXT` import consumes (VA-API surface export flow,
+        // va_drmcommon.h). READ_ONLY: the GUI only samples.
+        // SAFETY: desc is a valid out struct; surface is synced; PRIME_2 is the mem type
+        // vaExportSurfaceHandle fills a VADRMPRIMESurfaceDescriptor for.
+        let st = unsafe {
+            ffi::vaExportSurfaceHandle(
+                dpy,
+                surface,
+                ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                ffi::VA_EXPORT_SURFACE_READ_ONLY | ffi::VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+                &mut desc as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+        check(st, "vaExportSurfaceHandle")?;
+
+        let n_obj = (desc.num_objects as usize).min(ffi::VA_DRM_PRIME_MAX_OBJECTS);
+        let mut fds = Vec::with_capacity(n_obj);
+        for o in desc.objects.iter().take(n_obj) {
+            fds.push(o.fd as std::os::unix::io::RawFd);
+        }
+        // COMPOSED export → exactly one layer; its planes index into objects[].
+        let drm_modifier = desc.objects.first().map(|o| o.drm_format_modifier).unwrap_or(0);
+        let (drm_format, planes) = if desc.num_layers >= 1 {
+            let layer = &desc.layers[0];
+            let np = (layer.num_planes as usize).min(ffi::VA_DRM_PRIME_MAX_PLANES);
+            let planes: Vec<ExportedPlane> = (0..np)
+                .map(|i| ExportedPlane {
+                    object_index: layer.object_index[i],
+                    offset: layer.offset[i],
+                    pitch: layer.pitch[i],
+                })
+                .collect();
+            (layer.drm_format, planes)
+        } else {
+            (ffi::DRM_FORMAT_NV12, Vec::new())
+        };
+
+        Ok(ExportedSurface {
+            fds,
+            fourcc: desc.fourcc,
+            drm_format,
+            drm_modifier,
+            coded_w: desc.width,
+            coded_h: desc.height,
+            planes,
+        })
+    }
+
+    /// `dup()` every owned fd, transferring ownership to the caller — the serialize step:
+    /// the importer receives these duplicates (which it closes after `eglCreateImageKHR`),
+    /// while this wrapper still closes the originals on drop. Returns the dup'd fds in the
+    /// same order as [`fds`](Self::fds); a dup failure yields the fds dup'd so far (the
+    /// caller closes them and treats the frame as un-importable).
+    pub fn dup_fds(&self) -> std::io::Result<Vec<std::os::unix::io::RawFd>> {
+        let mut out = Vec::with_capacity(self.fds.len());
+        for &fd in &self.fds {
+            // SAFETY: fd is a live DMA-BUF fd owned by this surface; F_DUPFD_CLOEXEC gives
+            // the dup the close-on-exec flag (a leaked fd across exec would pin GPU memory).
+            let dup = unsafe { libc_dup_cloexec(fd) };
+            if dup < 0 {
+                for f in out {
+                    // SAFETY: f is a fd we just dup'd and own; close exactly once.
+                    unsafe {
+                        close_fd(f);
+                    }
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+            out.push(dup);
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for ExportedSurface {
+    fn drop(&mut self) {
+        for &fd in &self.fds {
+            // SAFETY: each fd was handed to us by vaExportSurfaceHandle and is owned here;
+            // closed exactly once (dup_fds hands out copies, never these).
+            unsafe {
+                close_fd(fd);
+            }
+        }
+    }
+}
+
+// Minimal libc shims so the crate keeps its "no non-core dependency" posture (it already
+// hand-rolls the whole libva FFI). `fcntl`/`close` are the two POSIX calls the fd hand-off
+// needs; both are in the C runtime this crate already links (via libva-drm).
+extern "C" {
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    fn close(fd: c_int) -> c_int;
+}
+
+/// `F_DUPFD_CLOEXEC` (fcntl.h, Linux) — dup to the lowest free fd ≥ arg with CLOEXEC set.
+const F_DUPFD_CLOEXEC: c_int = 1030;
+
+/// `dup(fd)` with the close-on-exec flag, via `fcntl(fd, F_DUPFD_CLOEXEC, 0)` — the
+/// race-free CLOEXEC dup (a plain `dup` + `fcntl(F_SETFD)` leaves a window where a
+/// concurrent `exec` would inherit the fd). Returns the new fd, or < 0 on error.
+///
+/// # Safety
+/// `fd` must be a live file descriptor.
+unsafe fn libc_dup_cloexec(fd: c_int) -> c_int {
+    fcntl(fd, F_DUPFD_CLOEXEC, 0)
+}
+
+/// `close(fd)`, ignoring the result (a Drop has nowhere to report it).
+///
+/// # Safety
+/// `fd` must be a live, owned file descriptor closed exactly once.
+unsafe fn close_fd(fd: c_int) {
+    close(fd);
 }
 
 /// The **write-path** inverse of [`MappedImage`]: a CPU-writable NV12 view over an

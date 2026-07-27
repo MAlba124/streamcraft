@@ -849,6 +849,10 @@ pub struct MkvDemux {
 struct Carry {
     pad: PadId,
     pts_ns: Option<u64>,
+    /// Presentation duration in ns (`BlockDuration`), stamped on every chunk of the frame so a
+    /// split emission preserves it — load-bearing for duration-bearing sparse tracks
+    /// (subtitles, where the cue span is `[pts, pts+dur)`). `None` when the block declared none.
+    duration_ns: Option<u64>,
     flags: BufferFlags,
     bytes: Vec<u8>,
     off: usize,
@@ -917,13 +921,14 @@ impl MkvDemux {
 
     /// Push `bytes[off..]` on `pad` via **pooled** slots (`try_alloc`), chunked to the slot
     /// size, returning the new offset — `< bytes.len()` means the pool ran dry and the caller
-    /// must carry the remainder and stop consuming input (spec: the backpressure rule). PTS
-    /// and `flags` (the frame's keyframe/delta tag, on every chunk of the frame) are stamped
-    /// on each buffer.
+    /// must carry the remainder and stop consuming input (spec: the backpressure rule). PTS,
+    /// duration (`BlockDuration`) and `flags` (the frame's keyframe/delta tag, on every chunk of
+    /// the frame) are stamped on each buffer.
     fn emit_bounded(
         ctx: &mut Ctx,
         pad: PadId,
         pts_ns: Option<u64>,
+        duration_ns: Option<u64>,
         flags: BufferFlags,
         bytes: &[u8],
         mut off: usize,
@@ -937,6 +942,9 @@ impl MkvDemux {
             buf.memory.set_len(n);
             if let Some(t) = pts_ns {
                 buf.pts = Timestamp::from_nanos(t);
+            }
+            if let Some(d) = duration_ns {
+                buf.duration = Timestamp::from_nanos(d);
             }
             buf.flags = flags;
             ctx.out(pad).push(buf);
@@ -952,6 +960,7 @@ impl MkvDemux {
         ctx: &mut Ctx,
         pad: PadId,
         pts_ns: Option<u64>,
+        duration_ns: Option<u64>,
         flags: BufferFlags,
         bytes: &[u8],
         off: usize,
@@ -966,6 +975,9 @@ impl MkvDemux {
         if let Some(t) = pts_ns {
             buf.pts = Timestamp::from_nanos(t);
         }
+        if let Some(d) = duration_ns {
+            buf.duration = Timestamp::from_nanos(d);
+        }
         buf.flags = flags;
         ctx.out(pad).push(buf);
     }
@@ -977,19 +989,20 @@ impl MkvDemux {
         ctx: &mut Ctx,
         pad: PadId,
         pts_ns: Option<u64>,
+        duration_ns: Option<u64>,
         flags: BufferFlags,
         bytes: Vec<u8>,
     ) {
-        let off = Self::emit_bounded(ctx, pad, pts_ns, flags, &bytes, 0);
+        let off = Self::emit_bounded(ctx, pad, pts_ns, duration_ns, flags, &bytes, 0);
         if off < bytes.len() {
-            self.pending.push_back(Carry { pad, pts_ns, flags, bytes, off });
+            self.pending.push_back(Carry { pad, pts_ns, duration_ns, flags, bytes, off });
         }
     }
 
     /// Resume parked emissions. `true` when everything pending has drained.
     fn drain_pending(&mut self, ctx: &mut Ctx) -> bool {
         while let Some(mut c) = self.pending.pop_front() {
-            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
+            c.off = Self::emit_bounded(ctx, c.pad, c.pts_ns, c.duration_ns, c.flags, &c.bytes, c.off);
             if c.off < c.bytes.len() {
                 self.pending.push_front(c);
                 return false;
@@ -1048,22 +1061,28 @@ impl MkvDemux {
                 let (pad, family) = (self.pad_tracks[idx].pad, self.pad_tracks[idx].family);
                 Self::announce(ctx, pad, family, &self.pad_tracks[idx].track);
                 // The head carries the stream start; stamp it with the first frame's pts. Take
-                // it (leaving empty) — it is emitted exactly once, before the first frame.
+                // it (leaving empty) — it is emitted exactly once, before the first frame. The
+                // head has no presentation duration of its own.
                 let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
-                self.emit_or_park(ctx, pad, Some(frame.pts_ns), BufferFlags::empty(), head);
+                self.emit_or_park(ctx, pad, Some(frame.pts_ns), None, BufferFlags::empty(), head);
             }
             let pad = self.pad_tracks[idx].pad;
             // The container's keyframe bit rides the buffer (spec: Buffer flags) so a
             // remuxing consumer preserves seekability; `DELTA` is explicit — an untagged
             // buffer would read as "unknown", which a muxer defaults to keyframe.
             let flags = if frame.keyframe { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
+            // The block's presentation duration (BlockGroup\BlockDuration), when present:
+            // rides the buffer's `duration` field so a duration-bearing sparse consumer (the
+            // subtitle overlay) has the cue span `[pts, pts+dur)`. `None` for a SimpleBlock.
+            let dur_ns = frame.duration_ns;
             // Emit from the (usually borrowed) reframed bytes; only a parked remainder
             // pays the copy into an owned carry.
-            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), flags, &out_bytes, 0);
+            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), dur_ns, flags, &out_bytes, 0);
             if off < out_bytes.len() {
                 self.pending.push_back(Carry {
                     pad,
                     pts_ns: Some(frame.pts_ns),
+                    duration_ns: dur_ns,
                     flags,
                     bytes: out_bytes.into_owned(),
                     off,
@@ -1082,7 +1101,7 @@ impl MkvDemux {
     /// input while it could emit, so at most one input batch's worth of samples sits here.
     fn flush_exact(&mut self, ctx: &mut Ctx) {
         while let Some(c) = self.pending.pop_front() {
-            Self::emit_exact(ctx, c.pad, c.pts_ns, c.flags, &c.bytes, c.off);
+            Self::emit_exact(ctx, c.pad, c.pts_ns, c.duration_ns, c.flags, &c.bytes, c.off);
         }
         // Reuse drain()'s routing/announce logic by swapping the emitter is overkill for
         // the tail; inline the same walk with exact emission.
@@ -1099,11 +1118,12 @@ impl MkvDemux {
                 let (pad, family) = (self.pad_tracks[idx].pad, self.pad_tracks[idx].family);
                 Self::announce(ctx, pad, family, &self.pad_tracks[idx].track);
                 let head = std::mem::take(&mut self.pad_tracks[idx].codec_head);
-                Self::emit_exact(ctx, pad, Some(frame.pts_ns), BufferFlags::empty(), &head, 0);
+                Self::emit_exact(ctx, pad, Some(frame.pts_ns), None, BufferFlags::empty(), &head, 0);
             }
             let pad = self.pad_tracks[idx].pad;
             let flags = if frame.keyframe { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
-            Self::emit_exact(ctx, pad, Some(frame.pts_ns), flags, &out_bytes, 0);
+            // Carry BlockDuration onto the tail buffer too (the subtitle cue span).
+            Self::emit_exact(ctx, pad, Some(frame.pts_ns), frame.duration_ns, flags, &out_bytes, 0);
         }
     }
 

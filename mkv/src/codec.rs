@@ -29,17 +29,50 @@ use streamcraft_core::format::OfferDesc;
 /// - `V_MPEG4/ISO/AVC` → `h264/annexb`, `V_MPEGH/ISO/HEVC` → `h265/annexb`;
 /// - `A_FLAC` → `flac`; anything else → `bytes` (the unknown-codec fallback).
 ///
+/// **Subtitle tracks** (RFC 9559 §12.7 subtitle codec mappings; Matroska codec registry
+/// at `codec.mkvtoolnix.download`):
+/// - *Text* (`S_TEXT/*`): `S_TEXT/UTF8` → `subtitle/srt` (SubRip cue text), `S_TEXT/ASS` and
+///   `S_TEXT/SSA` → `subtitle/ass` (Advanced/legacy SubStation Alpha — the same Dialogue
+///   grammar, so one family), `S_TEXT/WEBVTT` → `subtitle/vtt` (W3C WebVTT). Each Block is one
+///   cue's raw text; `sc-text`'s `subparse` links on the announced family and normalises markup
+///   to plain `subtitle/events` for the overlay.
+/// - *Bitmap* (`S_HDMV/PGS`) → `subtitle/pgs` (HDMV Presentation Graphics Stream — the
+///   image-based BluRay subtitle). Each Block is one PGS **Display Set** (bare PGS segments,
+///   no `.sup` `PG`/timestamp header — that framing is a raw-`.sup` concern, not the mkv one);
+///   `sc-text`'s `pgsdec` decodes the RLE bitmap + palette to `subtitle/bitmap` RGBA for the
+///   overlay's `image` pad. See `sc-text`'s `pgs` module for the segment grammar.
+///
+/// Timing rides the buffer PTS + duration on every subtitle path (see [`Reframer::Passthrough`]
+/// and the demuxer's BlockDuration plumbing — a PGS Display Set is one Block, so its
+/// presentation span is the Block's `BlockDuration`).
+///
 /// The families are `&'static str` so they can seed a pad's static offer menu (a pad may only
 /// announce a family it already offered — the vocabulary is interned from those offers).
 pub fn family_for(codec_id: &str) -> &'static str {
     match codec_id {
         "A_FLAC" => "flac",
         "A_AAC" => "aac",
+        // Surround/other audio (Matroska codec registry): AC-3 (ATSC A/52) and E-AC-3 (Dolby
+        // Digital Plus) decode via `sc-ac3`; MP3 via `sc-mp3`. DTS/Opus/Vorbis are named so the
+        // autoplugger reports "no decoder for <codec>" rather than an opaque `bytes` drop —
+        // and so a future decoder wires in by family with no demuxer change.
+        "A_AC3" => "ac3",
+        "A_EAC3" => "eac3",
+        "A_DTS" => "dts",
+        "A_MPEG/L3" => "mp3",
+        "A_OPUS" => "opus",
+        "A_VORBIS" => "vorbis",
         "V_VP8" => "vp8",
         "V_VP9" => "vp9",
         "V_AV1" => "av1",
         "V_MPEG4/ISO/AVC" => "h264/annexb",
         "V_MPEGH/ISO/HEVC" => "h265/annexb",
+        // Subtitle text codecs (RFC 9559 §12.7; Matroska codec registry).
+        "S_TEXT/UTF8" => "subtitle/srt",
+        "S_TEXT/ASS" | "S_TEXT/SSA" => "subtitle/ass",
+        "S_TEXT/WEBVTT" => "subtitle/vtt",
+        // Bitmap subtitle: HDMV PGS (BluRay). One Block = one PGS Display Set.
+        "S_HDMV/PGS" => "subtitle/pgs",
         _ => "bytes",
     }
 }
@@ -54,20 +87,43 @@ pub fn family_for(codec_id: &str) -> &'static str {
 pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
     static FLAC: [OfferDesc; 2] = [OfferDesc::any("flac"), OfferDesc::any("bytes")];
     static AAC: [OfferDesc; 2] = [OfferDesc::any("aac"), OfferDesc::any("bytes")];
+    static AC3: [OfferDesc; 2] = [OfferDesc::any("ac3"), OfferDesc::any("bytes")];
+    static EAC3: [OfferDesc; 2] = [OfferDesc::any("eac3"), OfferDesc::any("bytes")];
+    static DTS: [OfferDesc; 2] = [OfferDesc::any("dts"), OfferDesc::any("bytes")];
+    static MP3: [OfferDesc; 2] = [OfferDesc::any("mp3"), OfferDesc::any("bytes")];
+    static OPUS: [OfferDesc; 2] = [OfferDesc::any("opus"), OfferDesc::any("bytes")];
+    static VORBIS: [OfferDesc; 2] = [OfferDesc::any("vorbis"), OfferDesc::any("bytes")];
     static VP8: [OfferDesc; 2] = [OfferDesc::any("vp8"), OfferDesc::any("bytes")];
     static VP9: [OfferDesc; 2] = [OfferDesc::any("vp9"), OfferDesc::any("bytes")];
     static AV1: [OfferDesc; 2] = [OfferDesc::any("av1"), OfferDesc::any("bytes")];
     static H264: [OfferDesc; 2] = [OfferDesc::any("h264/annexb"), OfferDesc::any("bytes")];
     static H265: [OfferDesc; 2] = [OfferDesc::any("h265/annexb"), OfferDesc::any("bytes")];
+    // Subtitle text menus (RFC 9559 §12.7): the announced family + the `bytes` escape, so
+    // `sc-text`'s `subparse` selects on the family while a generic byte peer can still tap it.
+    static SRT: [OfferDesc; 2] = [OfferDesc::any("subtitle/srt"), OfferDesc::any("bytes")];
+    static ASS: [OfferDesc; 2] = [OfferDesc::any("subtitle/ass"), OfferDesc::any("bytes")];
+    static VTT: [OfferDesc; 2] = [OfferDesc::any("subtitle/vtt"), OfferDesc::any("bytes")];
+    // Bitmap subtitle: PGS (BluRay) — the announced family + the `bytes` escape.
+    static PGS: [OfferDesc; 2] = [OfferDesc::any("subtitle/pgs"), OfferDesc::any("bytes")];
     static BYTES: [OfferDesc; 1] = [OfferDesc::any("bytes")];
     match codec_id {
         "A_FLAC" => &FLAC,
         "A_AAC" => &AAC,
+        "A_AC3" => &AC3,
+        "A_EAC3" => &EAC3,
+        "A_DTS" => &DTS,
+        "A_MPEG/L3" => &MP3,
+        "A_OPUS" => &OPUS,
+        "A_VORBIS" => &VORBIS,
         "V_VP8" => &VP8,
         "V_VP9" => &VP9,
         "V_AV1" => &AV1,
         "V_MPEG4/ISO/AVC" => &H264,
         "V_MPEGH/ISO/HEVC" => &H265,
+        "S_TEXT/UTF8" => &SRT,
+        "S_TEXT/ASS" | "S_TEXT/SSA" => &ASS,
+        "S_TEXT/WEBVTT" => &VTT,
+        "S_HDMV/PGS" => &PGS,
         _ => &BYTES,
     }
 }
@@ -304,8 +360,37 @@ mod tests {
         assert_eq!(family_for("V_MPEG4/ISO/AVC"), "h264/annexb");
         assert_eq!(family_for("V_MPEGH/ISO/HEVC"), "h265/annexb");
         assert_eq!(family_for("A_FLAC"), "flac");
-        assert_eq!(family_for("A_OPUS"), "bytes", "unknown → bytes fallback");
+        // Subtitle text codecs (RFC 9559 §12.7).
+        assert_eq!(family_for("S_TEXT/UTF8"), "subtitle/srt");
+        assert_eq!(family_for("S_TEXT/ASS"), "subtitle/ass");
+        assert_eq!(family_for("S_TEXT/SSA"), "subtitle/ass", "legacy SSA shares the ASS family");
+        assert_eq!(family_for("S_TEXT/WEBVTT"), "subtitle/vtt");
+        assert_eq!(family_for("S_HDMV/PGS"), "subtitle/pgs", "PGS bitmap subtitle");
+        // Surround/other audio (Matroska codec registry).
+        assert_eq!(family_for("A_AC3"), "ac3", "Dolby Digital");
+        assert_eq!(family_for("A_EAC3"), "eac3", "Dolby Digital Plus");
+        assert_eq!(family_for("A_DTS"), "dts");
+        assert_eq!(family_for("A_MPEG/L3"), "mp3");
+        assert_eq!(family_for("A_OPUS"), "opus", "named so autoplug reports 'no decoder for opus'");
+        assert_eq!(family_for("A_VORBIS"), "vorbis");
+        assert_eq!(family_for("V_REAL/RV40"), "bytes", "unknown → bytes fallback");
         assert_eq!(family_for(""), "bytes", "empty codec id → bytes fallback");
+    }
+
+    #[test]
+    fn subtitle_offer_menus_carry_family_plus_bytes() {
+        for (id, family) in [
+            ("S_TEXT/UTF8", "subtitle/srt"),
+            ("S_TEXT/ASS", "subtitle/ass"),
+            ("S_TEXT/SSA", "subtitle/ass"),
+            ("S_TEXT/WEBVTT", "subtitle/vtt"),
+            ("S_HDMV/PGS", "subtitle/pgs"),
+        ] {
+            let offers = offers_for(id);
+            assert_eq!(offers.len(), 2, "{id}: family + bytes escape");
+            assert_eq!(offers[0].family, family, "{id} first offer is its family");
+            assert_eq!(offers[1].family, "bytes", "{id} second offer is the bytes escape");
+        }
     }
 
     #[test]

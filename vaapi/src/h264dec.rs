@@ -34,10 +34,16 @@ use streamcraft_core::log;
 use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
+use std::sync::Arc;
+
 use crate::ffi;
+use crate::gpuframe::{
+    self, GpuFrame, GpuFrameChannel, GpuFrameHeader, FrameToken, FAMILY_VIDEO_GPU, F_LAYOUT,
+    LAYOUT_NV12_DMABUF,
+};
 use crate::h264parse::{self, MmcoOp, Pps, PredWeightTable, RefListMod, SliceHeader, SliceType, Sps};
 use crate::probe;
-use crate::va::{Buffer as VaBuffer, Config, Context, Display, MappedImage, Surfaces};
+use crate::va::{Buffer as VaBuffer, Config, Context, Display, ExportedSurface, MappedImage, Surfaces};
 
 // `video/raw` family/field/value names, kept as literals (core-only, like the
 // software h264dec) — the pipeline interns by string so they line up with peers.
@@ -121,6 +127,12 @@ struct PendingOut {
     duration: Timestamp,
     width: u32,
     height: u32,
+    /// Coded (macroblock-aligned) surface dimensions — the dma-buf plane geometry the
+    /// zero-copy export reports is at this size (the readback path maps at the cropped size,
+    /// so it ignores these). H.264 frame-cropping is always relative to a (0,0) top-left
+    /// origin in this subset, so no crop_x/crop_y is carried (both 0).
+    coded_w: u32,
+    coded_h: u32,
 }
 
 /// Lazily-built VA-API state: created on the first usable SPS, torn down + rebuilt
@@ -136,6 +148,10 @@ struct VaState {
     free: Vec<ffi::VASurfaceID>,
     width: u32,
     height: u32,
+    /// Coded (macroblock-aligned) surface dimensions — the zero-copy export's dma-buf
+    /// plane geometry is at this size (the readback path maps at the cropped size).
+    coded_w: u32,
+    coded_h: u32,
 }
 
 /// The VA-API H.264 decode element.
@@ -170,6 +186,22 @@ pub struct VaapiH264Dec {
     alloc_stalled: bool,
     /// Set once a fatal setup error was reported, to avoid a warning storm.
     disabled: bool,
+
+    // --- Zero-copy (DMA-BUF export) mode -------------------------------------------------
+    /// When `Some`, `emit_pending` exports the decoded surface as DMA-BUF(s) and pushes a
+    /// [`GpuFrame`] into this channel instead of NV12 readback. `None` is the default
+    /// readback mode (unchanged for the CLI and software peers). See
+    /// [`new_zerocopy`](Self::new_zerocopy) and [`crate::gpuframe`] for the full flow.
+    zerocopy: Option<Arc<GpuFrameChannel>>,
+    /// Monotonic token pairing an in-band `video/gpu` buffer with its [`GpuFrame`].
+    next_token: FrameToken,
+    /// Surfaces exported to the GUI and not yet released (presented): surface id → token.
+    /// A surface here is **in flight** — its dma-buf is being sampled, so it must not return
+    /// to the free pool (a new decode into it would tear the display).
+    in_flight: std::collections::HashMap<ffi::VASurfaceID, FrameToken>,
+    /// One-time latch: the export path failed (driver refused PRIME_2) → fall back to
+    /// readback for the rest of the run.
+    export_failed: bool,
 }
 
 // SAFETY: the element is scheduled `SchedHint::Active` — it runs on a single
@@ -189,6 +221,19 @@ impl Default for VaapiH264Dec {
 
 impl VaapiH264Dec {
     pub fn new() -> Self {
+        Self::with_zerocopy(None)
+    }
+
+    /// Build the decoder in **zero-copy** mode: `emit_pending` exports the decoded surface
+    /// as DMA-BUF(s) (`vaExportSurfaceHandle`) and pushes a [`GpuFrame`] into `channel` for
+    /// the player's EGL frame-slot sink to import — no CPU readback. The default
+    /// [`new`](Self::new) readback mode (planar/NV12 for the CLI + software peers) is
+    /// unchanged. See [`GpuFrameChannel`] for the surface-lifetime handshake.
+    pub fn new_zerocopy(channel: Arc<GpuFrameChannel>) -> Self {
+        Self::with_zerocopy(Some(channel))
+    }
+
+    fn with_zerocopy(zerocopy: Option<Arc<GpuFrameChannel>>) -> Self {
         VaapiH264Dec {
             device: None,
             display: None,
@@ -205,6 +250,10 @@ impl VaapiH264Dec {
             dims: None,
             alloc_stalled: false,
             disabled: false,
+            zerocopy,
+            next_token: 1,
+            in_flight: std::collections::HashMap::new(),
+            export_failed: false,
         }
     }
 
@@ -278,7 +327,13 @@ impl VaapiH264Dec {
         // budget, and a later-decoded smaller-POC B-frame displays after a
         // newer frame — visible as old-frame glitches.
         let dpb_slots = (sps.max_num_ref_frames + 1).clamp(2, 16);
-        let count = dpb_slots * 2 + 4;
+        // Zero-copy adds a *presentation* budget: a surface exported to the GUI stays out of
+        // the free pool until the sink releases its token (anti-tear). +PRESENTATION_SLACK
+        // covers the triple-buffered slot's ≤3 in-flight frames plus release-drain latency;
+        // fewer and the decoder blocks on export backpressure (never tears).
+        const PRESENTATION_SLACK: u32 = 6;
+        let extra = if self.zerocopy.is_some() { PRESENTATION_SLACK } else { 0 };
+        let count = dpb_slots * 2 + 4 + extra;
 
         let profile = ffi::VAProfileH264High; // High ⊇ Main/CB for VLD on Intel.
         let config = match Config::new_decode(display, profile) {
@@ -310,6 +365,8 @@ impl VaapiH264Dec {
             free,
             width,
             height,
+            coded_w,
+            coded_h,
         });
         self.dims = Some((width, height));
         true
@@ -338,11 +395,13 @@ impl VaapiH264Dec {
     }
 
     /// Whether any live holder still needs `id`'s pixels: the DPB (a prediction
-    /// source), the reorder queue, or the readback carry.
+    /// source), the reorder queue, the readback carry, or — in zero-copy mode — the GUI
+    /// still sampling its exported dma-buf (`in_flight`, the anti-tear gate).
     fn surface_referenced(&self, id: ffi::VASurfaceID) -> bool {
         self.dpb.iter().any(|e| e.surface == id)
             || self.output_queue.iter().any(|o| o.surface == id)
             || self.pending.as_ref().is_some_and(|o| o.surface == id)
+            || self.in_flight.contains_key(&id)
     }
 
     /// The single return-to-free gate: a surface goes back on the free list only
@@ -474,7 +533,8 @@ impl VaapiH264Dec {
         };
 
         // 8) Build + submit the picture.
-        let (width, height) = self.va.as_ref().map(|v| (v.width, v.height)).unwrap();
+        let (width, height, coded_w, coded_h) =
+            self.va.as_ref().map(|v| (v.width, v.height, v.coded_w, v.coded_h)).unwrap();
         if let Err(e) = self.submit_picture(
             &sps, &pps, &headers, &slice_nals, target, top_poc, bottom_poc, ref_idc,
         ) {
@@ -495,6 +555,8 @@ impl VaapiH264Dec {
             duration,
             width,
             height,
+            coded_w,
+            coded_h,
         });
         // Keep the output queue (gop, POC)-sorted by pairing surface→key: we sort
         // by the matching DPB/output ordering. Simplest correct model for our
@@ -877,9 +939,20 @@ impl VaapiH264Dec {
         }
     }
 
+    /// Emit the pending decoded surface, dispatching on the output mode: zero-copy DMA-BUF
+    /// export ([`emit_pending_zerocopy`](Self::emit_pending_zerocopy)) when built with
+    /// [`new_zerocopy`](Self::new_zerocopy) and export has not fallen back, else CPU readback
+    /// ([`emit_pending_readback`](Self::emit_pending_readback)). `false` = backpressure.
+    fn emit_pending(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
+        if self.zerocopy.is_some() && !self.export_failed {
+            return self.emit_pending_zerocopy(ctx);
+        }
+        self.emit_pending_readback(ctx)
+    }
+
     /// Copy the pending decoded surface into a pool buffer as tight NV12 and emit.
     /// `false` = pool exhausted (backpressure).
-    fn emit_pending(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
+    fn emit_pending_readback(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
         // Refill pending from the output queue if empty (bumping already moved the
         // over-budget head; here we also pull when EOS/flush drained the budget).
         if self.pending.is_none() {
@@ -1001,13 +1074,168 @@ impl VaapiH264Dec {
         Ok(true)
     }
 
+    /// The zero-copy emit: export the pending surface as DMA-BUF(s), push a [`GpuFrame`]
+    /// out-of-band, and emit a tiny `video/gpu` buffer (token + display geometry) the
+    /// frame-slot sink pairs and imports via EGL. The surface is marked in flight and NOT
+    /// recycled until the sink releases its token (drained in `process`). `false` = the
+    /// presentation budget is full (backpressure). On export failure the mode latches back
+    /// to readback (`export_failed`) and the frame is retried there — never lost.
+    fn emit_pending_zerocopy(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
+        if self.surfaces_exhausted() && self.pending.is_none() && self.output_queue.is_empty() {
+            return Ok(true); // nothing to emit
+        }
+        if self.pending.is_none() {
+            self.pending = self.output_queue.pop_front();
+        }
+        let Some(out) = self.pending.take() else { return Ok(true) };
+
+        let dpy = match &self.display {
+            Some(d) => d.raw(),
+            None => return Ok(true),
+        };
+
+        let exported = match ExportedSurface::export(dpy, out.surface) {
+            Ok(e) => e,
+            Err(e) => {
+                self.export_failed = true;
+                self.warn(
+                    ctx,
+                    format!(
+                        "vaapih264dec: DMA-BUF export failed ({e}); falling back to CPU readback \
+                         for the rest of the run"
+                    ),
+                );
+                eprintln!(
+                    "scplay-ui: zero-copy VA-API export unavailable ({e}) — falling back to CPU \
+                     readback (video path = SDL texture upload)"
+                );
+                self.pending = Some(out); // retry via readback next call
+                return Ok(true);
+            }
+        };
+
+        let dup_fds = match exported.dup_fds() {
+            Ok(f) => f,
+            Err(e) => {
+                self.warn(ctx, format!("vaapih264dec: dup(dma-buf fd) failed: {e} — frame dropped"));
+                self.recycle_output_surface(out.surface);
+                return Ok(true);
+            }
+        };
+
+        if !self.announced {
+            log!(&*ctx, Level::Debug, "announce_gpu", width = out.width, height = out.height);
+            ctx.announce_format(
+                SRC_PAD,
+                FAMILY_VIDEO_GPU,
+                &[
+                    (F_WIDTH, ValueDesc::Int(out.width as i64)),
+                    (F_HEIGHT, ValueDesc::Int(out.height as i64)),
+                    (F_LAYOUT, ValueDesc::Id(LAYOUT_NV12_DMABUF)),
+                ],
+            );
+            self.announced = true;
+            eprintln!("scplay-ui: video path = zero-copy VA-API/EGL (vaapih264dec DMA-BUF export)");
+        }
+
+        let Some(mut buf) = ctx.try_alloc(SRC_PAD) else {
+            if !self.alloc_stalled {
+                self.alloc_stalled = true;
+                let s = ctx.pool_stats();
+                log!(&*ctx, Level::Debug, "alloc_stall", outstanding = s.outstanding, max_slots = s.max_slots);
+            }
+            for fd in dup_fds {
+                // SAFETY: owned dup we just made; close exactly once.
+                unsafe {
+                    gpuframe::close_raw_fd(fd);
+                }
+            }
+            self.pending = Some(out);
+            return Ok(false);
+        };
+        self.alloc_stalled = false;
+
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
+        let header = GpuFrameHeader {
+            token,
+            coded_w: out.coded_w,
+            coded_h: out.coded_h,
+            disp_w: out.width,
+            disp_h: out.height,
+            crop_x: 0,
+            crop_y: 0,
+        };
+        let bytes = header.to_bytes();
+        let dst = buf.memory.as_mut_full();
+        if dst.len() < bytes.len() {
+            for fd in dup_fds {
+                // SAFETY: owned dup; close once.
+                unsafe {
+                    gpuframe::close_raw_fd(fd);
+                }
+            }
+            self.recycle_output_surface(out.surface);
+            return Err(Error::Element {
+                element: ctx.element(),
+                message: format!(
+                    "vaapih264dec: video/gpu header needs {} bytes but pool slots hold {}",
+                    bytes.len(),
+                    dst.len()
+                ),
+            });
+        }
+        dst[..bytes.len()].copy_from_slice(&bytes);
+        buf.memory.set_len(bytes.len());
+        buf.pts = out.pts;
+        buf.duration = out.duration;
+
+        let frame = GpuFrame {
+            token,
+            fds: dup_fds,
+            drm_format: exported.drm_format,
+            drm_modifier: exported.drm_modifier,
+            coded_w: exported.coded_w,
+            coded_h: exported.coded_h,
+            disp_w: out.width,
+            disp_h: out.height,
+            crop_x: 0,
+            crop_y: 0,
+            planes: exported.planes.clone(),
+        };
+        drop(exported); // closes the originals; the importer has the dups
+        if let Some(ch) = &self.zerocopy {
+            ch.push(frame);
+        }
+        self.in_flight.insert(out.surface, token);
+
+        log!(&*ctx, Level::Trace, "gpu_frame", pts = buf.pts, token = token);
+        ctx.out(SRC_PAD).push(buf);
+
+        // In flight — do NOT recycle; only clear the output-order key.
+        self.output_key.remove(&out.surface);
+        Ok(true)
+    }
+
+    /// Drain tokens the sink has presented and return each token's surface to the free pool
+    /// (if nothing else references it). Called once per `process` in zero-copy mode.
+    fn drain_presentation_releases(&mut self) {
+        let Some(ch) = self.zerocopy.clone() else { return };
+        for token in ch.drain_released() {
+            let surface = self.in_flight.iter().find(|(_, &t)| t == token).map(|(&s, _)| s);
+            if let Some(surface) = surface {
+                self.in_flight.remove(&surface);
+                self.release_if_unreferenced(surface);
+            }
+        }
+    }
+
     /// After a picture is output, free its surface *only if it is not a live DPB
     /// reference*. Reference surfaces are freed when evicted.
     fn recycle_output_surface(&mut self, surface: ffi::VASurfaceID) {
         self.output_key.remove(&surface);
         self.release_if_unreferenced(surface);
     }
-
 }
 
 impl Element for VaapiH264Dec {
@@ -1025,6 +1253,9 @@ impl Element for VaapiH264Dec {
             while inputs.pop().is_some() {}
             return Ok(Flow::Ok);
         }
+        // Zero-copy: reclaim surfaces the sink has presented before anything else — what
+        // keeps the export path from starving on the presentation budget.
+        self.drain_presentation_releases();
         loop {
             // Emit any staged output; stop pulling input if the pool is dry.
             if !self.emit_over_budget(ctx)? {
@@ -1066,7 +1297,14 @@ impl Element for VaapiH264Dec {
                     .map(|o| o.surface)
                     .collect();
                 self.output_key.clear();
-                for id in outs {
+                // Zero-copy: a flush discards the pre-seek pictures, so in-flight surfaces
+                // can be reclaimed (the GUI's slot is overwritten by post-seek frames; a
+                // discarded frame's brief surface reuse is never displayed). The sink still
+                // owns + closes its dup'd fds; clearing here only frees the *surface*.
+                self.drain_presentation_releases();
+                let in_flight: Vec<_> = self.in_flight.keys().copied().collect();
+                self.in_flight.clear();
+                for id in outs.into_iter().chain(in_flight) {
                     self.release_if_unreferenced(id);
                 }
                 self.reset_dpb();
@@ -1076,10 +1314,12 @@ impl Element for VaapiH264Dec {
             }
             Event::Eos => {
                 // Bump every remaining picture out in POC order.
+                self.drain_presentation_releases();
                 while self.pending.is_some() || !self.output_queue.is_empty() {
                     if !self.emit_pending(ctx)? {
                         break; // pool dry; the scheduler re-cranks
                     }
+                    self.drain_presentation_releases();
                 }
             }
             _ => {}
@@ -1089,6 +1329,10 @@ impl Element for VaapiH264Dec {
 
     fn stop(&mut self, _ctx: &mut Ctx) {
         // RAII: dropping va/display destroys context/surfaces/config/display.
+        if let Some(ch) = &self.zerocopy {
+            ch.close();
+        }
+        self.in_flight.clear();
         self.pending = None;
         self.output_queue.clear();
         self.dpb.clear();
@@ -1433,6 +1677,8 @@ mod tests {
                 duration: Timestamp::ZERO,
                 width: 16,
                 height: 16,
+                coded_w: 16,
+                coded_h: 16,
             });
             dec.reorder_output(surface, poc);
         };

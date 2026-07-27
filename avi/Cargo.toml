@@ -1,0 +1,23 @@
+[package]
+name = "sc-avi"
+description = "Hand-written, dependency-free AVI (RIFF) container demuxer plugin for streamcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_avi"
+
+[dependencies]
+# Hand-written container — the whole point is zero container/codec dependencies. Only
+# the framework's core vocabulary (buffers, batches, the element contract, SeekIndex) is
+# pulled in for the element wrapper; the RIFF primitives and the reader are core-independent
+# and unit-tested in isolation (see `riff::tests`).
+streamcraft-core = { path = "../core" }
+
+[dev-dependencies]
+# Only for the end-to-end element test: drive `filesrc(tiny.avi) ! avidemux ! capturesink`
+# through a real Pipeline (FileSrc is the byte source; the demuxer is fed bytes on its sink
+# pad). No dependency cycle — the built-in elements do not depend on sc-avi.
+streamcraft-elements = { path = "../elements" }

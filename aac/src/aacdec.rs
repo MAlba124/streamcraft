@@ -24,7 +24,8 @@
 //! [`Mp3Dec`]: ../../sc_mp3/index.html
 
 use oxideav_aac::asc::AudioSpecificConfig;
-use oxideav_aac::decode::{DecodedFrame, StreamDecoder};
+use oxideav_aac::decode::{PlanarFrame, StreamDecoder};
+use oxideav_aac::pcm::interleave_s16_le_into;
 
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::bus::BusMessage;
@@ -114,8 +115,12 @@ struct Cfg {
 
 /// A decoded frame waiting for a pool slot (the backpressure carry — spec: the
 /// try_alloc + yield rule; a producer must never allocate unboundedly).
+///
+/// Carries the decoded **planar** `f64` channels rather than an interleaved `Vec<i16>`: the
+/// §4.6.11 integer-PCM interleave is deferred to [`AacDec::emit_pending`], which renders it
+/// straight into the pool slot (no intermediate `Vec<i16>`, no second copy — streamcraft patch).
 struct PendingPcm {
-    frame: DecodedFrame,
+    frame: PlanarFrame,
     pts: Timestamp,
 }
 
@@ -155,8 +160,11 @@ impl AacDec {
             self.pending = Some(p);
             return false;
         };
-        let pcm = &p.frame.pcm;
-        let need = pcm.len() * 2;
+        let channels = &p.frame.channels;
+        let channel_count = channels.len();
+        let frame_len = channels.first().map_or(0, Vec::len);
+        let total_samples = frame_len * channel_count;
+        let need = total_samples * 2;
         if buf.memory.capacity() < need {
             // One AAC frame is ≤ ~24 KB (2048 samples × 6 ch × 2 B); any sane
             // slot holds it. Refuse loudly rather than truncate.
@@ -180,7 +188,7 @@ impl AacDec {
                 Level::Debug,
                 "announce",
                 rate = p.frame.sample_rate,
-                channels = p.frame.channels,
+                channels = channel_count,
             );
             // Announce from *decoded* geometry, not the ASC: SBR doubles the
             // rate relative to the core index (ISO/IEC 14496-3 §4.6.18), and the
@@ -190,23 +198,38 @@ impl AacDec {
                 FAMILY,
                 &[
                     (F_RATE, ValueDesc::Int(i64::from(p.frame.sample_rate))),
-                    (F_CHANNELS, ValueDesc::Int(p.frame.channels as i64)),
+                    (F_CHANNELS, ValueDesc::Int(channel_count as i64)),
                     (F_SAMPLE, ValueDesc::Id(SAMPLE_S16)),
                 ],
             );
             self.announced = true;
         }
+        // Render the §4.6.11 integer PCM straight into the pool slot — one fused
+        // interleave + little-endian write, no intermediate `Vec<i16>` and no second copy.
         let dst = buf.memory.as_mut_full();
-        for (i, s) in pcm.iter().enumerate() {
-            dst[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
+        match interleave_s16_le_into(channels, dst) {
+            Ok(_) => {}
+            Err(e) => {
+                // The capacity was already checked above; a mismatch here means the decoder
+                // produced ragged channel lengths — drop the frame rather than emit garbage.
+                let element = ctx.element();
+                ctx.post(BusMessage::Warning {
+                    element,
+                    error: Error::Element {
+                        element,
+                        message: format!("aacdec: interleave failed: {e:?}"),
+                    },
+                });
+                return true;
+            }
         }
         buf.memory.set_len(need);
         buf.pts = p.pts;
         // Frame duration in ns: samples-per-channel over the output rate.
-        if p.frame.channels > 0 && p.frame.sample_rate > 0 {
-            let samples = (pcm.len() / p.frame.channels) as u64;
-            buf.duration =
-                Timestamp(samples.saturating_mul(1_000_000_000) / u64::from(p.frame.sample_rate));
+        if channel_count > 0 && p.frame.sample_rate > 0 {
+            buf.duration = Timestamp(
+                (frame_len as u64).saturating_mul(1_000_000_000) / u64::from(p.frame.sample_rate),
+            );
         }
         log!(&*ctx, Level::Trace, "frame", pts = buf.pts);
         ctx.out(SRC_PAD).push(buf);
@@ -277,7 +300,7 @@ impl Element for AacDec {
             };
             let au = self.au_index;
             self.au_index += 1;
-            match self.dec.decode_raw_data_block(
+            match self.dec.decode_raw_data_block_planar(
                 cfg.aot,
                 cfg.fs_index,
                 cfg.sample_rate,
@@ -287,7 +310,7 @@ impl Element for AacDec {
             ) {
                 Ok(frame) => {
                     self.consecutive_errors = 0;
-                    self.last_geometry = Some((frame.channels, frame.sample_rate));
+                    self.last_geometry = Some((frame.channels.len(), frame.sample_rate));
                     self.pending = Some(PendingPcm { frame, pts: inbuf.pts });
                 }
                 Err(e) => {
@@ -310,10 +333,12 @@ impl Element for AacDec {
                     }
                     log!(&*ctx, Level::Debug, "au_dropped", au = au);
                     if let Some((channels, sample_rate)) = self.last_geometry {
+                        // One frame of silence in planar form — the emit path interleaves it
+                        // into the pool slot like any decoded frame (1024 samples/channel,
+                        // matching the prior interleaved-silence length).
                         self.pending = Some(PendingPcm {
-                            frame: DecodedFrame {
-                                pcm: vec![0i16; 1024 * channels],
-                                channels,
+                            frame: PlanarFrame {
+                                channels: vec![vec![0.0f64; 1024]; channels],
                                 sample_rate,
                             },
                             pts: inbuf.pts,

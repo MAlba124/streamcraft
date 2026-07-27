@@ -1025,6 +1025,31 @@ impl Pipeline {
         }
     }
 
+    /// The offer families a pad (static or dynamic) advertises, by name (spec: Plugins —
+    /// the autoplug controller may pre-filter candidates by a pad's declared family before
+    /// leaning on negotiation). Read-only over `&'static` descriptors and the preroll-added
+    /// dynamic pads — the same lookup [`link`](Self::link) does, exposed for the controller.
+    ///
+    /// This is *not* a parallel caps system: it returns exactly the families the element
+    /// declared in its `OfferDesc`s, in declaration order. An autoplugger uses the first
+    /// (most-specific) family to skip decoders that could only ever byte-bridge-match — the
+    /// `[<codec>, bytes]` demux pads make every byte-accepting decoder link, so declaration
+    /// order is how the controller tells "this is really my codec" from "I linked loosely".
+    /// `None` when the element/pad does not exist.
+    pub fn pad_families(&self, el: ElementId, pad: &str) -> Option<Vec<&'static str>> {
+        let e = self.elements.get(el.0 as usize)?.as_ref()?;
+        let offers = if let Some(i) = e.desc().pads.iter().position(|p| p.name == pad) {
+            e.desc().pads[i].offers
+        } else {
+            self.dyn_pads
+                .get(el.0 as usize)?
+                .iter()
+                .find(|d| d.name == pad)?
+                .offers
+        };
+        Some(offers.iter().map(|o| o.family).collect())
+    }
+
     /// An element's descriptor name, for link diagnostics. Reads the captured desc,
     /// so it works even while the element itself is off in its group thread.
     fn name_of(&self, el: ElementId) -> &'static str {
