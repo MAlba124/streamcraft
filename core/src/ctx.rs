@@ -571,6 +571,13 @@ impl Ctx {
         // each park is capped to one tick, then everything re-derives.
         const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
         let entry_gen = self.seek_gen();
+        // Build the wait station **once** and re-park it each slice. It is deadline-agnostic
+        // (the deadline is re-derived and passed per `wait_ticked` call) and the gen/stop/pause
+        // re-checks below don't touch it, so there's no reason to rebuild it per tick — doing so
+        // was the single largest source of small heap allocations during playback, since a
+        // device-clock `new_wait` allocates an `Arc<Wake>` (and a clock `Arc`) every call and a
+        // multi-tick wait called it tens of times (streamcraft patch).
+        let wait = c.new_wait();
         loop {
             // A pending seek makes the buffer this wait paces stale: bail as an
             // interrupt so the group can flush promptly — the same contract sinks
@@ -619,7 +626,7 @@ impl Ctx {
             // clock kind — including MockClock, whose virtual time can stand
             // still across a seek. An "infinitely late" running of NONE parks
             // tick by tick until a seek, stop, or interrupt ends it.
-            match c.new_wait().wait_ticked(deadline, WAIT_SLICE) {
+            match wait.wait_ticked(deadline, WAIT_SLICE) {
                 crate::clock::TickedOutcome::Interrupted => return WaitOutcome::Interrupted,
                 crate::clock::TickedOutcome::Reached | crate::clock::TickedOutcome::Tick => {}
             }

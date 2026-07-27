@@ -97,6 +97,15 @@ impl Wake {
 /// starts near zero and never goes backwards.
 pub struct InstantClock {
     base: Instant,
+    /// One wake station shared by every wait this clock hands out, so `new_wait` is
+    /// allocation-free (it clones an `Arc`, not a fresh `Mutex`+`Condvar`). `new_wait` is
+    /// called per pacing wait — once per buffer per element — and profiled as ~5% of *all*
+    /// heap allocations when each call built its own `Wake` (streamcraft patch). Real time
+    /// advances on its own, so the shared condvar is only ever touched by `interrupt`, which
+    /// production never calls on a real-clock wait (interruption goes through `wait_ticked` +
+    /// the caller's seek-generation re-check); a spurious cross-waiter wake is re-checked and
+    /// re-parked by the `wait_instant` loop. Mirrors [`MockClock`]'s shared station.
+    wake: Arc<Wake>,
 }
 
 impl InstantClock {
@@ -104,6 +113,7 @@ impl InstantClock {
     pub fn new() -> Self {
         Self {
             base: Instant::now(),
+            wake: Wake::new(0),
         }
     }
 }
@@ -122,12 +132,13 @@ impl Clock for InstantClock {
     }
 
     fn new_wait(&self) -> ClockWait {
-        // Real time advances on its own; the wait only needs a private condvar for
-        // interrupts, plus this clock's base to measure the remaining duration.
+        // Real time advances on its own; the wait only needs a condvar for interrupts plus
+        // this clock's base to measure the remaining duration. Clone the shared station rather
+        // than allocate a fresh one per wait (see the `wake` field).
         ClockWait {
             kind: WaitKind::Instant {
                 base: self.base,
-                wake: Wake::new(0),
+                wake: Arc::clone(&self.wake),
             },
         }
     }

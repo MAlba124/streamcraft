@@ -17,6 +17,10 @@
 //! - [`harness`] — the threadless, mock-clocked single-element test rig (spec: Testing —
 //!   Element harness; it *is* the inline caller)
 
+// The scratch `Arena` implements the nightly `std::alloc::Allocator` trait so it can back a
+// `Vec<T, &Arena>` — letting decoders allocate per-frame scratch from the pipeline's
+// per-`process()` arena (reset by the scheduler) instead of the heap. Workspace pins nightly.
+#![feature(allocator_api)]
 // `unsafe` is permitted only in the audited modules: `memory` and the SPSC ring
 // (loom+miri covered), plus `io`'s raw-syscall shims (integer-only args, no
 // userspace pointers — see io.rs's justification header). `deny` (not `forbid`)

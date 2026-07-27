@@ -450,6 +450,19 @@ pub struct Arena {
     active: Cell<usize>,
     offset: Cell<usize>,
     chunk_size: usize,
+    /// The most-recent allocation as `(chunk index, start offset, size)`, for the bump
+    /// "free/grow the last allocation" fast path (the standard optimisation `bumpalo` uses):
+    /// a [`deallocate`] of exactly this region rolls the bump pointer back to `start`
+    /// (reclaiming it), and a [`grow`] of it extends in place (no allocate-and-copy). This is
+    /// what makes an arena-backed `Vec::push` loop *reuse* memory instead of leaking every
+    /// grown-past buffer until the next [`reset`]. `None` when the last allocation is unknown
+    /// (fresh, post-reset, or after a non-last free). A `(chunk, start)` pair — not a raw
+    /// pointer — so `Arena` stays pointer-free and the pointer is recomputed from the chunk
+    /// on demand.
+    ///
+    /// [`deallocate`]: std::alloc::Allocator::deallocate
+    /// [`grow`]: std::alloc::Allocator::grow
+    last: Cell<Option<(usize, usize, usize)>>,
 }
 
 impl Arena {
@@ -464,7 +477,19 @@ impl Arena {
             active: Cell::new(0),
             offset: Cell::new(0),
             chunk_size: chunk_size.max(1),
+            last: Cell::new(None),
         }
+    }
+
+    /// The pointer of the last allocation, recomputed from its `(chunk, start)` record; `None`
+    /// if there is no known last allocation. Used by the [`Allocator`](std::alloc::Allocator)
+    /// fast paths to recognise "is this the region I handed out last?".
+    fn last_ptr(&self) -> Option<*mut u8> {
+        let (chunk, start, _size) = self.last.get()?;
+        // SAFETY: shared read of the chunk list; `chunk` indexes a chunk that still exists
+        // (chunks are never removed, only appended / reset-retained), and `start` is within it.
+        let chunks = unsafe { &*self.chunks.get() };
+        Some(unsafe { (chunks[chunk].as_ptr() as *mut u8).add(start) })
     }
 
     fn make_chunk(cap: usize) -> Box<[UnsafeCell<u8>]> {
@@ -483,10 +508,11 @@ impl Arena {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         loop {
             // Try to carve from an existing chunk. The shared borrow of the chunk list
-            // ends with this block, before any growth below.
-            let carved: Option<*mut u8> = {
+            // ends with this block, before any growth below. Also capture `start` so the
+            // allocation can be recorded as the "last" for the free/grow fast path.
+            let carved: Option<(*mut u8, usize)> = {
                 let chunks = unsafe { &*self.chunks.get() };
-                let mut ptr = None;
+                let mut hit = None;
                 while self.active.get() < chunks.len() {
                     let chunk = &chunks[self.active.get()];
                     let base = chunk.as_ptr() as usize;
@@ -498,7 +524,7 @@ impl Arena {
                         // offset only advances, disjoint from every region already handed
                         // out — so this `&mut` cannot alias a live one. Bytes are
                         // `UnsafeCell`, so mutating through `&self` is sound.
-                        ptr = Some(unsafe { (chunk.as_ptr() as *mut u8).add(start) });
+                        hit = Some((unsafe { (chunk.as_ptr() as *mut u8).add(start) }, start));
                         break;
                     }
                     if self.active.get() + 1 < chunks.len() {
@@ -508,9 +534,10 @@ impl Arena {
                     }
                     break; // no existing chunk fits → grow
                 }
-                ptr
+                hit
             };
-            if let Some(ptr) = carved {
+            if let Some((ptr, start)) = carved {
+                self.last.set(Some((self.active.get(), start, size)));
                 // SAFETY: `ptr` is valid and writable for `size` bytes (checked above) and
                 // uniquely owned for the returned lifetime.
                 return unsafe { std::slice::from_raw_parts_mut(ptr, size) };
@@ -539,6 +566,7 @@ impl Arena {
     pub fn reset(&mut self) {
         self.active.set(0);
         self.offset.set(0);
+        self.last.set(None);
     }
 
     /// Number of chunks allocated. Flat across resets in steady state == the reuse goal.
@@ -551,6 +579,96 @@ impl Arena {
 impl Default for Arena {
     fn default() -> Self {
         Self::new(Self::DEFAULT_CHUNK)
+    }
+}
+
+// SAFETY: `&Arena` is a valid `Allocator` — every `allocate` carves a *disjoint* region (the
+// offset only advances, cf. [`Arena::alloc`]), so distinct live allocations never alias, and
+// the returned block stays valid until [`Arena::reset`] (which takes `&mut self`, so the borrow
+// checker guarantees no `&Arena`-backed value is still live at reset). `deallocate` is a no-op:
+// a bump arena reclaims nothing per-allocation, only wholesale on `reset`. The impl is on
+// `&Arena` (a `Copy` handle) so a `Vec<T, &Arena>` can clone its allocator, exactly as
+// `bumpalo` implements `Allocator for &Bump`. This is what lets a decoder's per-frame scratch
+// live in the pipeline's recycled `ctx.scratch()` arena instead of the heap.
+unsafe impl std::alloc::Allocator for &Arena {
+    fn allocate(
+        &self,
+        layout: std::alloc::Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let size = layout.size();
+        if size == 0 {
+            // A zero-sized allocation returns a dangling-but-aligned, non-null pointer.
+            let dangling = std::ptr::NonNull::<u8>::new(layout.align() as *mut u8)
+                .ok_or(std::alloc::AllocError)?;
+            return Ok(std::ptr::NonNull::slice_from_raw_parts(dangling, 0));
+        }
+        let region = self.alloc(size, layout.align());
+        let ptr = std::ptr::NonNull::new(region.as_mut_ptr()).ok_or(std::alloc::AllocError)?;
+        Ok(std::ptr::NonNull::slice_from_raw_parts(ptr, size))
+    }
+
+    // Free/reclaim only the **last** allocation (the bump fast path): if `ptr` is exactly the
+    // region handed out most recently, roll the bump pointer back to reclaim it; any other
+    // free is a no-op (a bump arena reclaims interior regions only on `reset`). This lets a
+    // `Vec` that shrinks/drops-then-reallocates give the space straight back.
+    //
+    // SAFETY: `ptr`/`layout` describe a block this arena returned. The only mutation is the
+    // `offset`/`last` cells; nothing dereferences `ptr`.
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, _layout: std::alloc::Layout) {
+        if self.last_ptr() == Some(ptr.as_ptr()) {
+            if let Some((_chunk, start, _size)) = self.last.get() {
+                self.offset.set(start);
+            }
+            self.last.set(None);
+        }
+    }
+
+    // Grow the **last** allocation in place when it still fits its chunk — no allocate-and-copy,
+    // and no leaked old buffer. This is what makes `Vec::push` into the arena reuse the same
+    // region as it grows (the block stays put; only the bump pointer advances). Any other grow,
+    // or one that overflows the chunk, falls back to allocate-new + copy.
+    //
+    // SAFETY: `ptr`/`old_layout` describe this arena's last block; `new_layout.size() >=
+    // old_layout.size()` (the trait's precondition). The in-place path keeps the same pointer,
+    // so the first `old_layout.size()` bytes are trivially preserved.
+    unsafe fn grow(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        old_layout: std::alloc::Layout,
+        new_layout: std::alloc::Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+        let new_size = new_layout.size();
+        // In-place extend only when: `ptr` is the last allocation, it lives in the active
+        // chunk, the alignment already satisfied still covers `new_layout`, and the grown size
+        // fits the chunk.
+        if new_layout.align() <= old_layout.align() && self.last_ptr() == Some(ptr.as_ptr()) {
+            if let Some((chunk, start, _size)) = self.last.get() {
+                if chunk == self.active.get() {
+                    // SAFETY: shared read; `chunk` still exists.
+                    let chunks = unsafe { &*self.chunks.get() };
+                    let chunk_len = chunks[chunk].len();
+                    if start + new_size <= chunk_len {
+                        self.offset.set(start + new_size);
+                        self.last.set(Some((chunk, start, new_size)));
+                        return Ok(std::ptr::NonNull::slice_from_raw_parts(ptr, new_size));
+                    }
+                }
+            }
+        }
+        // Fallback: fresh region + copy the old bytes. (The old region is no longer "last"
+        // after the new allocation, so it is simply left until `reset` — same as any interior
+        // free.)
+        let fresh = self.allocate(new_layout)?;
+        // SAFETY: `fresh` has `new_size >= old_layout.size()` bytes; `ptr` is readable for
+        // `old_layout.size()` bytes; the regions are distinct (bump never re-hands a live one).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.as_ptr(),
+                fresh.as_ptr() as *mut u8,
+                old_layout.size(),
+            );
+        }
+        Ok(fresh)
     }
 }
 
@@ -744,6 +862,54 @@ mod tests {
         let addr2 = arena.alloc_bytes(100).as_ptr() as usize;
         assert_eq!(addr, addr2, "reset rewinds to the same memory");
         assert_eq!(arena.chunk_count(), chunks, "reuse allocates no new chunk");
+    }
+
+    #[test]
+    fn arena_vec_grows_last_allocation_in_place() {
+        // A `Vec<T, &Arena>` built by repeated `push` must grow *in place* (the last-allocation
+        // fast path), so the arena consumes ~the final capacity — not the sum of every doubling
+        // step (which a naive bump would leak). And its data must survive each in-place grow.
+        let arena = Arena::new(64 * 1024);
+        {
+            let mut v: Vec<u64, &Arena> = Vec::new_in(&arena);
+            for i in 0..500u64 {
+                v.push(i);
+            }
+            assert_eq!(v.len(), 500);
+            assert_eq!(v[0], 0);
+            assert_eq!(v[499], 499);
+            assert_eq!(v.iter().copied().sum::<u64>(), (0..500u64).sum::<u64>());
+
+            // 500 u64 → final capacity 512 (4096 B). In-place growth leaves the arena at ~that;
+            // a leaking bump would sit near 8+16+…+512 elements of extra waste (≈ 12 KB).
+            let used = arena.offset.get();
+            assert!(used <= 512 * 8 + 64, "grow was not in-place — arena used {used} bytes");
+        }
+        // Dropping the Vec deallocates the last (and only) allocation → the bump pointer rolls
+        // all the way back.
+        assert_eq!(arena.offset.get(), 0, "last allocation was not reclaimed on drop");
+        assert_eq!(arena.chunk_count(), 1, "in-place growth spilled to extra chunks");
+    }
+
+    #[test]
+    fn arena_reclaims_only_the_last_allocation() {
+        // Freeing the last allocation rewinds the bump; freeing an interior one is a no-op
+        // (reclaimed only by `reset`) — exactly a bump arena's contract.
+        use std::alloc::{Allocator, Layout};
+        let arena = Arena::new(64 * 1024);
+        let arena_ref = &arena;
+        let l = Layout::from_size_align(64, 8).unwrap();
+        let a = arena_ref.allocate(l).unwrap();
+        let after_a = arena.offset.get();
+        let b = arena_ref.allocate(l).unwrap();
+        let after_b = arena.offset.get();
+        assert!(after_b > after_a);
+        // Freeing `a` (interior — `b` came after) does nothing.
+        unsafe { arena_ref.deallocate(a.cast(), l) };
+        assert_eq!(arena.offset.get(), after_b, "interior free must not rewind");
+        // Freeing `b` (the last) rewinds to before it.
+        unsafe { arena_ref.deallocate(b.cast(), l) };
+        assert_eq!(arena.offset.get(), after_a, "last free must rewind the bump pointer");
     }
 
     #[test]
