@@ -50,7 +50,7 @@
 use crate::ics_info::IcsInfo;
 use crate::scale_factor_data::{AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
 use crate::section_data::{Codebook, ZERO_HCB};
-use crate::spectral_data::{sect_sfb_offset, SpectralData};
+use crate::spectral_data::{sect_sfb_offset_in, SpectralData};
 use crate::{Error, Result};
 
 /// `SF_OFFSET` per §4.6.2.3.3 — the scalefactor that maps to unit
@@ -149,7 +149,23 @@ pub fn rescale_spectrum(
     ics_info: &IcsInfo,
     fs_index: u8,
 ) -> Result<Vec<Vec<f64>>> {
-    let offsets = sect_sfb_offset(ics_info, fs_index)?;
+    rescale_spectrum_in(std::alloc::Global, spectral, scale_factors, sfb_cb, ics_info, fs_index)
+}
+
+/// [`rescale_spectrum`] generalised over the output allocator. The hot decode path passes a
+/// per-frame `&bumpalo::Bump` so the rescaled `Vec<Vec<f64>>` scratch — which is consumed by
+/// `quant_to_spec` and immediately dropped — comes from the frame arena instead of the heap
+/// (streamcraft patch). `A: Copy` because a `Vec<Vec<f64, A>, A>` needs the same allocator for
+/// the outer vec and each inner vec; `Global` and `&Bump` are both `Copy`.
+pub fn rescale_spectrum_in<A: std::alloc::Allocator + Copy>(
+    alloc: A,
+    spectral: &SpectralData,
+    scale_factors: &AbsoluteScaleFactors,
+    sfb_cb: &[Vec<u8>],
+    ics_info: &IcsInfo,
+    fs_index: u8,
+) -> Result<Vec<Vec<f64, A>, A>> {
+    let offsets = sect_sfb_offset_in(alloc, ics_info, fs_index)?;
     let num_groups = ics_info.num_window_groups as usize;
     if spectral.x_quant.len() != num_groups
         || scale_factors.entries.len() != num_groups
@@ -158,7 +174,7 @@ pub fn rescale_spectrum(
         return Err(Error::DequantInvalid);
     }
 
-    let mut out = Vec::with_capacity(num_groups);
+    let mut out = Vec::with_capacity_in(num_groups, alloc);
     for (g, group_offsets) in offsets.iter().enumerate() {
         let x_quant = &spectral.x_quant[g];
         let expected_len = if ics_info.window_sequence.is_eight_short() {
@@ -170,7 +186,8 @@ pub fn rescale_spectrum(
             return Err(Error::DequantInvalid);
         }
 
-        let mut rescal = vec![0.0f64; x_quant.len()];
+        let mut rescal = Vec::with_capacity_in(x_quant.len(), alloc);
+        rescal.resize(x_quant.len(), 0.0f64);
         let mut entries = scale_factors.entries[g].iter();
         for (sfb, &cb) in sfb_cb[g].iter().enumerate() {
             if cb == ZERO_HCB {

@@ -397,6 +397,12 @@
 //!   RMS domain below 0.1 % error-to-signal (full byte-exactness is
 //!   precluded only by the §4.6.13.3 spec-undefined noise phase).
 
+// The decode path is generic over a scratch allocator (`rescale_spectrum_in`, `quant_to_spec`,
+// `decode_*_in`, `decode_raw_data_block_planar`): the per-channel transient `Vec`s allocate from
+// the caller-supplied `A: std::alloc::Allocator` — the streamcraft pipeline passes its
+// per-`process()` arena (`ctx.scratch()`), tests use `Global`. Needs the nightly allocator API
+// (the workspace pins nightly; streamcraft patch).
+#![feature(allocator_api)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 

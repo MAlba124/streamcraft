@@ -162,6 +162,18 @@ pub const ESC_FLAG: i32 = 16;
 ///   index `swb_offset[max_sfb]`, which only exists up to
 ///   `num_swb`).
 pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>> {
+    sect_sfb_offset_in(std::alloc::Global, ics_info, fs_index)
+}
+
+/// [`sect_sfb_offset`] generalised over the output allocator — the band-offset `Vec<Vec<u32>>`
+/// is pure per-frame scratch (built here, read once during rescale/de-interleave, dropped), so
+/// the decode path allocates it from the caller's frame arena rather than the heap (streamcraft
+/// patch). `A: Copy` because the nested `Vec<Vec<u32, A>, A>` shares one allocator.
+pub fn sect_sfb_offset_in<A: std::alloc::Allocator + Copy>(
+    alloc: A,
+    ics_info: &IcsInfo,
+    fs_index: u8,
+) -> Result<Vec<Vec<u32, A>, A>> {
     let max_sfb = ics_info.max_sfb as usize;
     if ics_info.window_sequence.is_eight_short() {
         let swb = short_window_offsets(fs_index)?;
@@ -170,10 +182,10 @@ pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>
         if max_sfb + 1 > swb.len() {
             return Err(Error::SpectralDataInvalid);
         }
-        let mut per_group = Vec::with_capacity(ics_info.num_window_groups as usize);
+        let mut per_group = Vec::with_capacity_in(ics_info.num_window_groups as usize, alloc);
         for g in 0..ics_info.num_window_groups as usize {
             let wgl = u32::from(ics_info.window_group_length[g]);
-            let mut offsets = Vec::with_capacity(max_sfb + 1);
+            let mut offsets = Vec::with_capacity_in(max_sfb + 1, alloc);
             let mut offset = 0u32;
             offsets.push(offset);
             for i in 0..max_sfb {
@@ -189,8 +201,11 @@ pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>
         if max_sfb + 1 > swb.len() {
             return Err(Error::SpectralDataInvalid);
         }
-        let offsets = swb[..=max_sfb].iter().map(|&o| u32::from(o)).collect();
-        Ok(vec![offsets])
+        let mut offsets = Vec::with_capacity_in(max_sfb + 1, alloc);
+        offsets.extend(swb[..=max_sfb].iter().map(|&o| u32::from(o)));
+        let mut per_group = Vec::with_capacity_in(1, alloc);
+        per_group.push(offsets);
+        Ok(per_group)
     }
 }
 
@@ -444,12 +459,16 @@ fn read_and_apply_signs(
     if !row.is_unsigned() {
         return Ok(tuple);
     }
+    // At most `dim` (≤ 4) sign bits — one per non-zero coefficient. A fixed stack array holds
+    // them so this hot per-tuple path allocates nothing (it was a `Vec<bool>` per tuple, which
+    // profiled as ~20% of *all* heap allocations and ~75% of the 1-byte allocations during
+    // playback — streamcraft patch, see STREAMCRAFT-PATCHES.md).
     let nonzero = tuple.iter().take(dim).filter(|&&v| v != 0).count();
-    let mut signs = Vec::with_capacity(nonzero);
-    for _ in 0..nonzero {
-        signs.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
+    let mut signs = [false; 4];
+    for s in signs.iter_mut().take(nonzero) {
+        *s = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
     }
-    apply_sign_bits(cb, tuple, &signs)
+    apply_sign_bits(cb, tuple, &signs[..nonzero])
 }
 
 /// Read one `hcod_esc_y` / `hcod_esc_z` escape sequence per

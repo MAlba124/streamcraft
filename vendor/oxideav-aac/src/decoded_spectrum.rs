@@ -96,7 +96,11 @@ use crate::{Error, Result};
 /// * [`Error::QuantToSpecInvalid`] — group count or a group buffer
 ///   length disagreeing with the `ics_info` grouping, or a grouping
 ///   whose `window_group_length` sum is not `num_windows`.
-pub fn quant_to_spec(groups: &[Vec<f64>], ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<f64>> {
+pub fn quant_to_spec<A: std::alloc::Allocator>(
+    groups: &[Vec<f64, A>],
+    ics_info: &IcsInfo,
+    fs_index: u8,
+) -> Result<Vec<f64>> {
     let (window_len, offsets) = if ics_info.window_sequence.is_eight_short() {
         (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
     } else {

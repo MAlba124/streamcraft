@@ -398,7 +398,9 @@ impl ScaleFactorData {
         let mut noise_pcm_flag = true;
         let mut entries: Vec<Vec<ScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
         for group in sfb_cb {
-            let mut group_entries: Vec<ScaleFactorEntry> = Vec::new();
+            // At most one entry per band — pre-size so the per-band pushes don't realloc-grow
+            // (grow_one profiled as a chunk of the 16/32-byte allocations; streamcraft patch).
+            let mut group_entries: Vec<ScaleFactorEntry> = Vec::with_capacity(group.len());
             for &cb in group {
                 if cb == ZERO_HCB {
                     continue;
@@ -641,7 +643,8 @@ pub fn accumulate(
     let mut out: Vec<Vec<AbsoluteScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
     for (group_entries, group_cb) in sfd.entries.iter().zip(sfb_cb.iter()) {
         let mut entry_iter = group_entries.iter();
-        let mut group_out: Vec<AbsoluteScaleFactorEntry> = Vec::new();
+        // One output per non-zero band — pre-size to avoid realloc-growth (streamcraft patch).
+        let mut group_out: Vec<AbsoluteScaleFactorEntry> = Vec::with_capacity(group_cb.len());
         for &cb in group_cb {
             if cb == ZERO_HCB {
                 continue;

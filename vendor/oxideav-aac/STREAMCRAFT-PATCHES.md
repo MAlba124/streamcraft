@@ -136,3 +136,36 @@ encode/decode round-trips, and `pcm_byte_exact` conformance all pass unchanged
 (1553 total; +2 `PrefixTable` unit tests). Memory: the tables are built lazily
 for books actually used; the widest (`hcod_sf`, 2^19 × 4 B = 2 MiB) is a
 one-time static.
+
+## 7. Per-frame scratch from a caller-supplied arena allocator
+
+A heaptrack profile (system allocator) of playback showed the decode path
+issuing ~10 K small allocations/second — the per-frame `Vec`/`Vec<Vec>` scratch
+of the spectral/scalefactor reconstruction. Several were removed outright first
+(`read_and_apply_signs` → stack `[bool;4]`; pre-sized scalefactor vecs;
+`reconstruct_pre_pair` no longer clones the whole `SpectralData` on the
+common no-pulse path — it borrows). The rest are genuine per-frame scratch, so
+the decode path is now **generic over a scratch allocator** and the streamcraft
+pipeline hands it a frame arena.
+
+`#![feature(allocator_api)]`. The reconstruction entry points gained an
+allocator-parameterised form: `dequant::rescale_spectrum_in<A>`,
+`decoded_spectrum::quant_to_spec<A>`, `element_decode::decode_sce_in<A>` /
+`decode_cpe_in<A>`, and `decode::StreamDecoder::decode_raw_data_block_planar<A>`
+— each `A: Allocator + Copy`. The rescaled `Vec<Vec<f64>>` (consumed by
+`quant_to_spec` and dropped inside the decode) is allocated from `A`; `spec`
+and the PCM output escape into the PNS/TNS/filterbank tail and stay heap `Vec`s.
+The original signatures remain as thin `Global` wrappers, so `decode_frame` /
+`decode_all` / every test are byte-for-byte unchanged (1553 pass).
+
+`A` is a **trait** (`std::alloc::Allocator`) — the crate names no streamcraft
+type and takes no streamcraft dependency, so the patch stays upstreamable.
+streamcraft's `Ctx::scratch()` arena implements `Allocator` (a ~20-line
+`unsafe impl Allocator for &Arena` in `core/src/memory.rs`; `deallocate` is a
+no-op, the scheduler `reset`s the arena after each `process()`), and the
+`sc-aac` element passes `ctx.scratch()` into
+`decode_raw_data_block_planar` — so the AAC decoder's per-frame scratch now
+lives in the pipeline's recycled arena with no steady-state heap traffic.
+Currently backs the `rescaled` buffer; the same generic seam extends to the
+other transients (`abs`, the band-indexed tables, `spec`) without further
+signature churn.

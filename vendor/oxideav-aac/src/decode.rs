@@ -178,6 +178,7 @@ impl StreamDecoder {
             channel_configuration,
             num_raw_data_blocks,
             payload,
+            std::alloc::Global,
         )?;
         let channels = planar.channels.len();
         let pcm = interleave_s16(&planar.channels)?;
@@ -194,7 +195,7 @@ impl StreamDecoder {
     /// straight into a pipeline buffer via [`crate::pcm::interleave_s16_le_into`]) uses this to
     /// avoid the intermediate interleaved `Vec<i16>`. Arguments are as
     /// [`Self::decode_raw_data_block`].
-    pub fn decode_raw_data_block_planar(
+    pub fn decode_raw_data_block_planar<A: std::alloc::Allocator + Copy>(
         &mut self,
         aot: u8,
         fs_index: u8,
@@ -202,6 +203,7 @@ impl StreamDecoder {
         channel_configuration: u8,
         num_raw_data_blocks: u8,
         payload: &[u8],
+        scratch: A,
     ) -> Result<PlanarFrame> {
         let fs = fs_index;
         let mut reader = BitReader::new(payload);
@@ -244,7 +246,7 @@ impl StreamDecoder {
                         elements.push(ElementOut {
                             key,
                             kind,
-                            channels: vec![dec.decode_sce(&ch, aot, fs)?],
+                            channels: vec![dec.decode_sce_in(&ch, aot, fs, scratch)?],
                             sbr: None,
                         });
                     }
@@ -253,7 +255,8 @@ impl StreamDecoder {
                         element_instance_tag,
                     } => {
                         let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
-                        let (l, r) = self.decode_cpe(&mut reader, aot, fs, element_instance_tag)?;
+                        let (l, r) =
+                            self.decode_cpe(&mut reader, aot, fs, element_instance_tag, scratch)?;
                         elements.push(ElementOut {
                             key,
                             kind: IdSynEle::Cpe,
@@ -428,12 +431,13 @@ impl StreamDecoder {
     /// Parse one CPE body (after the walker consumed its element-instance
     /// tag) and run it through the per-slot element decoder, returning
     /// the `(left, right)` channel time signals.
-    fn decode_cpe(
+    fn decode_cpe<A: std::alloc::Allocator + Copy>(
         &mut self,
         reader: &mut BitReader<'_>,
         aot: u8,
         fs: u8,
         element_instance_tag: u8,
+        scratch: A,
     ) -> Result<(Vec<f64>, Vec<f64>)> {
         let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
         let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
@@ -471,7 +475,7 @@ impl StreamDecoder {
                 ms_used,
             };
             let dec = self.decoders.entry(key).or_default();
-            dec.decode_cpe(&left, &right, &joint, aot, fs)
+            dec.decode_cpe_in(&left, &right, &joint, aot, fs, scratch)
         } else {
             // Non-shared CPE: each channel carries its own ics_info; no
             // M/S mask, so the joint-stereo tools do not run.
@@ -500,7 +504,7 @@ impl StreamDecoder {
                 spectral: &right_spectral,
             };
             let dec = self.decoders.entry(key).or_default();
-            dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)
+            dec.decode_cpe_in(&left, &right, &CpeJointStereo::default(), aot, fs, scratch)
         }
     }
 }

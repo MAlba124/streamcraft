@@ -75,7 +75,7 @@
 //!   noise is reproducible across a decode run.
 
 use crate::decoded_spectrum::quant_to_spec;
-use crate::dequant::rescale_spectrum;
+use crate::dequant::rescale_spectrum_in;
 use crate::filterbank::Filterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
@@ -192,20 +192,27 @@ fn noise_nrg_table(
 /// noise tools' input) alongside the accumulated absolute scalefactors
 /// (so the caller can derive the band-indexed `is_pos` / `noise_nrg`
 /// tracks without re-running the accumulator).
-fn reconstruct_pre_pair(
+fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
     ch: &ChannelInput<'_>,
     fs_index: u8,
+    scratch: A,
 ) -> Result<(Vec<f64>, AbsoluteScaleFactors)> {
     // 2. §4.6.3.3 pulse fix-up on the quantised spectrum (long windows
     //    only — the parser already rejects pulse on EIGHT_SHORT, and a
     //    long sequence has exactly one group).
-    let x_quant: SpectralData = if let Some(pd) = &ch.body.pulse_data {
-        let mut patched = ch.spectral.clone();
-        let group0 = patched.x_quant.first_mut().ok_or(Error::DequantInvalid)?;
+    // Only the (rare) pulse path mutates the quantised spectrum, so only it needs an owned
+    // copy — the common no-pulse path borrows `ch.spectral` directly. Cloning the whole
+    // `Vec<Vec<i32>>` unconditionally was a per-channel per-frame allocation (~2% of all heap
+    // allocations in profiling; streamcraft patch).
+    let patched;
+    let x_quant: &SpectralData = if let Some(pd) = &ch.body.pulse_data {
+        let mut p = ch.spectral.clone();
+        let group0 = p.x_quant.first_mut().ok_or(Error::DequantInvalid)?;
         apply_pulse_data(group0, fs_index, pd)?;
-        patched
+        patched = p;
+        &patched
     } else {
-        ch.spectral.clone()
+        ch.spectral
     };
 
     // 3a. §4.6.2.3.2 scalefactor accumulation.
@@ -215,9 +222,15 @@ fn reconstruct_pre_pair(
         ch.body.global_gain,
     )?;
 
-    // 3b. §4.6.1.3 + §4.6.2.3.3 inverse quantisation + rescaling.
-    let rescaled = rescale_spectrum(
-        &x_quant,
+    // 3b. §4.6.1.3 + §4.6.2.3.3 inverse quantisation + rescaling. The rescaled `Vec<Vec<f64>>`
+    //     is pure scratch — consumed by `quant_to_spec` on the next line and dropped — so it
+    //     comes from the caller's `scratch` allocator (the pipeline's per-`process()` arena,
+    //     reset by the scheduler) rather than the heap: no malloc/free of the outer + per-group
+    //     inner vectors every channel (streamcraft patch). `spec` escapes into the
+    //     PNS/TNS/filterbank tail, so it stays a heap `Vec`.
+    let rescaled = rescale_spectrum_in(
+        scratch,
+        x_quant,
         &abs,
         &ch.body.section_data.sfb_cb,
         ch.ics_info,
@@ -412,7 +425,19 @@ impl ElementDecoder {
     /// Returns `LONG_WINDOW_LEN` (1024) PCM-domain samples for the
     /// frame.
     pub fn decode_sce(&mut self, ch: &ChannelInput<'_>, aot: u8, fs_index: u8) -> Result<Vec<f64>> {
-        let (mut spec, abs) = reconstruct_pre_pair(ch, fs_index)?;
+        self.decode_sce_in(ch, aot, fs_index, std::alloc::Global)
+    }
+
+    /// [`decode_sce`](Self::decode_sce) with an explicit `scratch` allocator for the per-channel
+    /// transient buffers (the pipeline passes its per-`process()` arena; tests use `Global`).
+    pub fn decode_sce_in<A: std::alloc::Allocator + Copy>(
+        &mut self,
+        ch: &ChannelInput<'_>,
+        aot: u8,
+        fs_index: u8,
+        scratch: A,
+    ) -> Result<Vec<f64>> {
+        let (mut spec, abs) = reconstruct_pre_pair(ch, fs_index, scratch)?;
         let max_sfb = ch.ics_info.max_sfb as usize;
 
         // §4.6.13 PNS on the single channel (no pair correlation).
@@ -469,6 +494,20 @@ impl ElementDecoder {
         aot: u8,
         fs_index: u8,
     ) -> Result<(Vec<f64>, Vec<f64>)> {
+        self.decode_cpe_in(left, right, joint, aot, fs_index, std::alloc::Global)
+    }
+
+    /// [`decode_cpe`](Self::decode_cpe) with an explicit `scratch` allocator for the two
+    /// channels' transient buffers (the pipeline passes its per-`process()` arena).
+    pub fn decode_cpe_in<A: std::alloc::Allocator + Copy>(
+        &mut self,
+        left: &ChannelInput<'_>,
+        right: &ChannelInput<'_>,
+        joint: &CpeJointStereo,
+        aot: u8,
+        fs_index: u8,
+        scratch: A,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
         // The §4.6.8 joint-stereo tools de-matrix the two channels
         // band-for-band, so they require a shared window geometry. The
         // shared-info CPE form guarantees this; reject a mismatch the
@@ -485,8 +524,8 @@ impl ElementDecoder {
         let geom = left.ics_info;
         let max_sfb = geom.max_sfb as usize;
 
-        let (mut left_spec, left_abs) = reconstruct_pre_pair(left, fs_index)?;
-        let (mut right_spec, right_abs) = reconstruct_pre_pair(right, fs_index)?;
+        let (mut left_spec, left_abs) = reconstruct_pre_pair(left, fs_index, scratch)?;
+        let (mut right_spec, right_abs) = reconstruct_pre_pair(right, fs_index, scratch)?;
 
         // §4.6.8.1 M/S de-matrix (suppressed on intensity / noise bands
         // by apply_ms_stereo itself).
