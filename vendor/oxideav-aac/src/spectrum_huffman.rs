@@ -461,8 +461,11 @@
 //!   `section_data()`. That driver will land once codebooks 2..=11
 //!   are in place.
 
+use std::sync::OnceLock;
+
 use oxideav_core::bits::{BitReader, BitWriter};
 
+use crate::huffman_table::PrefixTable;
 use crate::{Error, Result};
 
 // =============================================================================
@@ -609,20 +612,12 @@ pub fn hcod1_encode(idx: u32) -> Result<(u8, u16)> {
 /// dead by the `hcod1_is_complete` regression test that exhaustively
 /// walks all `2¹¹` 11-bit prefixes.
 pub fn hcod1_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD1_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD1.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD1 is a complete 11-bit prefix code. The
-    // `hcod1_is_complete` regression test verifies every 11-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD1 is a complete 11-bit prefix code; the 11-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 1 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD1, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD1, HCOD1_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 1 codeword to `writer` by index.
@@ -784,20 +779,12 @@ pub fn hcod2_encode(idx: u32) -> Result<(u8, u16)> {
 /// `hcod2_is_complete` regression test that exhaustively walks all
 /// `2⁹` 9-bit prefixes.
 pub fn hcod2_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD2_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD2.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD2 is a complete 9-bit prefix code. The
-    // `hcod2_is_complete` regression test verifies every 9-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD2 is a complete 9-bit prefix code; the 9-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 2 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD2, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD2, HCOD2_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 2 codeword to `writer` by index.
@@ -974,20 +961,12 @@ pub fn hcod3_encode(idx: u32) -> Result<(u8, u16)> {
 /// translation and then reads exactly one sign bit per non-zero
 /// coefficient in low-frequency-first order.
 pub fn hcod3_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD3_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD3.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD3 is a complete 16-bit prefix code. The
-    // `hcod3_is_complete` regression test verifies every 16-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD3 is a complete 16-bit prefix code; the 16-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 3 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD3, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD3, HCOD3_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 3 codeword to `writer` by index.
@@ -1163,20 +1142,12 @@ pub fn hcod4_encode(idx: u32) -> Result<(u8, u16)> {
 /// translation and then reads exactly one sign bit per non-zero
 /// coefficient in low-frequency-first order.
 pub fn hcod4_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD4_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD4.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD4 is a complete 12-bit prefix code. The
-    // `hcod4_is_complete` regression test verifies every 12-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD4 is a complete 12-bit prefix code; the 12-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 4 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD4, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD4, HCOD4_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 4 codeword to `writer` by index.
@@ -1354,20 +1325,12 @@ pub fn hcod5_encode(idx: u32) -> Result<(u8, u16)> {
 /// coefficient's sign is already baked into the index via the
 /// `offset = LAV = 4` §4.6.3.3 polynomial.
 pub fn hcod5_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD5_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD5.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD5 is a complete 13-bit prefix code. The
-    // `hcod5_is_complete` regression test verifies every 13-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD5 is a complete 13-bit prefix code; the 13-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 5 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD5, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD5, HCOD5_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 5 codeword to `writer` by index.
@@ -1540,20 +1503,12 @@ pub fn hcod6_encode(idx: u32) -> Result<(u8, u16)> {
 /// `(y, z)` pair carries its sign inside the §4.6.3.3 index via the
 /// `offset = LAV = 4` shift.
 pub fn hcod6_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD6_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD6.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD6 is a complete 11-bit prefix code. The
-    // `hcod6_is_complete` regression test verifies every 11-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD6 is a complete 11-bit prefix code; the 11-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 6 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD6, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD6, HCOD6_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 6 codeword to `writer` by index.
@@ -1717,20 +1672,12 @@ pub fn hcod7_encode(idx: u32) -> Result<(u8, u16)> {
 /// coefficient after the Huffman codeword via
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod7_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD7_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD7.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD7 is a complete 12-bit prefix code. The
-    // `hcod7_is_complete` regression test verifies every 12-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD7 is a complete 12-bit prefix code; the 12-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 7 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD7, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD7, HCOD7_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 7 codeword to `writer` by index.
@@ -1905,20 +1852,12 @@ pub fn hcod8_encode(idx: u32) -> Result<(u8, u16)> {
 /// coefficient after the Huffman codeword via
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod8_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD8_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD8.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD8 is a complete 10-bit prefix code. The
-    // `hcod8_is_complete` regression test verifies every 10-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD8 is a complete 10-bit prefix code; the 10-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 8 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD8, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD8, HCOD8_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 8 codeword to `writer` by index.
@@ -2189,20 +2128,12 @@ pub fn hcod9_encode(idx: u32) -> Result<(u8, u16)> {
 /// coefficient after the Huffman codeword via
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod9_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD9_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD9.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD9 is a complete 15-bit prefix code. The
-    // `hcod9_is_complete` regression test verifies every 15-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD9 is a complete 15-bit prefix code; the 15-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 9 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD9, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD9, HCOD9_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 9 codeword to `writer` by index.
@@ -2480,20 +2411,12 @@ pub fn hcod10_encode(idx: u32) -> Result<(u8, u16)> {
 /// non-zero coefficient after the Huffman codeword via
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod10_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD10_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD10.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD10 is a complete 12-bit prefix code. The
-    // `hcod10_is_complete` regression test verifies every 12-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD10 is a complete 12-bit prefix code; the 12-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 10 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD10, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD10, HCOD10_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 10 codeword to `writer` by index.
@@ -2922,20 +2845,12 @@ pub fn hcod11_encode(idx: u32) -> Result<(u8, u16)> {
 /// bridge when the §4.6.3.3 index translation surfaces a `16` in
 /// either slot.
 pub fn hcod11_decode(reader: &mut BitReader<'_>) -> Result<u32> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD11_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        for (idx, &(entry_len, entry_cw)) in HCOD11.iter().enumerate() {
-            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
-                return Ok(idx as u32);
-            }
-        }
-    }
-    // Unreachable: HCOD11 is a complete 12-bit prefix code. The
-    // `hcod11_is_complete` regression test verifies every 12-bit
-    // prefix maps to exactly one entry.
-    unreachable!("HCOD11 is a complete 12-bit prefix code; the 12-bit walk must match");
+    // Peek-and-lookup over Table 4.A codebook 11 (was an O(entries*max_len) linear scan
+    // per symbol; streamcraft patch). The table is a pure function of HCOD11, so the
+    // decoded index is identical to the scan's.
+    static TABLE: OnceLock<PrefixTable> = OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD11, HCOD11_MAX_LEN));
+    table.decode(reader)
 }
 
 /// Write a Codebook 11 codeword to `writer` by index.

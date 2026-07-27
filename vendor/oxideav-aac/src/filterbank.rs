@@ -175,6 +175,11 @@ struct ImdctPlan {
     tw: Vec<C64>,
     /// Bit-reversal permutation for the `Q`-point radix-2 FFT.
     brev: Vec<u32>,
+    /// Reused `Q`-point FFT working buffer — held here so the per-frame IMDCT does not
+    /// allocate it each call (every entry is overwritten before use, so no clearing is needed).
+    scratch_z: Vec<C64>,
+    /// Reused `M`-length DCT-IV output buffer — same rationale (fully overwritten each call).
+    scratch_c4: Vec<f64>,
 }
 
 impl ImdctPlan {
@@ -193,31 +198,49 @@ impl ImdctPlan {
             .collect();
         let bits = q.trailing_zeros();
         let brev = (0..q as u32).map(|i| i.reverse_bits() >> (32 - bits)).collect();
-        ImdctPlan { n, pre, post, tw, brev }
+        ImdctPlan {
+            n,
+            pre,
+            post,
+            tw,
+            brev,
+            scratch_z: vec![C64 { re: 0.0, im: 0.0 }; q],
+            scratch_c4: vec![0.0f64; m],
+        }
     }
 
     /// The fast IMDCT: same contract as the reference [`imdct`] (spec in,
     /// `N` time-domain values out, `2/N` scale included).
-    fn imdct(&self, spec: &[f64]) -> Vec<f64> {
-        let n = self.n;
+    ///
+    /// The `Q`-point FFT working buffer (`z`) and the `M`-length DCT-IV buffer (`c4`) are
+    /// reused from the plan (`&mut self`) rather than allocated per call: both are fully
+    /// overwritten before they are read, so keeping them across frames removes two per-call
+    /// allocations (one of them a zeroed one) with no change to the result. The `N`-length
+    /// output is still freshly allocated — it is handed back to the caller as an owned `Vec`.
+    fn imdct(&mut self, spec: &[f64]) -> Vec<f64> {
+        // Destructure so the reused scratch (`&mut`) and the constant twiddle/permutation
+        // tables (`&`) are borrowed disjointly.
+        let ImdctPlan { n, pre, post, tw, brev, scratch_z, scratch_c4 } = self;
+        let n = *n;
         let (m, q) = (n / 2, n / 4);
         debug_assert_eq!(spec.len(), m);
         let scale = 2.0 / n as f64;
 
-        // Pair + pre-twiddle: z[j] = (X[2j] + i·X[M−1−2j]) · e^{−iπ(j+1/4)/M}.
-        let mut z: Vec<C64> = (0..q)
-            .map(|j| {
-                C64 {
-                    re: spec[2 * j],
-                    im: spec[m - 1 - 2 * j],
-                }
-                .mul(self.pre[j])
-            })
-            .collect();
+        // Pair + pre-twiddle: z[j] = (X[2j] + i·X[M−1−2j]) · e^{−iπ(j+1/4)/M}. Every slot is
+        // written here, so the buffer's prior contents are irrelevant (no clear needed).
+        let z = scratch_z;
+        debug_assert_eq!(z.len(), q);
+        for (j, zj) in z.iter_mut().enumerate() {
+            *zj = C64 {
+                re: spec[2 * j],
+                im: spec[m - 1 - 2 * j],
+            }
+            .mul(pre[j]);
+        }
 
         // In-place radix-2 decimation-in-time FFT (Cooley–Tukey 1965).
         for i in 0..q {
-            let j = self.brev[i] as usize;
+            let j = brev[i] as usize;
             if i < j {
                 z.swap(i, j);
             }
@@ -229,7 +252,7 @@ impl ImdctPlan {
             let mut base = 0;
             while base < q {
                 for k in 0..half {
-                    let w = self.tw[k * stride];
+                    let w = tw[k * stride];
                     let t = z[base + half + k].mul(w);
                     let u = z[base + k];
                     z[base + k] = C64 { re: u.re + t.re, im: u.im + t.im };
@@ -240,10 +263,11 @@ impl ImdctPlan {
             len <<= 1;
         }
 
-        // Post-twiddle → the M DCT-IV values.
-        let mut c4 = vec![0.0f64; m];
+        // Post-twiddle → the M DCT-IV values (each index written once, no clear needed).
+        let c4 = scratch_c4;
+        debug_assert_eq!(c4.len(), m);
         for r in 0..q {
-            let g = z[r].mul(self.post[r]);
+            let g = z[r].mul(post[r]);
             c4[2 * r] = g.re;
             c4[m - 1 - 2 * r] = -g.im;
         }
@@ -401,9 +425,9 @@ struct WindowHalves {
     right: Vec<f64>,
 }
 
-/// Build the left half for the requested `shape` at transform length
+/// Compute (uncached) the left half for the requested `shape` at transform length
 /// `n_transform`.
-fn half_window(n_transform: usize, shape: WindowShape) -> Vec<f64> {
+fn compute_half_window(n_transform: usize, shape: WindowShape) -> Vec<f64> {
     let half = n_transform / 2;
     match shape {
         WindowShape::Sine => sine_left(half),
@@ -418,20 +442,74 @@ fn half_window(n_transform: usize, shape: WindowShape) -> Vec<f64> {
     }
 }
 
+/// Build the left half for the requested `shape` at transform length `n_transform`, returning a
+/// reference into the cache.
+///
+/// The result is a **constant** keyed only by `(n_transform, shape)` — there are only four
+/// (long/short × sine/KBD) — so it is computed once and cached. Recomputing the KBD window
+/// per frame (a Bessel-I0 power series per sample) was ~3% of playback CPU in profiling; the
+/// window never changes, so a `OnceLock` per shape removes it (streamcraft patch — see
+/// `STREAMCRAFT-PATCHES.md`). Returning a `&'static` slice (rather than an owned clone) also
+/// drops the per-call 8 KiB copy that the earlier version paid.
+fn half_window(n_transform: usize, shape: WindowShape) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static LONG_SINE: OnceLock<Vec<f64>> = OnceLock::new();
+    static LONG_KBD: OnceLock<Vec<f64>> = OnceLock::new();
+    static SHORT_SINE: OnceLock<Vec<f64>> = OnceLock::new();
+    static SHORT_KBD: OnceLock<Vec<f64>> = OnceLock::new();
+    let cell = match (n_transform == LONG_TRANSFORM_LEN, shape) {
+        (true, WindowShape::Sine) => &LONG_SINE,
+        (true, WindowShape::Kbd) => &LONG_KBD,
+        (false, WindowShape::Sine) => &SHORT_SINE,
+        (false, WindowShape::Kbd) => &SHORT_KBD,
+    };
+    cell.get_or_init(|| compute_half_window(n_transform, shape))
+}
+
 /// §4.6.11.3.2 — assemble a transform's window from a `left` shape
 /// (inherited from the previous block) and a `right` shape (this
 /// block's `window_shape`). For a sine/KBD window the right half is
 /// the spatial mirror of that shape's *left* half, so we build the
 /// `right`-shape left half and reverse it.
+///
+/// **Cached**: the halves are a pure function of `(n_transform, left, right)` — 2 lengths × 2
+/// left × 2 right = 8 constant results — so they are assembled once (the left-half references
+/// plus the one reversed right half) and thereafter returned by reference. This drops the two
+/// half-window copies and the reverse the naive path paid per call; the short-block synthesis
+/// hit this eight times per frame per channel (streamcraft patch).
 fn window_halves(
     n_transform: usize,
     left_shape: WindowShape,
     right_shape: WindowShape,
-) -> WindowHalves {
-    let left = half_window(n_transform, left_shape);
-    let mut right = half_window(n_transform, right_shape);
-    right.reverse();
-    WindowHalves { left, right }
+) -> &'static WindowHalves {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<WindowHalves>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let lens = [LONG_TRANSFORM_LEN, SHORT_TRANSFORM_LEN];
+        let shapes = [WindowShape::Sine, WindowShape::Kbd];
+        let mut v: Vec<WindowHalves> = Vec::with_capacity(8);
+        // Fill in the exact order `window_halves_index` reads back: length outer, left
+        // middle, right inner.
+        for &n in &lens {
+            for &l in &shapes {
+                for &r in &shapes {
+                    let left = half_window(n, l).to_vec();
+                    let mut right = half_window(n, r).to_vec();
+                    right.reverse();
+                    v.push(WindowHalves { left, right });
+                }
+            }
+        }
+        v
+    });
+    &table[window_halves_index(n_transform, left_shape, right_shape)]
+}
+
+/// The [`window_halves`] cache index — matches the fill order in its initializer.
+#[inline]
+fn window_halves_index(n_transform: usize, left: WindowShape, right: WindowShape) -> usize {
+    let len_bit = usize::from(n_transform != LONG_TRANSFORM_LEN);
+    len_bit * 4 + (left as usize) * 2 + (right as usize)
 }
 
 /// The stateful per-channel §4.6.11 filterbank. One instance per
@@ -546,7 +624,7 @@ impl Filterbank {
     /// §4.6.11.3.1 + §4.6.11.3.2 — produce the full-length (`N_l =
     /// 2048`) windowed time signal `z[i][n]` for this frame, before
     /// the inter-block overlap-add. Dispatches on `window_sequence`.
-    fn windowed_signal(&self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
+    fn windowed_signal(&mut self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
         let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
         let right_shape = ics_info.window_shape;
         match ics_info.window_sequence {
@@ -570,7 +648,7 @@ impl Filterbank {
     /// half is shaped by the start/stop transition (a short half-window
     /// flanked by a flat `1.0` plateau and a zero region).
     fn long_windowed(
-        &self,
+        &mut self,
         spec: &[f64],
         left_shape: WindowShape,
         right_shape: WindowShape,
@@ -579,80 +657,14 @@ impl Filterbank {
         if spec.len() != LONG_WINDOW_LEN as usize {
             return Err(Error::FilterbankInvalid);
         }
-        let x = self.plan_long.imdct(spec);
-        let w = self.long_window(left_shape, right_shape, kind);
-        let z: Vec<f64> = x.iter().zip(w.iter()).map(|(&xv, &wv)| xv * wv).collect();
-        Ok(z)
-    }
-
-    /// §4.6.11.3.2 — assemble the length-2048 window vector for a
-    /// long-transform sequence.
-    ///
-    /// * `OnlyLong` (a): `[W_LEFT_l | W_RIGHT_l]`.
-    /// * `Start` (b): left half is `W_LEFT_l`; the right half is a
-    ///   flat `1.0` plateau over `[N_l/2, (3N_l − N_s)/4)`, the short
-    ///   right half-window over `[(3N_l − N_s)/4, (3N_l + N_s)/4)`, and
-    ///   `0.0` over `[(3N_l + N_s)/4, N_l)`.
-    /// * `Stop` (d): the left half is `0.0` over `[0, (N_l − N_s)/4)`,
-    ///   the short left half-window over `[(N_l − N_s)/4, (N_l +
-    ///   N_s)/4)`, and a flat `1.0` plateau over `[(N_l + N_s)/4,
-    ///   N_l/2)`; the right half is `W_RIGHT_l`.
-    fn long_window(
-        &self,
-        left_shape: WindowShape,
-        right_shape: WindowShape,
-        kind: LongKind,
-    ) -> Vec<f64> {
-        let long = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
-        let short = window_halves(SHORT_TRANSFORM_LEN, left_shape, right_shape);
-        let half_l = N_L / 2; // 1024
-        let mut w = vec![0.0f64; N_L];
-
-        // Left half is always the plain long left half for OnlyLong /
-        // Start; Stop replaces it with the start-transition mirror.
-        match kind {
-            LongKind::OnlyLong | LongKind::Start => {
-                w[..half_l].copy_from_slice(&long.left);
-            }
-            LongKind::Stop => {
-                // 0.0 over [0, (N_l − N_s)/4); short left half over
-                // [(N_l − N_s)/4, (N_l + N_s)/4); 1.0 over
-                // [(N_l + N_s)/4, N_l/2).
-                let a = (N_L - N_S) / 4; // 448
-                for (m, &sv) in short.left.iter().enumerate() {
-                    w[a + m] = sv;
-                }
-                for slot in w.iter_mut().take(half_l).skip(a + N_S / 2) {
-                    *slot = 1.0;
-                }
-            }
+        // Window the IMDCT output in place — `x` is consumed here, so scaling it by the window
+        // and returning it avoids a second 2048-wide allocation per channel per frame.
+        let mut x = self.plan_long.imdct(spec);
+        let w = long_window(left_shape, right_shape, kind);
+        for (xv, &wv) in x.iter_mut().zip(w.iter()) {
+            *xv *= wv;
         }
-
-        match kind {
-            LongKind::OnlyLong => {
-                for (m, &rv) in long.right.iter().enumerate() {
-                    w[half_l + m] = rv;
-                }
-            }
-            LongKind::Start => {
-                // 1.0 over [N_l/2, (3N_l − N_s)/4); short right half
-                // over [(3N_l − N_s)/4, (3N_l + N_s)/4); 0.0 after.
-                let b = (3 * N_L - N_S) / 4; // 1472
-                for slot in w.iter_mut().take(b).skip(half_l) {
-                    *slot = 1.0;
-                }
-                for (m, &rv) in short.right.iter().enumerate() {
-                    w[b + m] = rv;
-                }
-                // [(3N_l + N_s)/4, N_l) stays 0.0 from the vec init.
-            }
-            LongKind::Stop => {
-                for (m, &rv) in long.right.iter().enumerate() {
-                    w[half_l + m] = rv;
-                }
-            }
-        }
-        w
+        Ok(x)
     }
 
     /// §4.6.11.3.2 c) — the `EIGHT_SHORT` sequence: eight length-256
@@ -664,7 +676,7 @@ impl Filterbank {
     /// later short window's left half — and every short window's right
     /// half — uses this block's `window_shape`.
     fn short_windowed(
-        &self,
+        &mut self,
         spec: &[f64],
         left_shape: WindowShape,
         right_shape: WindowShape,
@@ -713,12 +725,133 @@ impl Filterbank {
 }
 
 /// Discriminates the three long-transform `window_sequence` shapes
-/// inside [`Filterbank::long_window`].
+/// inside [`long_window`].
 #[derive(Clone, Copy)]
 enum LongKind {
     OnlyLong,
     Start,
     Stop,
+}
+
+impl LongKind {
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            LongKind::OnlyLong => 0,
+            LongKind::Start => 1,
+            LongKind::Stop => 2,
+        }
+    }
+}
+
+/// §4.6.11.3.2 — the assembled length-2048 long-transform window for
+/// `(left_shape, right_shape, kind)`, **cached**.
+///
+/// The composite window is a pure function of its three discrete inputs — 2 left shapes × 2
+/// right shapes × 3 kinds = 12 constant vectors — yet the naive path rebuilt one every frame
+/// per channel: a 2048-wide zeroed allocation, two `window_halves` calls (each cloning cached
+/// half-windows and reversing them), and the piecewise copy loops. Profiling a zero-copy-video
+/// playback showed this per-frame window reconstruction (alloc + memset + clones) as a chunk of
+/// the audio-decode allocation churn (streamcraft patch — see `STREAMCRAFT-PATCHES.md`). The
+/// window never changes, so it is computed once per combo and thereafter returned by reference;
+/// the values are identical to [`compute_long_window`], so decoded output is byte-for-byte
+/// unchanged.
+fn long_window(left_shape: WindowShape, right_shape: WindowShape, kind: LongKind) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<Vec<f64>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let shapes = [WindowShape::Sine, WindowShape::Kbd];
+        let kinds = [LongKind::OnlyLong, LongKind::Start, LongKind::Stop];
+        let mut v: Vec<Vec<f64>> = Vec::with_capacity(12);
+        // Fill in the exact order `long_window_index` reads back: left outer, right middle,
+        // kind inner.
+        for &l in &shapes {
+            for &r in &shapes {
+                for &k in &kinds {
+                    v.push(compute_long_window(l, r, k));
+                }
+            }
+        }
+        v
+    });
+    &table[long_window_index(left_shape, right_shape, kind)]
+}
+
+/// The [`long_window`] cache index for `(left, right, kind)` — matches the fill order in
+/// [`long_window`]'s initializer.
+#[inline]
+fn long_window_index(left: WindowShape, right: WindowShape, kind: LongKind) -> usize {
+    (left as usize) * 6 + (right as usize) * 3 + kind.index()
+}
+
+/// §4.6.11.3.2 — assemble the length-2048 window vector for a
+/// long-transform sequence (the uncached compute; [`long_window`] caches
+/// the twelve constant results).
+///
+/// * `OnlyLong` (a): `[W_LEFT_l | W_RIGHT_l]`.
+/// * `Start` (b): left half is `W_LEFT_l`; the right half is a
+///   flat `1.0` plateau over `[N_l/2, (3N_l − N_s)/4)`, the short
+///   right half-window over `[(3N_l − N_s)/4, (3N_l + N_s)/4)`, and
+///   `0.0` over `[(3N_l + N_s)/4, N_l)`.
+/// * `Stop` (d): the left half is `0.0` over `[0, (N_l − N_s)/4)`,
+///   the short left half-window over `[(N_l − N_s)/4, (N_l +
+///   N_s)/4)`, and a flat `1.0` plateau over `[(N_l + N_s)/4,
+///   N_l/2)`; the right half is `W_RIGHT_l`.
+fn compute_long_window(
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+    kind: LongKind,
+) -> Vec<f64> {
+    let long = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
+    let short = window_halves(SHORT_TRANSFORM_LEN, left_shape, right_shape);
+    let half_l = N_L / 2; // 1024
+    let mut w = vec![0.0f64; N_L];
+
+    // Left half is always the plain long left half for OnlyLong /
+    // Start; Stop replaces it with the start-transition mirror.
+    match kind {
+        LongKind::OnlyLong | LongKind::Start => {
+            w[..half_l].copy_from_slice(&long.left);
+        }
+        LongKind::Stop => {
+            // 0.0 over [0, (N_l − N_s)/4); short left half over
+            // [(N_l − N_s)/4, (N_l + N_s)/4); 1.0 over
+            // [(N_l + N_s)/4, N_l/2).
+            let a = (N_L - N_S) / 4; // 448
+            for (m, &sv) in short.left.iter().enumerate() {
+                w[a + m] = sv;
+            }
+            for slot in w.iter_mut().take(half_l).skip(a + N_S / 2) {
+                *slot = 1.0;
+            }
+        }
+    }
+
+    match kind {
+        LongKind::OnlyLong => {
+            for (m, &rv) in long.right.iter().enumerate() {
+                w[half_l + m] = rv;
+            }
+        }
+        LongKind::Start => {
+            // 1.0 over [N_l/2, (3N_l − N_s)/4); short right half
+            // over [(3N_l − N_s)/4, (3N_l + N_s)/4); 0.0 after.
+            let b = (3 * N_L - N_S) / 4; // 1472
+            for slot in w.iter_mut().take(b).skip(half_l) {
+                *slot = 1.0;
+            }
+            for (m, &rv) in short.right.iter().enumerate() {
+                w[b + m] = rv;
+            }
+            // [(3N_l + N_s)/4, N_l) stays 0.0 from the vec init.
+        }
+        LongKind::Stop => {
+            for (m, &rv) in long.right.iter().enumerate() {
+                w[half_l + m] = rv;
+            }
+        }
+    }
+    w
 }
 
 #[cfg(test)]
@@ -1101,8 +1234,7 @@ mod tests {
     fn start_window_plateau_and_zero_regions() {
         // LONG_START: left half is the long left window, then a flat
         // 1.0 plateau, then the short right half, then zeros.
-        let fb = Filterbank::new();
-        let w = fb.long_window(WindowShape::Sine, WindowShape::Sine, LongKind::Start);
+        let w = long_window(WindowShape::Sine, WindowShape::Sine, LongKind::Start);
         assert_eq!(w.len(), N_L);
         // Plateau region [1024, 1472) is all 1.0.
         for v in w.iter().take(1472).skip(1024) {
@@ -1120,8 +1252,7 @@ mod tests {
     fn stop_window_zero_and_plateau_regions() {
         // LONG_STOP: leading zeros, short left half, 1.0 plateau, then
         // the long right window.
-        let fb = Filterbank::new();
-        let w = fb.long_window(WindowShape::Sine, WindowShape::Sine, LongKind::Stop);
+        let w = long_window(WindowShape::Sine, WindowShape::Sine, LongKind::Stop);
         assert_eq!(w.len(), N_L);
         // Leading [0, 448) zeros. (N_l − N_s)/4 = 448.
         for v in w.iter().take(448) {
@@ -1141,14 +1272,14 @@ mod tests {
         // left half uses its own window_shape (KBD here). Confirm the
         // left half equals the KBD left window, not the sine one.
         let info = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
-        let fb = Filterbank::new();
+        let mut fb = Filterbank::new();
         let w = fb
             .windowed_signal(&vec![0.0; LONG_WINDOW_LEN as usize], &info)
             .unwrap();
         // All-zero spectrum → zero time signal regardless, so instead
         // inspect the window directly.
         let _ = w;
-        let win = fb.long_window(WindowShape::Kbd, WindowShape::Kbd, LongKind::OnlyLong);
+        let win = long_window(WindowShape::Kbd, WindowShape::Kbd, LongKind::OnlyLong);
         let kbd = kbd_left(1024, 4.0);
         for n in 0..1024 {
             assert!((win[n] - kbd[n]).abs() < 1e-15);

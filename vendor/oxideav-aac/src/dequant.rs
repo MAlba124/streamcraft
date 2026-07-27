@@ -57,16 +57,46 @@ use crate::{Error, Result};
 /// gain. "The constant SF_OFFSET must be set to 100."
 pub const SF_OFFSET: i32 = 100;
 
+/// Largest `|x_quant|` the inverse-quantization table covers. AAC quantized magnitudes are
+/// bounded by the 13-bit escape range (§4.6.3.3), so `0..=8191` spans the whole domain; a
+/// magnitude beyond it (which the wire cannot encode) falls back to the direct `cbrt`.
+const POW43_MAX: usize = 8191;
+
+/// `|x|^(4/3)` for every `|x_quant|` in `0..=POW43_MAX`, computed once.
+///
+/// This replaces a `cbrt` **per spectral coefficient** (~1024 per frame per channel) with a
+/// table lookup — profiling a zero-copy-video playback showed this `cbrt` was the single
+/// hottest audio-decode op once the video path stopped touching the CPU (streamcraft patch,
+/// see `STREAMCRAFT-PATCHES.md`). Each entry is the **same** `abs · abs.cbrt()` the scalar
+/// path computed, so the dequantized spectrum is **byte-identical** — no accuracy change, the
+/// conformance gate is unaffected. 64 KiB, built lazily.
+fn pow43_table() -> &'static [f64; POW43_MAX + 1] {
+    use std::sync::OnceLock;
+    static TAB: OnceLock<Box<[f64; POW43_MAX + 1]>> = OnceLock::new();
+    TAB.get_or_init(|| {
+        let mut t = Box::new([0.0f64; POW43_MAX + 1]);
+        for (i, e) in t.iter_mut().enumerate() {
+            let a = i as f64;
+            *e = a * a.cbrt();
+        }
+        t
+    })
+}
+
 /// §4.6.1.3 inverse quantization of one coefficient:
 /// `Sign(x_quant) · |x_quant|^(4/3)`.
 #[inline]
 pub fn inverse_quantize(x_quant: i32) -> f64 {
-    // |x|^(4/3) computed as |x| · |x|^(1/3): `cbrt` is correctly
-    // rounded, so perfect cubes (and 0 / ±1) invert exactly, and the
-    // general case avoids the representation error of the literal
-    // exponent 4/3.
-    let abs = f64::from(x_quant.unsigned_abs());
-    let mag = abs * abs.cbrt();
+    // |x|^(4/3) via a precomputed table (identical to `|x| · |x|^(1/3)` — `cbrt` is correctly
+    // rounded, so perfect cubes and 0/±1 invert exactly). A magnitude past the escape range
+    // (unreachable from the wire) still computes directly, so correctness is total.
+    let abs = x_quant.unsigned_abs() as usize;
+    let mag = if abs <= POW43_MAX {
+        pow43_table()[abs]
+    } else {
+        let a = abs as f64;
+        a * a.cbrt()
+    };
     if x_quant < 0 {
         -mag
     } else {

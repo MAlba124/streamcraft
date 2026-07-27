@@ -113,6 +113,42 @@ pub fn interleave_s16(channels: &[Vec<f64>]) -> Result<Vec<i16>> {
     Ok(out)
 }
 
+/// Interleave a frame's per-channel time signals **directly into a caller byte buffer** as
+/// little-endian 16-bit PCM, returning the number of bytes written.
+///
+/// This is exactly [`interleave_s16`] followed by an `i16 → little-endian bytes` copy, fused
+/// into one pass: `dst[(n·C + c)·2 ..][..2] = to_s16(channels[c][n]).to_le_bytes()`. It lets a
+/// caller render straight into an output/pipeline buffer with no intermediate `Vec<i16>` and no
+/// second copy (streamcraft patch — the AAC element interleaves into its pool slot here).
+///
+/// `dst` must hold at least `frame_len · num_channels · 2` bytes (checked; a short buffer is
+/// rejected with [`Error::PcmInvalid`] rather than truncating). Every channel buffer must be the
+/// same length, same as [`interleave_s16`]. An empty channel list writes nothing and returns 0.
+pub fn interleave_s16_le_into(channels: &[Vec<f64>], dst: &mut [u8]) -> Result<usize> {
+    if channels.is_empty() {
+        return Ok(0);
+    }
+    let frame_len = channels[0].len();
+    if channels.iter().any(|c| c.len() != frame_len) {
+        return Err(Error::PcmInvalid);
+    }
+    let num_channels = channels.len();
+    let need = frame_len * num_channels * 2;
+    if dst.len() < need {
+        return Err(Error::PcmInvalid);
+    }
+    let mut o = 0;
+    for n in 0..frame_len {
+        for ch in channels {
+            let bytes = to_s16(ch[n]).to_le_bytes();
+            dst[o] = bytes[0];
+            dst[o + 1] = bytes[1];
+            o += 2;
+        }
+    }
+    Ok(need)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +230,43 @@ mod tests {
         let l = vec![0.0, 1.0];
         let r = vec![0.0, 1.0, 2.0];
         assert!(matches!(interleave_s16(&[l, r]), Err(Error::PcmInvalid)));
+    }
+
+    #[test]
+    fn interleave_le_into_matches_the_two_step_path() {
+        // The fused writer must be byte-for-byte identical to `interleave_s16` followed by a
+        // little-endian byte copy, over saturating and rounding cases and multiple channels.
+        let a = vec![0.0, 10.4, 10.5, -10.5, 40000.0, -40000.0, 32767.5, -32768.5];
+        let b = vec![1.0, -1.0, 100.0, -100.0, 0.5, -0.5, 12345.0, -12345.0];
+        let c = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0];
+        let channels = [a, b, c];
+
+        let reference: Vec<u8> = interleave_s16(&channels)
+            .unwrap()
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+
+        let mut dst = vec![0u8; reference.len()];
+        let n = interleave_s16_le_into(&channels, &mut dst).unwrap();
+        assert_eq!(n, reference.len());
+        assert_eq!(dst, reference);
+    }
+
+    #[test]
+    fn interleave_le_into_rejects_short_buffer() {
+        let l = vec![0.0, 1.0];
+        let r = vec![2.0, 3.0];
+        let mut dst = [0u8; 7]; // need 2*2*2 = 8
+        assert!(matches!(
+            interleave_s16_le_into(&[l, r], &mut dst),
+            Err(Error::PcmInvalid)
+        ));
+    }
+
+    #[test]
+    fn interleave_le_into_empty_writes_nothing() {
+        let mut dst = [0u8; 4];
+        assert_eq!(interleave_s16_le_into(&[], &mut dst).unwrap(), 0);
     }
 }

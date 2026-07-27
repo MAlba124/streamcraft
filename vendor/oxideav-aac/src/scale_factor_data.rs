@@ -123,6 +123,8 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
+use crate::huffman_table::PrefixTable;
+
 use crate::ics_info::WindowSequence;
 use crate::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
 use crate::{Error, Result};
@@ -322,22 +324,14 @@ pub fn hcod_sf_encode(dpcm: i8) -> Result<(u8, u32)> {
 /// dead code by the [`hcod_sf_decode_is_complete`](#) regression
 /// test that exhaustively walks all `2^19` 19-bit prefixes.
 pub fn hcod_sf_decode(reader: &mut BitReader<'_>) -> Result<i8> {
-    let mut acc: u32 = 0;
-    for len in 1..=HCOD_SF_MAX_LEN {
-        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
-        acc = (acc << 1) | bit;
-        // Linear scan: cost is bounded by HCOD_SF_NUM_ENTRIES * 19.
-        for (idx, &(entry_len, entry_cw)) in HCOD_SF.iter().enumerate() {
-            if u32::from(entry_len) == len && entry_cw == acc {
-                return Ok((idx as i8) + SF_INDEX_OFFSET);
-            }
-        }
-    }
-    // Unreachable: the codebook is a complete prefix code over
-    // 19 bits (Kraft equality = 524288), so the inner loop must
-    // hit for at least one `len <= 19`. The guard is here so the
-    // compiler doesn't infer a non-`!` return path.
-    unreachable!("HCOD_SF is a complete 19-bit prefix code; the 19-bit walk must match");
+    // Peek-and-lookup over the §4.A.1 codebook (was an O(entries·max_len) linear scan per
+    // symbol — the hottest audio-decode op in profiling; streamcraft patch). The table is a
+    // pure function of `HCOD_SF`, so the decoded index — and thus every `(idx + SF_INDEX_OFFSET)`
+    // DPCM delta — is identical.
+    static TABLE: std::sync::OnceLock<PrefixTable> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD_SF, HCOD_SF_MAX_LEN));
+    let idx = table.decode(reader)?;
+    Ok((idx as i8) + SF_INDEX_OFFSET)
 }
 
 // =============================================================================

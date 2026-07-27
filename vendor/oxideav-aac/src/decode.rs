@@ -78,6 +78,20 @@ pub struct DecodedFrame {
     pub sample_rate: u32,
 }
 
+/// A decoded frame in **planar** form: one `f64` time-signal buffer per output channel, in the
+/// canonical [`crate::channel_map`] interleave order, *before* the §4.6.11 integer-PCM
+/// rendering. This is the shape [`StreamDecoder::decode_raw_data_block`] builds internally and
+/// then folds through [`crate::pcm::interleave_s16`]; exposing it lets a caller render the
+/// integer PCM straight into its own output buffer (via
+/// [`crate::pcm::interleave_s16_le_into`]) with no intermediate `Vec<i16>` (streamcraft patch).
+#[derive(Debug, Clone)]
+pub struct PlanarFrame {
+    /// Per-channel time signals, `channels[c][n]`; every buffer is the per-frame sample count.
+    pub channels: Vec<Vec<f64>>,
+    /// The frame's sampling rate in Hz (SBR-doubled when the stream is SBR-active).
+    pub sample_rate: u32,
+}
+
 /// Stateful whole-stream ADTS decoder.
 ///
 /// Holds one [`ElementDecoder`] per `(element-id, instance-tag)` slot so
@@ -157,6 +171,38 @@ impl StreamDecoder {
         num_raw_data_blocks: u8,
         payload: &[u8],
     ) -> Result<DecodedFrame> {
+        let planar = self.decode_raw_data_block_planar(
+            aot,
+            fs_index,
+            sample_rate,
+            channel_configuration,
+            num_raw_data_blocks,
+            payload,
+        )?;
+        let channels = planar.channels.len();
+        let pcm = interleave_s16(&planar.channels)?;
+        Ok(DecodedFrame {
+            pcm,
+            channels,
+            sample_rate: planar.sample_rate,
+        })
+    }
+
+    /// Decode one `raw_data_block()` payload to **planar** per-channel `f64` time signals (see
+    /// [`PlanarFrame`]) — the same decode as [`Self::decode_raw_data_block`] up to but not
+    /// including the §4.6.11 integer-PCM interleave. A caller that renders the PCM itself (e.g.
+    /// straight into a pipeline buffer via [`crate::pcm::interleave_s16_le_into`]) uses this to
+    /// avoid the intermediate interleaved `Vec<i16>`. Arguments are as
+    /// [`Self::decode_raw_data_block`].
+    pub fn decode_raw_data_block_planar(
+        &mut self,
+        aot: u8,
+        fs_index: u8,
+        sample_rate: u32,
+        channel_configuration: u8,
+        num_raw_data_blocks: u8,
+        payload: &[u8],
+    ) -> Result<PlanarFrame> {
         let fs = fs_index;
         let mut reader = BitReader::new(payload);
 
@@ -304,10 +350,8 @@ impl StreamDecoder {
         // does not yet reorder — see `channel_map`).
         let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
 
-        let pcm = interleave_s16(&channels)?;
-        Ok(DecodedFrame {
-            pcm,
-            channels: channels.len(),
+        Ok(PlanarFrame {
+            channels,
             sample_rate: out_rate,
         })
     }
