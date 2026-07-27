@@ -146,6 +146,12 @@ pub struct MatroskaReader {
     /// Decoded frames waiting to be drained by [`next_frame`](Self::next_frame), in stream
     /// order (a laced block pushes several at once).
     pending: VecDeque<Frame>,
+    /// Recycled frame-payload buffers (streamcraft patch). [`push_frame`] draws a `Vec<u8>`
+    /// from here instead of allocating; a consumer hands each drained frame's buffer back via
+    /// [`recycle`](Self::recycle) once done with it, so steady-state framing allocates nothing.
+    /// Bounded, so a stalled consumer cannot grow it without limit. Empty for consumers that
+    /// don't recycle (probing, tests) — they simply keep allocating, which is still correct.
+    free: Vec<Vec<u8>>,
 }
 
 impl Default for MatroskaReader {
@@ -168,6 +174,18 @@ impl MatroskaReader {
             duration_ns: None,
             cluster_base_tick: 0,
             pending: VecDeque::new(),
+            free: Vec::new(),
+        }
+    }
+
+    /// Hand a drained frame's payload buffer back for reuse by a later [`push_frame`], so
+    /// steady-state framing allocates nothing (streamcraft patch). Bounded — buffers past the
+    /// cap are dropped. Recycling is optional: a consumer that never calls this just keeps
+    /// allocating fresh buffers, with identical output.
+    pub fn recycle(&mut self, buf: Vec<u8>) {
+        const MAX_FREE: usize = 64;
+        if self.free.len() < MAX_FREE {
+            self.free.push(buf);
         }
     }
 
@@ -314,10 +332,10 @@ impl MatroskaReader {
             self.cluster_base_tick = read_uint(&self.buf[ds..de]) as i64;
         } else if id == id::SIMPLE_BLOCK {
             let (base, scale) = (self.cluster_base_tick, self.timestamp_scale);
-            decode_simple_block(&self.buf[ds..de], base, scale, &mut self.pending)?;
+            decode_simple_block(&self.buf[ds..de], base, scale, &mut self.pending, &mut self.free)?;
         } else if id == id::BLOCK_GROUP {
             let (base, scale) = (self.cluster_base_tick, self.timestamp_scale);
-            decode_block_group(&self.buf[ds..de], base, scale, &mut self.pending)?;
+            decode_block_group(&self.buf[ds..de], base, scale, &mut self.pending, &mut self.free)?;
         }
         // Any other element (EBML Header, Cues, Tags, Void, unknown) is skipped as opaque.
 
@@ -608,6 +626,7 @@ fn decode_block_group(
     cluster_base_tick: i64,
     scale: u64,
     out: &mut VecDeque<Frame>,
+    free: &mut Vec<Vec<u8>>,
 ) -> Result<(), ReadError> {
     let mut at = 0;
     let mut has_reference = false;
@@ -635,7 +654,7 @@ fn decode_block_group(
         let duration_ns = duration_ticks.map(|t| t.saturating_mul(scale));
         // Keyframe status comes from the group (no ReferenceBlock => keyframe), not a flag in
         // the block body — pass it in.
-        decode_block(&data[s..e], !has_reference, cluster_base_tick, scale, duration_ns, out)?;
+        decode_block(&data[s..e], !has_reference, cluster_base_tick, scale, duration_ns, out, free)?;
     }
     Ok(())
 }
@@ -648,11 +667,12 @@ fn decode_simple_block(
     cluster_base_tick: i64,
     scale: u64,
     out: &mut VecDeque<Frame>,
+    free: &mut Vec<Vec<u8>>,
 ) -> Result<(), ReadError> {
     let (_track, _rel, flags, _start) = parse_block_header(data)?;
     let keyframe = flags & 0x80 != 0;
     // A SimpleBlock has no BlockDuration (only a BlockGroup carries one) — duration unknown.
-    decode_block(data, keyframe, cluster_base_tick, scale, None, out)
+    decode_block(data, keyframe, cluster_base_tick, scale, None, out, free)
 }
 
 /// Decode a Block/SimpleBlock body with an already-decided `keyframe` (from the flags byte for
@@ -668,6 +688,7 @@ fn decode_block(
     scale: u64,
     duration_ns: Option<u64>,
     out: &mut VecDeque<Frame>,
+    free: &mut Vec<Vec<u8>>,
 ) -> Result<(), ReadError> {
     let (track, rel_ts, flags, frames_start) = parse_block_header(data)?;
     let pts_ns = block_pts_ns(cluster_base_tick, rel_ts, scale);
@@ -676,7 +697,7 @@ fn decode_block(
     let sizes = match lacing {
         0b00 => {
             // No lacing: the whole payload is one frame (RFC 9559 §10.3.1).
-            push_frame(out, track, pts_ns, duration_ns, keyframe, payload);
+            push_frame(out, free, track, pts_ns, duration_ns, keyframe, payload);
             return Ok(());
         }
         0b01 => xiph_lace_sizes(payload)?,
@@ -689,12 +710,12 @@ fn decode_block(
     for &sz in &sizes.frames {
         let end = off.checked_add(sz).ok_or(ReadError::Malformed("laced frame size overflow"))?;
         let frame = payload.get(off..end).ok_or(ReadError::Malformed("laced frame runs past the block"))?;
-        push_frame(out, track, pts_ns, duration_ns, keyframe, frame);
+        push_frame(out, free, track, pts_ns, duration_ns, keyframe, frame);
         off = end;
     }
     // The last frame's size is whatever remains after the coded ones (§10.3.2/3/4).
     let last = payload.get(off..).ok_or(ReadError::Malformed("last laced frame runs past the block"))?;
-    push_frame(out, track, pts_ns, duration_ns, keyframe, last);
+    push_frame(out, free, track, pts_ns, duration_ns, keyframe, last);
     Ok(())
 }
 
@@ -720,21 +741,27 @@ fn block_pts_ns(cluster_base_tick: i64, rel_ts: i16, scale: u64) -> u64 {
     abs_tick.saturating_mul(scale)
 }
 
-/// Queue one decoded frame (copying its bytes out of the shared buffer window into `out`).
+/// Queue one decoded frame, copying its bytes out of the shared buffer window into a payload
+/// buffer drawn from `free` (a recycled buffer when the consumer returns them via
+/// [`MatroskaReader::recycle`], else a fresh allocation).
 fn push_frame(
     out: &mut VecDeque<Frame>,
+    free: &mut Vec<Vec<u8>>,
     track: u64,
     pts_ns: u64,
     duration_ns: Option<u64>,
     keyframe: bool,
     data: &[u8],
 ) {
+    let mut buf = free.pop().unwrap_or_default();
+    buf.clear();
+    buf.extend_from_slice(data);
     out.push_back(Frame {
         track_number: track,
         pts_ns,
         duration_ns,
         keyframe,
-        data: data.to_vec(),
+        data: buf,
     });
 }
 

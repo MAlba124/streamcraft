@@ -1077,17 +1077,32 @@ impl MkvDemux {
             let dur_ns = frame.duration_ns;
             // Emit from the (usually borrowed) reframed bytes; only a parked remainder
             // pays the copy into an owned carry.
+            let out_len = out_bytes.len();
             let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), dur_ns, flags, &out_bytes, 0);
-            if off < out_bytes.len() {
+            // Consume `out_bytes` in **both** arms — for a passthrough track it borrows
+            // `frame.data`, and the frame's payload buffer must be free of borrows before it is
+            // recycled below.
+            let remainder = if off < out_len {
+                Some(out_bytes.into_owned())
+            } else {
+                drop(out_bytes);
+                None
+            };
+            if let Some(bytes) = remainder {
                 self.pending.push_back(Carry {
                     pad,
                     pts_ns: Some(frame.pts_ns),
                     duration_ns: dur_ns,
                     flags,
-                    bytes: out_bytes.into_owned(),
+                    bytes,
                     off,
                 });
             }
+            // Return the frame's payload buffer to the reader for reuse (streamcraft patch): the
+            // Matroska framing then allocates nothing in steady state. `out_bytes` is fully
+            // consumed above, so `frame.data` is no longer borrowed. `next_frame` returned an
+            // owned `Frame`, so `self.reader` is free to borrow here.
+            self.reader.recycle(frame.data);
             if !self.pending.is_empty() {
                 return false; // pool dry — carry parked, stop pulling reader frames
             }
