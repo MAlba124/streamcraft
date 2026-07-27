@@ -54,5 +54,14 @@ sc-sdl3 = { path = "../sdl3" }
 sc-pipewire = { path = "../pipewire" }
 # The h264 decoder churns malloc internally (see sdl3/examples/play_file.rs) — the `scplay`
 # binary swaps the global allocator to mimalloc for playback headroom. Only the binary uses
-# it (`#[global_allocator]`); the library stays allocator-agnostic.
-mimalloc = "0.1.52"
+# it (`#[global_allocator]`); the library stays allocator-agnostic. Gated behind the default
+# `mimalloc` feature so an allocation profile can build with the system allocator
+# (`--no-default-features`) — heaptrack interposes libc malloc and cannot see mimalloc.
+mimalloc = { version = "0.1.52", optional = true }
+
+[features]
+default = ["mimalloc"]
+# Enables the mimalloc global allocator in the `scplay` binary. Turn off
+# (`cargo build -p sc-play --no-default-features`) for heaptrack/valgrind, which need the
+# system allocator to observe the decode-path allocations.
+mimalloc = ["dep:mimalloc"]

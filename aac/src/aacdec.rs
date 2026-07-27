@@ -300,14 +300,25 @@ impl Element for AacDec {
             };
             let au = self.au_index;
             self.au_index += 1;
-            match self.dec.decode_raw_data_block_planar(
-                cfg.aot,
-                cfg.fs_index,
-                cfg.sample_rate,
-                cfg.channel_configuration,
-                1, // container AUs carry one raw_data_block each
-                data,
-            ) {
+            // Decode the block, allocating its per-channel transient scratch from the pipeline's
+            // per-`process()` arena (`ctx.scratch()`) rather than the heap — the scheduler
+            // resets that arena after each `process()`, so the decoder's scratch imposes no
+            // steady-state heap traffic. Block-scoped: the returned `PlanarFrame` owns its PCM
+            // (the arena backs only the dropped intermediates), so the `&ctx` borrow ends here,
+            // freeing `ctx` for the `&mut` calls (`ctx.post`) in the match arms below.
+            let decoded = {
+                let scratch = ctx.scratch();
+                self.dec.decode_raw_data_block_planar(
+                    cfg.aot,
+                    cfg.fs_index,
+                    cfg.sample_rate,
+                    cfg.channel_configuration,
+                    1, // container AUs carry one raw_data_block each
+                    data,
+                    scratch,
+                )
+            };
+            match decoded {
                 Ok(frame) => {
                     self.consecutive_errors = 0;
                     self.last_geometry = Some((frame.channels.len(), frame.sample_rate));

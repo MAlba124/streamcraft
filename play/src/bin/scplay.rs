@@ -18,7 +18,10 @@
 
 // The adopted h264 decoder allocates ~1.5M times/s internally (see play_file); mimalloc buys
 // the headroom until the churn is fixed upstream. Binary-only — the library stays
-// allocator-agnostic.
+// allocator-agnostic. Gated behind the default `mimalloc` feature: build
+// `--no-default-features` to fall back to the system allocator so heaptrack/valgrind can see
+// the decode-path allocations (mimalloc bypasses the libc malloc they interpose).
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

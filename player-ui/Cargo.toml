@@ -39,4 +39,11 @@ sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
 # The h264/hevc decoders churn malloc internally (see sdl3/examples/play_file.rs);
 # the binary swaps the global allocator for playback headroom, exactly like scplay.
 # Only the binary uses it (`#[global_allocator]`); the library stays allocator-agnostic.
-mimalloc = "0.1.52"
+# Gated behind the default `mimalloc` feature so `--no-default-features` builds with the
+# system allocator (heaptrack/valgrind cannot observe mimalloc allocations).
+mimalloc = { version = "0.1.52", optional = true }
+
+[features]
+default = ["mimalloc"]
+# Enables the mimalloc global allocator in the binary; disable for heaptrack/valgrind.
+mimalloc = ["dep:mimalloc"]

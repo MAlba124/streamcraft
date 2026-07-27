@@ -18,7 +18,9 @@
 
 // The adopted h264/hevc decoders churn malloc internally (see sdl3/examples/play_file.rs);
 // mimalloc buys playback headroom, exactly like scplay. Binary-only — the library stays
-// allocator-agnostic.
+// allocator-agnostic. Gated behind the default `mimalloc` feature: `--no-default-features`
+// falls back to the system allocator so heaptrack/valgrind can observe allocations.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
