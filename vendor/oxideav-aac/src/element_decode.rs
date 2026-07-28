@@ -126,9 +126,14 @@ pub struct ChannelInput<'a, A: std::alloc::Allocator = std::alloc::Global> {
 /// interest (`is_pos` or `noise_nrg`), or `None` for a record that
 /// belongs to a different track (in which case the slot stays
 /// `default`).
-fn band_indexed_track<F, A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+fn band_indexed_track<
+    F,
+    A: std::alloc::Allocator + Copy,
+    S: std::alloc::Allocator,
+    SA: std::alloc::Allocator,
+>(
     abs: &AbsoluteScaleFactors<S>,
-    sfb_cb: &[Vec<u8>],
+    sfb_cb: &[Vec<u8, SA>],
     max_sfb: usize,
     default: i32,
     scratch: A,
@@ -168,9 +173,13 @@ where
 
 /// Band-indexed `is_pos[g][sfb]` (§4.6.8.1.4), default `0` on
 /// non-intensity bands.
-fn is_pos_table<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+fn is_pos_table<
+    A: std::alloc::Allocator + Copy,
+    S: std::alloc::Allocator,
+    SA: std::alloc::Allocator,
+>(
     abs: &AbsoluteScaleFactors<S>,
-    sfb_cb: &[Vec<u8>],
+    sfb_cb: &[Vec<u8, SA>],
     max_sfb: usize,
     scratch: A,
 ) -> Result<Vec<Vec<i32, A>, A>> {
@@ -182,9 +191,13 @@ fn is_pos_table<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
 
 /// Band-indexed `noise_nrg[g][sfb]` (§4.6.13.3), default `0` on
 /// non-noise bands.
-fn noise_nrg_table<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+fn noise_nrg_table<
+    A: std::alloc::Allocator + Copy,
+    S: std::alloc::Allocator,
+    SA: std::alloc::Allocator,
+>(
     abs: &AbsoluteScaleFactors<S>,
-    sfb_cb: &[Vec<u8>],
+    sfb_cb: &[Vec<u8, SA>],
     max_sfb: usize,
     scratch: A,
 ) -> Result<Vec<Vec<i32, A>, A>> {

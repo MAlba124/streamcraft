@@ -148,15 +148,15 @@ fn is_noise_cb(cb: u8) -> bool {
 /// (from its [`crate::section_data::SectionData`]); they drive the
 /// intensity (right) / noise (either) exclusions.
 #[derive(Debug)]
-pub struct ChannelPairSpectra<'a> {
+pub struct ChannelPairSpectra<'a, SA: std::alloc::Allocator = std::alloc::Global> {
     /// First ("left") channel spectrum — mid on entry, left on return.
     pub left: &'a mut [f64],
     /// Second ("right") channel spectrum — side on entry, right on return.
     pub right: &'a mut [f64],
     /// Left channel `sfb_cb[g][sfb]`.
-    pub left_sfb_cb: &'a [Vec<u8>],
+    pub left_sfb_cb: &'a [Vec<u8, SA>],
     /// Right channel `sfb_cb[g][sfb]`.
-    pub right_sfb_cb: &'a [Vec<u8>],
+    pub right_sfb_cb: &'a [Vec<u8, SA>],
 }
 
 /// Apply the §4.6.8.1.3 M/S de-matrix in place to a channel pair.
@@ -179,8 +179,8 @@ pub struct ChannelPairSpectra<'a> {
 ///
 /// Returns [`Error::MsStereoInvalid`] if the buffer / mask / `sfb_cb`
 /// shapes disagree with `ics_info` (see the variant docs).
-pub fn apply_ms_stereo(
-    pair: &mut ChannelPairSpectra<'_>,
+pub fn apply_ms_stereo<SA: std::alloc::Allocator>(
+    pair: &mut ChannelPairSpectra<'_, SA>,
     ms_mask_present: MsMaskPresent,
     ms_used: &[Vec<bool>],
     ics_info: &IcsInfo,

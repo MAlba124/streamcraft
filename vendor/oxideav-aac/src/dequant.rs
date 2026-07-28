@@ -161,11 +161,12 @@ pub fn rescale_spectrum_in<
     A: std::alloc::Allocator + Copy,
     S: std::alloc::Allocator,
     P: std::alloc::Allocator,
+    SA: std::alloc::Allocator,
 >(
     alloc: A,
     spectral: &SpectralData<P>,
     scale_factors: &AbsoluteScaleFactors<S>,
-    sfb_cb: &[Vec<u8>],
+    sfb_cb: &[Vec<u8, SA>],
     ics_info: &IcsInfo,
     fs_index: u8,
 ) -> Result<Vec<Vec<f64, A>, A>> {

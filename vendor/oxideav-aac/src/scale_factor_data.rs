@@ -424,9 +424,9 @@ impl<A: std::alloc::Allocator + Copy> ScaleFactorData<A> {
     /// `entries` lists (the pipeline passes its per-`process()` arena; tests infer `A = Global`).
     /// The returned records are transient side info consumed by [`accumulate_in`] within the same
     /// frame, so on the hot path they cost no heap malloc/free per channel (streamcraft patch).
-    pub fn parse_in(
+    pub fn parse_in<SA: std::alloc::Allocator>(
         reader: &mut BitReader<'_>,
-        sfb_cb: &[Vec<u8>],
+        sfb_cb: &[Vec<u8, SA>],
         scratch: A,
     ) -> Result<Self> {
         let mut noise_pcm_flag = true;
@@ -491,7 +491,11 @@ impl<A: std::alloc::Allocator + Copy> ScaleFactorData<A> {
     ///   `-60..=+60`.
     /// * A `NoisePcm` value exceeds the 9-bit field cap
     ///   (`> 0x1ff`).
-    pub fn write(&self, writer: &mut BitWriter, sfb_cb: &[Vec<u8>]) -> Result<()> {
+    pub fn write<SA: std::alloc::Allocator>(
+        &self,
+        writer: &mut BitWriter,
+        sfb_cb: &[Vec<u8, SA>],
+    ) -> Result<()> {
         if self.entries.len() != sfb_cb.len() {
             return Err(Error::ScaleFactorDataEncodeInvalid);
         }
@@ -692,9 +696,9 @@ pub fn accumulate(
 /// joint-stereo / noise passes within the same frame — comes from the arena rather than the heap
 /// (streamcraft patch). `A: Copy` because the outer and inner vecs share one allocator; `Global`
 /// and `&Bump` are both `Copy`.
-pub fn accumulate_in<A: std::alloc::Allocator + Copy>(
+pub fn accumulate_in<A: std::alloc::Allocator + Copy, SA: std::alloc::Allocator>(
     sfd: &ScaleFactorData<A>,
-    sfb_cb: &[Vec<u8>],
+    sfb_cb: &[Vec<u8, SA>],
     global_gain: u8,
     scratch: A,
 ) -> Result<AbsoluteScaleFactors<A>> {

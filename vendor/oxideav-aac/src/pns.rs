@@ -185,20 +185,24 @@ fn normalise_band(band: &mut [f64], noise_nrg: i32) {
 /// (§4.6.13.3) for each noise band (consulted only where
 /// `sfb_cb == NOISE_HCB`).
 #[derive(Debug)]
-pub struct PnsChannel<'a, A: std::alloc::Allocator = std::alloc::Global> {
+pub struct PnsChannel<
+    'a,
+    A: std::alloc::Allocator = std::alloc::Global,
+    SA: std::alloc::Allocator = std::alloc::Global,
+> {
     /// Window-major channel spectrum; noise bands overwritten in place.
     pub spec: &'a mut [f64],
     /// Per-band `sfb_cb[g][sfb]`.
-    pub sfb_cb: &'a [Vec<u8>],
+    pub sfb_cb: &'a [Vec<u8, SA>],
     /// Absolute `noise_nrg[g][sfb]` (§4.6.13.3).
     pub noise_nrg: &'a [Vec<i32, A>],
 }
 
 /// Validate that a channel's spectrum / `sfb_cb` / `noise_nrg` shapes
 /// agree with `ics_info`, returning the window geometry.
-fn channel_geometry<'a, A: std::alloc::Allocator>(
+fn channel_geometry<'a, A: std::alloc::Allocator, SA: std::alloc::Allocator>(
     spec_len: usize,
-    sfb_cb: &[Vec<u8>],
+    sfb_cb: &[Vec<u8, SA>],
     noise_nrg: &[Vec<i32, A>],
     ics_info: &IcsInfo,
     fs_index: u8,
@@ -262,8 +266,8 @@ fn channel_geometry<'a, A: std::alloc::Allocator>(
 /// Returns [`Error::PnsInvalid`] if the buffer / `sfb_cb` / `noise_nrg`
 /// shapes disagree with `ics_info` (see the variant docs). When no band
 /// is noise-coded the spectrum is left untouched.
-pub fn apply_pns<F, A: std::alloc::Allocator>(
-    chan: &mut PnsChannel<'_, A>,
+pub fn apply_pns<F, A: std::alloc::Allocator, SA: std::alloc::Allocator>(
+    chan: &mut PnsChannel<'_, A, SA>,
     ics_info: &IcsInfo,
     fs_index: u8,
     mut rng: F,
@@ -335,9 +339,9 @@ where
 ///
 /// Returns [`Error::PnsInvalid`] on any shape mismatch.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_pns_pair<F, A: std::alloc::Allocator>(
-    left: &mut PnsChannel<'_, A>,
-    right: &mut PnsChannel<'_, A>,
+pub fn apply_pns_pair<F, A: std::alloc::Allocator, SA: std::alloc::Allocator>(
+    left: &mut PnsChannel<'_, A, SA>,
+    right: &mut PnsChannel<'_, A, SA>,
     ms_mask_present: bool,
     all_shared: bool,
     ms_used: &[Vec<bool>],

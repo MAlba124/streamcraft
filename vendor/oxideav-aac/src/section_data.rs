@@ -253,17 +253,19 @@ impl Section {
 /// map are surfaced; `scale_factor_data()` (next round) consumes
 /// `sfb_cb` to decide which bands carry a transmitted scalefactor.
 ///
-/// The `sections` field is generic over an allocator `A` (defaulting
-/// to [`std::alloc::Global`] so existing callers and tests are
-/// unchanged): on the hot decode path the per-group section lists —
-/// pure per-frame scratch, built here and consumed once by
-/// [`crate::spectral_data::SpectralData::parse_in`] — come from the
+/// The `sections` and `sfb_cb` fields are generic over an allocator
+/// `A` (defaulting to [`std::alloc::Global`] so existing callers and
+/// tests are unchanged): on the hot decode path both are pure
+/// per-frame scratch — built here and consumed once within a single
+/// `decode_raw_data_block_planar` call — so they come from the
 /// caller's per-`process()` bump arena rather than the heap
-/// (streamcraft patch). `sfb_cb` is deliberately **left on the heap**
-/// (`Global`): it is read as `&[Vec<u8>]` by ~19 downstream tools
-/// (pns, cce, dequant, ms/intensity stereo, scale_factor_data,
-/// element_decode), and threading `A` through all of them buys
-/// nothing — `sfb_cb`'s allocation profile is dwarfed by `sections`.
+/// (streamcraft patch). `sfb_cb`'s per-band rows are the last per-frame
+/// heap allocation in the parse path (~2.6K `vec![0u8; max_sfb]` allocs
+/// per run in a live capture); they are read as `&[Vec<u8, A>]` by ~19
+/// downstream tools (pns, cce, dequant, ms/intensity stereo,
+/// scale_factor_data, element_decode), each of which is now generic
+/// over the row allocator so the always-`Global` test callers stay
+/// unchanged.
 #[derive(Debug, Clone)]
 pub struct SectionData<A: std::alloc::Allocator = std::alloc::Global> {
     /// `sect[g]` — the ordered sections of window group `g`. The
@@ -272,15 +274,15 @@ pub struct SectionData<A: std::alloc::Allocator = std::alloc::Global> {
     pub sections: Vec<Vec<Section, A>, A>,
     /// `sfb_cb[g][sfb]` — the codebook assigned to scalefactor band
     /// `sfb` of group `g`, for `sfb in 0..max_sfb`. Flattened per
-    /// group; the outer index runs `0..num_window_groups`. Kept on
-    /// the heap (`Global`) regardless of `A` — see the struct docs.
-    pub sfb_cb: Vec<Vec<u8>>,
+    /// group; the outer index runs `0..num_window_groups`. Arena-backed
+    /// (allocator `A`) on the hot path — see the struct docs.
+    pub sfb_cb: Vec<Vec<u8, A>, A>,
 }
 
 // Hand-written PartialEq / Eq (as for `SpectralData` / `AbsoluteScaleFactors`): a derive would
 // bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
 // PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
-// allocators — including the always-`Global` `sfb_cb` (streamcraft patch).
+// allocators — including `sfb_cb`, whose rows are now allocator-parametric (streamcraft patch).
 impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<SectionData<A2>>
     for SectionData<A1>
 {
@@ -368,11 +370,14 @@ impl<A: std::alloc::Allocator + Copy> SectionData<A> {
 
         let mut sections: Vec<Vec<Section, A>, A> =
             Vec::with_capacity_in(num_window_groups as usize, scratch);
-        let mut sfb_cb: Vec<Vec<u8>> = Vec::with_capacity(num_window_groups as usize);
+        let mut sfb_cb: Vec<Vec<u8, A>, A> =
+            Vec::with_capacity_in(num_window_groups as usize, scratch);
 
         for _g in 0..num_window_groups {
             let mut group_sections: Vec<Section, A> = Vec::new_in(scratch);
-            let mut group_sfb_cb: Vec<u8> = vec![ZERO_HCB; max_sfb as usize];
+            let mut group_sfb_cb: Vec<u8, A> =
+                Vec::with_capacity_in(max_sfb as usize, scratch);
+            group_sfb_cb.resize(max_sfb as usize, ZERO_HCB);
 
             let mut k: u32 = 0;
             let max = max_sfb as u32;
@@ -457,11 +462,14 @@ impl<A: std::alloc::Allocator + Copy> SectionData<A> {
 
         let mut sections: Vec<Vec<Section, A>, A> =
             Vec::with_capacity_in(num_window_groups as usize, scratch);
-        let mut sfb_cb: Vec<Vec<u8>> = Vec::with_capacity(num_window_groups as usize);
+        let mut sfb_cb: Vec<Vec<u8, A>, A> =
+            Vec::with_capacity_in(num_window_groups as usize, scratch);
 
         for _g in 0..num_window_groups {
             let mut group_sections: Vec<Section, A> = Vec::new_in(scratch);
-            let mut group_sfb_cb: Vec<u8> = vec![ZERO_HCB; max_sfb as usize];
+            let mut group_sfb_cb: Vec<u8, A> =
+                Vec::with_capacity_in(max_sfb as usize, scratch);
+            group_sfb_cb.resize(max_sfb as usize, ZERO_HCB);
 
             let mut k: u32 = 0;
             let max = max_sfb as u32;

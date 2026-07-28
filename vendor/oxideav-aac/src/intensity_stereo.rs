@@ -136,14 +136,18 @@ pub fn intensity_gain(is_pos: i32) -> f64 {
 /// (§4.6.8.1.4, from [`crate::scale_factor_data::accumulate`]). Only
 /// the entries at intensity-coded `(g, sfb)` are consulted.
 #[derive(Debug)]
-pub struct IntensityPairSpectra<'a, A: std::alloc::Allocator = std::alloc::Global> {
+pub struct IntensityPairSpectra<
+    'a,
+    A: std::alloc::Allocator = std::alloc::Global,
+    SA: std::alloc::Allocator = std::alloc::Global,
+> {
     /// First ("left") channel spectrum — read only.
     pub left: &'a [f64],
     /// Second ("right") channel spectrum — derived from `left` on
     /// intensity bands, untouched elsewhere.
     pub right: &'a mut [f64],
     /// Right channel `sfb_cb[g][sfb]`.
-    pub right_sfb_cb: &'a [Vec<u8>],
+    pub right_sfb_cb: &'a [Vec<u8, SA>],
     /// Right channel absolute `is_pos[g][sfb]` (§4.6.8.1.4).
     pub is_pos: &'a [Vec<i32, A>],
 }
@@ -168,8 +172,8 @@ pub struct IntensityPairSpectra<'a, A: std::alloc::Allocator = std::alloc::Globa
 /// `sfb_cb` / `is_pos` shapes disagree with `ics_info` (see the variant
 /// docs). When no band is intensity-coded the right buffer is left
 /// untouched.
-pub fn apply_intensity_stereo<A: std::alloc::Allocator>(
-    pair: &mut IntensityPairSpectra<'_, A>,
+pub fn apply_intensity_stereo<A: std::alloc::Allocator, SA: std::alloc::Allocator>(
+    pair: &mut IntensityPairSpectra<'_, A, SA>,
     ms_mask_present: bool,
     ms_used: &[Vec<bool>],
     ics_info: &IcsInfo,
