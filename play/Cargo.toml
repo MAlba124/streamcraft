@@ -51,6 +51,8 @@ sc-mpeg4p2 = { path = "../mpeg4p2" }
 sc-vaapi = { path = "../vaapi" }
 # The window and the audio device (the pipewire sink provides the pipeline clock).
 sc-sdl3 = { path = "../sdl3" }
+# The raw-wire Wayland presenter (SC_PRESENT): an internal zero-copy waylandvideosink.
+sc-present = { path = "../present" }
 sc-pipewire = { path = "../pipewire" }
 # The h264 decoder churns malloc internally (see sdl3/examples/play_file.rs) — the `scplay`
 # binary swaps the global allocator to mimalloc for playback headroom. Only the binary uses

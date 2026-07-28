@@ -251,6 +251,34 @@ pub fn autoplug_container(
             // DMA-BUF-export mode taps `decoder.src` DIRECTLY (no suboverlay — a CPU overlay
             // cannot touch a GPU-only frame; subtitles are the documented follow-up). Its src
             // is `video/gpu`, so it can only link a `video/gpu` presenter.
+            // Internal raw-wire Wayland presenter (opt-in via `SC_PRESENT`): a zero-copy HW
+            // decoder feeding `waylandvideosink` over a channel created here, so both the
+            // decoder and the sink hold `Arc` clones and it lives with the pipeline. No
+            // libwayland, no readback, no SDL. Falls through to the normal path if the HW
+            // decoder can't be built/linked for this family.
+            if std::env::var_os("SC_PRESENT").is_some() {
+                let ch = sc_vaapi::gpuframe::GpuFrameChannel::new();
+                if let Some((dec_id, name)) =
+                    try_link_video_zerocopy(p, (ap.element, &ap.name), family, &ch)
+                {
+                    p.set_element_pool(dec_id, VIDEO_SLOT, VIDEO_SLOTS);
+                    p.set_queue_capacity(dec_id, VIDEO_QUEUE);
+                    let sink = p.add_boxed(Box::new(
+                        sc_present::WaylandVideoSink::new().with_channel(ch),
+                    ));
+                    p.link((dec_id, "src"), (sink, "sink"))
+                        .expect("video/gpu ! waylandvideosink");
+                    w.video_sink = Some(sink);
+                    w.video_dec = Some(dec_id);
+                    w.video_zerocopy = true;
+                    w.tracks.push(TrackOutcome {
+                        pad: ap.name.clone(),
+                        summary: format!("{family} → {name}(zero-copy) → waylandvideosink"),
+                        linked: true,
+                    });
+                    continue;
+                }
+            }
             if video_sink == SinkChoice::ExternalZeroCopy {
                 if let Some(ch) = zc_channel {
                     if let Some((dec_id, name)) =
