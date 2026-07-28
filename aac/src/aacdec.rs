@@ -24,8 +24,8 @@
 //! [`Mp3Dec`]: ../../sc_mp3/index.html
 
 use oxideav_aac::asc::AudioSpecificConfig;
-use oxideav_aac::decode::{PlanarFrame, StreamDecoder};
-use oxideav_aac::pcm::interleave_s16_le_into;
+use oxideav_aac::decode::StreamDecoder;
+use oxideav_aac::pcm::{interleave_s16_into, s16_slice_le_into};
 
 use streamcraft_core::batch::Inputs;
 use streamcraft_core::bus::BusMessage;
@@ -115,14 +115,22 @@ struct Cfg {
     channel_configuration: u8,
 }
 
-/// A decoded frame waiting for a pool slot (the backpressure carry — spec: the
-/// try_alloc + yield rule; a producer must never allocate unboundedly).
+/// The geometry + timestamp of a decoded frame waiting for a pool slot (the backpressure carry —
+/// spec: the try_alloc + yield rule; a producer must never allocate unboundedly).
 ///
-/// Carries the decoded **planar** `f64` channels rather than an interleaved `Vec<i16>`: the
-/// §4.6.11 integer-PCM interleave is deferred to [`AacDec::emit_pending`], which renders it
-/// straight into the pool slot (no intermediate `Vec<i16>`, no second copy — streamcraft patch).
+/// The decoded samples themselves live in [`AacDec::pending_pcm`] (an owned, reused `Vec<i16>`),
+/// interleaved to §4.6.11 integer PCM the moment the frame is decoded. The planar decode borrows
+/// the per-`process()` arena (`ctx.scratch()`), so the decoded `PlanarFrame<&Arena>` cannot be
+/// parked across `process()` calls — it is consumed into `pending_pcm` (Global) inside the
+/// arena-borrow scope, and only this arena-free geometry is carried (streamcraft patch).
+#[derive(Clone, Copy)]
 struct PendingPcm {
-    frame: PlanarFrame,
+    /// Output channel count of the parked frame.
+    channels: usize,
+    /// Per-channel sample count of the parked frame.
+    frame_len: usize,
+    /// Output sample rate of the parked frame (SBR-doubled when active).
+    sample_rate: u32,
     pts: Timestamp,
 }
 
@@ -131,7 +139,13 @@ pub struct AacDec {
     dec: StreamDecoder,
     cfg: Option<Cfg>,
     announced: bool,
+    /// Geometry + pts of the carried frame; its samples are in [`Self::pending_pcm`]. `None`
+    /// when nothing is carried.
     pending: Option<PendingPcm>,
+    /// The carried frame's interleaved s16 PCM — an owned buffer reused across frames (allocates
+    /// once when it first grows to the frame size, then only re-fills), so parking a frame past a
+    /// `process()` boundary keeps no arena memory (spec: the try_alloc + yield rule).
+    pending_pcm: Vec<i16>,
     /// Consecutive decode failures, for capped warning spam (warn the first
     /// few, then go quiet until an AU succeeds again).
     consecutive_errors: u32,
@@ -143,12 +157,16 @@ pub struct AacDec {
 }
 
 impl AacDec {
+    // One-time element setup: `pending_pcm` is reused-and-cleared across frames, not
+    // re-allocated per frame (spec: performance #1) — cold.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             dec: StreamDecoder::new(),
             cfg: None,
             announced: false,
             pending: None,
+            pending_pcm: Vec::new(),
             consecutive_errors: 0,
             au_index: 0,
             last_geometry: None,
@@ -156,17 +174,19 @@ impl AacDec {
     }
 
     /// Emit the carried frame if the pool allows. `false` = still carried.
+    ///
+    /// The frame's interleaved s16 samples already live in [`Self::pending_pcm`] (rendered when
+    /// the frame decoded, inside the arena-borrow scope); this step copies them into the pool
+    /// slot as little-endian bytes — the owned-buffer `try_alloc` + copy path (spec: backpressure
+    /// carry). `pending` holds only the arena-free geometry + pts.
     fn emit_pending(&mut self, ctx: &mut Ctx) -> bool {
-        let Some(p) = self.pending.take() else { return true };
+        let Some(p) = self.pending else { return true };
         let Some(mut buf) = ctx.try_alloc(SRC_PAD) else {
-            self.pending = Some(p);
             return false;
         };
-        let channels = &p.frame.channels;
-        let channel_count = channels.len();
-        let frame_len = channels.first().map_or(0, Vec::len);
-        let total_samples = frame_len * channel_count;
-        let need = total_samples * 2;
+        let channel_count = p.channels;
+        let frame_len = p.frame_len;
+        let need = self.pending_pcm.len() * 2;
         if buf.memory.capacity() < need {
             // One AAC frame is ≤ ~24 KB (2048 samples × 6 ch × 2 B); any sane
             // slot holds it. Refuse loudly rather than truncate.
@@ -182,14 +202,16 @@ impl AacDec {
                     ),
                 },
             });
-            return true; // dropped; keep flowing
+            // Consume the carry: dropped, keep flowing.
+            self.pending = None;
+            return true;
         }
         if !self.announced {
             log!(
                 &*ctx,
                 Level::Debug,
                 "announce",
-                rate = p.frame.sample_rate,
+                rate = p.sample_rate,
                 channels = channel_count,
             );
             // Announce from *decoded* geometry, not the ASC: SBR doubles the
@@ -199,42 +221,43 @@ impl AacDec {
                 SRC_PAD,
                 FAMILY,
                 &[
-                    (F_RATE, ValueDesc::Int(i64::from(p.frame.sample_rate))),
+                    (F_RATE, ValueDesc::Int(i64::from(p.sample_rate))),
                     (F_CHANNELS, ValueDesc::Int(channel_count as i64)),
                     (F_SAMPLE, ValueDesc::Id(SAMPLE_S16)),
                 ],
             );
             self.announced = true;
         }
-        // Render the §4.6.11 integer PCM straight into the pool slot — one fused
-        // interleave + little-endian write, no intermediate `Vec<i16>` and no second copy.
+        // Copy the parked interleaved PCM into the pool slot as little-endian bytes.
         let dst = buf.memory.as_mut_full();
-        match interleave_s16_le_into(channels, dst) {
+        match s16_slice_le_into(&self.pending_pcm, dst) {
             Ok(_) => {}
             Err(e) => {
-                // The capacity was already checked above; a mismatch here means the decoder
-                // produced ragged channel lengths — drop the frame rather than emit garbage.
+                // The capacity was already checked above; a mismatch here can only mean a
+                // corrupted carry — drop the frame rather than emit garbage.
                 let element = ctx.element();
                 ctx.post(BusMessage::Warning {
                     element,
                     error: Error::Element {
                         element,
-                        message: format!("aacdec: interleave failed: {e:?}"),
+                        message: format!("aacdec: emit failed: {e:?}"),
                     },
                 });
+                self.pending = None;
                 return true;
             }
         }
         buf.memory.set_len(need);
         buf.pts = p.pts;
         // Frame duration in ns: samples-per-channel over the output rate.
-        if channel_count > 0 && p.frame.sample_rate > 0 {
+        if channel_count > 0 && p.sample_rate > 0 {
             buf.duration = Timestamp(
-                (frame_len as u64).saturating_mul(1_000_000_000) / u64::from(p.frame.sample_rate),
+                (frame_len as u64).saturating_mul(1_000_000_000) / u64::from(p.sample_rate),
             );
         }
         log!(&*ctx, Level::Trace, "frame", pts = buf.pts);
         ctx.out(SRC_PAD).push(buf);
+        self.pending = None;
         true
     }
 
@@ -302,15 +325,16 @@ impl Element for AacDec {
             };
             let au = self.au_index;
             self.au_index += 1;
-            // Decode the block, allocating its per-channel transient scratch from the pipeline's
-            // per-`process()` arena (`ctx.scratch()`) rather than the heap — the scheduler
-            // resets that arena after each `process()`, so the decoder's scratch imposes no
-            // steady-state heap traffic. Block-scoped: the returned `PlanarFrame` owns its PCM
-            // (the arena backs only the dropped intermediates), so the `&ctx` borrow ends here,
-            // freeing `ctx` for the `&mut` calls (`ctx.post`) in the match arms below.
-            let decoded = {
+            // Decode the block into the pipeline's per-`process()` arena (`ctx.scratch()`): the
+            // whole planar decode — every transient AND the returned `PlanarFrame<&Arena>` PCM —
+            // lives in that arena, which the scheduler resets after each `process()`, so the
+            // decoder imposes no steady-state heap traffic. The arena-borrowed frame CANNOT be
+            // parked across `process()` calls; inside this scope we interleave it into the owned
+            // (Global, reused) `self.pending_pcm` and record the arena-free geometry, then drop
+            // the frame so the `&ctx` borrow ends before the `&mut ctx` (`ctx.post`) error path.
+            let outcome: Result<PendingPcm, oxideav_aac::Error> = {
                 let scratch = ctx.scratch();
-                self.dec.decode_raw_data_block_planar(
+                match self.dec.decode_raw_data_block_planar(
                     cfg.aot,
                     cfg.fs_index,
                     cfg.sample_rate,
@@ -318,13 +342,32 @@ impl Element for AacDec {
                     1, // container AUs carry one raw_data_block each
                     data,
                     scratch,
-                )
+                ) {
+                    Ok(frame) => {
+                        let channels = frame.channels.len();
+                        let frame_len = frame.channels.first().map_or(0, Vec::len);
+                        // Interleave the arena-backed planar channels into the owned reused
+                        // buffer here, while the arena is still live; a ragged-length frame is
+                        // surfaced as a decode error (silence-substituted) rather than emitting
+                        // garbage.
+                        match interleave_s16_into(&frame.channels, &mut self.pending_pcm) {
+                            Ok(()) => Ok(PendingPcm {
+                                channels,
+                                frame_len,
+                                sample_rate: frame.sample_rate,
+                                pts: inbuf.pts,
+                            }),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             };
-            match decoded {
-                Ok(frame) => {
+            match outcome {
+                Ok(p) => {
                     self.consecutive_errors = 0;
-                    self.last_geometry = Some((frame.channels.len(), frame.sample_rate));
-                    self.pending = Some(PendingPcm { frame, pts: inbuf.pts });
+                    self.last_geometry = Some((p.channels, p.sample_rate));
+                    self.pending = Some(p);
                 }
                 Err(e) => {
                     // Per-buffer error scope: warn (capped, AU-indexed for stream
@@ -346,14 +389,16 @@ impl Element for AacDec {
                     }
                     log!(&*ctx, Level::Debug, "au_dropped", au = au);
                     if let Some((channels, sample_rate)) = self.last_geometry {
-                        // One frame of silence in planar form — the emit path interleaves it
-                        // into the pool slot like any decoded frame (1024 samples/channel,
-                        // matching the prior interleaved-silence length).
+                        // One frame of silence interleaved into the reused buffer (1024
+                        // samples/channel, matching a normal frame), parked like any decoded
+                        // frame so the emit path copies it into the pool slot unchanged.
+                        let frame_len = 1024usize;
+                        self.pending_pcm.clear();
+                        self.pending_pcm.resize(frame_len * channels, 0i16);
                         self.pending = Some(PendingPcm {
-                            frame: PlanarFrame {
-                                channels: vec![vec![0.0f64; 1024]; channels],
-                                sample_rate,
-                            },
+                            channels,
+                            frame_len,
+                            sample_rate,
                             pts: inbuf.pts,
                         });
                     }
@@ -373,15 +418,12 @@ impl Element for AacDec {
                 self.dec = StreamDecoder::new();
                 self.consecutive_errors = 0;
             }
-            // EOS: flush the carried frame with the unbounded allocator — waiting
-            // is no longer an option (the same rule every producer follows).
+            // EOS: try once more to land the carried frame — waiting is no longer an
+            // option (the same rule every producer follows). One retry via the normal
+            // path; if the pool is still dry the frame is dropped with the teardown
+            // (one frame, at EOS).
             Event::Eos => {
-                if let Some(p) = self.pending.take() {
-                    self.pending = Some(p);
-                    // One retry via the normal path; if the pool is still dry the
-                    // frame is dropped with the teardown (one frame, at EOS).
-                    let _ = self.emit_pending(ctx);
-                }
+                let _ = self.emit_pending(ctx);
             }
             _ => {}
         }

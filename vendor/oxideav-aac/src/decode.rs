@@ -84,10 +84,16 @@ pub struct DecodedFrame {
 /// then folds through [`crate::pcm::interleave_s16`]; exposing it lets a caller render the
 /// integer PCM straight into its own output buffer (via
 /// [`crate::pcm::interleave_s16_le_into`]) with no intermediate `Vec<i16>` (streamcraft patch).
+///
+/// Generic over the allocator `A` so the hot path can build the whole planar frame — the outer
+/// channel list *and* every per-channel PCM buffer — in the caller's per-`process()` arena
+/// (`Vec<Vec<f64, A>, A>`), off the heap (streamcraft patch). The default `A = Global` keeps the
+/// public [`StreamDecoder::decode_raw_data_block_planar`] / [`decode_frame`] surface a plain
+/// owned `PlanarFrame`, so existing callers and tests are unchanged.
 #[derive(Debug, Clone)]
-pub struct PlanarFrame {
+pub struct PlanarFrame<A: std::alloc::Allocator = std::alloc::Global> {
     /// Per-channel time signals, `channels[c][n]`; every buffer is the per-frame sample count.
-    pub channels: Vec<Vec<f64>>,
+    pub channels: Vec<Vec<f64, A>, A>,
     /// The frame's sampling rate in Hz (SBR-doubled when the stream is SBR-active).
     pub sample_rate: u32,
 }
@@ -204,20 +210,22 @@ impl StreamDecoder {
         num_raw_data_blocks: u8,
         payload: &[u8],
         scratch: A,
-    ) -> Result<PlanarFrame> {
+    ) -> Result<PlanarFrame<A>> {
         let fs = fs_index;
         let mut reader = BitReader::new(payload);
 
         // Per channel-element outputs in element order: the decoded
         // core time signals plus any SBR extension payload that
-        // followed the element in a FIL.
-        struct ElementOut {
+        // followed the element in a FIL. The per-element channel PCM
+        // (`channels`) and the element list itself are per-frame transients
+        // drawn from the caller's `scratch` arena (streamcraft patch).
+        struct ElementOut<A: std::alloc::Allocator> {
             key: (u8, u8),
             kind: IdSynEle,
-            channels: Vec<Vec<f64>>,
+            channels: Vec<Vec<f64, A>, A>,
             sbr: Option<Box<SbrExtensionData>>,
         }
-        let mut elements: Vec<ElementOut> = Vec::new();
+        let mut elements: Vec<ElementOut<A>, A> = Vec::new_in(scratch);
         let fs_sbr = sample_rate.saturating_mul(2);
 
         // `num_raw_data_blocks` is the resolved count `N`. The walker
@@ -243,10 +251,13 @@ impl StreamDecoder {
                         };
                         let key = (kind_id(kind), element_instance_tag);
                         let dec = self.decoders.entry(key).or_default();
+                        let pcm = dec.decode_sce_in(&ch, aot, fs, scratch)?;
+                        let mut channels: Vec<Vec<f64, A>, A> = Vec::with_capacity_in(1, scratch);
+                        channels.push(pcm);
                         elements.push(ElementOut {
                             key,
                             kind,
-                            channels: vec![dec.decode_sce_in(&ch, aot, fs, scratch)?],
+                            channels,
                             sbr: None,
                         });
                     }
@@ -257,10 +268,13 @@ impl StreamDecoder {
                         let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
                         let (l, r) =
                             self.decode_cpe(&mut reader, aot, fs, element_instance_tag, scratch)?;
+                        let mut channels: Vec<Vec<f64, A>, A> = Vec::with_capacity_in(2, scratch);
+                        channels.push(l);
+                        channels.push(r);
                         elements.push(ElementOut {
                             key,
                             kind: IdSynEle::Cpe,
-                            channels: vec![l, r],
+                            channels,
                             sbr: None,
                         });
                     }
@@ -321,7 +335,9 @@ impl StreamDecoder {
             self.sbr_active = true;
         }
 
-        let mut channels: Vec<Vec<f64>> = Vec::new();
+        // The assembled per-frame channel list is arena-backed (`Vec<Vec<f64, A>, A>`), so the
+        // whole planar frame handed upstream lives in the caller's per-`process()` arena.
+        let mut channels: Vec<Vec<f64, A>, A> = Vec::new_in(scratch);
         let mut out_rate = sample_rate;
         if self.sbr_active {
             out_rate = fs_sbr;
@@ -333,12 +349,19 @@ impl StreamDecoder {
                         v.insert(SbrDecoder::new(fs_sbr, n_ch)?)
                     }
                 };
-                let core: Vec<&[f64]> = el.channels.iter().map(Vec::as_slice).collect();
+                let core: Vec<&[f64]> = el.channels.iter().map(|c| c.as_slice()).collect();
+                // The persistent `SbrDecoder` holds Global QMF/PS state and returns Global
+                // buffers; copy its up-sampled output into the arena so `PlanarFrame<A>` stays
+                // consistent (the persistent SBR state itself never holds arena memory).
                 let up = match &el.sbr {
                     Some(ext) => dec.process_frame(ext, &core)?,
                     None => dec.upsample_frame(&core)?,
                 };
-                channels.extend(up);
+                for up_ch in up {
+                    let mut arena_ch: Vec<f64, A> = Vec::with_capacity_in(up_ch.len(), scratch);
+                    arena_ch.extend_from_slice(&up_ch);
+                    channels.push(arena_ch);
+                }
             }
         } else {
             for el in elements {
@@ -438,7 +461,7 @@ impl StreamDecoder {
         fs: u8,
         element_instance_tag: u8,
         scratch: A,
-    ) -> Result<(Vec<f64>, Vec<f64>)> {
+    ) -> Result<(Vec<f64, A>, Vec<f64, A>)> {
         let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
         let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
         if common_window {

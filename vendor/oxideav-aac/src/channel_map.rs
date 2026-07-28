@@ -132,9 +132,15 @@ pub fn reorder_permutation(channel_configuration: u8) -> Option<Vec<usize>> {
 /// permutation length, the input order is preserved (returned unchanged).
 ///
 /// This is the entry point the decode driver calls once a frame's
-/// element-order channels are assembled.
+/// element-order channels are assembled. Generic over the allocator `A`
+/// of the outer channel list so the hot decode path can reorder in place
+/// in its per-`process()` arena rather than the heap (streamcraft patch);
+/// the temporary `slots` scratch is drawn from that same allocator.
 #[must_use]
-pub fn reorder_channels<T>(channel_configuration: u8, channels: Vec<Vec<T>>) -> Vec<Vec<T>> {
+pub fn reorder_channels<T, A: std::alloc::Allocator + Copy>(
+    channel_configuration: u8,
+    channels: Vec<T, A>,
+) -> Vec<T, A> {
     let Some(perm) = reorder_permutation(channel_configuration) else {
         return channels;
     };
@@ -146,9 +152,12 @@ pub fn reorder_channels<T>(channel_configuration: u8, channels: Vec<Vec<T>>) -> 
     }
     // `perm[i]` is the source slot for output slot `i`. Move each source
     // buffer into its destination exactly once (the permutation is a
-    // bijection over `0..len`).
-    let mut slots: Vec<Option<Vec<T>>> = channels.into_iter().map(Some).collect();
-    let mut out = Vec::with_capacity(perm.len());
+    // bijection over `0..len`). Both the `slots` scratch and the output
+    // list use the input's allocator.
+    let alloc = *channels.allocator();
+    let mut slots: Vec<Option<T>, A> = Vec::with_capacity_in(channels.len(), alloc);
+    slots.extend(channels.into_iter().map(Some));
+    let mut out: Vec<T, A> = Vec::with_capacity_in(perm.len(), alloc);
     for &src in &perm {
         out.push(
             slots[src]

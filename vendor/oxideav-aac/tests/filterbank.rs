@@ -1,3 +1,5 @@
+#![feature(allocator_api)] // Filterbank::synthesize takes an explicit allocator (arena on the
+                           // hot path); this test drives it with the Global allocator.
 //! §4.6.11 filterbank integration over a real ADTS fixture.
 //!
 //! [`oxideav_aac::filterbank::Filterbank`] is unit-tested in `src/`
@@ -84,7 +86,7 @@ fn mono_fixture_filterbank_runs_finite_and_couples_frames() {
                         let spec = decode_channel_spectrum(&body, &ics, &spectral, aot, fs_index)
                             .expect("pipeline");
                         // §4.6.11 — synthesize one frame of PCM.
-                        let pcm = fb.synthesize(&spec, &ics).expect("filterbank");
+                        let pcm = fb.synthesize(&spec, &ics, std::alloc::Global).expect("filterbank");
                         assert_eq!(
                             pcm.len(),
                             LONG_WINDOW_LEN as usize,
@@ -175,7 +177,7 @@ fn decode_second_frame_isolated(data: &[u8]) -> Option<Vec<f64>> {
                                 decode_channel_spectrum(&body, &ics, &spectral, aot, fs_index)
                                     .ok()?;
                             let mut fresh = Filterbank::new();
-                            return fresh.synthesize(&spec, &ics).ok();
+                            return fresh.synthesize(&spec, &ics, std::alloc::Global).ok();
                         }
                         Element::End => break,
                         _ => {}

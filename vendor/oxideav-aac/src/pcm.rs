@@ -113,6 +113,62 @@ pub fn interleave_s16(channels: &[Vec<f64>]) -> Result<Vec<i16>> {
     Ok(out)
 }
 
+/// Interleave a frame's per-channel time signals into a **caller-provided, reused** `Vec<i16>`,
+/// in the same element-order interleaved layout as [`interleave_s16`].
+///
+/// `out` is cleared and refilled (`out[n·C + c] = to_s16(channels[c][n])`), so a caller that
+/// parks one frame at a time reuses a single owned buffer across frames — it allocates once (when
+/// the buffer first grows to the frame size) and thereafter only re-fills, imposing no
+/// steady-state heap traffic (streamcraft patch — the AAC element parks its decoded frame here).
+/// Generic over the per-channel allocator `CA` so it accepts arena-backed planar buffers
+/// (`Vec<f64, &Arena>`) directly, without a heap copy of the planar data first.
+///
+/// Every channel buffer must be the same length; a disagreement is rejected with
+/// [`Error::PcmInvalid`] (leaving `out` cleared). An empty channel list clears `out` and returns.
+pub fn interleave_s16_into<CA: std::alloc::Allocator>(
+    channels: &[Vec<f64, CA>],
+    out: &mut Vec<i16>,
+) -> Result<()> {
+    out.clear();
+    if channels.is_empty() {
+        return Ok(());
+    }
+    let frame_len = channels[0].len();
+    if channels.iter().any(|c| c.len() != frame_len) {
+        return Err(Error::PcmInvalid);
+    }
+    let num_channels = channels.len();
+    out.reserve(frame_len * num_channels);
+    for n in 0..frame_len {
+        for ch in channels {
+            out.push(to_s16(ch[n]));
+        }
+    }
+    Ok(())
+}
+
+/// Write a slice of already-rendered 16-bit PCM samples into a caller byte buffer as
+/// little-endian bytes, returning the number of bytes written.
+///
+/// This is the second half of the [`interleave_s16_into`] → sink path: once a frame is parked as
+/// interleaved `i16` (owned, reused), the emit step copies it into the pool slot here. `dst` must
+/// hold at least `samples.len() · 2` bytes (checked; a short buffer is rejected with
+/// [`Error::PcmInvalid`]).
+pub fn s16_slice_le_into(samples: &[i16], dst: &mut [u8]) -> Result<usize> {
+    let need = samples.len() * 2;
+    if dst.len() < need {
+        return Err(Error::PcmInvalid);
+    }
+    let mut o = 0;
+    for &s in samples {
+        let bytes = s.to_le_bytes();
+        dst[o] = bytes[0];
+        dst[o + 1] = bytes[1];
+        o += 2;
+    }
+    Ok(need)
+}
+
 /// Interleave a frame's per-channel time signals **directly into a caller byte buffer** as
 /// little-endian 16-bit PCM, returning the number of bytes written.
 ///
@@ -268,5 +324,48 @@ mod tests {
     fn interleave_le_into_empty_writes_nothing() {
         let mut dst = [0u8; 4];
         assert_eq!(interleave_s16_le_into(&[], &mut dst).unwrap(), 0);
+    }
+
+    #[test]
+    fn interleave_into_matches_interleave_s16_and_reuses() {
+        // The reused-buffer interleave must produce the same samples as `interleave_s16`, and
+        // refilling clears the prior contents (so a shorter second frame does not keep stale
+        // tail samples).
+        let l = vec![0.0, 10.0, 20.0];
+        let r = vec![1.0, 11.0, 21.0];
+        let want = interleave_s16(&[l.clone(), r.clone()]).unwrap();
+        let mut buf: Vec<i16> = vec![99; 100]; // pre-seeded to prove the clear
+        interleave_s16_into(&[l, r], &mut buf).unwrap();
+        assert_eq!(buf, want);
+        // Reuse for a shorter frame — no stale samples survive.
+        let mono = vec![3.4, 3.5];
+        interleave_s16_into(&[mono], &mut buf).unwrap();
+        assert_eq!(buf, vec![3, 4]);
+    }
+
+    #[test]
+    fn interleave_into_rejects_length_mismatch_and_clears() {
+        let l = vec![0.0, 1.0];
+        let r = vec![0.0, 1.0, 2.0];
+        let mut buf: Vec<i16> = vec![7, 7];
+        assert!(matches!(interleave_s16_into(&[l, r], &mut buf), Err(Error::PcmInvalid)));
+        assert!(buf.is_empty(), "a rejected interleave leaves the buffer cleared");
+    }
+
+    #[test]
+    fn s16_slice_le_writes_little_endian() {
+        let samples = [0i16, 1, -1, 258, i16::MIN, i16::MAX];
+        let mut dst = vec![0u8; samples.len() * 2];
+        let n = s16_slice_le_into(&samples, &mut dst).unwrap();
+        assert_eq!(n, dst.len());
+        let want: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        assert_eq!(dst, want);
+    }
+
+    #[test]
+    fn s16_slice_le_rejects_short_buffer() {
+        let samples = [1i16, 2, 3];
+        let mut dst = [0u8; 5]; // need 6
+        assert!(matches!(s16_slice_le_into(&samples, &mut dst), Err(Error::PcmInvalid)));
     }
 }

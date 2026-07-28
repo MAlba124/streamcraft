@@ -288,7 +288,7 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
 /// `ltp_data_present == 0`, in which case no prediction is added but the
 /// history is still advanced so it stays continuous across frames.
 #[allow(clippy::too_many_arguments)]
-fn finish_channel<A: std::alloc::Allocator>(
+fn finish_channel<A: std::alloc::Allocator + Copy>(
     spec: &mut [f64],
     body: &IcsBody<A>,
     ics_info: &IcsInfo,
@@ -298,7 +298,8 @@ fn finish_channel<A: std::alloc::Allocator>(
     fb: &mut Filterbank,
     ltp_state: &mut LtpState,
     predictor_bank: &mut Option<PredictorBank>,
-) -> Result<Vec<f64>> {
+    scratch: A,
+) -> Result<Vec<f64, A>> {
     // §4.6.6 MPEG-2 frequency-domain prediction (AAC Main, AOT 1 only).
     // The backward-adaptive predictor bank is run on EVERY frame so its
     // coefficients keep tracking the signal statistics, whether or not
@@ -344,9 +345,10 @@ fn finish_channel<A: std::alloc::Allocator>(
         )?;
     }
 
-    // §4.6.11 filterbank → PCM, then advance the LTP history with this
-    // frame's output and aliased IMDCT tail (§4.6.7.3).
-    let out = fb.synthesize(spec, ics_info)?;
+    // §4.6.11 filterbank → PCM (arena-backed output), then advance the LTP history with this
+    // frame's output and aliased IMDCT tail (§4.6.7.3). `push_frame` takes `&[f64]` and copies
+    // into its own Global history buffers, so the persistent LTP state never holds arena memory.
+    let out = fb.synthesize(spec, ics_info, scratch)?;
     ltp_state.push_frame(&out, fb.aliased_tail());
     Ok(out)
 }
@@ -455,14 +457,16 @@ impl ElementDecoder {
     }
 
     /// [`decode_sce`](Self::decode_sce) with an explicit `scratch` allocator for the per-channel
-    /// transient buffers (the pipeline passes its per-`process()` arena; tests use `Global`).
+    /// transient buffers *and* the returned PCM (the pipeline passes its per-`process()` arena;
+    /// tests use `Global`). The whole single-channel decode — including the §4.6.11 filterbank
+    /// output — is off the heap when `scratch` is an arena (streamcraft patch).
     pub fn decode_sce_in<A: std::alloc::Allocator + Copy>(
         &mut self,
         ch: &ChannelInput<'_, A>,
         aot: u8,
         fs_index: u8,
         scratch: A,
-    ) -> Result<Vec<f64>> {
+    ) -> Result<Vec<f64, A>> {
         let (mut spec, abs) = reconstruct_pre_pair(ch, fs_index, scratch)?;
         let max_sfb = ch.ics_info.max_sfb as usize;
 
@@ -489,6 +493,7 @@ impl ElementDecoder {
             &mut self.filterbanks[0],
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
+            scratch,
         )
     }
 
@@ -524,7 +529,8 @@ impl ElementDecoder {
     }
 
     /// [`decode_cpe`](Self::decode_cpe) with an explicit `scratch` allocator for the two
-    /// channels' transient buffers (the pipeline passes its per-`process()` arena).
+    /// channels' transient buffers *and* the returned PCM pair (the pipeline passes its
+    /// per-`process()` arena). The filterbank outputs come from `scratch` too (streamcraft patch).
     pub fn decode_cpe_in<A: std::alloc::Allocator + Copy>(
         &mut self,
         left: &ChannelInput<'_, A>,
@@ -533,7 +539,7 @@ impl ElementDecoder {
         aot: u8,
         fs_index: u8,
         scratch: A,
-    ) -> Result<(Vec<f64>, Vec<f64>)> {
+    ) -> Result<(Vec<f64, A>, Vec<f64, A>)> {
         // The §4.6.8 joint-stereo tools de-matrix the two channels
         // band-for-band, so they require a shared window geometry. The
         // shared-info CPE form guarantees this; reject a mismatch the
@@ -641,6 +647,7 @@ impl ElementDecoder {
             &mut self.filterbanks[0],
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
+            scratch,
         )?;
         let out_right = finish_channel(
             &mut right_spec,
@@ -652,6 +659,7 @@ impl ElementDecoder {
             &mut self.filterbanks[1],
             &mut self.ltp_states[1],
             &mut self.predictor_banks[1],
+            scratch,
         )?;
         Ok((out_left, out_right))
     }

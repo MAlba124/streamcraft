@@ -216,8 +216,11 @@ impl ImdctPlan {
     /// reused from the plan (`&mut self`) rather than allocated per call: both are fully
     /// overwritten before they are read, so keeping them across frames removes two per-call
     /// allocations (one of them a zeroed one) with no change to the result. The `N`-length
-    /// output is still freshly allocated — it is handed back to the caller as an owned `Vec`.
-    fn imdct(&mut self, spec: &[f64]) -> Vec<f64> {
+    /// output is drawn from the caller's `scratch` allocator (the pipeline's per-`process()`
+    /// arena, reset by the scheduler) rather than the heap — it is a per-frame transient the
+    /// windowing step below consumes in place (streamcraft patch). The reused plan scratch
+    /// (`scratch_z` / `scratch_c4`) stays Global — it persists across frames.
+    fn imdct<A: std::alloc::Allocator + Copy>(&mut self, spec: &[f64], scratch: A) -> Vec<f64, A> {
         // Destructure so the reused scratch (`&mut`) and the constant twiddle/permutation
         // tables (`&`) are borrowed disjointly.
         let ImdctPlan { n, pre, post, tw, brev, scratch_z, scratch_c4 } = self;
@@ -274,8 +277,10 @@ impl ImdctPlan {
 
         // Scatter with the extension symmetries (step 1 above): direct over
         // p = n + M/2 ∈ [M/2, M), antisymmetric mirror about M − 1/2, then the
-        // 2M-antiperiodic wrap.
-        let mut out = vec![0.0f64; n];
+        // 2M-antiperiodic wrap. The `N`-length output is a per-frame transient from the
+        // caller's arena; every slot is written below, so no clear is needed.
+        let mut out: Vec<f64, A> = Vec::with_capacity_in(n, scratch);
+        out.resize(n, 0.0f64);
         for (i, slot) in out.iter_mut().take(m / 2).enumerate() {
             *slot = scale * c4[i + m / 2];
         }
@@ -597,21 +602,39 @@ impl Filterbank {
     /// updates the internal overlap tail and previous-block shape for
     /// the next call.
     ///
+    /// The returned PCM and every transform intermediate are drawn from the caller's `scratch`
+    /// allocator (the pipeline's per-`process()` arena, reset by the scheduler) rather than the
+    /// heap — the whole frame's filterbank stage imposes no steady-state heap traffic
+    /// (streamcraft patch). The persistent overlap tail (`self.overlap`) stays a Global `Vec`:
+    /// it is refilled by copy (`extend_from_slice` copies the arena tail into the Global buffer),
+    /// so it never holds arena memory across the reset.
+    ///
     /// Errors: [`Error::FilterbankInvalid`] if `spec.len()` disagrees
     /// with `ics_info.window_sequence`.
-    pub fn synthesize(&mut self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
-        let z = self.windowed_signal(spec, ics_info)?;
+    pub fn synthesize<A: std::alloc::Allocator + Copy>(
+        &mut self,
+        spec: &[f64],
+        ics_info: &IcsInfo,
+        scratch: A,
+    ) -> Result<Vec<f64, A>> {
+        let z = self.windowed_signal(spec, ics_info, scratch)?;
         debug_assert_eq!(z.len(), N_L);
 
-        // §4.6.11.3.3 overlap-add: out[n] = z[i][n] + z[i-1][n + N/2].
+        // §4.6.11.3.3 overlap-add: out[n] = z[i][n] + z[i-1][n + N/2]. The output is a
+        // per-frame transient from the arena; the caller (finish_channel) consumes it into the
+        // planar frame it hands upstream.
         let half = LONG_WINDOW_LEN as usize;
-        let out: Vec<f64> = z[..half]
-            .iter()
-            .zip(self.overlap.iter())
-            .map(|(&zn, &on)| zn + on)
-            .collect();
+        let mut out: Vec<f64, A> = Vec::with_capacity_in(half, scratch);
+        out.extend(
+            z[..half]
+                .iter()
+                .zip(self.overlap.iter())
+                .map(|(&zn, &on)| zn + on),
+        );
 
-        // Retain z[i][N/2 .. N] as next frame's z[i-1][n + N/2].
+        // Retain z[i][N/2 .. N] as next frame's z[i-1][n + N/2]. `self.overlap` is a Global
+        // buffer; `extend_from_slice` copies the arena-backed tail into it (across allocators),
+        // so the persistent overlap never holds arena memory.
         self.overlap.clear();
         self.overlap.extend_from_slice(&z[half..]);
 
@@ -623,21 +646,29 @@ impl Filterbank {
 
     /// §4.6.11.3.1 + §4.6.11.3.2 — produce the full-length (`N_l =
     /// 2048`) windowed time signal `z[i][n]` for this frame, before
-    /// the inter-block overlap-add. Dispatches on `window_sequence`.
-    fn windowed_signal(&mut self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
+    /// the inter-block overlap-add. Dispatches on `window_sequence`. The
+    /// full-length signal is a per-frame transient drawn from `scratch`.
+    fn windowed_signal<A: std::alloc::Allocator + Copy>(
+        &mut self,
+        spec: &[f64],
+        ics_info: &IcsInfo,
+        scratch: A,
+    ) -> Result<Vec<f64, A>> {
         let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
         let right_shape = ics_info.window_shape;
         match ics_info.window_sequence {
             WindowSequence::OnlyLong => {
-                self.long_windowed(spec, left_shape, right_shape, LongKind::OnlyLong)
+                self.long_windowed(spec, left_shape, right_shape, LongKind::OnlyLong, scratch)
             }
             WindowSequence::LongStart => {
-                self.long_windowed(spec, left_shape, right_shape, LongKind::Start)
+                self.long_windowed(spec, left_shape, right_shape, LongKind::Start, scratch)
             }
             WindowSequence::LongStop => {
-                self.long_windowed(spec, left_shape, right_shape, LongKind::Stop)
+                self.long_windowed(spec, left_shape, right_shape, LongKind::Stop, scratch)
             }
-            WindowSequence::EightShort => self.short_windowed(spec, left_shape, right_shape),
+            WindowSequence::EightShort => {
+                self.short_windowed(spec, left_shape, right_shape, scratch)
+            }
         }
     }
 
@@ -647,19 +678,21 @@ impl Filterbank {
     /// (`LONG_STOP`) is the full long half-window, and whose other
     /// half is shaped by the start/stop transition (a short half-window
     /// flanked by a flat `1.0` plateau and a zero region).
-    fn long_windowed(
+    fn long_windowed<A: std::alloc::Allocator + Copy>(
         &mut self,
         spec: &[f64],
         left_shape: WindowShape,
         right_shape: WindowShape,
         kind: LongKind,
-    ) -> Result<Vec<f64>> {
+        scratch: A,
+    ) -> Result<Vec<f64, A>> {
         if spec.len() != LONG_WINDOW_LEN as usize {
             return Err(Error::FilterbankInvalid);
         }
-        // Window the IMDCT output in place — `x` is consumed here, so scaling it by the window
-        // and returning it avoids a second 2048-wide allocation per channel per frame.
-        let mut x = self.plan_long.imdct(spec);
+        // Window the IMDCT output in place — `x` is the arena-backed IMDCT transient, consumed
+        // here, so scaling it by the window and returning it avoids a second 2048-wide
+        // allocation per channel per frame (and keeps the whole path off the heap).
+        let mut x = self.plan_long.imdct(spec, scratch);
         let w = long_window(left_shape, right_shape, kind);
         for (xv, &wv) in x.iter_mut().zip(w.iter()) {
             *xv *= wv;
@@ -675,49 +708,41 @@ impl Filterbank {
     /// window's left half uses the previous block's shape; every
     /// later short window's left half — and every short window's right
     /// half — uses this block's `window_shape`.
-    fn short_windowed(
+    fn short_windowed<A: std::alloc::Allocator + Copy>(
         &mut self,
         spec: &[f64],
         left_shape: WindowShape,
         right_shape: WindowShape,
-    ) -> Result<Vec<f64>> {
+        scratch: A,
+    ) -> Result<Vec<f64, A>> {
         let short_len = SHORT_WINDOW_LEN as usize; // 128
         if spec.len() != NUM_SHORT_WINDOWS * short_len {
             return Err(Error::FilterbankInvalid);
         }
 
-        // Per-window windowed length-256 time signals.
-        let mut windowed: Vec<Vec<f64>> = Vec::with_capacity(NUM_SHORT_WINDOWS);
+        // §4.6.11.3.2 c) overlap-add of the eight short windows into a 2048-sample frame. Short
+        // window `j` starts at offset `(N_l − N_s)/4 + j·N_s/2` (each successive short window is
+        // hopped by N_s/2 = 128 samples) — the spec's piecewise z_{i,n} is exactly this
+        // 50%-overlap-add with the first window placed at (N_l − N_s)/4. The accumulator and the
+        // per-window intermediates are per-frame transients from the arena.
+        let mut z: Vec<f64, A> = Vec::with_capacity_in(N_L, scratch);
+        z.resize(N_L, 0.0f64);
+        let start = (N_L - N_S) / 4; // 448
+        let hop = N_S / 2; // 128
         for j in 0..NUM_SHORT_WINDOWS {
             let coeffs = &spec[j * short_len..(j + 1) * short_len];
-            let x = self.plan_short.imdct(coeffs);
+            // The length-256 IMDCT transient draws from the arena too.
+            let x = self.plan_short.imdct(coeffs, scratch);
             // W_0 left half inherits the previous block's shape; all
             // other windows' left halves use this block's shape.
             let this_left = if j == 0 { left_shape } else { right_shape };
             let halves = window_halves(SHORT_TRANSFORM_LEN, this_left, right_shape);
-            let mut z = vec![0.0f64; N_S];
+            let base = start + j * hop;
             for n in 0..N_S / 2 {
-                z[n] = x[n] * halves.left[n];
+                z[base + n] += x[n] * halves.left[n];
             }
             for n in N_S / 2..N_S {
-                z[n] = x[n] * halves.right[n - N_S / 2];
-            }
-            windowed.push(z);
-        }
-
-        // §4.6.11.3.2 c) overlap-add of the eight short windows into a
-        // 2048-sample frame. Short window `j` starts at offset
-        // `(N_l − N_s)/4 + j·N_s/2` (each successive short window is
-        // hopped by N_s/2 = 128 samples) — the spec's piecewise z_{i,n}
-        // is exactly this 50%-overlap-add with the first window placed
-        // at (N_l − N_s)/4.
-        let mut z = vec![0.0f64; N_L];
-        let start = (N_L - N_S) / 4; // 448
-        let hop = N_S / 2; // 128
-        for (j, win) in windowed.iter().enumerate() {
-            let base = start + j * hop;
-            for (n, &v) in win.iter().enumerate() {
-                z[base + n] += v;
+                z[base + n] += x[n] * halves.right[n - N_S / 2];
             }
         }
         Ok(z)
@@ -978,7 +1003,7 @@ mod tests {
         for n in [8usize, SHORT_TRANSFORM_LEN, LONG_TRANSFORM_LEN] {
             let spec: Vec<f64> = (0..n / 2).map(|_| rng()).collect();
             let want = imdct(&spec, n);
-            let got = ImdctPlan::new(n).imdct(&spec);
+            let got = ImdctPlan::new(n).imdct(&spec, std::alloc::Global);
             assert_eq!(got.len(), want.len());
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!(
@@ -1067,7 +1092,7 @@ mod tests {
                 })
                 .collect();
             let spec = forward_mdct(&frame, n);
-            outputs.push(fb.synthesize(&spec, &info).unwrap());
+            outputs.push(fb.synthesize(&spec, &info, std::alloc::Global).unwrap());
         }
 
         // The decoder output for frame f covers input samples
@@ -1122,7 +1147,7 @@ mod tests {
                 })
                 .collect();
             let spec = forward_mdct(&frame, n);
-            outputs.push(fb.synthesize(&spec, &info).unwrap());
+            outputs.push(fb.synthesize(&spec, &info, std::alloc::Global).unwrap());
         }
         for (f, out) in outputs.iter().enumerate().take(3).skip(1) {
             let base = f * hop;
@@ -1172,7 +1197,7 @@ mod tests {
 
         let info = short_info(WindowShape::Sine);
         let mut fb = Filterbank::new();
-        let out = fb.synthesize(&spec, &info).unwrap();
+        let out = fb.synthesize(&spec, &info, std::alloc::Global).unwrap();
 
         // The output frame is z[0:1024]; overlap with the (zero) prior
         // frame leaves the interior intact. The central short windows
@@ -1197,7 +1222,7 @@ mod tests {
         let info = long_info(WindowShape::Sine, WindowSequence::OnlyLong);
         let mut fb = Filterbank::new();
         let spec = vec![0.25f64; LONG_WINDOW_LEN as usize];
-        let out = fb.synthesize(&spec, &info).unwrap();
+        let out = fb.synthesize(&spec, &info, std::alloc::Global).unwrap();
         assert_eq!(out.len(), LONG_WINDOW_LEN as usize);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -1207,7 +1232,7 @@ mod tests {
         let info = short_info(WindowShape::Sine);
         let mut fb = Filterbank::new();
         let spec = vec![0.1f64; NUM_SHORT_WINDOWS * SHORT_WINDOW_LEN as usize];
-        let out = fb.synthesize(&spec, &info).unwrap();
+        let out = fb.synthesize(&spec, &info, std::alloc::Global).unwrap();
         assert_eq!(out.len(), LONG_WINDOW_LEN as usize);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -1218,14 +1243,14 @@ mod tests {
         let mut fb = Filterbank::new();
         let spec = vec![0.0f64; 512];
         assert!(matches!(
-            fb.synthesize(&spec, &info),
+            fb.synthesize(&spec, &info, std::alloc::Global),
             Err(Error::FilterbankInvalid)
         ));
         let sinfo = short_info(WindowShape::Sine);
         let mut fb2 = Filterbank::new();
         let bad = vec![0.0f64; 1000];
         assert!(matches!(
-            fb2.synthesize(&bad, &sinfo),
+            fb2.synthesize(&bad, &sinfo, std::alloc::Global),
             Err(Error::FilterbankInvalid)
         ));
     }
@@ -1274,7 +1299,7 @@ mod tests {
         let info = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
         let mut fb = Filterbank::new();
         let w = fb
-            .windowed_signal(&vec![0.0; LONG_WINDOW_LEN as usize], &info)
+            .windowed_signal(&vec![0.0; LONG_WINDOW_LEN as usize], &info, std::alloc::Global)
             .unwrap();
         // All-zero spectrum → zero time signal regardless, so instead
         // inspect the window directly.
