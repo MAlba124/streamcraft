@@ -235,7 +235,7 @@ impl StreamDecoder {
                         let body = IcsBody::parse(&mut reader, aot, fs, false)?;
                         let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
                         let spectral =
-                            SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
+                            SpectralData::parse_in(&mut reader, &ics, &body.section_data, fs, scratch)?;
                         let ch = ChannelInput {
                             body: &body,
                             ics_info: &ics,
@@ -457,9 +457,9 @@ impl StreamDecoder {
                 }
             }
             let left_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
-            let left_spectral = SpectralData::parse(reader, &ics, &left_body.section_data, fs)?;
+            let left_spectral = SpectralData::parse_in(reader, &ics, &left_body.section_data, fs, scratch)?;
             let right_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
-            let right_spectral = SpectralData::parse(reader, &ics, &right_body.section_data, fs)?;
+            let right_spectral = SpectralData::parse_in(reader, &ics, &right_body.section_data, fs, scratch)?;
             let left = ChannelInput {
                 body: &left_body,
                 ics_info: &ics,
@@ -485,14 +485,14 @@ impl StreamDecoder {
                 .clone()
                 .ok_or(Error::ElementDecodeInvalid)?;
             let left_spectral =
-                SpectralData::parse(reader, &left_ics, &left_body.section_data, fs)?;
+                SpectralData::parse_in(reader, &left_ics, &left_body.section_data, fs, scratch)?;
             let right_body = IcsBody::parse(reader, aot, fs, false)?;
             let right_ics = right_body
                 .ics_info
                 .clone()
                 .ok_or(Error::ElementDecodeInvalid)?;
             let right_spectral =
-                SpectralData::parse(reader, &right_ics, &right_body.section_data, fs)?;
+                SpectralData::parse_in(reader, &right_ics, &right_body.section_data, fs, scratch)?;
             let left = ChannelInput {
                 body: &left_body,
                 ics_info: &left_ics,

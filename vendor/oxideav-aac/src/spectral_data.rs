@@ -264,7 +264,23 @@ impl SpectralData {
         section_data: &SectionData,
         fs_index: u8,
     ) -> Result<Self> {
-        let offsets = sect_sfb_offset(ics_info, fs_index)?;
+        Self::parse_in(reader, ics_info, section_data, fs_index, std::alloc::Global)
+    }
+
+    /// [`parse`](Self::parse) with an explicit `scratch` allocator for the transient
+    /// `sect_sfb_offset` band-offset table (`Vec<Vec<u32>>`), which is consumed inside this
+    /// function and dropped — so the pipeline passes its per-`process()` arena and the offset
+    /// table costs no heap malloc/free per channel per frame. The decoded `x_quant` still
+    /// escapes into the returned [`SpectralData`], so it stays a heap `Vec` (streamcraft patch).
+    /// Tests call [`parse`](Self::parse), inferring `A = Global`.
+    pub fn parse_in<A: std::alloc::Allocator + Copy>(
+        reader: &mut BitReader<'_>,
+        ics_info: &IcsInfo,
+        section_data: &SectionData,
+        fs_index: u8,
+        scratch: A,
+    ) -> Result<Self> {
+        let offsets = sect_sfb_offset_in(scratch, ics_info, fs_index)?;
         let num_groups = ics_info.num_window_groups as usize;
         if section_data.sections.len() != num_groups {
             return Err(Error::SpectralDataInvalid);
