@@ -348,6 +348,8 @@ fn push_candidates(c: &Constraint, out: &mut Vec<Value>) {
 /// first. Limitation: two overlapping `Range`s whose overlap contains neither
 /// endpoint and whose steps are misaligned can be missed — real formats use Eq/Set
 /// or matching ranges, and this can grow an LCM walk later.
+// Link-time format fixation (runs once per link when solving the graph), not per buffer.
+#[allow(clippy::disallowed_methods)]
 fn fixate(a: Option<&FieldConstraint>, b: Option<&FieldConstraint>) -> Option<Option<Value>> {
     let ca = a.map_or(&ANY, |f| &f.allowed);
     let cb = b.map_or(&ANY, |f| &f.allowed);

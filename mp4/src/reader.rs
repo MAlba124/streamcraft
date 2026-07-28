@@ -196,6 +196,8 @@ impl Mp4Reader {
     ///
     /// Errors (never panics) on a missing/truncated `moov`, a fragmented file (`mvex`/`moof`),
     /// or a self-inconsistent sample table.
+    // COLD: resolves the moov sample tables once at construction — not the streaming path.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(head: &[u8]) -> Result<Self, Mp4Error> {
         let moov = find_top_level(head, boxes::boxtype::MOOV)?
             .ok_or(Mp4Error::Missing("moov"))?;
@@ -287,6 +289,8 @@ impl Mp4Reader {
 
     /// [`push`](Self::push) for plain bytes (small chunks, tests, oracle tools): copies
     /// `data` into a compacted owned chunk. Never on the full-slot streaming hot path.
+    // COLD: sub-RETAIN_MIN dribble/test compaction only; real IO sources retain zero-copy.
+    #[allow(clippy::disallowed_methods)]
     pub fn push_bytes(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -339,6 +343,8 @@ impl Mp4Reader {
         self.next += 1;
         if s.size == 0 {
             // Degenerate zero-length sample: nothing to slice, nothing to retain.
+            // `Vec::new()` allocates nothing (empty-Vec guarantee) — no heap traffic.
+            #[allow(clippy::disallowed_methods)]
             return Some(ResolvedSample {
                 track_index: s.track_index,
                 pts: s.pts,
@@ -374,6 +380,10 @@ impl Mp4Reader {
             // Straddle across chunks, or bytes living in a compacted owned chunk: gather
             // the range by copy (bounds proven by the checks above). The cold path.
             None => {
+                // Cold straddle/compacted-chunk gather — NOT the per-sample steady state
+                // (that is the zero-copy `Slice` arm above); only when a sample crosses
+                // retained-chunk bounds, which a zero-copy IO source never hits.
+                #[allow(clippy::disallowed_methods)]
                 let mut v = Vec::with_capacity(s.size as usize);
                 let (mut at, mut cbase, mut i) = (start, base, idx);
                 while at < end {
@@ -464,6 +474,8 @@ fn find_top_level(head: &[u8], kind: boxes::FourCc) -> Result<Option<BoxHeader>,
 /// Resolve one `trak`: parse its `mdia`/`minf`/`stbl` tables and the `tkhd` dims, build the
 /// per-sample list, and shift the timeline per a single-entry edit list. Returns `None` for
 /// a track we skip (no `stbl`, or an empty sample table — a hint/metadata track).
+// COLD: resolves one track's sample tables once per stream — not the per-sample path.
+#[allow(clippy::disallowed_methods)]
 fn resolve_track(trak_body: &[u8], track_index: usize) -> Result<Option<(Track, Vec<Sample>)>, Mp4Error> {
     // tkhd (dimensions + track_id) — optional; a track without one still resolves.
     let tkhd = match boxes::find_child(trak_body, boxes::boxtype::TKHD)? {
@@ -594,7 +606,8 @@ fn edit_list_shift(trak_body: &[u8]) -> Result<i64, Mp4Error> {
 /// plus the `stco` chunk bases plus cumulative sizes within a chunk), decode time (the
 /// running `stts` sum), presentation time (`dts + ctts` offset, minus the edit shift), and
 /// the sync flag.
-#[allow(clippy::too_many_arguments)]
+// COLD: folds the stbl tables into the flat sample list once per stream, at resolution.
+#[allow(clippy::too_many_arguments, clippy::disallowed_methods)]
 fn build_samples(
     track_index: usize,
     sample_count: usize,

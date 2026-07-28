@@ -84,6 +84,8 @@ impl Registry {
     /// offending token. Nothing is half-built on error: the elements added so far stay
     /// on the pipeline (harmless; a fresh pipeline is the normal caller), but no partial
     /// chain is returned.
+    // Launch-string parse (builds the graph once from a description string), not per frame.
+    #[allow(clippy::disallowed_methods)]
     pub fn parse(&self, into: &mut Pipeline, launch: &str) -> Result<Vec<ElementId>, ParseError> {
         let stages = lex_chain(launch)?;
         if stages.is_empty() {
@@ -196,6 +198,8 @@ enum ParsedValue<'a> {
 /// Split a launch string into its `!`-separated stages, each lexed into a name plus
 /// `key=value` properties. Empty stages (`a !! b`, a leading/trailing `!`) are a named
 /// error, never a silent drop.
+// Launch-string lexer (once at parse time), not per frame.
+#[allow(clippy::disallowed_methods)]
 fn lex_chain(launch: &str) -> Result<Vec<ParsedStage<'_>>, ParseError> {
     let mut stages = Vec::new();
     // `split('!')` yields one item per segment including the empties around a stray `!`,
@@ -219,6 +223,8 @@ fn lex_chain(launch: &str) -> Result<Vec<ParsedStage<'_>>, ParseError> {
 
 /// Lex one stage: the leading token is the element name, each following token is a
 /// `key=value` property.
+// Launch-string stage lexer (once at parse time), not per frame.
+#[allow(clippy::disallowed_methods)]
 fn lex_stage(stage: &str) -> Result<ParsedStage<'_>, ParseError> {
     let mut tokens = stage.split_whitespace();
     let name = tokens.next().ok_or_else(|| ParseError {
@@ -308,6 +314,8 @@ impl Registry {
 }
 
 /// Render one descriptor (see [`Registry::describe`]).
+// Descriptor rendering (diagnostic / `describe`), not the per-buffer path.
+#[allow(clippy::disallowed_methods)]
 pub fn describe_desc(desc: &ElementDesc) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -395,6 +403,8 @@ fn fmt_ts(t: crate::time::Timestamp) -> String {
     }
 }
 
+// Value-desc rendering (diagnostic display helper), not the per-buffer path.
+#[allow(clippy::disallowed_methods)]
 fn fmt_value_desc(v: &crate::format::ValueDesc) -> String {
     use crate::format::ValueDesc as V;
     match v {
@@ -422,6 +432,8 @@ fn fmt_constraint_desc(c: &crate::format::ConstraintDesc) -> String {
     }
 }
 
+// Value rendering (diagnostic display helper), not the per-buffer path.
+#[allow(clippy::disallowed_methods)]
 fn fmt_value(v: &Value) -> String {
     match v {
         Value::Int(i) => i.to_string(),

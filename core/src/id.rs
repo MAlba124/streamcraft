@@ -44,6 +44,8 @@ pub struct Interner {
 }
 
 impl Interner {
+    // Interner constructor (built once at pipeline setup); empty Vec allocates nothing.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),

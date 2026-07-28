@@ -48,6 +48,9 @@ impl Pool {
 
     /// A pool capped at `max_slots` concurrently-outstanding buffers. Once the cap
     /// is hit, [`Pool::try_acquire`] returns `None` — the backpressure signal.
+    // Pool constructor (once at pipeline setup); the free-list Vec starts empty (no alloc)
+    // and is the recycling domain, not a per-frame allocation.
+    #[allow(clippy::disallowed_methods)]
     pub fn bounded(slot_size: usize, max_slots: u32) -> Self {
         Self {
             inner: Arc::new(PoolInner {
@@ -471,6 +474,9 @@ impl Arena {
 
     /// A fresh arena whose chunks default to `chunk_size` bytes (min 1). No chunk is
     /// allocated until the first [`alloc`](Arena::alloc).
+    // Arena constructor; the chunk-list Vec starts empty — no chunk is allocated until the
+    // first `alloc`, so this is not a per-`process()` cost.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(chunk_size: usize) -> Self {
         Self {
             chunks: UnsafeCell::new(Vec::new()),

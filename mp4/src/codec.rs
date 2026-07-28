@@ -20,6 +20,10 @@
 //! malformed config record degrades to an empty Annex B head (the pad still links — the
 //! decoder resyncs at an in-band parameter set), never a panic.
 
+// COLD: stsd/sample-entry/esds parsing — runs once per stream at preroll, building
+// codec-head/config-record buffers that outlive process(); no per-sample hot path here.
+#![allow(clippy::disallowed_methods)]
+
 use crate::boxes::{self, BoxError, BoxHeader};
 
 pub use sc_mkv::{nal_head_from_config, Reframer};

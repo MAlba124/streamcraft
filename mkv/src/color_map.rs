@@ -92,6 +92,8 @@ pub(crate) fn primaries_name_h273(name: &str) -> Option<u8> {
 
 /// Read announced colorimetry names from a fixed format into H.273 code points
 /// for the writer's `Colour` element (spec: Formats — remux preserves color).
+// COLD: once per stream at writer header setup; owns each color-name string briefly.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn colour_from_format(
     ctx: &streamcraft_core::ctx::Ctx,
     f: &streamcraft_core::format::FixedFormat,

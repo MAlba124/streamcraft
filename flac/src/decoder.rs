@@ -65,6 +65,9 @@ pub struct FlacDecoder {
 
 impl FlacDecoder {
     /// Decode an entire in-memory FLAC stream.
+    // One-shot whole-file API (not the incremental element path): `samples` holds the
+    // entire decoded stream, allocated once here — not per-frame heap traffic.
+    #[allow(clippy::disallowed_methods)]
     pub fn decode(data: &[u8]) -> Result<Self, DecodeError> {
         let mut r = BitReader::new(data);
 
@@ -185,6 +188,10 @@ impl FlacDecoder {
         // Subframes (§9.2): one per channel, decoded into reused per-channel buffers.
         // Side channels carry an extra bit (§4.2).
         let Scratch { planar, work } = scratch;
+        // One-time growth to the (stream-constant) channel count: runs on the first frame
+        // only, then `planar.len() == channels` forever — the per-channel buffers are
+        // reused (cleared+refilled) every frame, so this is not per-frame heap traffic.
+        #[allow(clippy::disallowed_methods)]
         while planar.len() < channels as usize {
             planar.push(Vec::new());
         }
@@ -288,6 +295,9 @@ impl StreamDecoder {
     /// (a truncated frame is not an error — it is backpressure). The `fLaC` marker and
     /// STREAMINFO are parsed on the first call(s) with enough bytes; thereafter
     /// [`info`](Self::info) is populated. Malformed input returns `Err`, never a panic.
+    // Convenience wrapper that owns its output; the element's zero-alloc hot path uses
+    // `pull_into` instead (reusing a caller buffer), so this per-call alloc is off it.
+    #[allow(clippy::disallowed_methods)]
     pub fn pull(&mut self) -> Result<Option<DecodedFrame>, DecodeError> {
         let mut samples = Vec::new();
         match self.pull_into(&mut samples)? {

@@ -226,6 +226,9 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    // Per-element Ctx constructor (run/harness setup, once per element): empty Vecs allocate
+    // nothing until the run fills them — not a per-`process()` cost.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(
         pool: Pool,
         bus: BusSender,
@@ -305,6 +308,9 @@ impl Ctx {
     /// downstream, and the peer reads the concrete format via
     /// [`negotiated`](Self::negotiated). Cheap and rare — announce on change, not per
     /// buffer.
+    // Announce on format change, not per buffer (decoder/demuxer learning a header): the
+    // fields copy is once-per-change, not steady-state heap traffic.
+    #[allow(clippy::disallowed_methods)]
     pub fn announce_format(
         &mut self,
         pad: PadId,
@@ -727,6 +733,9 @@ impl Ctx {
     /// discovers a stream: the id (past the static pads) is what the element writes to via
     /// [`out`](Self::out), and the pad is recorded so the pipeline can link it and post a
     /// `PadAdded`. `offers` is the pad's format menu, exactly like a static pad's.
+    // Runtime pad add at preroll (once per stream discovery), not per buffer — the owned name
+    // is a one-time cost.
+    #[allow(clippy::disallowed_methods)]
     pub fn add_pad(
         &mut self,
         direction: Direction,

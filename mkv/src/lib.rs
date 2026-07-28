@@ -117,6 +117,8 @@ use streamcraft_core::registry::Registry;
 ///
 /// The `&'static ElementDesc`s are taken from throwaway instances — only `desc()` is
 /// called, so the instances are dropped.
+// COLD: one-time registration; empty header for a throwaway descriptor-only instance.
+#[allow(clippy::disallowed_methods)]
 pub fn register(registry: &mut Registry) {
     registry.register(MkvMux::from_caps().desc());
     registry.register(MkvMuxN::new().desc());

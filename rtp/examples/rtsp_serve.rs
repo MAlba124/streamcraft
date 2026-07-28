@@ -260,6 +260,7 @@ impl Element for CamSrc {
             }
         }
         // Emit parsed frames while output slots allow.
+        let mut reframe_buf = Vec::new();
         loop {
             if !self.flush_pending(ctx) {
                 return Ok(Flow::Ok); // pool dry — backpressure
@@ -270,7 +271,7 @@ impl Element for CamSrc {
             }
             let body = self
                 .reframer
-                .reframe_block(&frame.data)
+                .reframe_into(&frame.data, &mut reframe_buf)
                 .map_err(|e| Error::Resource(format!("camsrc: reframe: {e:?}")))?;
             let mut au = Vec::with_capacity(self.head.len() + body.len());
             if frame.keyframe {

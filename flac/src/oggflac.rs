@@ -84,6 +84,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// `make_default` boxes one element instance at registry/parse time, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "oggflacdeframe",
     pads: &PADS,
@@ -121,6 +123,8 @@ impl OggFlacDeframe {
     /// Validate the mapping header on the first packet and return the native-FLAC tail
     /// (everything from `"fLaC"` onward). Errors on a malformed / too-short header rather
     /// than panicking (spec: decoders parse untrusted input).
+    // Runs once per stream (first packet only); the `to_string` is a cold error message.
+    #[allow(clippy::disallowed_methods)]
     fn strip_mapping_header(data: &[u8]) -> Result<&[u8], Error> {
         if data.len() < MAPPING_PREFIX_LEN {
             return Err(Error::Resource(format!(

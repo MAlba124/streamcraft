@@ -137,6 +137,8 @@ pub fn parse_wav_header(b: &[u8]) -> Result<WavHeader, WavError> {
 
 /// Write a canonical 44-byte-header PCM WAV wrapping `pcm` — the muxer half, so
 /// `wav → … → wav` round-trips in tests/examples and a future `wavenc` has a home.
+// COLD: one-shot WAV-blob builder for tests/examples/muxer, not on the `process` hot path.
+#[allow(clippy::disallowed_methods)]
 pub fn write_pcm_wav(format: &AudioFormat, pcm: &[u8]) -> Vec<u8> {
     let block_align = format.frame_stride() as u16;
     let byte_rate = format.sample_rate * block_align as u32;
@@ -184,6 +186,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: the `make_default` factory boxes one element at construction, not per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "wavparse",
     pads: &PADS,
@@ -274,7 +278,11 @@ impl Element for WavParse {
                 Ok(h) => {
                     // The bytes past the header, already buffered, are the first PCM.
                     let tail = self.acc.split_off(h.data_offset);
-                    self.acc = Vec::new(); // done accumulating; release the header bytes
+                    // COLD: fires once per stream at the header→PCM transition (later buffers
+                    // early-return above); releases the header buffer, no steady-state alloc.
+                    #[allow(clippy::disallowed_methods)]
+                    let acc = Vec::new();
+                    self.acc = acc; // done accumulating; release the header bytes
                     self.header = Some(h);
                     self.emit_data(ctx, &tail)?;
                 }
@@ -296,6 +304,8 @@ impl Element for WavParse {
         Ok(())
     }
 
+    // COLD: teardown; releases the accumulation buffer once, not per buffer.
+    #[allow(clippy::disallowed_methods)]
     fn stop(&mut self, _ctx: &mut Ctx) {
         self.header = None;
         self.acc = Vec::new();

@@ -98,6 +98,15 @@ pub struct FlacEncoder {
     frame_writer: BitWriter,
     residual: Vec<i64>,
     part_scratch: Vec<u64>,
+    /// Reused winning-residual copy for the subframe FIXED search (was a per-subframe
+    /// `Vec::new`), so steady-state encoding does not allocate per frame.
+    best_residual: Vec<i64>,
+    /// Reused Rice-parameter buffer for the winning residual plan (was `ResidualPlan`'s
+    /// owned `params`), so steady-state encoding does not allocate per frame.
+    plan_params: Vec<u32>,
+    /// Reused per-partition-order candidate Rice params inside the search (was a
+    /// per-search `Vec::with_capacity`), cleared and refilled per partition order.
+    cand_params: Vec<u32>,
 }
 
 impl FlacEncoder {
@@ -107,6 +116,9 @@ impl FlacEncoder {
     ///
     /// Supports 1–8 channels and 8/16/24/32-bit samples; the milestone target is S16
     /// mono+stereo at 44100/48000, but nothing here is limited to that.
+    // One-time construction: the per-frame scratch (planar/residual/writer/params) is
+    // built once here and reused across frames; the header buffer is emitted once.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(
         sample_rate: u32,
         channels: u32,
@@ -137,6 +149,9 @@ impl FlacEncoder {
             frame_writer: BitWriter::with_capacity(16 * 1024),
             residual: Vec::new(),
             part_scratch: Vec::new(),
+            best_residual: Vec::new(),
+            plan_params: Vec::new(),
+            cand_params: Vec::new(),
         };
 
         let mut header = Vec::with_capacity(4 + 4 + STREAMINFO_BODY_LEN);
@@ -158,6 +173,8 @@ impl FlacEncoder {
     /// frame sizes / total samples are written as 0 == "unknown", which is spec-legal
     /// (§8.2: "A value of 0 signifies that the value is not known"). The result is a
     /// valid, streamable FLAC header requiring no finalisation.
+    // One-time construction: builds the header buffer once, per stream (not per frame).
+    #[allow(clippy::disallowed_methods)]
     pub fn new_streaming(
         sample_rate: u32,
         channels: u32,
@@ -317,6 +334,9 @@ impl FlacEncoder {
                 self.bits_per_sample,
                 &mut self.residual,
                 &mut self.part_scratch,
+                &mut self.best_residual,
+                &mut self.plan_params,
+                &mut self.cand_params,
             );
             self.planar[c] = samples;
         }
@@ -382,12 +402,16 @@ impl FlacEncoder {
 
     /// Encode one channel as the cheapest available subframe type (§9.2). `samples`
     /// are already sign-extended to i64; `bps` is the subframe bit depth.
+    #[allow(clippy::too_many_arguments)] // all buffers are reused scratch threaded to avoid per-frame allocation
     fn write_subframe(
         w: &mut BitWriter,
         samples: &[i64],
         bps: u32,
         residual: &mut Vec<i64>,
         part_scratch: &mut Vec<u64>,
+        best_residual: &mut Vec<i64>,
+        plan_params: &mut Vec<u32>,
+        cand_params: &mut Vec<u32>,
     ) {
         let n = samples.len();
 
@@ -408,7 +432,8 @@ impl FlacEncoder {
         let max_order = 4.min(n.saturating_sub(1));
         let mut best_order: Option<u32> = None;
         let mut best_bits = u64::MAX;
-        let mut best_residual: Vec<i64> = Vec::new();
+        best_residual.clear();
+        plan_params.clear();
         let mut best_res_cost = ResidualPlan::default();
 
         for order in 0..=max_order as u32 {
@@ -416,7 +441,10 @@ impl FlacEncoder {
             if !residual_in_range(residual) {
                 continue;
             }
-            let (res_bits, plan) = best_residual_cost(residual, n, order, part_scratch);
+            // `best_residual_cost` writes the winning partition's Rice params into
+            // `cand_params` (reused scratch); we snapshot them into `plan_params` only
+            // when this order wins overall — no per-order/per-subframe allocation.
+            let (res_bits, plan) = best_residual_cost(residual, n, order, part_scratch, cand_params);
             // Subframe cost = header (7 bits + warm-up samples) + residual bits.
             let warmup_bits = order as u64 * bps as u64;
             let total = 8 + warmup_bits + res_bits;
@@ -425,6 +453,8 @@ impl FlacEncoder {
                 best_order = Some(order);
                 best_residual.clear();
                 best_residual.extend_from_slice(residual);
+                plan_params.clear();
+                plan_params.extend_from_slice(cand_params);
                 best_res_cost = plan;
             }
         }
@@ -434,7 +464,7 @@ impl FlacEncoder {
 
         match best_order {
             Some(order) if best_bits <= verbatim_bits => {
-                Self::write_fixed_subframe(w, samples, order, bps, &best_residual, &best_res_cost);
+                Self::write_fixed_subframe(w, samples, order, bps, best_residual, plan_params, &best_res_cost);
             }
             _ => Self::write_verbatim_subframe(w, samples, bps),
         }
@@ -456,6 +486,7 @@ impl FlacEncoder {
         order: u32,
         bps: u32,
         residual: &[i64],
+        params: &[u32],
         plan: &ResidualPlan,
     ) {
         // Header: 0 bit + type 0b001ooo (v = 8 + order) + wasted-bits flag 0 (§9.2.1).
@@ -466,19 +497,18 @@ impl FlacEncoder {
         for &s in &samples[..order as usize] {
             w.write_signed(s, bps);
         }
-        write_partitioned_residual(w, residual, samples.len(), order, plan);
+        write_partitioned_residual(w, residual, samples.len(), order, params, plan);
     }
 }
 
-/// A chosen residual-coding plan: partition order plus one Rice parameter per
-/// partition (§9.2.7). Built by [`best_residual_cost`] and replayed by
-/// [`write_partitioned_residual`], so the search cost is not paid twice.
-#[derive(Default, Clone)]
+/// A chosen residual-coding plan: partition order plus the Rice-parameter field width
+/// (§9.2.7). Built by [`best_residual_cost`] and replayed by
+/// [`write_partitioned_residual`], so the search cost is not paid twice. The per-
+/// partition Rice parameters themselves live in a caller-owned reusable buffer (the
+/// encoder's `plan_params`), passed alongside this plan — never a per-subframe `Vec`.
+#[derive(Default, Clone, Copy)]
 struct ResidualPlan {
     partition_order: u32,
-    /// Rice parameter per partition (index = partition). Escape is never emitted; the
-    /// range check in `write_subframe` guarantees a finite Rice cost exists.
-    params: Vec<u32>,
     /// 4- or 5-bit Rice parameters (§9.2.7 Table 23). 4 unless a param needs 5 bits.
     param_bits: u32,
 }
@@ -567,12 +597,15 @@ fn zigzag(v: i64) -> u64 {
 /// Search partition orders and Rice parameters for the residual of a subframe, and
 /// return the total residual bit cost together with the winning [`ResidualPlan`]
 /// (§9.2.7). `n` is the block size; `order` the predictor order (so the first
-/// partition holds `(n >> po) - order` samples).
+/// partition holds `(n >> po) - order` samples). The winning partition's Rice
+/// parameters are written into `out_params` (a caller-owned reusable buffer, cleared
+/// first) so nothing is allocated per subframe.
 fn best_residual_cost(
     residual: &[i64],
     n: usize,
     order: u32,
     scratch: &mut Vec<u64>,
+    out_params: &mut Vec<u32>,
 ) -> (u64, ResidualPlan) {
     // Precompute folded residuals once (indices `order..n`).
     scratch.clear();
@@ -583,6 +616,7 @@ fn best_residual_cost(
 
     let mut best_bits = u64::MAX;
     let mut best_plan = ResidualPlan::default();
+    out_params.clear();
 
     // Only partition orders where n is divisible by 2^po and each partition is larger
     // than the predictor order are valid (§9.2.7). Search 0..=MAX_PARTITION_ORDER.
@@ -596,7 +630,6 @@ fn best_residual_cost(
             break; // (block >> po) must exceed predictor order; larger po only shrinks it
         }
 
-        let mut params = Vec::with_capacity(parts as usize);
         let mut max_param = 0u32;
         // Partition parameter overhead is added after we know param_bits.
         let mut coded_bits = 0u64;
@@ -609,7 +642,6 @@ fn best_residual_cost(
             let (param, bits) = best_rice_param(slice);
             coded_bits += bits;
             max_param = max_param.max(param);
-            params.push(param);
         }
 
         // Rice parameter field is 4 bits, or 5 if any parameter needs 5 bits (§9.2.7).
@@ -619,11 +651,18 @@ fn best_residual_cost(
         let total = 2 + 4 + (parts as u64) * param_bits as u64 + coded_bits;
         if total < best_bits {
             best_bits = total;
-            best_plan = ResidualPlan {
-                partition_order: po,
-                params,
-                param_bits,
-            };
+            best_plan = ResidualPlan { partition_order: po, param_bits };
+            // Refill `out_params` for the new winner (cheap re-run of the convex Rice
+            // search; only happens on an improving partition order, a few times total).
+            out_params.clear();
+            let mut folded_idx = 0usize;
+            for p in 0..parts as usize {
+                let count = if p == 0 { part_len - order as usize } else { part_len };
+                let slice = &scratch[folded_idx..folded_idx + count];
+                folded_idx += count;
+                let (param, _) = best_rice_param(slice);
+                out_params.push(param);
+            }
         }
     }
 
@@ -696,6 +735,7 @@ fn write_partitioned_residual(
     residual: &[i64],
     n: usize,
     order: u32,
+    params: &[u32],
     plan: &ResidualPlan,
 ) {
     // Coding method (§9.2.7 Table 23): 0b00 for 4-bit params, 0b01 for 5-bit.
@@ -708,7 +748,7 @@ fn write_partitioned_residual(
     let mut idx = order as usize; // residual proper starts after warm-up
     for p in 0..parts {
         let count = if p == 0 { part_len - order as usize } else { part_len };
-        let param = plan.params[p];
+        let param = params[p];
         w.write_bits(param as u64, plan.param_bits);
         for _ in 0..count {
             let folded = zigzag(residual[idx]);

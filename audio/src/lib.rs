@@ -6,6 +6,7 @@
 //!
 //! TODO(milestone 3+): sample views feeding the hand-written FLAC/Opus codecs.
 
+#![feature(allocator_api)] // per-`process()` arena scratch (`ctx.scratch() -> &Arena: Allocator`)
 #![allow(dead_code)]
 
 pub mod convert;

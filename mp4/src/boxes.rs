@@ -27,6 +27,10 @@
 //! write-agnostic so a `writer.rs` can join later without reshaping the read side (see
 //! the crate docs, "Not yet").
 
+// COLD: pure box-parse grammar — runs once per stream at preroll, building owned sample
+// tables that outlive process(); nothing here is on the per-sample hot path.
+#![allow(clippy::disallowed_methods)]
+
 /// A four-character box type code (FourCC, §4.2), stored as its raw big-endian octets so
 /// it compares directly against the [`FourCc`] constants (no per-compare string alloc).
 pub type FourCc = [u8; 4];

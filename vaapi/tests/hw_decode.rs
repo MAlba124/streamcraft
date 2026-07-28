@@ -77,12 +77,13 @@ fn read_annexb_aus(max_aus: usize) -> Option<Vec<(Vec<u8>, bool)>> {
 
     let mut aus: Vec<(Vec<u8>, bool)> = Vec::new();
     let mut first = true;
+    let mut reframe_buf = Vec::new();
     loop {
         while let Some(frame) = reader.next_frame() {
             if frame.track_number != track.track_number {
                 continue;
             }
-            let annexb = reframer.reframe_block(&frame.data).ok()?;
+            let annexb = reframer.reframe_into(&frame.data, &mut reframe_buf).ok()?;
             let mut au = Vec::new();
             if first {
                 au.extend_from_slice(&head);

@@ -146,7 +146,7 @@ pub enum ReframeError {
 
 /// How a track's frames and its stream-start head are reframed on the way out of the demuxer.
 /// Chosen once from the CodecID (via [`for_codec`](Reframer::for_codec)); applied per frame.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Reframer {
     /// Frames pass through verbatim (WebM video, and any raw-`bytes` track). The head is
     /// whatever the demuxer already computed (empty for video, the FLAC head for `A_FLAC`).
@@ -166,17 +166,24 @@ impl Reframer {
         }
     }
 
-    /// Reframe one Block's payload to the bytes emitted downstream. For [`Passthrough`] this is
-    /// the input unchanged (borrowed); for [`Nal`] each length-prefixed NAL becomes a
-    /// start-code NAL (owned). Errors on a malformed length-prefixed block (never panics).
+    /// Reframe one Block's payload into `out`, returning the bytes to emit. Hot path: `out` is a
+    /// caller-owned buffer reused across frames, so the per-frame NAL reframe allocates nothing on
+    /// the global heap. For [`Passthrough`] the input is returned borrowed (`out` untouched); for
+    /// [`Nal`] `out` is cleared and refilled with the start-code form and returned. Errors on a
+    /// malformed length-prefixed block (never panics).
     ///
     /// [`Passthrough`]: Reframer::Passthrough
     /// [`Nal`]: Reframer::Nal
-    pub fn reframe_block<'a>(&self, block: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, ReframeError> {
+    pub fn reframe_into<'a>(
+        &self,
+        block: &'a [u8],
+        out: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], ReframeError> {
         match self {
-            Reframer::Passthrough => Ok(std::borrow::Cow::Borrowed(block)),
+            Reframer::Passthrough => Ok(block),
             Reframer::Nal { length_size } => {
-                Ok(std::borrow::Cow::Owned(length_prefixed_to_annex_b(block, *length_size)?))
+                length_prefixed_to_annex_b_into(block, *length_size, out)?;
+                Ok(out)
             }
         }
     }
@@ -211,6 +218,8 @@ pub fn nal_head_from_config(codec_private: &[u8], is_hevc: bool) -> Result<(Vec<
 /// numOfPPS                    u8
 ///   [ PPS length u16, PPS bytes ] * numOfPPS
 /// ```
+// COLD: once per stream — builds the Annex B parameter-set head from CodecPrivate.
+#[allow(clippy::disallowed_methods)]
 fn parse_avcc(data: &[u8]) -> Result<(Vec<u8>, usize), ReframeError> {
     let mut r = Cursor::new(data);
     let version = r.u8("avcC configurationVersion")?;
@@ -244,6 +253,8 @@ fn parse_avcc(data: &[u8]) -> Result<(Vec<u8>, usize), ReframeError> {
 ///     numNalus                                    u16
 ///       [ nalUnitLength u16, NAL bytes ] * numNalus
 /// ```
+// COLD: once per stream — builds the Annex B parameter-set head from CodecPrivate.
+#[allow(clippy::disallowed_methods)]
 fn parse_hvcc(data: &[u8]) -> Result<(Vec<u8>, usize), ReframeError> {
     let mut r = Cursor::new(data);
     let version = r.u8("hvcC configurationVersion")?;
@@ -266,12 +277,18 @@ fn parse_hvcc(data: &[u8]) -> Result<(Vec<u8>, usize), ReframeError> {
     Ok((head, length_size))
 }
 
-/// Convert a Block of length-prefixed NAL units to an Annex B access unit: each NAL is preceded
-/// by a `length_size`-octet big-endian length, replaced by a `00 00 00 01` start code. Errors
-/// on a truncated length field or a NAL length that runs past the block (never panics).
-fn length_prefixed_to_annex_b(block: &[u8], length_size: usize) -> Result<Vec<u8>, ReframeError> {
+/// Convert a Block of length-prefixed NAL units to an Annex B access unit into `out` (cleared
+/// first): each NAL is preceded by a `length_size`-octet big-endian length, replaced by a
+/// `00 00 00 01` start code. Errors on a truncated length field or a NAL length that runs past
+/// the block (never panics). Hot path: `out` is a reused buffer, so no per-frame heap traffic.
+fn length_prefixed_to_annex_b_into(
+    block: &[u8],
+    length_size: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), ReframeError> {
     debug_assert!((1..=4).contains(&length_size));
-    let mut out = Vec::with_capacity(block.len() + START_CODE.len());
+    out.clear();
+    out.reserve(block.len() + START_CODE.len());
     let mut at = 0usize;
     while at < block.len() {
         // Read the big-endian NAL length.
@@ -291,10 +308,19 @@ fn length_prefixed_to_annex_b(block: &[u8], length_size: usize) -> Result<Vec<u8
         // A zero-length NAL is degenerate but not fatal — skip it rather than emit a bare start
         // code (some muxers pad; the decoder would ignore an empty NAL anyway).
         if !nal.is_empty() {
-            append_nal(&mut out, nal);
+            append_nal(out, nal);
         }
         at = nal_end;
     }
+    Ok(())
+}
+
+/// Allocating wrapper over [`length_prefixed_to_annex_b_into`] for the unit tests (the hot path
+/// reframes into a reused buffer instead).
+#[cfg(test)]
+fn length_prefixed_to_annex_b(block: &[u8], length_size: usize) -> Result<Vec<u8>, ReframeError> {
+    let mut out = Vec::new();
+    length_prefixed_to_annex_b_into(block, length_size, &mut out)?;
     Ok(out)
 }
 

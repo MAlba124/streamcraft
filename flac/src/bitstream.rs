@@ -28,6 +28,7 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
+    #[allow(clippy::disallowed_methods)] // one-time construction; the reused frame writer is built once, then cleared per frame
     pub fn new() -> Self {
         Self {
             bytes: Vec::new(),
@@ -36,6 +37,7 @@ impl BitWriter {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // one-time construction; the reused frame writer is built once, then cleared per frame
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(cap),

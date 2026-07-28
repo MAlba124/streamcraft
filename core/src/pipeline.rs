@@ -615,6 +615,9 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    // Pipeline constructor (once at build); empty Vecs/interners allocate nothing until the
+    // graph is assembled — not a per-frame cost.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         let (tx, rx) = Bus::channel();
         // Bound first: the pause transport shares the running-time base cell and the
@@ -795,6 +798,8 @@ impl Pipeline {
 
     /// A negotiated format as `family, field=value, …` — the caps a link fixed
     /// (resolved through this pipeline's interners; build-phase display only).
+    // Build-phase display formatting (logging/diagnostics), not the per-buffer path.
+    #[allow(clippy::disallowed_methods)]
     fn format_display(&self, f: &FixedFormat) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -815,6 +820,8 @@ impl Pipeline {
     // --- Topology: legal in every state (spec: Runtime configuration) ---
 
     /// Elements arrive already constructed: `pipeline.add(FileSrc::new(path))`.
+    // Element registration (build-time), not per frame: the box is the dyn-dispatch handle.
+    #[allow(clippy::disallowed_methods)]
     pub fn add(&mut self, element: impl Element + 'static) -> ElementId {
         self.add_boxed(Box::new(element))
     }
@@ -822,6 +829,8 @@ impl Pipeline {
     /// Add an already-boxed element (spec: Plugins — the parse layer builds elements by
     /// name via `ElementDesc::make_default`, which yields a `Box<dyn Element>`). The
     /// typed [`add`](Self::add) is the primary path; this is its type-erased twin.
+    // Element registration (build-time), not per frame: the empty dyn-pads slot is grown later.
+    #[allow(clippy::disallowed_methods)]
     pub fn add_boxed(&mut self, element: Box<dyn Element>) -> ElementId {
         let id = ElementId(self.elements.len() as u32);
         let desc = element.desc();
@@ -1140,6 +1149,8 @@ impl Pipeline {
     /// after the static edges are linked. Topology is expected to settle here and then be
     /// frozen for the streaming phase — mid-stream topology change is out of scope. A
     /// static pipeline need not call this (every `preroll` defaults to a no-op).
+    // Discovery phase (once, before run): instantiates dynamic pads, does not stream buffers.
+    #[allow(clippy::disallowed_methods)]
     pub fn preroll(&mut self) -> Result<Vec<AddedPadInfo>, Error> {
         // A throwaway pool: preroll only instantiates pads, it does not stream buffers.
         let pool = Pool::bounded(self.slot_size, 1);
@@ -1194,6 +1205,9 @@ impl Pipeline {
 
     /// Start the chain, drive it to EOS, and stop it. Spawns one thread per group,
     /// joins them all, and returns the first error (if any).
+    // Run setup: builds the group/ring/thread topology once, then spawns workers and joins —
+    // the per-buffer loop lives in `run_group`, not here, so these allocs are one-per-run.
+    #[allow(clippy::disallowed_methods)]
     pub fn run(&mut self) -> Result<(), Error> {
         self.stop.store(false, Ordering::Release);
         // Zero-code attach mode (spec: server architecture): if no server is active and
@@ -1575,6 +1589,8 @@ impl Pipeline {
     /// per-target `name:level` rules from `STREAMCRAFT_DEBUG` raise matching elements
     /// above it. If nothing is enabled, this wires *nothing* — no channels, no thread —
     /// so a run with logging off pays only this one comparison.
+    // Logging wiring (once per run at setup), not the per-buffer path.
+    #[allow(clippy::disallowed_methods)]
     fn build_logging(&self, total: usize) -> LoggingBuild {
         // Fold the programmatic level and the env global into one shared gate; the more
         // verbose (higher rank) of the two wins.
@@ -1702,6 +1718,8 @@ impl Pipeline {
     }
 
     /// Order the elements into a single source→sink chain (milestone topology).
+    // Topological sort (once per run at setup), not per frame.
+    #[allow(clippy::disallowed_methods)]
     fn topo_order(&self) -> Result<Vec<ElementId>, Error> {
         let n = self.elements.len();
         if n == 0 {
@@ -1750,6 +1768,8 @@ impl Pipeline {
     /// run inline). Branching (fan-out) therefore lives *between* groups, wired as rings.
     /// Passive fan-out (a passive with two downstreams, or two passives sharing one
     /// upstream) is rejected — make the branch point active.
+    // Group partitioning (once per run at setup), not per frame.
+    #[allow(clippy::disallowed_methods)]
     fn compute_groups(&self, order: &[ElementId]) -> Result<Vec<Vec<ElementId>>, Error> {
         let n = self.elements.len();
         // Incoming edges per element. A passive element must have exactly one (it inlines
@@ -1977,6 +1997,8 @@ impl Pipeline {
     /// Render the topology as Graphviz `dot`, clustering elements by thread group
     /// (spec: Debuggability — graph dump). Call before `run()` (elements are moved
     /// into their threads during a run).
+    // Graphviz dump (diagnostic, called before run), not the per-buffer path.
+    #[allow(clippy::disallowed_methods)]
     pub fn dump_dot(&self) -> String {
         let mut s = String::from("digraph streamcraft {\n  rankdir=LR;\n  node [shape=box];\n");
         for (i, e) in self.elements.iter().enumerate() {
@@ -2013,6 +2035,8 @@ impl Pipeline {
     /// The computed per-path latency breakdown (spec: Latency — a graph traversal
     /// over data the pipeline already holds; no query protocol). Callable in any
     /// state; the same numbers a sink's `wait_until` compensates while playing.
+    // Latency report (diagnostic, computed on demand), not the per-buffer path.
+    #[allow(clippy::disallowed_methods)]
     pub fn latency_report(&self) -> LatencyReport {
         let (in_lat, pred) = self.compute_in_latency();
         let n = self.descs.len();
@@ -2509,7 +2533,8 @@ fn run_group(
     let m = elements.len();
     let is_source = upstream.is_empty();
     // Reused completions buffer for `run_once` (ZERO-COPY.md stage 4.2): one
-    // allocation for the whole run instead of one per pass.
+    // allocation for the whole run instead of one per pass — not a per-buffer cost.
+    #[allow(clippy::disallowed_methods)]
     let mut completions_buf: Vec<(ElementId, crate::io::Completion)> = Vec::new();
     // A fan-in (aggregator) head reads several upstream rings; a single-input head reads
     // one. The single-input head's sink pad (the one the ring feeds) is where a

@@ -188,6 +188,10 @@ pub struct Mp4Demux {
     /// the milestone-1 transport — `Batch::push` drops the per-row format and `pop_front`
     /// restamps from the batch — but kept faithful for later transports.
     out_fmt: FormatId,
+    /// Reused NAL→Annex B reframe buffer: each length-prefixed → Annex B conversion refills
+    /// this in place ([`Reframer::reframe_into`]), so the per-sample reframe allocates nothing
+    /// on the global heap (mirrors `sc_mkv::MkvDemux`). Passthrough leaves it untouched.
+    reframe_buf: Vec<u8>,
 }
 
 impl Mp4Demux {
@@ -199,6 +203,8 @@ impl Mp4Demux {
     /// Resolution is deferred to [`preroll`](Element::preroll) so a construction-time parse
     /// failure surfaces as a preroll error (loud, at the right phase) rather than a panic in
     /// `new`. `new` therefore always succeeds; a malformed head errors in `preroll`.
+    // COLD: one-time constructor — builds fixed element state, not a per-sample path.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(head: Vec<u8>) -> Self {
         Self {
             head,
@@ -207,6 +213,7 @@ impl Mp4Demux {
             reader: None, // resolved in `preroll`
             pending: std::collections::VecDeque::new(),
             out_fmt: FormatId(0), // probed at `start`
+            reframe_buf: Vec::new(),
         }
     }
 
@@ -359,6 +366,8 @@ impl Mp4Demux {
     /// current mode. Decode mode (default): Annex B head + NAL reframing, families the
     /// decoders link on. Passthrough mode: the raw config record verbatim as the head,
     /// samples untouched, the `h264/avcc`/`h265/hvcc` remux families (RFC 9559 §12 shape).
+    // COLD: run once per track at preroll/start to seed the codec head — not per-sample.
+    #[allow(clippy::disallowed_methods)]
     fn track_wiring(
         track: &crate::reader::Track,
         passthrough: bool,
@@ -399,7 +408,7 @@ impl Mp4Demux {
         }
         let fmt = self.out_fmt;
         loop {
-            let Self { reader, pad_tracks, pending, .. } = self;
+            let Self { reader, pad_tracks, pending, reframe_buf, .. } = self;
             let Some(reader) = reader.as_mut() else { return true };
             let Some(s) = reader.next_sample() else { return true };
             let (idx, sync) = (s.track_index, s.sync);
@@ -421,7 +430,7 @@ impl Mp4Demux {
             }
             let pad = pt.pad;
             // Route the payload: slice-through for passthrough (the zero-copy path),
-            // otherwise an owned blob (straddle gather / Annex B conversion).
+            // otherwise an owned blob (straddle gather) or the reused reframe buffer.
             let owned: Vec<u8> = match (&pt.reframer, s.payload) {
                 (Reframer::Passthrough, SamplePayload::Slice(mem)) => {
                     if pending.is_empty() {
@@ -440,22 +449,45 @@ impl Mp4Demux {
                     continue;
                 }
                 (Reframer::Passthrough, SamplePayload::Copied(v)) => v,
-                (reframer, payload) => match reframer.reframe_block(payload.data()) {
-                    Ok(bytes) => bytes.into_owned(),
-                    Err(e) => {
-                        let element = ctx.element();
-                        ctx.post(BusMessage::Warning {
-                            element,
-                            error: Error::Element {
+                (reframer, payload) => {
+                    // NAL→Annex B into the reused buffer — allocates nothing per sample on the
+                    // common (pool-has-slots) path; only a parked remainder is owned (cold).
+                    let bytes = match reframer.reframe_into(payload.data(), reframe_buf) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let element = ctx.element();
+                            ctx.post(BusMessage::Warning {
                                 element,
-                                message: format!(
-                                    "mp4demux: dropping malformed sample on track {idx}: {e:?}"
-                                ),
-                            },
+                                error: Error::Element {
+                                    element,
+                                    message: format!(
+                                        "mp4demux: dropping malformed sample on track {idx}: {e:?}"
+                                    ),
+                                },
+                            });
+                            continue; // drop this sample, try the next
+                        }
+                    };
+                    let off = if pending.is_empty() {
+                        Self::emit_bounded(ctx, pad, Some(pts_ns), flags, bytes, 0)
+                    } else {
+                        0 // a parked head precedes this sample — keep order, park whole
+                    };
+                    if off < bytes.len() {
+                        // Pool dry (or head parked ahead): own only the un-emitted remainder.
+                        pending.push_back(Carry {
+                            pad,
+                            pts_ns: Some(pts_ns),
+                            flags,
+                            payload: CarryPayload::Owned(own_remainder(bytes, off)),
+                            off: 0,
                         });
-                        continue; // drop this sample, try the next
                     }
-                },
+                    if !pending.is_empty() {
+                        return false; // pool dry — carry parked, stop pulling reader samples
+                    }
+                    continue;
+                }
             };
             let off = if pending.is_empty() {
                 Self::emit_bounded(ctx, pad, Some(pts_ns), flags, &owned, 0)
@@ -496,7 +528,7 @@ impl Mp4Demux {
             }
         }
         loop {
-            let Self { reader, pad_tracks, .. } = self;
+            let Self { reader, pad_tracks, reframe_buf, .. } = self;
             let Some(reader) = reader.as_mut() else { return };
             let Some(s) = reader.next_sample() else { return };
             let (idx, sync) = (s.track_index, s.sync);
@@ -520,8 +552,8 @@ impl Mp4Demux {
                 (Reframer::Passthrough, SamplePayload::Copied(v)) => {
                     Self::emit_exact(ctx, pad, Some(pts_ns), flags, &v, 0)
                 }
-                (reframer, payload) => match reframer.reframe_block(payload.data()) {
-                    Ok(bytes) => Self::emit_exact(ctx, pad, Some(pts_ns), flags, &bytes, 0),
+                (reframer, payload) => match reframer.reframe_into(payload.data(), reframe_buf) {
+                    Ok(bytes) => Self::emit_exact(ctx, pad, Some(pts_ns), flags, bytes, 0),
                     Err(_) => continue, // tail flush: drop silently rather than warn-spam
                 },
             }
@@ -532,6 +564,8 @@ impl Mp4Demux {
     /// families carry `width`/`height` when declared; audio carries `rate`/`channels`;
     /// otherwise a bare family announcement. Every family rides a byte bridge, so a
     /// caps-ignoring decoder still links on the family offer.
+    // COLD: runs once per pad on its first sample to assemble the announce field list.
+    #[allow(clippy::disallowed_methods)]
     fn announce(ctx: &mut Ctx, pad: PadId, family: &'static str, announce: Announce) {
         match announce {
             Announce::Video { width, height, duration_ns } if width != 0 && height != 0 => {
@@ -619,6 +653,8 @@ impl Element for Mp4Demux {
         Ok(())
     }
 
+    // COLD: lifecycle start — the error-message string only builds on a misuse path, once.
+    #[allow(clippy::disallowed_methods)]
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         // Probe the out-format a pooled buffer would carry (see the `out_fmt` field): one
         // throwaway right-sized allocation, recycled on drop — never a steady-state cost.
@@ -690,7 +726,16 @@ impl Element for Mp4Demux {
     }
 }
 
+/// Own the un-emitted tail of a reframed sample when the pool ran dry, so it can be parked.
+// COLD: only on pool exhaustion (backpressure) — the steady-state path emits borrowed bytes.
+#[allow(clippy::disallowed_methods)]
+fn own_remainder(bytes: &[u8], off: usize) -> Vec<u8> {
+    bytes[off..].to_vec()
+}
+
 /// Map a resolver error to a worded `streamcraft` error (loud, at preroll).
+// COLD: builds an error string only on a preroll resolve failure — never per-sample.
+#[allow(clippy::disallowed_methods)]
 fn map_resolve_err(e: Mp4Error) -> Error {
     let msg = match e {
         Mp4Error::Fragmented => "mp4demux: fragmented MP4 (moof/mvex) is not supported — v1 \

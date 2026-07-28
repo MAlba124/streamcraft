@@ -94,6 +94,8 @@ static PROPS: [PropDesc; 1] = [PropDesc {
     live: false,
 }];
 
+// COLD: the `make_default` factory boxes one element at construction, not per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "audioconvert",
     pads: &PADS,
@@ -158,6 +160,8 @@ impl AudioConvert {
     /// [`process`]: Element::process
     /// [`flacdec`]: https://docs.rs/sc-flac
     /// [`pipewireaudiosink`]: https://docs.rs/sc-pipewire
+    // COLD: constructs the element once; `carry`/`scratch` are reused cross-buffer buffers, not per-buffer scratch.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(target: SampleFormat) -> Self {
         Self {
             target,
@@ -351,6 +355,8 @@ impl Element for AudioConvert {
         Ok(())
     }
 
+    // COLD: teardown; releases the reused scratch buffer once, not per buffer.
+    #[allow(clippy::disallowed_methods)]
     fn stop(&mut self, _ctx: &mut Ctx) {
         // A leftover carry is an incomplete final interchannel frame (ragged input) — drop
         // it so the output stays frame-aligned.

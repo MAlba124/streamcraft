@@ -172,6 +172,8 @@ static MUX_PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: make_default boxes the element once at construction (descriptor factory).
+#[allow(clippy::disallowed_methods)]
 static MUX_DESC: ElementDesc = ElementDesc {
     name: "mkvmux",
     pads: &MUX_PADS,
@@ -556,6 +558,8 @@ impl Element for MkvMux {
                         // CodecPrivate *is* the AVC/HEVCDecoderConfigurationRecord).
                         // configurationVersion is 1 for both records — a cheap guard
                         // against being fed sample data first.
+                        // COLD: once per stream — owns the CodecPrivate record before the writer exists.
+                        #[allow(clippy::disallowed_methods)]
                         let head = buf.memory.data().to_vec();
                         if head.first() != Some(&1) {
                             return Err(Error::Todo(
@@ -628,6 +632,8 @@ impl Element for MkvMux {
         Ok(Flow::Ok)
     }
 
+    // COLD: EOS finalize + once-per-stream caps-driven track-config assembly (no per-frame path).
+    #[allow(clippy::disallowed_methods)]
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
             // Primary finalize path: the pipeline delivers EOS in-band and pushes whatever
@@ -835,6 +841,9 @@ pub struct MkvDemux {
     reader: MatroskaReader,
     /// Reused byte buffer for chunked emission (mirrors `MkvMux::scratch`).
     scratch: Vec<u8>,
+    /// Reused NAL-reframe buffer: each length-prefixed → Annex B conversion refills this in
+    /// place, so the per-frame hot path allocates nothing on the global heap (spec: Memory).
+    reframe_buf: Vec<u8>,
     /// Emissions stalled on pool exhaustion (spec: the backpressure rule — the pool,
     /// never the heap, bounds a demuxer racing a slow decoder). While non-empty the
     /// demuxer consumes **no input**, so upstream backs up into the scheduler's gates
@@ -858,18 +867,30 @@ struct Carry {
     off: usize,
 }
 
+/// Own a parked remainder's bytes for a [`Carry`]. Called only on pool exhaustion (the
+/// backpressure boundary), at most once per stall — the element then stops consuming input —
+/// so this owned allocation is bounded, not a steady-state per-frame cost.
+// COLD: backpressure park only; the parked remainder must outlive the current `process()`.
+#[allow(clippy::disallowed_methods)]
+fn own_remainder(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
 impl MkvDemux {
     /// A demuxer that discovers its tracks from `header` — the leading bytes of the Matroska
     /// stream, which MUST include the whole EBML Header + Segment Info + Tracks (everything up
     /// to the first Cluster). The caller reads these once up front (e.g. the first read of a
     /// `filesrc`); the full stream — these bytes and all that follow — is then fed on the
     /// sink pad at run time. See the type docs for why discovery is constructor-supplied.
+    // COLD: element construction — empty reusable buffers/collections, filled at run time.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(header: Vec<u8>) -> Self {
         Self {
             header,
             pad_tracks: Vec::new(),
             reader: MatroskaReader::new(),
             scratch: Vec::new(),
+            reframe_buf: Vec::new(),
             pending: std::collections::VecDeque::new(),
             posted_duration: false,
         }
@@ -900,6 +921,8 @@ impl MkvDemux {
     ///   B. A **malformed** record degrades to an empty head + passthrough (never panics): the
     ///   pad still links, the decoder simply gets no parameter sets until an in-band one arrives.
     /// - **Everything else** (WebM VP8/VP9/AV1, unknown `bytes`): no head, passthrough frames.
+    // COLD: once per track (discovery/start/seek) — owns the codec head (CodecPrivate/param sets).
+    #[allow(clippy::disallowed_methods)]
     fn head_and_reframer(track: &Track) -> (Vec<u8>, Reframer) {
         match track.codec_id.as_str() {
             CODEC_A_FLAC => (track.codec_private.clone(), Reframer::Passthrough),
@@ -1038,9 +1061,15 @@ impl MkvDemux {
             // Reframe the Block payload to the downstream bytes (before touching pool memory)
             // so a malformed access unit is dropped without ever emitting the codec head/format
             // for a track that would then carry nothing (announce happens only on a good frame).
-            let out_bytes = match self.pad_tracks[idx].reframer.reframe_block(&frame.data) {
+            // Reframe into the element's reusable buffer (taken out to free the `self` borrow for
+            // the head emission below) — the NAL path allocates nothing per frame; passthrough
+            // borrows `frame.data`, leaving the buffer untouched.
+            let reframer = self.pad_tracks[idx].reframer;
+            let mut reframe_buf = std::mem::take(&mut self.reframe_buf);
+            let out_bytes: &[u8] = match reframer.reframe_into(&frame.data, &mut reframe_buf) {
                 Ok(bytes) => bytes,
                 Err(e) => {
+                    self.reframe_buf = reframe_buf;
                     let element = ctx.element();
                     ctx.post(BusMessage::Warning {
                         element,
@@ -1055,6 +1084,8 @@ impl MkvDemux {
                     continue;
                 }
             };
+            // `out_bytes` borrows `frame.data` and/or `reframe_buf` (both locals now) — no `self`
+            // borrow, so the head emission's `&mut self` call below is free.
             // First frame on this pad: emit the native codec head and announce the format.
             if !self.pad_tracks[idx].started {
                 self.pad_tracks[idx].started = true;
@@ -1075,19 +1106,17 @@ impl MkvDemux {
             // rides the buffer's `duration` field so a duration-bearing sparse consumer (the
             // subtitle overlay) has the cue span `[pts, pts+dur)`. `None` for a SimpleBlock.
             let dur_ns = frame.duration_ns;
-            // Emit from the (usually borrowed) reframed bytes; only a parked remainder
-            // pays the copy into an owned carry.
+            // Emit from the (borrowed) reframed bytes; only a parked remainder pays the copy
+            // into an owned carry.
             let out_len = out_bytes.len();
-            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), dur_ns, flags, &out_bytes, 0);
-            // Consume `out_bytes` in **both** arms — for a passthrough track it borrows
-            // `frame.data`, and the frame's payload buffer must be free of borrows before it is
-            // recycled below.
-            let remainder = if off < out_len {
-                Some(out_bytes.into_owned())
-            } else {
-                drop(out_bytes);
-                None
-            };
+            let off = Self::emit_bounded(ctx, pad, Some(frame.pts_ns), dur_ns, flags, out_bytes, 0);
+            // A parked remainder must own its bytes (it outlives this `process`); copy it out
+            // before the `reframe_buf`/`frame.data` borrows end. Steady state (pool keeping up)
+            // parks nothing, so no per-frame owned allocation.
+            let remainder = (off < out_len).then(|| own_remainder(&out_bytes[off..]));
+            // `out_bytes` is now unused: its borrow of `reframe_buf`/`frame.data` has ended, so
+            // the buffer can be restored (kept for the next frame) and the frame payload recycled.
+            self.reframe_buf = reframe_buf;
             if let Some(bytes) = remainder {
                 self.pending.push_back(Carry {
                     pad,
@@ -1124,9 +1153,18 @@ impl MkvDemux {
             let Some(idx) = self.pad_tracks.iter().position(|pt| pt.track_number == frame.track_number) else {
                 continue;
             };
-            let out_bytes = match self.pad_tracks[idx].reframer.reframe_block(&frame.data) {
+            // Reframe into the reusable buffer (taken out to free the `self` borrow), same as
+            // `drain`; the tail is bounded so this stays off the per-frame heap too. `out_bytes`
+            // borrows the local `reframe_buf`/`frame.data`, not `self`, so the head emission's
+            // `&mut self` take below is free — and the head still goes out before the frame.
+            let reframer = self.pad_tracks[idx].reframer;
+            let mut reframe_buf = std::mem::take(&mut self.reframe_buf);
+            let out_bytes: &[u8] = match reframer.reframe_into(&frame.data, &mut reframe_buf) {
                 Ok(bytes) => bytes,
-                Err(_) => continue, // tail flush: drop silently rather than warn-spam
+                Err(_) => {
+                    self.reframe_buf = reframe_buf;
+                    continue; // tail flush: drop silently rather than warn-spam
+                }
             };
             if !self.pad_tracks[idx].started {
                 self.pad_tracks[idx].started = true;
@@ -1138,7 +1176,8 @@ impl MkvDemux {
             let pad = self.pad_tracks[idx].pad;
             let flags = if frame.keyframe { BufferFlags::KEYFRAME } else { BufferFlags::DELTA };
             // Carry BlockDuration onto the tail buffer too (the subtitle cue span).
-            Self::emit_exact(ctx, pad, Some(frame.pts_ns), frame.duration_ns, flags, &out_bytes, 0);
+            Self::emit_exact(ctx, pad, Some(frame.pts_ns), frame.duration_ns, flags, out_bytes, 0);
+            self.reframe_buf = reframe_buf; // borrow of the buffer ends here
         }
     }
 
@@ -1235,6 +1274,8 @@ impl Element for MkvDemux {
         &DEMUX_DESC
     }
 
+    // COLD: once-per-stream track discovery + pad creation (topology settles at preroll).
+    #[allow(clippy::disallowed_methods)]
     fn preroll(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         // Discover tracks from the constructor-supplied header, then add one src pad per
         // track (spec: dynamic pads — topology settles at preroll). A throwaway reader: the
@@ -1292,6 +1333,7 @@ impl Element for MkvDemux {
             pt.reframer = reframer;
         }
         self.scratch.clear();
+        self.reframe_buf.clear();
         self.pending.clear();
         Ok(())
     }
@@ -1370,7 +1412,8 @@ impl Element for MkvDemux {
         // Belt-and-braces: flush any final frame even if `event(Eos)` was not delivered.
         self.flush_exact(ctx);
         self.reader = MatroskaReader::new();
-        self.scratch = Vec::new();
+        self.scratch.clear();
+        self.reframe_buf.clear();
         self.pending.clear();
         self.posted_duration = false;
     }

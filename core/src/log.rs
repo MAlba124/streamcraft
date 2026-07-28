@@ -166,6 +166,8 @@ pub struct DebugSpec {
 impl DebugSpec {
     /// Parse the gst-style syntax: comma-separated tokens, each either a bare level
     /// (global) or `name:level`. Whitespace-tolerant; malformed tokens are skipped.
+    // Parses the STREAMCRAFT_DEBUG env var once at startup, not per frame.
+    #[allow(clippy::disallowed_methods)]
     pub fn parse(s: &str) -> DebugSpec {
         let mut spec = DebugSpec::default();
         for tok in s.split(',') {

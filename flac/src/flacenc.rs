@@ -96,6 +96,8 @@ static PROPS: [PropDesc; 3] = [
     PropDesc { name: "format", allowed: Constraint::Any, live: false },
 ];
 
+// `make_default` boxes one element instance at registry/parse time, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "flacenc",
     pads: &PADS,
@@ -144,6 +146,8 @@ pub struct FlacEnc {
 impl FlacEnc {
     /// Create a FLAC encoder element for interleaved `format` PCM at `sample_rate` Hz
     /// with `channels` channels. Parameters are validated lazily in `start()`.
+    // One-time construction: `carry`/`scratch_out` are reused across frames, not re-allocated.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(sample_rate: u32, channels: u32, format: SampleFormat) -> Self {
         let frame_stride = channels as usize * format.bytes_per_sample();
         Self {

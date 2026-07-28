@@ -52,6 +52,9 @@ pub struct Batch {
 }
 
 impl Batch {
+    // Batch shell constructor (setup / shell-ring fallback): empty Vecs allocate nothing until
+    // filled, and steady state recycles shells — never per-buffer heap traffic.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(format: FormatId) -> Self {
         Self {
             format,

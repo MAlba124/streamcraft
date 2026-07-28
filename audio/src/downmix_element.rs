@@ -61,6 +61,8 @@ static PADS: [PadDesc; 2] = [
 
 static PROPS: [PropDesc; 0] = [];
 
+// COLD: the `make_default` factory boxes one element at construction, not per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "audiodownmix",
     pads: &PADS,
@@ -253,6 +255,8 @@ impl Element for AudioDownmix {
         Ok(())
     }
 
+    // COLD: teardown; releases the reused scratch buffer once, not per buffer.
+    #[allow(clippy::disallowed_methods)]
     fn stop(&mut self, _ctx: &mut Ctx) {
         self.carry.clear();
         self.scratch = Vec::new();

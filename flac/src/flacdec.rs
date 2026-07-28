@@ -77,6 +77,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// `make_default` boxes one element instance at registry/parse time, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "flacdec",
     pads: &PADS,

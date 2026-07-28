@@ -99,6 +99,8 @@ static PROPS: [PropDesc; 1] = [PropDesc {
     live: false,
 }];
 
+// COLD: the `make_default` factory boxes one element at construction, not per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "audioresample",
     pads: &PADS,
@@ -156,6 +158,8 @@ impl AudioResample {
     /// upstream's negotiated `audio/raw` caps (spec: dynamic caps — consumer side). The whole
     /// input [`AudioFormat`] is read by name off the negotiated [`FixedFormat`] — same pattern as
     /// [`AudioConvert::new`](crate::convert_element::AudioConvert::new).
+    // COLD: constructs the element once; `carry` is a reused cross-buffer accumulator, not per-buffer scratch.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(target_rate: u32) -> Self {
         assert!(target_rate > 0, "audioresample: target rate must be positive");
         Self {
@@ -297,46 +301,53 @@ impl AudioResample {
             .ok_or(Error::Todo("audioresample: ragged frame in emit"))?;
         let frames = inter.len() / (4 * nch); // f32 == 4 bytes
 
-        // 2. De-interleave into planar per-channel f32, resample each, collect planar outputs.
-        //    (Scratch vecs per call; the hot-path zero-alloc refinement is a follow-up — this is
-        //    the polyphase math proven correct first.)
-        let mut planar_out: Vec<Vec<f32>> = Vec::with_capacity(nch);
-        let mut max_out = 0usize;
-        for ch in 0..nch {
-            let mut lane = Vec::with_capacity(frames);
-            for f in 0..frames {
-                lane.push(f32::from_le_bytes([
-                    inter[(f * nch + ch) * 4],
-                    inter[(f * nch + ch) * 4 + 1],
-                    inter[(f * nch + ch) * 4 + 2],
-                    inter[(f * nch + ch) * 4 + 3],
-                ]));
-            }
-            let mut out = Vec::new();
-            engine.channels[ch].process(&lane, &mut out);
-            max_out = max_out.max(out.len());
-            planar_out.push(out);
-        }
-        // Every channel shares L/M and history sizing, so they emit the same count in lock-step.
-        debug_assert!(
-            planar_out.iter().all(|c| c.len() == max_out),
-            "channel output counts diverged"
-        );
-        if max_out == 0 {
-            return Ok(());
-        }
+        // All per-buffer de-interleave / resample scratch is carved from the per-`process()`
+        // arena (`ctx.scratch()`), so steady-state resampling adds no heap traffic. Scoped so the
+        // arena borrow of `ctx` ends before the `&mut ctx` `emit_bytes` below — only the re-encoded
+        // `pcm` (an owned Vec independent of the arena) escapes.
+        let pcm = {
+            let arena = ctx.scratch();
 
-        // 3. Re-interleave to f32 bytes, then re-encode to the input sample format.
-        let mut inter_out = vec![0u8; max_out * nch * 4];
-        for f in 0..max_out {
-            for (ch, lane) in planar_out.iter().enumerate() {
-                let v = lane.get(f).copied().unwrap_or(0.0);
-                let off = (f * nch + ch) * 4;
-                inter_out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            // 2. De-interleave into planar per-channel f32, resample each, collect planar outputs.
+            let mut planar_out: Vec<Vec<f32, &_>, &_> = Vec::with_capacity_in(nch, arena);
+            let mut max_out = 0usize;
+            for ch in 0..nch {
+                let mut lane: Vec<f32, &_> = Vec::with_capacity_in(frames, arena);
+                for f in 0..frames {
+                    lane.push(f32::from_le_bytes([
+                        inter[(f * nch + ch) * 4],
+                        inter[(f * nch + ch) * 4 + 1],
+                        inter[(f * nch + ch) * 4 + 2],
+                        inter[(f * nch + ch) * 4 + 3],
+                    ]));
+                }
+                let mut out: Vec<f32, &_> = Vec::new_in(arena);
+                engine.channels[ch].process(&lane, &mut out);
+                max_out = max_out.max(out.len());
+                planar_out.push(out);
             }
-        }
-        let pcm = convert_interleaved_vec(SampleFormat::F32, engine.sample, nch, &inter_out)
-            .ok_or(Error::Todo("audioresample: re-encode failed"))?;
+            // Every channel shares L/M and history sizing, so they emit the same count in lock-step.
+            debug_assert!(
+                planar_out.iter().all(|c| c.len() == max_out),
+                "channel output counts diverged"
+            );
+            if max_out == 0 {
+                return Ok(());
+            }
+
+            // 3. Re-interleave to f32 bytes (arena scratch), then re-encode to the input format.
+            let mut inter_out: Vec<u8, &_> = Vec::with_capacity_in(max_out * nch * 4, arena);
+            inter_out.resize(max_out * nch * 4, 0u8);
+            for f in 0..max_out {
+                for (ch, lane) in planar_out.iter().enumerate() {
+                    let v = lane.get(f).copied().unwrap_or(0.0);
+                    let off = (f * nch + ch) * 4;
+                    inter_out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            convert_interleaved_vec(SampleFormat::F32, engine.sample, nch, &inter_out)
+                .ok_or(Error::Todo("audioresample: re-encode failed"))?
+        };
         Self::emit_bytes(ctx, &pcm)
     }
 

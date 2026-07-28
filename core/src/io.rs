@@ -504,6 +504,9 @@ struct ReactorFile {
 }
 
 impl SyncReactor {
+    // Reactor constructor (once per group thread at run setup); empty Vecs allocate nothing,
+    // and `scratch` retains its capacity across passes thereafter.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),

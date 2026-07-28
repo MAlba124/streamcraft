@@ -25,6 +25,11 @@
 //! lacing), then the frame bytes copied verbatim. The relative timestamp is 16-bit signed,
 //! so a new Cluster is started before a frame would fall outside `±32767` ticks of the
 //! current base (and, opportunistically, on a track-0 keyframe).
+//!
+//! COLD module: pure byte-assembly muxer — the only allocations are once-per-track config,
+//! header/SeekHead/Cues assembly, and finalize patches. The per-frame `write_frame_scatter`
+//! path holds the frame payload as a zero-copy `Memory` refcount and allocates nothing.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::VecDeque;
 

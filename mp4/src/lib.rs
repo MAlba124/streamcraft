@@ -78,6 +78,8 @@ use streamcraft_core::registry::Registry;
 ///
 /// The `&'static ElementDesc` is taken from a throwaway instance (a bare `Mp4Demux` over an
 /// empty head) — only `desc()` is called, so the instance is dropped.
+// COLD: one-time registry setup — a throwaway empty-head instance for its descriptor.
+#[allow(clippy::disallowed_methods)]
 pub fn register(registry: &mut Registry) {
     registry.register(Mp4Demux::new(Vec::new()).desc());
 }

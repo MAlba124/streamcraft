@@ -136,6 +136,8 @@ impl Harness {
     /// The full constructor: `slot_size` bytes per pool slot, capped at `max_slots`
     /// outstanding. A small `max_slots` exercises the backpressure path — the element's
     /// `try_alloc` returns `None`, its own signal to yield (spec: submission credits).
+    // Test-rig constructor (once per harness): boxes the element for the dyn-dispatch table.
+    #[allow(clippy::disallowed_methods)]
     pub fn with_pool(element: impl Element + 'static, slot_size: usize, max_slots: u32) -> Self {
         let element: Box<dyn Element> = Box::new(element);
         let desc = element.desc();
@@ -361,6 +363,8 @@ impl Harness {
     }
 
     /// Drain every message the element posted to the bus since the last call.
+    // Test-rig assertion helper (out-of-band, not the element hot path).
+    #[allow(clippy::disallowed_methods)]
     pub fn bus_messages(&mut self) -> Vec<BusMessage> {
         let mut out = Vec::new();
         while let Some(m) = self.bus.try_recv() {
@@ -376,6 +380,8 @@ impl Harness {
     }
 
     /// Every buffer currently staged on the primary src pad, FIFO, leaving it empty.
+    // Test-rig collection helper (assertion-side, not the element hot path).
+    #[allow(clippy::disallowed_methods)]
     pub fn drain_outputs(&mut self) -> Vec<Buffer> {
         let pad = self.primary_src_pad();
         let mut batch = self.ctx.take_output(pad);

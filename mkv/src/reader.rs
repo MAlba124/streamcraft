@@ -152,6 +152,10 @@ pub struct MatroskaReader {
     /// Bounded, so a stalled consumer cannot grow it without limit. Empty for consumers that
     /// don't recycle (probing, tests) — they simply keep allocating, which is still correct.
     free: Vec<Vec<u8>>,
+    /// Reused scratch for a laced block's per-frame sizes: `decode_block` clears and refills
+    /// this in place so a laced block (audio packing) allocates nothing per block. Unlaced
+    /// blocks (the common video/one-frame-per-block case) never touch it.
+    lace_sizes: Vec<usize>,
 }
 
 impl Default for MatroskaReader {
@@ -162,6 +166,8 @@ impl Default for MatroskaReader {
 
 impl MatroskaReader {
     /// A fresh reader awaiting the EBML Header.
+    // COLD: reader construction — empty reusable buffers/collections, filled as bytes arrive.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -175,6 +181,7 @@ impl MatroskaReader {
             cluster_base_tick: 0,
             pending: VecDeque::new(),
             free: Vec::new(),
+            lace_sizes: Vec::new(),
         }
     }
 
@@ -342,10 +349,24 @@ impl MatroskaReader {
             self.cluster_base_tick = read_uint(&self.buf[ds..de]) as i64;
         } else if id == id::SIMPLE_BLOCK {
             let (base, scale) = (self.cluster_base_tick, self.timestamp_scale);
-            decode_simple_block(&self.buf[ds..de], base, scale, &mut self.pending, &mut self.free)?;
+            decode_simple_block(
+                &self.buf[ds..de],
+                base,
+                scale,
+                &mut self.pending,
+                &mut self.free,
+                &mut self.lace_sizes,
+            )?;
         } else if id == id::BLOCK_GROUP {
             let (base, scale) = (self.cluster_base_tick, self.timestamp_scale);
-            decode_block_group(&self.buf[ds..de], base, scale, &mut self.pending, &mut self.free)?;
+            decode_block_group(
+                &self.buf[ds..de],
+                base,
+                scale,
+                &mut self.pending,
+                &mut self.free,
+                &mut self.lace_sizes,
+            )?;
         }
         // Any other element (EBML Header, Cues, Tags, Void, unknown) is skipped as opaque.
 
@@ -486,6 +507,8 @@ fn parse_info(data: &[u8]) -> Result<(Option<u64>, Option<f64>), ReadError> {
 }
 
 /// Parse the `Tracks` master into one [`Track`] per `TrackEntry` (spec `§ID-tree`).
+// COLD: once per stream — Tracks discovery, owns the per-track config.
+#[allow(clippy::disallowed_methods)]
 fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, ReadError> {
     let mut tracks = Vec::new();
     let mut at = 0;
@@ -505,6 +528,8 @@ fn parse_tracks(data: &[u8]) -> Result<Vec<Track>, ReadError> {
 
 /// Parse one `TrackEntry` master (spec `§ID-tree`) into a [`Track`]. Descends the nested
 /// `Audio` master for the audio params and the `Video` master for pixel dimensions.
+// COLD: once per track — owns the track's codec id / CodecPrivate.
+#[allow(clippy::disallowed_methods)]
 fn parse_track_entry(data: &[u8]) -> Result<Track, ReadError> {
     let mut track = Track {
         track_number: 0,
@@ -637,6 +662,7 @@ fn decode_block_group(
     scale: u64,
     out: &mut VecDeque<Frame>,
     free: &mut Vec<Vec<u8>>,
+    lace_buf: &mut Vec<usize>,
 ) -> Result<(), ReadError> {
     let mut at = 0;
     let mut has_reference = false;
@@ -664,7 +690,7 @@ fn decode_block_group(
         let duration_ns = duration_ticks.map(|t| t.saturating_mul(scale));
         // Keyframe status comes from the group (no ReferenceBlock => keyframe), not a flag in
         // the block body — pass it in.
-        decode_block(&data[s..e], !has_reference, cluster_base_tick, scale, duration_ns, out, free)?;
+        decode_block(&data[s..e], !has_reference, cluster_base_tick, scale, duration_ns, out, free, lace_buf)?;
     }
     Ok(())
 }
@@ -678,11 +704,12 @@ fn decode_simple_block(
     scale: u64,
     out: &mut VecDeque<Frame>,
     free: &mut Vec<Vec<u8>>,
+    lace_buf: &mut Vec<usize>,
 ) -> Result<(), ReadError> {
     let (_track, _rel, flags, _start) = parse_block_header(data)?;
     let keyframe = flags & 0x80 != 0;
     // A SimpleBlock has no BlockDuration (only a BlockGroup carries one) — duration unknown.
-    decode_block(data, keyframe, cluster_base_tick, scale, None, out, free)
+    decode_block(data, keyframe, cluster_base_tick, scale, None, out, free, lace_buf)
 }
 
 /// Decode a Block/SimpleBlock body with an already-decided `keyframe` (from the flags byte for
@@ -691,6 +718,8 @@ fn decode_simple_block(
 /// Parses the header, splits the lace, and pushes one [`Frame`] per laced frame into `out`. The
 /// block duration applies to the block as a whole; every laced frame carries it (a laced
 /// subtitle block is degenerate — the common single-cue case is unlaced anyway).
+// Threads the reader's reused pool/scratch buffers (`free`, `lace_buf`) for zero-alloc decode.
+#[allow(clippy::too_many_arguments)]
 fn decode_block(
     data: &[u8],
     keyframe: bool,
@@ -699,25 +728,29 @@ fn decode_block(
     duration_ns: Option<u64>,
     out: &mut VecDeque<Frame>,
     free: &mut Vec<Vec<u8>>,
+    lace_buf: &mut Vec<usize>,
 ) -> Result<(), ReadError> {
     let (track, rel_ts, flags, frames_start) = parse_block_header(data)?;
     let pts_ns = block_pts_ns(cluster_base_tick, rel_ts, scale);
     let lacing = (flags >> 1) & 0x03; // bits 0x06 → LACING (§10.1)
     let payload = data.get(frames_start..).ok_or(ReadError::Malformed("block payload truncated"))?;
-    let sizes = match lacing {
+    // The coded frame sizes fill `lace_buf` (reused, cleared here) so a laced block allocates
+    // nothing; `header` is the octet count of lacing metadata before the frame data.
+    lace_buf.clear();
+    let header = match lacing {
         0b00 => {
             // No lacing: the whole payload is one frame (RFC 9559 §10.3.1).
             push_frame(out, free, track, pts_ns, duration_ns, keyframe, payload);
             return Ok(());
         }
-        0b01 => xiph_lace_sizes(payload)?,
-        0b11 => ebml_lace_sizes(payload)?,
-        0b10 => fixed_lace_sizes(payload)?,
+        0b01 => xiph_lace_sizes(payload, lace_buf)?,
+        0b11 => ebml_lace_sizes(payload, lace_buf)?,
+        0b10 => fixed_lace_sizes(payload, lace_buf)?,
         _ => unreachable!("2-bit lacing field"),
     };
-    // `sizes.header` bytes of lacing metadata precede the frames; carve each frame out.
-    let mut off = sizes.header;
-    for &sz in &sizes.frames {
+    // `header` bytes of lacing metadata precede the frames; carve each frame out.
+    let mut off = header;
+    for &sz in lace_buf.iter() {
         let end = off.checked_add(sz).ok_or(ReadError::Malformed("laced frame size overflow"))?;
         let frame = payload.get(off..end).ok_or(ReadError::Malformed("laced frame runs past the block"))?;
         push_frame(out, free, track, pts_ns, duration_ns, keyframe, frame);
@@ -778,10 +811,9 @@ fn push_frame(
 /// Xiph lacing frame sizes (RFC 9559 §10.3.2): a 1-octet frame count minus one, then, for
 /// every frame but the last, its size coded as a run of `0xFF` octets summed with a final
 /// `< 0xFF` octet. Returns the coded sizes (all but the last frame) and the header length.
-fn xiph_lace_sizes(payload: &[u8]) -> Result<LaceSizes, ReadError> {
+fn xiph_lace_sizes(payload: &[u8], sizes: &mut Vec<usize>) -> Result<usize, ReadError> {
     let count_minus_one = *payload.first().ok_or(ReadError::Malformed("Xiph lace: missing frame count"))?;
     let n_coded = count_minus_one as usize; // sizes stored for all but the last frame
-    let mut sizes = Vec::with_capacity(n_coded);
     let mut at = 1usize;
     for _ in 0..n_coded {
         let mut sz = 0usize;
@@ -795,19 +827,19 @@ fn xiph_lace_sizes(payload: &[u8]) -> Result<LaceSizes, ReadError> {
         }
         sizes.push(sz);
     }
-    Ok(LaceSizes { header: at, frames: sizes })
+    Ok(at)
 }
 
 /// EBML lacing frame sizes (RFC 9559 §10.3.3): a 1-octet frame count minus one, the first
 /// frame size as an unsigned EBML VINT, then each subsequent size as a *signed* VINT delta
-/// from the previous size (bias `2^((7*n)-1) - 1`). Returns the coded sizes and header length.
-fn ebml_lace_sizes(payload: &[u8]) -> Result<LaceSizes, ReadError> {
+/// from the previous size (bias `2^((7*n)-1) - 1`). Fills `sizes` (all but the last frame) and
+/// returns the header length.
+fn ebml_lace_sizes(payload: &[u8], sizes: &mut Vec<usize>) -> Result<usize, ReadError> {
     let count_minus_one = *payload.first().ok_or(ReadError::Malformed("EBML lace: missing frame count"))?;
     let n_coded = count_minus_one as usize; // sizes stored for all but the last frame
-    let mut sizes = Vec::with_capacity(n_coded);
     let mut at = 1usize;
     if n_coded == 0 {
-        return Ok(LaceSizes { header: at, frames: sizes });
+        return Ok(at);
     }
     // First size: a plain unsigned VINT (its value is the frame length).
     let (first, len, _ao) = ebml::read_vint(payload, at)?;
@@ -826,13 +858,13 @@ fn ebml_lace_sizes(payload: &[u8]) -> Result<LaceSizes, ReadError> {
         sizes.push(prev as usize);
         at += len;
     }
-    Ok(LaceSizes { header: at, frames: sizes })
+    Ok(at)
 }
 
 /// Fixed-size lacing frame sizes (RFC 9559 §10.3.4): a 1-octet frame count minus one; no sizes
-/// are stored — every frame is `remaining / count` octets. Returns the sizes for all but the
-/// last frame (each the equal size) and the header length.
-fn fixed_lace_sizes(payload: &[u8]) -> Result<LaceSizes, ReadError> {
+/// are stored — every frame is `remaining / count` octets. Fills `sizes` for all but the last
+/// frame (each the equal size) and returns the header length.
+fn fixed_lace_sizes(payload: &[u8], sizes: &mut Vec<usize>) -> Result<usize, ReadError> {
     let count_minus_one = *payload.first().ok_or(ReadError::Malformed("fixed lace: missing frame count"))?;
     let count = count_minus_one as usize + 1;
     let body = payload.len() - 1; // frames follow the 1-octet header
@@ -841,16 +873,8 @@ fn fixed_lace_sizes(payload: &[u8]) -> Result<LaceSizes, ReadError> {
     }
     let each = body / count;
     // Sizes for all but the last frame; the caller derives the last from the remainder.
-    Ok(LaceSizes { header: 1, frames: vec![each; count - 1] })
-}
-
-/// The decoded lacing layout: how many header octets precede the frame data, and the sizes of
-/// every frame *except the last* (whose size the caller derives from the block remainder).
-struct LaceSizes {
-    /// Number of octets from the start of the block payload to the first frame's data.
-    header: usize,
-    /// Sizes of all frames but the last, in order.
-    frames: Vec<usize>,
+    sizes.extend(std::iter::repeat_n(each, count - 1));
+    Ok(1)
 }
 
 /// Find the first occurrence of `needle` in `hay`, returning its start offset. A tiny
@@ -1004,6 +1028,8 @@ fn seek_entry_cues_pos(data: &[u8]) -> Option<u64> {
 /// several CueTrackPositions (multi-track cues) contributes one entry per position; we take the
 /// first per CuePoint (they share the CueTime and, for the writer's single-cue-track output,
 /// there is exactly one). Never panics.
+// COLD: once per stream — builds the seek index from the Cues element.
+#[allow(clippy::disallowed_methods)]
 pub fn parse_cues(
     cues_bytes: &[u8],
     segment_data_start: u64,

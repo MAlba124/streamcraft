@@ -197,7 +197,10 @@ impl ChannelResampler {
     /// retained, so calling this repeatedly on consecutive chunks yields exactly the same
     /// samples as one call on the concatenation (proven in the streaming test). Returns the
     /// number of output samples appended this call.
-    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) -> usize {
+    ///
+    /// `out` is generic over its allocator so the element can accumulate straight into a
+    /// per-`process()` arena (`ctx.scratch()`) — see `resample_element`.
+    pub fn process<A: std::alloc::Allocator>(&mut self, input: &[f32], out: &mut Vec<f32, A>) -> usize {
         let l = self.filter.l;
         let m = self.filter.m;
         let tpp = self.filter.taps_per_phase;

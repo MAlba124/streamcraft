@@ -28,6 +28,7 @@ fn main() {
     let mut wrote_head = false;
     let mut frames = 0usize;
     let mut dropped = 0usize;
+    let mut reframe_buf: Vec<u8> = Vec::new();
 
     'outer: loop {
         let n = file.read(&mut chunk).expect("read");
@@ -77,9 +78,9 @@ fn main() {
                 };
                 reframer = Some(rf);
             }
-            match reframer.as_ref().unwrap().reframe_block(&frame.data) {
+            match reframer.as_ref().unwrap().reframe_into(&frame.data, &mut reframe_buf) {
                 Ok(bytes) => {
-                    out.write_all(&bytes).unwrap();
+                    out.write_all(bytes).unwrap();
                     frames += 1;
                 }
                 Err(e) => {

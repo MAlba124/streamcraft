@@ -203,6 +203,8 @@ static MUXN_PADS: [PadDesc; MAX_TRACKS + 1] = [
     },
 ];
 
+// COLD: make_default boxes the element once at construction (descriptor factory).
+#[allow(clippy::disallowed_methods)]
 static MUXN_DESC: ElementDesc = ElementDesc {
     name: "mkvmuxn",
     pads: &MUXN_PADS,
@@ -322,6 +324,8 @@ impl Default for MkvMuxN {
 
 impl MkvMuxN {
     /// A multi-track muxer for however many sink pads the app links (at least one).
+    // COLD: element construction — the empty lane vec fills at link/preroll time.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             expect: None,
@@ -607,6 +611,8 @@ impl MkvMuxN {
                 // First buffer = the raw config record, verbatim (RFC 9559 §12).
                 // configurationVersion is 1 for avcC and hvcC both — a cheap guard
                 // against being fed sample data first.
+                // COLD: once per lane — owns the CodecPrivate record; the lane then goes Ready.
+                #[allow(clippy::disallowed_methods)]
                 let head = buf.memory.data().to_vec();
                 if head.first() != Some(&1) {
                     return Err(Error::Todo(
@@ -626,6 +632,8 @@ impl MkvMuxN {
                 // First buffer = the raw AudioSpecificConfig (ISO/IEC 14496-3 §1.6.2.1):
                 // ≥ 2 octets (5-bit audioObjectType + 4-bit samplingFrequencyIndex +
                 // 4-bit channelConfiguration = 13 bits minimum).
+                // COLD: once per lane — owns the AudioSpecificConfig; the lane then goes Ready.
+                #[allow(clippy::disallowed_methods)]
                 let head = buf.memory.data().to_vec();
                 if head.len() < 2 {
                     return Err(Error::Todo(
@@ -795,6 +803,8 @@ impl MkvMuxN {
     /// Handle a runtime format announcement: attribute it to a pad (see the module docs
     /// — the scheduler installed it on the arrival pad's negotiated slot before this
     /// call), then run the family dispatch `MkvMux::from_caps` runs, per pad.
+    // COLD: once per lane — caps-driven track-config assembly (family name + codec id owned).
+    #[allow(clippy::disallowed_methods)]
     fn on_format_change(&mut self, ctx: &mut Ctx, f: &FixedFormat) -> Result<(), Error> {
         let matches = |l: &Lane| ctx.negotiated(l.pad).is_some_and(|g| fixed_eq(g, f));
         let Some(idx) = self
@@ -907,6 +917,8 @@ impl Element for MkvMuxN {
         &MUXN_DESC
     }
 
+    // COLD: once at start — linked-pad discovery + lane setup (error string owned on failure).
+    #[allow(clippy::disallowed_methods)]
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         // Discover the linked sink pads: a linked pad carries a link-time negotiated
         // format, an unlinked one carries none (see the module docs for why the pad set
