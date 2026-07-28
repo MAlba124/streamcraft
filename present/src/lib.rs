@@ -23,4 +23,6 @@
 
 pub mod conn;
 pub mod protocol;
+pub mod raster;
+pub mod window;
 pub mod wire;

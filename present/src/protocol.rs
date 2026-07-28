@@ -106,7 +106,26 @@ pub mod seat {
 }
 
 /// `zwp_linux_dmabuf_v1` — imports a VA-API decode surface's dmabuf as a `wl_buffer` (zero-copy
-/// video). Wired in Phase 2.
+/// video).
 pub mod dmabuf {
     pub const NAME: &str = "zwp_linux_dmabuf_v1";
+    pub const CREATE_PARAMS: u16 = 1; // -> new_id zwp_linux_buffer_params_v1
+}
+
+/// `zwp_linux_buffer_params_v1` — accumulates dmabuf planes, then mints a `wl_buffer`.
+pub mod dmabuf_params {
+    pub const DESTROY: u16 = 0;
+    /// `add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo)`.
+    pub const ADD: u16 = 1;
+    /// `create_immed(new_id buffer, width, height, format, flags)` — synchronous (no
+    /// `created`/`failed` round-trip); available since interface version 2.
+    pub const CREATE_IMMED: u16 = 3;
+    pub const EV_CREATED: u16 = 0; // buffer  (async `create` path — unused)
+    pub const EV_FAILED: u16 = 1;
+}
+
+/// DRM FourCC + flag constants for the dmabuf import (matches `<drm_fourcc.h>`).
+pub mod drm {
+    /// `DRM_FORMAT_MOD_INVALID` — "no explicit modifier"; the importer omits the modifier hint.
+    pub const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 }
