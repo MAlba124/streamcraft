@@ -67,8 +67,17 @@ pub struct Window {
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
+    /// The video `wl_surface` + its `wl_subsurface` under the root (the root is a black
+    /// letterbox background; the video is centered + aspect-scaled on top). Created lazily on
+    /// the first dmabuf frame when the compositor has `wl_subcompositor`; otherwise the video
+    /// falls back to the root surface (stretched to the window).
+    video_surface: u32,
+    video_subsurface: u32,
     /// The video surface's `wp_viewport` (crop+scale), created lazily on the first dmabuf frame.
     viewport: u32,
+    /// The window size the black background was last rendered at (re-render on resize).
+    bg_w: i32,
+    bg_h: i32,
     /// The GUI overlay `wl_surface` + its `wl_subsurface` over the video (created lazily on the
     /// first [`present_gui`](Self::present_gui)); the compositor blends it above the video.
     gui_surface: u32,
@@ -152,7 +161,11 @@ impl Window {
             subcompositor: 0,
             seat: 0,
             keyboard: 0,
+            video_surface: 0,
+            video_subsurface: 0,
             viewport: 0,
+            bg_w: 0,
+            bg_h: 0,
             gui_surface: 0,
             gui_subsurface: 0,
             width,
@@ -308,17 +321,76 @@ impl Window {
         Ok(ShmBuffer { buffer, fd, map_addr: map as usize, size, width: w, height: h, busy: false })
     }
 
-    /// Present a zero-copy dmabuf video frame: import its planes as a `wl_buffer`
-    /// (`zwp_linux_dmabuf`), crop the coded surface to the display rect and scale it to the
-    /// window (`wp_viewport`), then attach + commit. The `wl_buffer` is destroyed when the
-    /// compositor releases it (tracked in `dmabuf_inflight`), so the decoder's surface stays
-    /// pinned exactly until the compositor is done sampling it. Requires the compositor to
-    /// expose `zwp_linux_dmabuf_v1` (checked) — [`has_dmabuf`](Self::has_dmabuf).
+    /// Present a zero-copy dmabuf video frame. With `wl_subcompositor` + `wp_viewporter` the
+    /// video rides a **subsurface centered + aspect-scaled over a black root** (proper
+    /// letterbox); otherwise it takes the root surface stretched to the window. The imported
+    /// `wl_buffer` is destroyed when the compositor releases it (`dmabuf_inflight`), pinning the
+    /// decoder's surface exactly until the compositor is done sampling it. Requires
+    /// `zwp_linux_dmabuf_v1` — [`has_dmabuf`](Self::has_dmabuf).
     pub fn present_dmabuf(&mut self, v: &DmabufVideo<'_>) -> io::Result<()> {
         if self.dmabuf == 0 {
             return Err(io::Error::other("compositor lacks zwp_linux_dmabuf_v1"));
         }
-        // Accumulate the planes into a params object, then mint the buffer synchronously.
+        let use_sub = self.subcompositor != 0 && self.viewporter != 0;
+        let target = if use_sub {
+            self.ensure_video_subsurface();
+            self.video_surface
+        } else {
+            self.surface
+        };
+
+        let buffer = self.import_dmabuf(v)?;
+
+        // Fit rect: aspect-preserving letterbox into the window (subsurface path), else stretch.
+        let (win_w, win_h) = (self.width.max(1), self.height.max(1));
+        let (fit_x, fit_y, fit_w, fit_h) = if use_sub {
+            letterbox(v.disp_w.max(1), v.disp_h.max(1), win_w, win_h)
+        } else {
+            (0, 0, win_w, win_h)
+        };
+
+        // Crop the coded surface to the display rect and scale it to the fit size.
+        self.ensure_viewport(target);
+        if self.viewport != 0 {
+            self.conn
+                .request(self.viewport, p::viewport::SET_SOURCE)
+                .fixed(fx(v.crop_x))
+                .fixed(fx(v.crop_y))
+                .fixed(fx(v.disp_w))
+                .fixed(fx(v.disp_h))
+                .finish();
+            self.conn
+                .request(self.viewport, p::viewport::SET_DESTINATION)
+                .i32(fit_w.max(1))
+                .i32(fit_h.max(1))
+                .finish();
+        }
+        self.conn.request(target, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        self.conn
+            .request(target, p::surface::DAMAGE_BUFFER)
+            .i32(0)
+            .i32(0)
+            .i32(v.coded_w)
+            .i32(v.coded_h)
+            .finish();
+        self.conn.request(target, p::surface::COMMIT).finish();
+        self.dmabuf_inflight.push(buffer);
+
+        // First frame / resize: (re)paint the black background + (re)position the video
+        // subsurface, then commit the root to apply the placement (and map it all together).
+        if use_sub && (self.bg_w != win_w || self.bg_h != win_h) {
+            self.render_background(win_w, win_h)?;
+            let sub = self.video_subsurface;
+            self.conn.request(sub, p::subsurface::SET_POSITION).i32(fit_x).i32(fit_y).finish();
+            self.conn.request(self.surface, p::surface::COMMIT).finish();
+            self.bg_w = win_w;
+            self.bg_h = win_h;
+        }
+        self.conn.flush()
+    }
+
+    /// Import a dmabuf frame's planes as a `wl_buffer` (synchronous `create_immed`).
+    fn import_dmabuf(&mut self, v: &DmabufVideo<'_>) -> io::Result<u32> {
         let params = self.conn.alloc_id();
         self.conn.request(self.dmabuf, p::dmabuf::CREATE_PARAMS).u32(params).finish();
         let mod_hi = (v.drm_modifier >> 32) as u32;
@@ -345,34 +417,48 @@ impl Window {
             .u32(0) // flags: no y-invert / interlace
             .finish();
         self.conn.request(params, p::dmabuf_params::DESTROY).finish();
+        Ok(buffer)
+    }
 
-        // Crop the coded surface to the (cropped) display rect and scale it to the window.
-        self.ensure_viewport();
-        if self.viewport != 0 {
-            self.conn
-                .request(self.viewport, p::viewport::SET_SOURCE)
-                .fixed(fx(v.crop_x))
-                .fixed(fx(v.crop_y))
-                .fixed(fx(v.disp_w))
-                .fixed(fx(v.disp_h))
-                .finish();
-            self.conn
-                .request(self.viewport, p::viewport::SET_DESTINATION)
-                .i32(self.width.max(1))
-                .i32(self.height.max(1))
-                .finish();
+    /// Paint the root surface opaque black (the letterbox background) with a recycled
+    /// window-sized shm buffer. The caller commits the root (to also apply subsurface placement).
+    fn render_background(&mut self, w: i32, h: i32) -> io::Result<()> {
+        let idx = self.acquire(w, h)?;
+        {
+            let b = &mut self.pool[idx];
+            let stride = (b.width * 4) as u32;
+            let (bw, bh) = (b.width as u32, b.height as u32);
+            let mut c = Canvas::new(b.pixels(), bw, bh, stride);
+            c.clear(0xff00_0000); // opaque black
         }
-        self.conn.request(self.surface, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        let (buffer, bw, bh) = {
+            let b = &self.pool[idx];
+            (b.buffer, b.width, b.height)
+        };
+        self.pool[idx].busy = true;
+        let root = self.surface;
+        self.conn.request(root, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        self.conn.request(root, p::surface::DAMAGE_BUFFER).i32(0).i32(0).i32(bw).i32(bh).finish();
+        Ok(())
+    }
+
+    /// Lazily create the video `wl_surface` + its `wl_subsurface` under the root, once. The
+    /// video subsurface is created before any GUI subsurface, so the GUI stacks above it.
+    fn ensure_video_subsurface(&mut self) {
+        if self.video_subsurface != 0 || self.subcompositor == 0 {
+            return;
+        }
+        self.video_surface = self.conn.alloc_id();
+        self.conn.request(self.compositor, p::compositor::CREATE_SURFACE).u32(self.video_surface).finish();
+        self.video_subsurface = self.conn.alloc_id();
+        let (sub, vs, parent) = (self.video_subsurface, self.video_surface, self.surface);
         self.conn
-            .request(self.surface, p::surface::DAMAGE_BUFFER)
-            .i32(0)
-            .i32(0)
-            .i32(v.coded_w)
-            .i32(v.coded_h)
+            .request(self.subcompositor, p::subcompositor::GET_SUBSURFACE)
+            .u32(sub)
+            .object(vs)
+            .object(parent)
             .finish();
-        self.conn.request(self.surface, p::surface::COMMIT).finish();
-        self.dmabuf_inflight.push(buffer);
-        self.conn.flush()
+        self.conn.request(sub, p::subsurface::SET_DESYNC).finish();
     }
 
     /// Whether the compositor can import dmabuf video (else the caller must fall back to shm).
@@ -380,12 +466,12 @@ impl Window {
         self.dmabuf != 0
     }
 
-    /// Lazily create the video surface's `wp_viewport` (once), if the compositor has viewporter.
-    fn ensure_viewport(&mut self) {
+    /// Lazily create `surface`'s `wp_viewport` (once), if the compositor has viewporter.
+    fn ensure_viewport(&mut self, surface: u32) {
         if self.viewport == 0 && self.viewporter != 0 {
             self.viewport = self.conn.alloc_id();
-            let (vp, surf) = (self.viewport, self.surface);
-            self.conn.request(self.viewporter, p::viewporter::GET_VIEWPORT).u32(vp).object(surf).finish();
+            let vp = self.viewport;
+            self.conn.request(self.viewporter, p::viewporter::GET_VIEWPORT).u32(vp).object(surface).finish();
         }
     }
 
@@ -565,6 +651,17 @@ pub struct DmabufVideo<'a> {
 /// Integer → `wl_fixed` (24.8) for the viewport source rect.
 fn fx(n: i32) -> crate::wire::Fixed {
     crate::wire::Fixed::from_int(n)
+}
+
+/// Aspect-preserving fit of a `vw×vh` video into a `ww×wh` window: the centered `(x, y, w, h)`
+/// destination rect, black-barred on the short axis. Integer cross-multiply (no float).
+fn letterbox(vw: i32, vh: i32, ww: i32, wh: i32) -> (i32, i32, i32, i32) {
+    let (fw, fh) = if ww * vh >= wh * vw {
+        (vw * wh / vh, wh) // window at least as wide as the video AR → fit to height
+    } else {
+        (ww, vh * ww / vw) // window taller → fit to width
+    };
+    ((ww - fw) / 2, (wh - fh) / 2, fw, fh)
 }
 
 fn miss(iface: &str) -> io::Error {
