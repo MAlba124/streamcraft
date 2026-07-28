@@ -28,6 +28,7 @@ members = [
     "mp3",
     "mp4",
     "sdl3",
+    "present",
     "vaapi",
     "rtp",
     "rtsp",

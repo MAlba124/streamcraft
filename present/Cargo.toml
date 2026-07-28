@@ -1,0 +1,23 @@
+[package]
+name = "sc-present"
+description = "Minimal raw-wire Wayland presenter for streamcraft — zero per-frame allocation, dmabuf video + software-rendered GUI subsurfaces (no libwayland, no SDL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sc_present"
+
+[dependencies]
+streamcraft-core = { path = "../core" }
+# The Wayland wire protocol is spoken directly over the display socket to avoid
+# libwayland-client's per-message `wl_closure` heap allocation (the whole reason
+# this crate exists). `libc` is only for the socket syscalls + `SCM_RIGHTS` fd
+# passing (`sendmsg`/`recvmsg` with control messages) that `std::os::unix` does
+# not expose; no protocol logic lives in it.
+libc = "0.2"
+
+[[example]]
+name = "wl_spike"
+path = "examples/wl_spike.rs"
