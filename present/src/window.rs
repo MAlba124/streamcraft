@@ -19,7 +19,11 @@ use crate::raster::Canvas;
 struct ShmBuffer {
     buffer: u32,
     fd: RawFd,
-    map: *mut u8,
+    /// The mmap base as an integer address (not a raw pointer) so `ShmBuffer` — and thus the
+    /// `Window` and the sink element — stays `Send`: the mapping is only ever touched from the
+    /// single thread that owns the `Window`, so passing the address across the element's move
+    /// to its scheduler thread is sound.
+    map_addr: usize,
     size: usize,
     width: i32,
     height: i32,
@@ -30,8 +34,10 @@ struct ShmBuffer {
 impl ShmBuffer {
     /// The pixel bytes as a mutable slice (ARGB8888, `width*4` stride).
     fn pixels(&mut self) -> &mut [u8] {
-        // SAFETY: `map` addresses `size` writable bytes for this buffer's lifetime.
-        unsafe { std::slice::from_raw_parts_mut(self.map, self.size) }
+        // SAFETY: `map_addr` is our mapping's base, valid+writable for `size` bytes for this
+        // buffer's lifetime, and this `&mut self` is the sole access (the compositor only reads
+        // it while `busy`, between commit and release).
+        unsafe { std::slice::from_raw_parts_mut(self.map_addr as *mut u8, self.size) }
     }
 }
 
@@ -39,7 +45,7 @@ impl Drop for ShmBuffer {
     fn drop(&mut self) {
         // SAFETY: our mapping + owned fd, released exactly once.
         unsafe {
-            libc::munmap(self.map as *mut libc::c_void, self.size);
+            libc::munmap(self.map_addr as *mut libc::c_void, self.size);
             libc::close(self.fd);
         }
     }
@@ -53,10 +59,13 @@ pub struct Window {
     shm: u32,
     wm_base: u32,
     dmabuf: u32,
+    viewporter: u32,
     // Window objects.
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
+    /// The video surface's `wp_viewport` (crop+scale), created lazily on the first dmabuf frame.
+    viewport: u32,
     // Geometry (compositor-configured; falls back to the requested default until then).
     width: i32,
     height: i32,
@@ -132,6 +141,8 @@ impl Window {
             shm: 0,
             wm_base: 0,
             dmabuf: 0,
+            viewporter: 0,
+            viewport: 0,
             width,
             height,
             configured: false,
@@ -169,6 +180,14 @@ impl Window {
                 .request(registry, p::registry::BIND)
                 .u32(dname)
                 .bind_new_id(p::dmabuf::NAME, dver.min(4), w.dmabuf)
+                .finish();
+        }
+        if let Some((vname, vver)) = find(p::viewporter::NAME) {
+            w.viewporter = w.conn.alloc_id();
+            w.conn
+                .request(registry, p::registry::BIND)
+                .u32(vname)
+                .bind_new_id(p::viewporter::NAME, vver.min(1), w.viewporter)
                 .finish();
         }
 
@@ -258,7 +277,88 @@ impl Window {
         // The buffer holds its own reference to the mmap'd memory, so the pool object can go
         // now (spec: wl_shm_pool.destroy) — frees the id, keeps the buffer valid.
         self.conn.request(pool, p::shm_pool::DESTROY).finish();
-        Ok(ShmBuffer { buffer, fd, map: map as *mut u8, size, width: w, height: h, busy: false })
+        Ok(ShmBuffer { buffer, fd, map_addr: map as usize, size, width: w, height: h, busy: false })
+    }
+
+    /// Present a zero-copy dmabuf video frame: import its planes as a `wl_buffer`
+    /// (`zwp_linux_dmabuf`), crop the coded surface to the display rect and scale it to the
+    /// window (`wp_viewport`), then attach + commit. The `wl_buffer` is destroyed when the
+    /// compositor releases it (tracked in `dmabuf_inflight`), so the decoder's surface stays
+    /// pinned exactly until the compositor is done sampling it. Requires the compositor to
+    /// expose `zwp_linux_dmabuf_v1` (checked) — [`has_dmabuf`](Self::has_dmabuf).
+    pub fn present_dmabuf(&mut self, v: &DmabufVideo<'_>) -> io::Result<()> {
+        if self.dmabuf == 0 {
+            return Err(io::Error::other("compositor lacks zwp_linux_dmabuf_v1"));
+        }
+        // Accumulate the planes into a params object, then mint the buffer synchronously.
+        let params = self.conn.alloc_id();
+        self.conn.request(self.dmabuf, p::dmabuf::CREATE_PARAMS).u32(params).finish();
+        let mod_hi = (v.drm_modifier >> 32) as u32;
+        let mod_lo = v.drm_modifier as u32;
+        for (i, pl) in v.planes.iter().enumerate() {
+            let fd = v.fds[pl.object_index as usize];
+            self.conn
+                .request(params, p::dmabuf_params::ADD)
+                .fd(fd)
+                .u32(i as u32)
+                .u32(pl.offset)
+                .u32(pl.pitch)
+                .u32(mod_hi)
+                .u32(mod_lo)
+                .finish();
+        }
+        let buffer = self.conn.alloc_id();
+        self.conn
+            .request(params, p::dmabuf_params::CREATE_IMMED)
+            .u32(buffer)
+            .i32(v.coded_w)
+            .i32(v.coded_h)
+            .u32(v.drm_format)
+            .u32(0) // flags: no y-invert / interlace
+            .finish();
+        self.conn.request(params, p::dmabuf_params::DESTROY).finish();
+
+        // Crop the coded surface to the (cropped) display rect and scale it to the window.
+        self.ensure_viewport();
+        if self.viewport != 0 {
+            self.conn
+                .request(self.viewport, p::viewport::SET_SOURCE)
+                .fixed(fx(v.crop_x))
+                .fixed(fx(v.crop_y))
+                .fixed(fx(v.disp_w))
+                .fixed(fx(v.disp_h))
+                .finish();
+            self.conn
+                .request(self.viewport, p::viewport::SET_DESTINATION)
+                .i32(self.width.max(1))
+                .i32(self.height.max(1))
+                .finish();
+        }
+        self.conn.request(self.surface, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        self.conn
+            .request(self.surface, p::surface::DAMAGE_BUFFER)
+            .i32(0)
+            .i32(0)
+            .i32(v.coded_w)
+            .i32(v.coded_h)
+            .finish();
+        self.conn.request(self.surface, p::surface::COMMIT).finish();
+        self.dmabuf_inflight.push(buffer);
+        self.conn.flush()
+    }
+
+    /// Whether the compositor can import dmabuf video (else the caller must fall back to shm).
+    pub fn has_dmabuf(&self) -> bool {
+        self.dmabuf != 0
+    }
+
+    /// Lazily create the video surface's `wp_viewport` (once), if the compositor has viewporter.
+    fn ensure_viewport(&mut self) {
+        if self.viewport == 0 && self.viewporter != 0 {
+            self.viewport = self.conn.alloc_id();
+            let (vp, surf) = (self.viewport, self.surface);
+            self.conn.request(self.viewporter, p::viewporter::GET_VIEWPORT).u32(vp).object(surf).finish();
+        }
     }
 
     /// Pump the socket once and dispatch pending events (configure/ping/close/release). When
@@ -312,22 +412,44 @@ impl Window {
         Ok(())
     }
 
-    /// Mutable access to the raw connection (for the video path to mint dmabuf buffers).
-    pub fn conn(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
+}
 
-    /// The bound `zwp_linux_dmabuf_v1` id (0 if the compositor lacks it), the video surface id,
-    /// and a slot to register an in-flight dmabuf buffer for release-driven destroy.
-    pub fn dmabuf_global(&self) -> u32 {
-        self.dmabuf
-    }
-    pub fn video_surface(&self) -> u32 {
-        self.surface
-    }
-    pub fn register_dmabuf_inflight(&mut self, buffer: u32) {
-        self.dmabuf_inflight.push(buffer);
-    }
+/// One dmabuf plane's geometry (mirrors `sc_vaapi::va::ExportedPlane`, kept local so the
+/// presenter core does not depend on the VA-API crate — the sink maps `GpuFrame` into these).
+#[derive(Clone, Copy)]
+pub struct Plane {
+    /// Index into [`DmabufVideo::fds`] — which dmabuf object holds this plane.
+    pub object_index: u32,
+    /// Byte offset of the plane's first row within that object.
+    pub offset: u32,
+    /// Row stride in bytes.
+    pub pitch: u32,
+}
+
+/// A zero-copy video frame to import via `zwp_linux_dmabuf` — the decoded VA surface's dmabuf
+/// fds + plane layout + DRM format/modifier + the coded/crop/display geometry.
+pub struct DmabufVideo<'a> {
+    /// The dup'd dmabuf fds (one per object); still owned by the caller (the sink closes them
+    /// after this call — the compositor holds its own references once the buffer is created).
+    pub fds: &'a [RawFd],
+    pub planes: &'a [Plane],
+    /// DRM FourCC (e.g. `DRM_FORMAT_NV12`).
+    pub drm_format: u32,
+    /// DRM format modifier (`DRM_FORMAT_MOD_INVALID` when none).
+    pub drm_modifier: u64,
+    /// Coded (allocation) size — the dmabuf plane geometry.
+    pub coded_w: i32,
+    pub coded_h: i32,
+    /// Crop origin + display (cropped) size within the coded surface (the viewport source).
+    pub crop_x: i32,
+    pub crop_y: i32,
+    pub disp_w: i32,
+    pub disp_h: i32,
+}
+
+/// Integer → `wl_fixed` (24.8) for the viewport source rect.
+fn fx(n: i32) -> crate::wire::Fixed {
+    crate::wire::Fixed::from_int(n)
 }
 
 fn miss(iface: &str) -> io::Error {

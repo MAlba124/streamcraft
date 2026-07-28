@@ -124,6 +124,19 @@ pub mod dmabuf_params {
     pub const EV_FAILED: u16 = 1;
 }
 
+/// `wp_viewporter` / `wp_viewport` — crops (the coded surface → the display rect) and scales
+/// (→ the window size), so a padded NV12 decode surface displays correctly.
+pub mod viewporter {
+    pub const NAME: &str = "wp_viewporter";
+    pub const GET_VIEWPORT: u16 = 1; // new_id, surface
+}
+pub mod viewport {
+    /// `set_source(x, y, width, height)` — all `wl_fixed` (crop rect in surface coords).
+    pub const SET_SOURCE: u16 = 1;
+    /// `set_destination(width, height)` — integers (the on-screen size).
+    pub const SET_DESTINATION: u16 = 2;
+}
+
 /// DRM FourCC + flag constants for the dmabuf import (matches `<drm_fourcc.h>`).
 pub mod drm {
     /// `DRM_FORMAT_MOD_INVALID` — "no explicit modifier"; the importer omits the modifier hint.
