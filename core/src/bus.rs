@@ -256,6 +256,8 @@ impl Bus {
 
     /// A bus bounded at `capacity` droppable+critical messages. `capacity` is clamped to
     /// at least 1 so a critical message always has somewhere to land.
+    // Cold: one-time bus construction; the introspect taps Vec is created once here.
+    #[allow(clippy::disallowed_methods)]
     pub fn channel_with_capacity(capacity: usize) -> (BusSender, Bus) {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {

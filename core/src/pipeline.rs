@@ -1956,6 +1956,8 @@ impl Pipeline {
     /// filters are empty here (logging is wired at `run()`); `run()` republishes the
     /// handles with the real filters and the topology with dynamic pads.
     #[cfg(feature = "introspect")]
+    // Cold: builds the introspect server's shared state once at attach, not per media buffer.
+    #[allow(clippy::disallowed_methods)]
     fn build_introspect_shared(&self) -> Arc<crate::introspect::IntrospectShared> {
         use crate::introspect::server::{Handles, IntrospectShared};
         let snap = self.introspect_snapshot();
@@ -2111,6 +2113,9 @@ impl Pipeline {
     /// `topo_order`/`compute_groups`/`latency_report`/`dump_dot`. Callable before or
     /// after `run()`; the caller republishes it after preroll so dynamic pads are shown.
     #[cfg(feature = "introspect")]
+    // Cold: owned topology image built on client poll/attach (interned ids resolved to owned
+    // strings here), never on the per-media-frame hot path — one snapshot per diagnostic poll.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn introspect_snapshot(&self) -> crate::introspect::snapshot::TopologySnapshot {
         use crate::introspect::snapshot::{
             SnapEdge, SnapElement, SnapField, SnapLatencyPath, SnapPad, SnapProp, SnapValue,
@@ -2308,6 +2313,8 @@ impl Default for Pipeline {
 /// Set⇒len). `resolve` names a categorical value id. Kept out of `format.rs` (which is
 /// dep-free and feature-agnostic) so the wire shape lives with the protocol.
 #[cfg(feature = "introspect")]
+// Cold: flattens a prop constraint for one Props reply row during a diagnostic snapshot.
+#[allow(clippy::disallowed_methods)]
 fn constraint_to_snap(
     c: &crate::format::Constraint,
     resolve: impl Fn(u32) -> String,

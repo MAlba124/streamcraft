@@ -40,7 +40,8 @@ disallowed-methods = [
     # error this catches — move it to `ctx.scratch()`/the pool.
     { path = "std::vec::Vec::new", reason = "hot path allocates from ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
     { path = "std::vec::Vec::with_capacity", reason = "hot path allocates from ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
-    { path = "std::vec::Vec::from", reason = "hot path allocates from ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
+    # (`Vec::from` has no single reachable def-path clippy resolves — its heap allocation is
+    #  caught via the `From`/`to_vec`/`with_capacity` it lowers to, so it is not listed here.)
     { path = "slice::to_vec", reason = "hot path copies into ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
     { path = "std::borrow::ToOwned::to_owned", reason = "hot path copies into ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
     { path = "std::string::ToString::to_string", reason = "hot path avoids heap strings; one-time setup #[allow]s with a justification" },

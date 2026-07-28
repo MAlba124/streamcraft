@@ -233,6 +233,8 @@ impl Default for LogTapRegistry {
 }
 
 impl LogTapRegistry {
+    // Cold: one-time registry construction (the empty subs Vec), not per media buffer.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             nsubs: AtomicUsize::new(0),

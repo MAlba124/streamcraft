@@ -18,6 +18,10 @@
 //! grows additively (new frame kinds; new fields appended to a row, lengthening
 //! `row_size`). Clients gate on `ver_major` and walk tables by the server's stride.
 
+// Cold diagnostic serializer: runs on client poll/attach, never on the per-media-frame
+// hot path — these Vec/to_vec allocations build one wire frame per request.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{self, Read};
 
 /// Wire protocol major version (breaking; never intended to change).

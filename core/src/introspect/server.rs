@@ -13,6 +13,11 @@
 //! [`TopologySnapshot`], live [`Handles`], the [`LogTapRegistry`], and the bus tap
 //! port — the server never touches the pipeline's interners or streaming threads.
 
+// Entirely the diagnostic introspection server (opt-in, one thread per ~1-2 clients):
+// allocations and blocking reactor-free IO here run on client poll/attach, never on the
+// per-media-frame hot path. Zero cost unattached.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};

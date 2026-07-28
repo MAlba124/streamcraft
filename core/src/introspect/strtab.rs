@@ -10,6 +10,10 @@
 //! string) fall back to a **content** key so equal contents dedup. The two key spaces
 //! never collide: a static key is `(ptr, len)`, a content key is the owned bytes.
 
+// Cold diagnostic path: this per-connection interner lives on the client thread and
+// allocates only while serializing a snapshot to a poll/attach, not per media buffer.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 
 /// A key that distinguishes a `&'static str` (by address) from an owned string (by
