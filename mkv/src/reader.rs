@@ -277,7 +277,17 @@ impl MatroskaReader {
             return Ok(false);
         }
         let header = ebml::read_element_header(&self.buf, self.pos)?;
-        let id = header.id.to_vec();
+        // Stack-copy the (≤4-octet) EBML ID so the value outlives `header`'s borrow of
+        // `self.buf` without a per-element heap `Vec` (this runs for *every* element — the
+        // single hottest allocation site in the demux). EBML IDs are 1–4 octets (RFC 8794
+        // §5, EBMLMaxIDLength default 4); a longer one is malformed here.
+        let mut id_buf = [0u8; 4];
+        let id_len = header.id.len();
+        if id_len > id_buf.len() {
+            return Err(ReadError::Malformed("EBML ID longer than 4 octets"));
+        }
+        id_buf[..id_len].copy_from_slice(header.id);
+        let id = &id_buf[..id_len];
         let hdr_end = header.data_start;
 
         // Descend into the two streamed (unknown-size) masters incrementally: consume just
