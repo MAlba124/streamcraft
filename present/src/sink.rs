@@ -26,7 +26,7 @@ use streamcraft_core::log;
 use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
-use sc_text::pgs;
+use sc_text::{font, pgs};
 use sc_vaapi::gpuframe::{GpuFrame, GpuFrameChannel, GpuFrameHeader, GPU_OFFER};
 
 use crate::raster::Canvas;
@@ -218,7 +218,8 @@ impl WaylandVideoSink {
                         }
                         if w.has_gui() && n % 6 == 0 {
                             let (ww, wh) = w.size();
-                            let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, n));
+                            let secs = pts.nanos().unwrap_or(0) / 1_000_000_000;
+                            let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, secs));
                         }
                         match subtitle.as_ref().filter(|c| pts >= c.start && pts < c.end) {
                             Some(c) => {
@@ -310,18 +311,42 @@ impl WaylandVideoSink {
 /// The control-bar overlay height in px.
 const BAR_H: i32 = 40;
 
-/// Draw the GUI overlay (a translucent control bar with a brand mark + a moving position line)
-/// into `c` — a `width×BAR_H` ARGB canvas, `0` alpha where the video should show through. The
-/// compositor blends this `wl_subsurface` over the video; this is the seam where the scope UI /
-/// player controls land (immediate-mode `Canvas` calls, no GPU).
-fn draw_controls(c: &mut Canvas, width: i32, frame: u64) {
+/// Draw the player HUD control bar into `c` — a `width×BAR_H` ARGB canvas, `0` alpha where the
+/// video shows through. Anti-aliased shapes + text (the compositor blends this `wl_subsurface`
+/// over the video, no GPU). This is the seam where the full scope UI / controls land; today it
+/// carries the play state, the elapsed time, and a timeline rail (seek head lands here once
+/// duration + seek plumbing is wired).
+fn draw_controls(c: &mut Canvas, width: i32, elapsed_secs: u64) {
+    const ACCENT: u32 = 0xff30_ffa0; // streamcraft green
+    const INK: u32 = 0xffe6_edf5;
     c.clear(0); // fully transparent — video shows through everywhere we don't draw
     c.blend_rect(0, 0, width, BAR_H, 0xd010_1822); // translucent dark bar
-    // Brand mark: a small streamcraft-green play triangle.
-    c.fill_triangle((14, 10), (14, 30), (30, 20), 0xff30_ffa0);
-    // A moving position line across the bar (proves the overlay updates live over the video).
-    let prog = ((frame % 600) as i32) * width / 600;
-    c.fill_rect(0, BAR_H - 3, prog, 3, 0xff30_ffa0);
+    // Play indicator (AA triangle).
+    c.fill_triangle((16, 11), (16, 29), (34, 20), ACCENT);
+
+    // Elapsed time "MM:SS", anti-aliased text — formatted into a stack buffer (no heap).
+    let (mm, ss) = (elapsed_secs / 60, elapsed_secs % 60);
+    let buf = [
+        b'0' + ((mm / 10) % 10) as u8,
+        b'0' + (mm % 10) as u8,
+        b':',
+        b'0' + (ss / 10) as u8,
+        b'0' + (ss % 10) as u8,
+    ];
+    let text = std::str::from_utf8(&buf).unwrap_or("00:00");
+    let s = font::size_nearest(18.0);
+    let bm = font::rasterize_line(s, text);
+    let ty = ((BAR_H - bm.h as i32) / 2).max(0);
+    c.blit_a8(48, ty, &bm.cov, bm.w as u32, bm.h as u32, bm.w as u32, INK);
+
+    // Timeline rail (the seek head lands here once duration + seek are wired).
+    let tx = 48 + bm.w as i32 + 18;
+    let tw = width - tx - 16;
+    if tw > 0 {
+        c.blend_rect(tx, BAR_H / 2 - 1, tw, 2, 0x6050_6274);
+        let kx = tx + (elapsed_secs % 60) as i32 * tw / 60; // decorative until seek exists
+        c.fill_circle(kx as f32, (BAR_H / 2) as f32, 5.0, ACCENT);
+    }
 }
 
 impl Element for WaylandVideoSink {
