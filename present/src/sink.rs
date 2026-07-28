@@ -90,11 +90,19 @@ pub struct WaylandVideoSink {
     /// The window↔app control channel (clicks → pause/seek; duration/paused → HUD). Set by the
     /// player; `None` = display-only (no interactive controls).
     control: Option<Arc<crate::control::PlayerControl>>,
-    /// Pump-tick counter (throttles the HUD redraw, which runs far faster than the video rate).
-    pumps: u64,
-    /// The pause state the HUD was last drawn at — a change forces an immediate glyph redraw
-    /// (don't wait for the throttle) so play/pause feels instant.
+    /// HUD auto-hide: stay visible until this instant (bumped on pointer activity); hidden when
+    /// elapsed *and* playing (a paused player always shows its controls). `None` = never shown.
+    hud_deadline: Option<std::time::Instant>,
+    /// Whether the HUD subsurface is currently mapped — the redraw/hide edge trigger.
+    hud_mapped: bool,
+    /// The wall-second and pause state the HUD was last drawn at, so it redraws only on a real
+    /// content change (the clock ticking or a play/pause flip), not every pump — the overlay
+    /// was previously re-rendered ~15×/s for nothing (the "2% CPU while playing").
+    hud_sec: u64,
     hud_paused: bool,
+    /// The `[start, end)` span of the caption currently committed to the subtitle subsurface, so
+    /// it is re-rendered only when the visible cue changes — not every pump while one is up.
+    sub_shown: Option<(Timestamp, Timestamp)>,
     /// `Quit` was pushed to the control channel on window close — once only.
     quit_sent: bool,
 }
@@ -125,8 +133,11 @@ impl WaylandVideoSink {
             frames: 0,
             subtitle: None,
             control: None,
-            pumps: 0,
+            hud_deadline: None,
+            hud_mapped: false,
+            hud_sec: u64::MAX,
             hud_paused: false,
+            sub_shown: None,
             quit_sent: false,
         }
     }
@@ -178,6 +189,9 @@ impl WaylandVideoSink {
                         self.disabled = true;
                     }
                     self.window = Some(w);
+                    // Reveal the controls briefly on open (then they auto-hide) so the user
+                    // sees them without having to move the pointer first.
+                    self.hud_deadline = Some(std::time::Instant::now() + HUD_LINGER);
                 }
                 Err(e) => {
                     let element = ctx.element();
@@ -255,9 +269,20 @@ impl WaylandVideoSink {
     /// the running position to show. All hits are throttled/idempotent, so calling this at the
     /// ~8 ms slice rate is cheap. No `ctx` — nothing here needs the scheduler.
     fn pump_window(&mut self, pos_ns: u64) {
-        let Self { window, subtitle, channel, control, pumps, hud_paused, quit_sent, .. } = self;
+        let Self {
+            window,
+            subtitle,
+            channel,
+            control,
+            hud_deadline,
+            hud_mapped,
+            hud_sec,
+            hud_paused,
+            sub_shown,
+            quit_sent,
+            ..
+        } = self;
         let Some(w) = window.as_mut() else { return };
-        *pumps = pumps.wrapping_add(1);
         let _ = w.dispatch(false);
         // Deferred token release: hand back the surfaces the compositor is done sampling.
         if let Some(ch) = channel.as_ref() {
@@ -285,37 +310,60 @@ impl WaylandVideoSink {
                 *quit_sent = true;
             }
         }
-        // HUD: throttle to a fraction of the pump rate, but redraw at once on a pause-state flip.
+        // HUD: shown while paused or for a few seconds after pointer activity, then auto-hidden
+        // so idle playback pays nothing for it. While visible, redraw only when the content
+        // actually changes (the wall-second ticks or play/pause flips) — not every pump.
         if w.has_gui() {
+            if w.take_pointer_activity() {
+                *hud_deadline = Some(std::time::Instant::now() + HUD_LINGER);
+            }
             let (dur_ns, paused) = control
                 .as_ref()
                 .map(|c| (c.duration_ns(), c.paused()))
                 .unwrap_or((0, false));
-            if paused != *hud_paused || *pumps % 8 == 0 {
-                *hud_paused = paused;
-                let (ww, wh) = w.size();
-                let hud = Hud { width: ww, pos_ns, dur_ns, paused };
-                let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, &hud));
+            let show = paused || hud_deadline.is_some_and(|d| std::time::Instant::now() < d);
+            let sec = pos_ns / 1_000_000_000;
+            if show {
+                if !*hud_mapped || paused != *hud_paused || sec != *hud_sec {
+                    *hud_mapped = true;
+                    *hud_paused = paused;
+                    *hud_sec = sec;
+                    let (ww, wh) = w.size();
+                    let hud = Hud { width: ww, pos_ns, dur_ns, paused };
+                    let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, &hud));
+                }
+            } else if *hud_mapped {
+                *hud_mapped = false;
+                let _ = w.hide_gui();
             }
         }
-        // Show / clear the caption for the current position.
+        // Caption for the current position — (re)rendered only when the visible cue changes, not
+        // every pump (present_subtitle rasterizes + uploads the bitmap; doing it at the pump rate
+        // was a second constant-redraw cost whenever a subtitle was on screen).
         let pts = Timestamp::from_nanos(pos_ns);
-        match subtitle.as_ref().filter(|c| pts >= c.start && pts < c.end) {
-            Some(c) => {
-                let ds = &c.ds;
-                let _ = w.present_subtitle(
-                    ds.video_width as i32,
-                    ds.video_height as i32,
-                    ds.x as i32,
-                    ds.y as i32,
-                    ds.width as i32,
-                    ds.height as i32,
-                    &ds.rgba,
-                );
+        let want = subtitle
+            .as_ref()
+            .filter(|c| pts >= c.start && pts < c.end)
+            .map(|c| (c.start, c.end));
+        if want != *sub_shown {
+            match subtitle.as_ref().filter(|_| want.is_some()) {
+                Some(c) => {
+                    let ds = &c.ds;
+                    let _ = w.present_subtitle(
+                        ds.video_width as i32,
+                        ds.video_height as i32,
+                        ds.x as i32,
+                        ds.y as i32,
+                        ds.width as i32,
+                        ds.height as i32,
+                        &ds.rgba,
+                    );
+                }
+                None => {
+                    let _ = w.hide_subtitle();
+                }
             }
-            None => {
-                let _ = w.hide_subtitle();
-            }
+            *sub_shown = want;
         }
     }
 
@@ -370,6 +418,10 @@ impl WaylandVideoSink {
 
 /// The control-bar overlay height in px.
 const BAR_H: i32 = 40;
+
+/// How long the HUD lingers after the last pointer activity before auto-hiding (playing only —
+/// a paused player keeps its controls up).
+const HUD_LINGER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Where the timeline rail starts (after the play glyph + the `MM:SS` time) and its right pad.
 const TRACK_X: i32 = 108;
@@ -471,7 +523,23 @@ impl Element for WaylandVideoSink {
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
         match event {
-            Event::FlushStart => self.preroll_next = true,
+            Event::FlushStart => {
+                // Orphan any decoder run-ahead frames still queued for us: a seek discarded
+                // their `video/gpu` buffers, so we will never pace/take them. Releasing them
+                // frees the decoder's surfaces (else its pool starves → the seek stalls) and,
+                // crucially, clears stale entries so a post-seek `take(token)` can't return a
+                // pre-seek frame on a recycled token (the "seek shows the wrong/old frame"
+                // unreliability). While playing the decoder runs ahead, so several frames sit
+                // here at seek time — which is exactly why seeking while playing was slower and
+                // flakier than while paused (paused → no run-ahead → nothing to orphan).
+                if let Some(ch) = &self.channel {
+                    ch.flush_pending();
+                }
+                // Drop the pre-seek caption; the subtitle track re-emits for the new position
+                // (the pump hides it next pass when `pts` no longer falls in its span).
+                self.subtitle = None;
+                self.preroll_next = true;
+            }
             Event::Eos => {
                 // Keep the last frame on screen; drain window events so a close still answers.
                 if let Some(w) = self.window.as_mut() {

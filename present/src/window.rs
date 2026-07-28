@@ -71,6 +71,9 @@ pub struct Window {
     pointer_y: i32,
     /// Window-relative left-click positions, drained by the sink for HUD hit-testing.
     clicks: Vec<(i32, i32)>,
+    /// Set on any pointer enter/motion/button since the last [`take_pointer_activity`]; drives
+    /// the HUD's show-on-activity / auto-hide-when-idle behaviour.
+    pointer_activity: bool,
     // Window objects.
     surface: u32,
     xdg_surface: u32,
@@ -201,6 +204,7 @@ impl Window {
             pointer_x: 0,
             pointer_y: 0,
             clicks: Vec::new(),
+            pointer_activity: false,
             video_surface: 0,
             video_subsurface: 0,
             viewport: 0,
@@ -648,6 +652,24 @@ impl Window {
         }
     }
 
+    /// Whether the pointer moved / entered / clicked since the last call (consumes the flag).
+    /// The sink uses it to reveal the HUD on activity and auto-hide it after an idle period.
+    pub fn take_pointer_activity(&mut self) -> bool {
+        std::mem::take(&mut self.pointer_activity)
+    }
+
+    /// Unmap the GUI overlay subsurface (null-buffer attach + commit) — the HUD is auto-hidden
+    /// during idle playback so it neither shows nor costs a redraw. Idempotent-friendly: the
+    /// caller tracks mapped state and only calls this on the visible→hidden edge.
+    pub fn hide_gui(&mut self) -> io::Result<()> {
+        if self.gui_surface == 0 {
+            return Ok(());
+        }
+        self.conn.request(self.gui_surface, p::surface::ATTACH).object(0).i32(0).i32(0).finish();
+        self.conn.request(self.gui_surface, p::surface::COMMIT).finish();
+        self.conn.flush()
+    }
+
     /// Pop the next window-relative left-click, for HUD hit-testing.
     pub fn take_click(&mut self) -> Option<(i32, i32)> {
         if self.clicks.is_empty() {
@@ -836,12 +858,14 @@ impl Window {
             self.pointer_surface = a.u32().unwrap_or(0);
             self.pointer_x = a.fixed().map(|f| f.to_int()).unwrap_or(0);
             self.pointer_y = a.fixed().map(|f| f.to_int()).unwrap_or(0);
+            self.pointer_activity = true;
         } else if obj == self.pointer && op == p::pointer::EV_MOTION {
             // motion(time, x, y): update the local position.
             let mut a = self.conn.args();
             let _time = a.u32();
             self.pointer_x = a.fixed().map(|f| f.to_int()).unwrap_or(self.pointer_x);
             self.pointer_y = a.fixed().map(|f| f.to_int()).unwrap_or(self.pointer_y);
+            self.pointer_activity = true;
         } else if obj == self.pointer && op == p::pointer::EV_BUTTON {
             // button(serial, time, button, state): on a left press, record a window click.
             let mut a = self.conn.args();
@@ -849,6 +873,7 @@ impl Window {
             let _time = a.u32();
             let button = a.u32().unwrap_or(0);
             let state = a.u32().unwrap_or(0);
+            self.pointer_activity = true;
             if button == p::pointer::BTN_LEFT && state == p::pointer::STATE_PRESSED {
                 let (ox, oy) = self.surface_origin(self.pointer_surface);
                 self.clicks.push((ox + self.pointer_x, oy + self.pointer_y));
