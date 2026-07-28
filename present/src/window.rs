@@ -61,6 +61,8 @@ pub struct Window {
     dmabuf: u32,
     viewporter: u32,
     subcompositor: u32,
+    seat: u32,
+    keyboard: u32,
     // Window objects.
     surface: u32,
     xdg_surface: u32,
@@ -148,6 +150,8 @@ impl Window {
             dmabuf: 0,
             viewporter: 0,
             subcompositor: 0,
+            seat: 0,
+            keyboard: 0,
             viewport: 0,
             gui_surface: 0,
             gui_subsurface: 0,
@@ -204,6 +208,14 @@ impl Window {
                 .request(registry, p::registry::BIND)
                 .u32(scname)
                 .bind_new_id(p::subcompositor::NAME, scver.min(1), w.subcompositor)
+                .finish();
+        }
+        if let Some((sename, sever)) = find(p::seat::NAME) {
+            w.seat = w.conn.alloc_id();
+            w.conn
+                .request(registry, p::registry::BIND)
+                .u32(sename)
+                .bind_new_id(p::seat::NAME, sever.min(5), w.seat)
                 .finish();
         }
 
@@ -481,6 +493,26 @@ impl Window {
             }
         } else if obj == self.toplevel && op == p::xdg_toplevel::EV_CLOSE {
             self.closed = true;
+        } else if obj == self.seat && op == p::seat::EV_CAPABILITIES {
+            // Grab a keyboard once the seat advertises one (for Esc/q → close).
+            let caps = self.conn.args().u32().unwrap_or(0);
+            if caps & p::seat::CAP_KEYBOARD != 0 && self.keyboard == 0 {
+                self.keyboard = self.conn.alloc_id();
+                let (kb, seat) = (self.keyboard, self.seat);
+                self.conn.request(seat, p::seat::GET_KEYBOARD).u32(kb).finish();
+            }
+        } else if obj == self.keyboard && op == p::keyboard::EV_KEY {
+            // key(serial, time, key, state): Esc / q closes the window.
+            let mut a = self.conn.args();
+            let _serial = a.u32();
+            let _time = a.u32();
+            let key = a.u32().unwrap_or(0);
+            let state = a.u32().unwrap_or(0);
+            if state == p::keyboard::STATE_PRESSED
+                && (key == p::keyboard::KEY_ESC || key == p::keyboard::KEY_Q)
+            {
+                self.closed = true;
+            }
         } else if op == p::buffer::EV_RELEASE {
             // A pool buffer (recycle) or an in-flight dmabuf buffer (destroy) was released.
             if let Some(b) = self.pool.iter_mut().find(|b| b.buffer == obj) {

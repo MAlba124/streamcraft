@@ -101,8 +101,21 @@ pub mod xdg_toplevel {
 /// `wl_seat` — input device hub (pointer/keyboard for controls).
 pub mod seat {
     pub const NAME: &str = "wl_seat";
-    pub const EV_CAPABILITIES: u16 = 0; // capabilities
+    pub const GET_KEYBOARD: u16 = 1; // -> new_id wl_keyboard
+    pub const EV_CAPABILITIES: u16 = 0; // capabilities (bitmask)
     pub const EV_NAME: u16 = 1; // name
+    /// Capability bit: a keyboard is available.
+    pub const CAP_KEYBOARD: u32 = 2;
+}
+
+/// `wl_keyboard` — key events. Keys are raw Linux evdev codes (`<linux/input-event-codes.h>`):
+/// `KEY_ESC = 1`, `KEY_Q = 16`.
+pub mod keyboard {
+    pub const EV_KEY: u16 = 3; // serial, time, key, state
+    /// `state == 1` ⇒ pressed.
+    pub const STATE_PRESSED: u32 = 1;
+    pub const KEY_ESC: u32 = 1;
+    pub const KEY_Q: u32 = 16;
 }
 
 /// `zwp_linux_dmabuf_v1` — imports a VA-API decode surface's dmabuf as a `wl_buffer` (zero-copy
