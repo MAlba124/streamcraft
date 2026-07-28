@@ -60,12 +60,17 @@ pub struct Window {
     wm_base: u32,
     dmabuf: u32,
     viewporter: u32,
+    subcompositor: u32,
     // Window objects.
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
     /// The video surface's `wp_viewport` (crop+scale), created lazily on the first dmabuf frame.
     viewport: u32,
+    /// The GUI overlay `wl_surface` + its `wl_subsurface` over the video (created lazily on the
+    /// first [`present_gui`](Self::present_gui)); the compositor blends it above the video.
+    gui_surface: u32,
+    gui_subsurface: u32,
     // Geometry (compositor-configured; falls back to the requested default until then).
     width: i32,
     height: i32,
@@ -142,7 +147,10 @@ impl Window {
             wm_base: 0,
             dmabuf: 0,
             viewporter: 0,
+            subcompositor: 0,
             viewport: 0,
+            gui_surface: 0,
+            gui_subsurface: 0,
             width,
             height,
             configured: false,
@@ -188,6 +196,14 @@ impl Window {
                 .request(registry, p::registry::BIND)
                 .u32(vname)
                 .bind_new_id(p::viewporter::NAME, vver.min(1), w.viewporter)
+                .finish();
+        }
+        if let Some((scname, scver)) = find(p::subcompositor::NAME) {
+            w.subcompositor = w.conn.alloc_id();
+            w.conn
+                .request(registry, p::registry::BIND)
+                .u32(scname)
+                .bind_new_id(p::subcompositor::NAME, scver.min(1), w.subcompositor)
                 .finish();
         }
 
@@ -359,6 +375,73 @@ impl Window {
             let (vp, surf) = (self.viewport, self.surface);
             self.conn.request(self.viewporter, p::viewporter::GET_VIEWPORT).u32(vp).object(surf).finish();
         }
+    }
+
+    /// Render + present the **GUI overlay**: a `wl_subsurface` above the video at `(x, y)`,
+    /// software-rendered `w×h` through the [`Canvas`] into a recycled shm buffer. The compositor
+    /// blends it over the video — no GPU, no readback. The subsurface is desynchronized, so the
+    /// GUI updates independently of the video rate (call it only on change). No-op if the
+    /// compositor lacks `wl_subcompositor`. Whether the overlay is available:
+    /// [`has_gui`](Self::has_gui).
+    pub fn present_gui<F: FnOnce(&mut Canvas)>(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        render: F,
+    ) -> io::Result<()> {
+        if self.subcompositor == 0 {
+            return Ok(());
+        }
+        self.ensure_gui_subsurface(x, y);
+        let (w, h) = (w.max(1), h.max(1));
+        let idx = self.acquire(w, h)?;
+        {
+            let b = &mut self.pool[idx];
+            let stride = (b.width * 4) as u32;
+            let (bw, bh) = (b.width as u32, b.height as u32);
+            let mut canvas = Canvas::new(b.pixels(), bw, bh, stride);
+            render(&mut canvas);
+        }
+        let (buffer, bw, bh) = {
+            let b = &self.pool[idx];
+            (b.buffer, b.width, b.height)
+        };
+        self.pool[idx].busy = true;
+        let gs = self.gui_surface;
+        self.conn.request(gs, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        self.conn.request(gs, p::surface::DAMAGE_BUFFER).i32(0).i32(0).i32(bw).i32(bh).finish();
+        self.conn.request(gs, p::surface::COMMIT).finish();
+        self.conn.flush()
+    }
+
+    /// Whether the compositor supports the GUI overlay (`wl_subcompositor`).
+    pub fn has_gui(&self) -> bool {
+        self.subcompositor != 0
+    }
+
+    /// Lazily create the GUI `wl_surface` + `wl_subsurface` over the video at `(x, y)`, once.
+    fn ensure_gui_subsurface(&mut self, x: i32, y: i32) {
+        if self.gui_subsurface != 0 || self.subcompositor == 0 {
+            return;
+        }
+        self.gui_surface = self.conn.alloc_id();
+        self.conn.request(self.compositor, p::compositor::CREATE_SURFACE).u32(self.gui_surface).finish();
+        self.gui_subsurface = self.conn.alloc_id();
+        let (sub, gs, parent) = (self.gui_subsurface, self.gui_surface, self.surface);
+        self.conn
+            .request(self.subcompositor, p::subcompositor::GET_SUBSURFACE)
+            .u32(sub)
+            .object(gs)
+            .object(parent)
+            .finish();
+        self.conn.request(sub, p::subsurface::SET_POSITION).i32(x).i32(y).finish();
+        // Desync: the GUI commits apply immediately, decoupled from the video surface's cadence.
+        self.conn.request(sub, p::subsurface::SET_DESYNC).finish();
+        // The subsurface add + position are parent-cached — a parent commit applies them (a
+        // present_dmabuf commit follows anyway, but do one now so the placement takes effect).
+        self.conn.request(self.surface, p::surface::COMMIT).finish();
     }
 
     /// Pump the socket once and dispatch pending events (configure/ping/close/release). When

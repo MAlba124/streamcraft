@@ -26,6 +26,7 @@ use streamcraft_core::time::Timestamp;
 
 use sc_vaapi::gpuframe::{GpuFrame, GpuFrameChannel, GpuFrameHeader, GPU_OFFER};
 
+use crate::raster::Canvas;
 use crate::window::{DmabufVideo, Plane, Window};
 
 static SINK_OFFERS: [streamcraft_core::format::OfferDesc; 1] = [GPU_OFFER];
@@ -64,6 +65,8 @@ pub struct WaylandVideoSink {
     disabled: bool,
     /// The next frame after a flush presents immediately (no clock wait) — preroll.
     preroll_next: bool,
+    /// Frames presented — drives the GUI overlay's decoupled (lower-rate) update cadence.
+    frames: u64,
 }
 
 impl Default for WaylandVideoSink {
@@ -77,7 +80,7 @@ impl WaylandVideoSink {
     // COLD: constructor.
     #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
-        WaylandVideoSink { channel: None, window: None, disabled: false, preroll_next: false }
+        WaylandVideoSink { channel: None, window: None, disabled: false, preroll_next: false, frames: 0 }
     }
 
     /// Attach the shared [`GpuFrameChannel`] (the same `Arc` the zero-copy decoder holds).
@@ -161,9 +164,17 @@ impl WaylandVideoSink {
         self.release(header.token);
         match present {
             Ok(()) => {
-                // Pump window events (close/ping/release-recycle) without blocking the graph.
+                self.frames = self.frames.wrapping_add(1);
+                let n = self.frames;
+                // Pump window events (close/ping/release-recycle) without blocking the graph,
+                // and refresh the GUI overlay at ~1/6 the video rate (a wl_subsurface the
+                // compositor blends over the video — decoupled from the frame cadence).
                 if let Some(w) = self.window.as_mut() {
                     let _ = w.dispatch(false);
+                    if w.has_gui() && n % 6 == 0 {
+                        let (ww, wh) = w.size();
+                        let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, n));
+                    }
                     if w.should_close() {
                         self.on_close(ctx);
                     }
@@ -212,6 +223,23 @@ impl WaylandVideoSink {
         self.window = None;
         self.disabled = true;
     }
+}
+
+/// The control-bar overlay height in px.
+const BAR_H: i32 = 40;
+
+/// Draw the GUI overlay (a translucent control bar with a brand mark + a moving position line)
+/// into `c` — a `width×BAR_H` ARGB canvas, `0` alpha where the video should show through. The
+/// compositor blends this `wl_subsurface` over the video; this is the seam where the scope UI /
+/// player controls land (immediate-mode `Canvas` calls, no GPU).
+fn draw_controls(c: &mut Canvas, width: i32, frame: u64) {
+    c.clear(0); // fully transparent — video shows through everywhere we don't draw
+    c.blend_rect(0, 0, width, BAR_H, 0xd010_1822); // translucent dark bar
+    // Brand mark: a small streamcraft-green play triangle.
+    c.fill_triangle((14, 10), (14, 30), (30, 20), 0xff30_ffa0);
+    // A moving position line across the bar (proves the overlay updates live over the video).
+    let prog = ((frame % 600) as i32) * width / 600;
+    c.fill_rect(0, BAR_H - 3, prog, 3, 0xff30_ffa0);
 }
 
 impl Element for WaylandVideoSink {
