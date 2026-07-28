@@ -448,8 +448,9 @@ pub struct SyncPoint {
 /// the borrow checker guarantees no region is still live when the arena is reset.
 pub struct Arena {
     /// All chunks; `active` indexes the one currently being filled. Bytes live in
-    /// `UnsafeCell` so regions can be mutated through the shared `&self` of `alloc`.
-    chunks: UnsafeCell<Vec<Box<[UnsafeCell<u8>]>>>,
+    /// `UnsafeCell` so regions can be mutated through the shared `&self` of `alloc`. Each
+    /// chunk is a whole number of page-aligned [`Page`]s (see [`Arena::make_chunk`]).
+    chunks: UnsafeCell<Vec<Box<[Page]>>>,
     active: Cell<usize>,
     offset: Cell<usize>,
     chunk_size: usize,
@@ -468,8 +469,21 @@ pub struct Arena {
     last: Cell<Option<(usize, usize, usize)>>,
 }
 
+/// The page size the arena rounds and aligns its chunks to (4 KiB — the common x86-64/aarch64
+/// base page).
+const PAGE: usize = 4096;
+
+/// One page of arena backing. `#[repr(align(4096))]` forces every `Box<[Page]>` chunk onto a
+/// page boundary, so a chunk allocation is a whole number of pages *starting on* a page — it
+/// maps cleanly onto the allocator's large-object/mmap path, and a page-aligned request (SIMD,
+/// O_DIRECT) is satisfiable without cross-page waste. The bytes are `UnsafeCell` so
+/// [`Arena::alloc`] can carve mutable regions through its shared `&self`.
+#[repr(align(4096))]
+struct Page(UnsafeCell<[u8; PAGE]>);
+
 impl Arena {
-    /// Default scratch chunk size in bytes; a call needing more grows a larger chunk.
+    /// Default scratch chunk size in bytes (16 pages); a call needing more grows a larger,
+    /// still page-rounded chunk.
     pub const DEFAULT_CHUNK: usize = 64 * 1024;
 
     /// A fresh arena whose chunks default to `chunk_size` bytes (min 1). No chunk is
@@ -498,8 +512,12 @@ impl Arena {
         Some(unsafe { (chunks[chunk].as_ptr() as *mut u8).add(start) })
     }
 
-    fn make_chunk(cap: usize) -> Box<[UnsafeCell<u8>]> {
-        (0..cap).map(|_| UnsafeCell::new(0u8)).collect::<Vec<_>>().into_boxed_slice()
+    fn make_chunk(cap: usize) -> Box<[Page]> {
+        // Round the requested capacity up to whole pages: chunks are page-sized and (via
+        // `Page`'s `repr(align)`) page-aligned. One-time — chunks are retained and reused
+        // across `reset`, so this is not a per-`process()` cost.
+        let npages = cap.div_ceil(PAGE).max(1);
+        (0..npages).map(|_| Page(UnsafeCell::new([0u8; PAGE]))).collect::<Vec<_>>().into_boxed_slice()
     }
 
     /// Carve `size` bytes aligned to `align` (a power of two) and return a fresh mutable
@@ -524,7 +542,7 @@ impl Arena {
                     let base = chunk.as_ptr() as usize;
                     let aligned = (base + self.offset.get()).wrapping_add(align - 1) & !(align - 1);
                     let start = aligned - base;
-                    if start + size <= chunk.len() {
+                    if start + size <= chunk.len() * PAGE {
                         self.offset.set(start + size);
                         // SAFETY: [start, start+size) is inside this chunk and, because the
                         // offset only advances, disjoint from every region already handed
@@ -652,7 +670,7 @@ unsafe impl std::alloc::Allocator for &Arena {
                 if chunk == self.active.get() {
                     // SAFETY: shared read; `chunk` still exists.
                     let chunks = unsafe { &*self.chunks.get() };
-                    let chunk_len = chunks[chunk].len();
+                    let chunk_len = chunks[chunk].len() * PAGE;
                     if start + new_size <= chunk_len {
                         self.offset.set(start + new_size);
                         self.last.set(Some((chunk, start, new_size)));
@@ -920,10 +938,11 @@ mod tests {
 
     #[test]
     fn arena_grows_across_chunks_keeping_regions_valid() {
-        let arena = Arena::new(64); // small chunks: several allocs force growth
+        // Chunks are page-rounded, so force growth with half-page regions (two per chunk).
+        let arena = Arena::new(PAGE);
         let mut regions: Vec<&mut [u8]> = Vec::new();
         for i in 0..10u8 {
-            let r = arena.alloc_bytes(32);
+            let r = arena.alloc_bytes(PAGE / 2);
             r.fill(i);
             regions.push(r);
         }
@@ -936,16 +955,16 @@ mod tests {
 
     #[test]
     fn arena_reset_after_growth_reuses_all_chunks() {
-        let mut arena = Arena::new(64);
+        let mut arena = Arena::new(PAGE);
         for _ in 0..8 {
-            let _ = arena.alloc_bytes(32);
+            let _ = arena.alloc_bytes(PAGE / 2);
         }
         let grown = arena.chunk_count();
         assert!(grown >= 2);
         arena.reset();
         // The same total again fits in the retained chunks — no further allocation.
         for _ in 0..8 {
-            let _ = arena.alloc_bytes(32);
+            let _ = arena.alloc_bytes(PAGE / 2);
         }
         assert_eq!(arena.chunk_count(), grown, "retained chunks are reused after reset");
     }
