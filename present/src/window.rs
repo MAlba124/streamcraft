@@ -82,6 +82,9 @@ pub struct Window {
     /// first [`present_gui`](Self::present_gui)); the compositor blends it above the video.
     gui_surface: u32,
     gui_subsurface: u32,
+    /// The GUI subsurface's last position, so it re-places only on change (e.g. resize).
+    gui_x: i32,
+    gui_y: i32,
     // Geometry (compositor-configured; falls back to the requested default until then).
     width: i32,
     height: i32,
@@ -168,6 +171,8 @@ impl Window {
             bg_h: 0,
             gui_surface: 0,
             gui_subsurface: 0,
+            gui_x: i32::MIN,
+            gui_y: i32::MIN,
             width,
             height,
             configured: false,
@@ -492,7 +497,16 @@ impl Window {
         if self.subcompositor == 0 {
             return Ok(());
         }
-        self.ensure_gui_subsurface(x, y);
+        self.ensure_gui_subsurface();
+        // (Re)place the overlay when its position changes (first frame / window resize); the
+        // subsurface position is parent-cached, so a root commit applies it.
+        if (x, y) != (self.gui_x, self.gui_y) {
+            let sub = self.gui_subsurface;
+            self.conn.request(sub, p::subsurface::SET_POSITION).i32(x).i32(y).finish();
+            self.conn.request(self.surface, p::surface::COMMIT).finish();
+            self.gui_x = x;
+            self.gui_y = y;
+        }
         let (w, h) = (w.max(1), h.max(1));
         let idx = self.acquire(w, h)?;
         {
@@ -519,8 +533,10 @@ impl Window {
         self.subcompositor != 0
     }
 
-    /// Lazily create the GUI `wl_surface` + `wl_subsurface` over the video at `(x, y)`, once.
-    fn ensure_gui_subsurface(&mut self, x: i32, y: i32) {
+    /// Lazily create the GUI `wl_surface` + `wl_subsurface` over the video, once. Created after
+    /// the video subsurface, so it stacks above the video. Position is set by
+    /// [`present_gui`](Self::present_gui).
+    fn ensure_gui_subsurface(&mut self) {
         if self.gui_subsurface != 0 || self.subcompositor == 0 {
             return;
         }
@@ -534,12 +550,8 @@ impl Window {
             .object(gs)
             .object(parent)
             .finish();
-        self.conn.request(sub, p::subsurface::SET_POSITION).i32(x).i32(y).finish();
         // Desync: the GUI commits apply immediately, decoupled from the video surface's cadence.
         self.conn.request(sub, p::subsurface::SET_DESYNC).finish();
-        // The subsurface add + position are parent-cached — a parent commit applies them (a
-        // present_dmabuf commit follows anyway, but do one now so the placement takes effect).
-        self.conn.request(self.surface, p::surface::COMMIT).finish();
     }
 
     /// Pump the socket once and dispatch pending events (configure/ping/close/release). When
