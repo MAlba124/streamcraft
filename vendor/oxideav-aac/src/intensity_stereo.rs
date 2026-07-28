@@ -136,7 +136,7 @@ pub fn intensity_gain(is_pos: i32) -> f64 {
 /// (§4.6.8.1.4, from [`crate::scale_factor_data::accumulate`]). Only
 /// the entries at intensity-coded `(g, sfb)` are consulted.
 #[derive(Debug)]
-pub struct IntensityPairSpectra<'a> {
+pub struct IntensityPairSpectra<'a, A: std::alloc::Allocator = std::alloc::Global> {
     /// First ("left") channel spectrum — read only.
     pub left: &'a [f64],
     /// Second ("right") channel spectrum — derived from `left` on
@@ -145,7 +145,7 @@ pub struct IntensityPairSpectra<'a> {
     /// Right channel `sfb_cb[g][sfb]`.
     pub right_sfb_cb: &'a [Vec<u8>],
     /// Right channel absolute `is_pos[g][sfb]` (§4.6.8.1.4).
-    pub is_pos: &'a [Vec<i32>],
+    pub is_pos: &'a [Vec<i32, A>],
 }
 
 /// Apply the §4.6.8.2.3 intensity-stereo left→right derivation in place.
@@ -168,8 +168,8 @@ pub struct IntensityPairSpectra<'a> {
 /// `sfb_cb` / `is_pos` shapes disagree with `ics_info` (see the variant
 /// docs). When no band is intensity-coded the right buffer is left
 /// untouched.
-pub fn apply_intensity_stereo(
-    pair: &mut IntensityPairSpectra<'_>,
+pub fn apply_intensity_stereo<A: std::alloc::Allocator>(
+    pair: &mut IntensityPairSpectra<'_, A>,
     ms_mask_present: bool,
     ms_used: &[Vec<bool>],
     ics_info: &IcsInfo,

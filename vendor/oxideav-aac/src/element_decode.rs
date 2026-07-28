@@ -84,7 +84,9 @@ use crate::ltp::LtpState;
 use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
 use crate::pns::{apply_pns, apply_pns_pair, gen_rand_vector, PnsChannel};
 use crate::predictor::PredictorBank;
-use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
+use crate::scale_factor_data::{
+    accumulate_in, AbsoluteScaleFactorEntry, AbsoluteScaleFactors,
+};
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::apply_pulse_data;
@@ -94,7 +96,7 @@ use crate::{Error, Result};
 /// One channel's parsed Table 4.50 body plus its Table 4.56 spectrum,
 /// bundled so the element driver can take them by reference.
 #[derive(Debug)]
-pub struct ChannelInput<'a> {
+pub struct ChannelInput<'a, A: std::alloc::Allocator = std::alloc::Global> {
     /// The parsed `individual_channel_stream()` body
     /// ([`IcsBody::parse`] / [`IcsBody::parse_with_ics_info`]).
     pub body: &'a IcsBody,
@@ -103,8 +105,9 @@ pub struct ChannelInput<'a> {
     /// is the shared `ics_info` the caller parsed once.
     pub ics_info: &'a IcsInfo,
     /// The channel's parsed `spectral_data()`
-    /// ([`SpectralData::parse`]).
-    pub spectral: &'a SpectralData,
+    /// ([`SpectralData::parse`]). Its `x_quant` may live in the caller's
+    /// per-`process()` scratch arena (`A`) on the hot decode path.
+    pub spectral: &'a SpectralData<A>,
 }
 
 /// Expand a wire-order [`AbsoluteScaleFactors`] into the band-indexed
@@ -121,25 +124,27 @@ pub struct ChannelInput<'a> {
 /// interest (`is_pos` or `noise_nrg`), or `None` for a record that
 /// belongs to a different track (in which case the slot stays
 /// `default`).
-fn band_indexed_track<F>(
-    abs: &AbsoluteScaleFactors,
+fn band_indexed_track<F, A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+    abs: &AbsoluteScaleFactors<S>,
     sfb_cb: &[Vec<u8>],
     max_sfb: usize,
     default: i32,
+    scratch: A,
     pick: F,
-) -> Result<Vec<Vec<i32>>>
+) -> Result<Vec<Vec<i32, A>, A>>
 where
     F: Fn(&AbsoluteScaleFactorEntry) -> Option<i32>,
 {
     if abs.entries.len() != sfb_cb.len() {
         return Err(Error::ElementDecodeInvalid);
     }
-    let mut out: Vec<Vec<i32>> = Vec::with_capacity(sfb_cb.len());
+    let mut out: Vec<Vec<i32, A>, A> = Vec::with_capacity_in(sfb_cb.len(), scratch);
     for (group_records, group_cb) in abs.entries.iter().zip(sfb_cb.iter()) {
         if group_cb.len() < max_sfb {
             return Err(Error::ElementDecodeInvalid);
         }
-        let mut row = vec![default; max_sfb];
+        let mut row: Vec<i32, A> = Vec::with_capacity_in(max_sfb, scratch);
+        row.resize(max_sfb, default);
         let mut rec = group_records.iter();
         for (sfb, &cb) in group_cb.iter().enumerate() {
             if cb == ZERO_HCB {
@@ -161,12 +166,13 @@ where
 
 /// Band-indexed `is_pos[g][sfb]` (§4.6.8.1.4), default `0` on
 /// non-intensity bands.
-fn is_pos_table(
-    abs: &AbsoluteScaleFactors,
+fn is_pos_table<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+    abs: &AbsoluteScaleFactors<S>,
     sfb_cb: &[Vec<u8>],
     max_sfb: usize,
-) -> Result<Vec<Vec<i32>>> {
-    band_indexed_track(abs, sfb_cb, max_sfb, 0, |e| match e {
+    scratch: A,
+) -> Result<Vec<Vec<i32, A>, A>> {
+    band_indexed_track(abs, sfb_cb, max_sfb, 0, scratch, |e| match e {
         AbsoluteScaleFactorEntry::IsPos(p) => Some(i32::from(*p)),
         _ => None,
     })
@@ -174,12 +180,13 @@ fn is_pos_table(
 
 /// Band-indexed `noise_nrg[g][sfb]` (§4.6.13.3), default `0` on
 /// non-noise bands.
-fn noise_nrg_table(
-    abs: &AbsoluteScaleFactors,
+fn noise_nrg_table<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+    abs: &AbsoluteScaleFactors<S>,
     sfb_cb: &[Vec<u8>],
     max_sfb: usize,
-) -> Result<Vec<Vec<i32>>> {
-    band_indexed_track(abs, sfb_cb, max_sfb, 0, |e| match e {
+    scratch: A,
+) -> Result<Vec<Vec<i32, A>, A>> {
+    band_indexed_track(abs, sfb_cb, max_sfb, 0, scratch, |e| match e {
         AbsoluteScaleFactorEntry::NoiseNrg(n) => Some(*n),
         _ => None,
     })
@@ -193,19 +200,19 @@ fn noise_nrg_table(
 /// (so the caller can derive the band-indexed `is_pos` / `noise_nrg`
 /// tracks without re-running the accumulator).
 fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
-    ch: &ChannelInput<'_>,
+    ch: &ChannelInput<'_, A>,
     fs_index: u8,
     scratch: A,
-) -> Result<(Vec<f64>, AbsoluteScaleFactors)> {
+) -> Result<(Vec<f64>, AbsoluteScaleFactors<A>)> {
     // 2. §4.6.3.3 pulse fix-up on the quantised spectrum (long windows
     //    only — the parser already rejects pulse on EIGHT_SHORT, and a
     //    long sequence has exactly one group).
     // Only the (rare) pulse path mutates the quantised spectrum, so only it needs an owned
-    // copy — the common no-pulse path borrows `ch.spectral` directly. Cloning the whole
-    // `Vec<Vec<i32>>` unconditionally was a per-channel per-frame allocation (~2% of all heap
-    // allocations in profiling; streamcraft patch).
+    // copy — the common no-pulse path borrows `ch.spectral` directly. The clone lands in the
+    // same `scratch` arena as the rest of the frame's transients (Vec<T, A>::clone clones in
+    // `A`), so even the rare pulse copy is off the heap (streamcraft patch).
     let patched;
-    let x_quant: &SpectralData = if let Some(pd) = &ch.body.pulse_data {
+    let x_quant: &SpectralData<A> = if let Some(pd) = &ch.body.pulse_data {
         let mut p = ch.spectral.clone();
         let group0 = p.x_quant.first_mut().ok_or(Error::DequantInvalid)?;
         apply_pulse_data(group0, fs_index, pd)?;
@@ -215,11 +222,14 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
         ch.spectral
     };
 
-    // 3a. §4.6.2.3.2 scalefactor accumulation.
-    let abs = accumulate(
+    // 3a. §4.6.2.3.2 scalefactor accumulation. The accumulated absolute records are transient
+    //     side info consumed by the dequant / joint-stereo / noise passes within this frame, so
+    //     they come from the caller's `scratch` arena rather than the heap (streamcraft patch).
+    let abs = accumulate_in(
         &ch.body.scale_factor_data,
         &ch.body.section_data.sfb_cb,
         ch.body.global_gain,
+        scratch,
     )?;
 
     // 3b. §4.6.1.3 + §4.6.2.3.3 inverse quantisation + rescaling. The rescaled `Vec<Vec<f64>>`
@@ -432,7 +442,7 @@ impl ElementDecoder {
     /// transient buffers (the pipeline passes its per-`process()` arena; tests use `Global`).
     pub fn decode_sce_in<A: std::alloc::Allocator + Copy>(
         &mut self,
-        ch: &ChannelInput<'_>,
+        ch: &ChannelInput<'_, A>,
         aot: u8,
         fs_index: u8,
         scratch: A,
@@ -441,7 +451,7 @@ impl ElementDecoder {
         let max_sfb = ch.ics_info.max_sfb as usize;
 
         // §4.6.13 PNS on the single channel (no pair correlation).
-        let noise_nrg = noise_nrg_table(&abs, &ch.body.section_data.sfb_cb, max_sfb)?;
+        let noise_nrg = noise_nrg_table(&abs, &ch.body.section_data.sfb_cb, max_sfb, scratch)?;
         let state = &mut self.pns_state;
         let mut pns_chan = PnsChannel {
             spec: &mut spec,
@@ -501,8 +511,8 @@ impl ElementDecoder {
     /// channels' transient buffers (the pipeline passes its per-`process()` arena).
     pub fn decode_cpe_in<A: std::alloc::Allocator + Copy>(
         &mut self,
-        left: &ChannelInput<'_>,
-        right: &ChannelInput<'_>,
+        left: &ChannelInput<'_, A>,
+        right: &ChannelInput<'_, A>,
         joint: &CpeJointStereo,
         aot: u8,
         fs_index: u8,
@@ -554,7 +564,8 @@ impl ElementDecoder {
         // §4.6.8.2 intensity stereo: right derived from left on
         // intensity bands. invert_intensity reads the per-band M/S mask
         // only when ms_mask_present == 01 (Mask).
-        let right_is_pos = is_pos_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
+        let right_is_pos =
+            is_pos_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb, scratch)?;
         let is_mask = joint.ms_mask_present == MsMaskPresent::Mask;
         {
             let mut pair = IntensityPairSpectra {
@@ -569,8 +580,9 @@ impl ElementDecoder {
         // §4.6.13 PNS with the shared-vector correlation rule. PNS and
         // M/S are mutually exclusive per band (§4.6.13.5), so a noise
         // band was skipped by the M/S de-matrix above; here it is filled.
-        let left_nrg = noise_nrg_table(&left_abs, &left.body.section_data.sfb_cb, max_sfb)?;
-        let right_nrg = noise_nrg_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb)?;
+        let left_nrg = noise_nrg_table(&left_abs, &left.body.section_data.sfb_cb, max_sfb, scratch)?;
+        let right_nrg =
+            noise_nrg_table(&right_abs, &right.body.section_data.sfb_cb, max_sfb, scratch)?;
         let all_shared = joint.ms_mask_present == MsMaskPresent::AllOnes;
         {
             let mut left_chan = PnsChannel {
@@ -693,9 +705,9 @@ mod tests {
                 AbsoluteScaleFactorEntry::Sf(120),
             ]],
         };
-        let is_pos = is_pos_table(&abs, &sfb_cb, 4).unwrap();
+        let is_pos = is_pos_table(&abs, &sfb_cb, 4, std::alloc::Global).unwrap();
         assert_eq!(is_pos[0], vec![0, 7, 0, 0]);
-        let nrg = noise_nrg_table(&abs, &sfb_cb, 4).unwrap();
+        let nrg = noise_nrg_table(&abs, &sfb_cb, 4, std::alloc::Global).unwrap();
         assert_eq!(nrg[0], vec![0, 0, 42, 0]);
     }
 
@@ -707,7 +719,7 @@ mod tests {
             entries: vec![vec![AbsoluteScaleFactorEntry::IsPos(1)]],
         };
         assert!(matches!(
-            is_pos_table(&abs, &sfb_cb, 2),
+            is_pos_table(&abs, &sfb_cb, 2, std::alloc::Global),
             Err(Error::ElementDecodeInvalid)
         ));
     }
@@ -719,7 +731,7 @@ mod tests {
             entries: vec![vec![AbsoluteScaleFactorEntry::Sf(100)]],
         };
         assert!(matches!(
-            noise_nrg_table(&abs, &sfb_cb, 1),
+            noise_nrg_table(&abs, &sfb_cb, 1, std::alloc::Global),
             Err(Error::ElementDecodeInvalid)
         ));
     }

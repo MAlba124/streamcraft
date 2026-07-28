@@ -602,14 +602,28 @@ pub enum AbsoluteScaleFactorEntry {
 /// `entries[g]` length matches the `entries[g]` of the source
 /// [`ScaleFactorData`] (the non-`ZERO_HCB` band count of the
 /// matching `sfb_cb[g]`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AbsoluteScaleFactors {
+#[derive(Debug, Clone)]
+pub struct AbsoluteScaleFactors<A: std::alloc::Allocator = std::alloc::Global> {
     /// `entries[g]` — the per-band absolute records of window group
     /// `g` in wire (low-frequency-first) order. Variant order
     /// follows the per-band codebook classification in the matching
     /// `sfb_cb[g]`, skipping `ZERO_HCB` bands.
-    pub entries: Vec<Vec<AbsoluteScaleFactorEntry>>,
+    pub entries: Vec<Vec<AbsoluteScaleFactorEntry, A>, A>,
 }
+
+// PartialEq / Eq are hand-written so they compare `entries` element-wise regardless of the
+// allocator type parameter: a derived impl would bound `A: PartialEq`, which `Global` (and the
+// arena allocators the hot path uses) does not satisfy. `Vec<T, A1>: PartialEq<Vec<T, A2>>`
+// compares contents only, so this stays a value comparison. (streamcraft patch)
+impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<AbsoluteScaleFactors<A2>>
+    for AbsoluteScaleFactors<A1>
+{
+    fn eq(&self, other: &AbsoluteScaleFactors<A2>) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl<A: std::alloc::Allocator> Eq for AbsoluteScaleFactors<A> {}
 
 /// Run the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulators
 /// forward over `sfd` to recover absolute scalefactors, intensity
@@ -633,6 +647,21 @@ pub fn accumulate(
     sfb_cb: &[Vec<u8>],
     global_gain: u8,
 ) -> Result<AbsoluteScaleFactors> {
+    accumulate_in(sfd, sfb_cb, global_gain, std::alloc::Global)
+}
+
+/// [`accumulate`] with an explicit `scratch` allocator for the accumulated absolute-scalefactor
+/// records: the hot decode path passes its per-`process()` bump arena so the
+/// `Vec<Vec<AbsoluteScaleFactorEntry, A>, A>` — transient side info consumed by the dequant /
+/// joint-stereo / noise passes within the same frame — comes from the arena rather than the heap
+/// (streamcraft patch). `A: Copy` because the outer and inner vecs share one allocator; `Global`
+/// and `&Bump` are both `Copy`.
+pub fn accumulate_in<A: std::alloc::Allocator + Copy>(
+    sfd: &ScaleFactorData,
+    sfb_cb: &[Vec<u8>],
+    global_gain: u8,
+    scratch: A,
+) -> Result<AbsoluteScaleFactors<A>> {
     if sfd.entries.len() != sfb_cb.len() {
         return Err(Error::ScaleFactorAccumulatorInvalid);
     }
@@ -640,11 +669,13 @@ pub fn accumulate(
     let mut last_is: i32 = 0;
     let mut last_nrg: i32 = i32::from(global_gain) - NOISE_OFFSET - 256;
     let mut noise_pcm_flag = true;
-    let mut out: Vec<Vec<AbsoluteScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
+    let mut out: Vec<Vec<AbsoluteScaleFactorEntry, A>, A> =
+        Vec::with_capacity_in(sfb_cb.len(), scratch);
     for (group_entries, group_cb) in sfd.entries.iter().zip(sfb_cb.iter()) {
         let mut entry_iter = group_entries.iter();
         // One output per non-zero band — pre-size to avoid realloc-growth (streamcraft patch).
-        let mut group_out: Vec<AbsoluteScaleFactorEntry> = Vec::with_capacity(group_cb.len());
+        let mut group_out: Vec<AbsoluteScaleFactorEntry, A> =
+            Vec::with_capacity_in(group_cb.len(), scratch);
         for &cb in group_cb {
             if cb == ZERO_HCB {
                 continue;

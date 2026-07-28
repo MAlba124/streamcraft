@@ -211,27 +211,41 @@ pub fn sect_sfb_offset_in<A: std::alloc::Allocator + Copy>(
 
 /// Quantised spectral coefficients recovered from (or destined for)
 /// a Table 4.56 `spectral_data()` block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpectralData {
+#[derive(Debug, Clone)]
+pub struct SpectralData<A: std::alloc::Allocator = std::alloc::Global> {
     /// `x_quant`, one buffer per window group, in the §4.5.2.3.5
     /// transmission (interleaved) order. `x_quant[g].len() ==
     /// window_group_length[g] × 128` for `EIGHT_SHORT_SEQUENCE`,
     /// `1024` otherwise; bands at or above `max_sfb` and bands whose
     /// section codebook carries no spectrum (`ZERO_HCB`,
     /// `NOISE_HCB`, intensity) are `0`.
-    pub x_quant: Vec<Vec<i32>>,
+    pub x_quant: Vec<Vec<i32, A>, A>,
+}
+
+// Hand-written PartialEq / Eq (as for `AbsoluteScaleFactors`): a derive would bound
+// `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
+// PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
+// allocators. (streamcraft patch)
+impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<SpectralData<A2>>
+    for SpectralData<A1>
+{
+    fn eq(&self, other: &SpectralData<A2>) -> bool {
+        self.x_quant == other.x_quant
+    }
+}
+
+impl<A: std::alloc::Allocator> Eq for SpectralData<A> {}
+
+/// Length of one window group's coefficient buffer.
+fn group_len(ics_info: &IcsInfo, g: usize) -> usize {
+    if ics_info.window_sequence.is_eight_short() {
+        ics_info.window_group_length[g] as usize * SHORT_WINDOW_LEN as usize
+    } else {
+        LONG_WINDOW_LEN as usize
+    }
 }
 
 impl SpectralData {
-    /// Length of one window group's coefficient buffer.
-    fn group_len(ics_info: &IcsInfo, g: usize) -> usize {
-        if ics_info.window_sequence.is_eight_short() {
-            ics_info.window_group_length[g] as usize * SHORT_WINDOW_LEN as usize
-        } else {
-            LONG_WINDOW_LEN as usize
-        }
-    }
-
     /// Parse a Table 4.56 `spectral_data()` block.
     ///
     /// * `reader` — positioned at the first `spectral_data()` bit
@@ -264,31 +278,33 @@ impl SpectralData {
         section_data: &SectionData,
         fs_index: u8,
     ) -> Result<Self> {
-        Self::parse_in(reader, ics_info, section_data, fs_index, std::alloc::Global)
+        SpectralData::parse_in(reader, ics_info, section_data, fs_index, std::alloc::Global)
     }
 
-    /// [`parse`](Self::parse) with an explicit `scratch` allocator for the transient
-    /// `sect_sfb_offset` band-offset table (`Vec<Vec<u32>>`), which is consumed inside this
-    /// function and dropped — so the pipeline passes its per-`process()` arena and the offset
-    /// table costs no heap malloc/free per channel per frame. The decoded `x_quant` still
-    /// escapes into the returned [`SpectralData`], so it stays a heap `Vec` (streamcraft patch).
-    /// Tests call [`parse`](Self::parse), inferring `A = Global`.
+    /// [`parse`](SpectralData::parse) with an explicit `scratch` allocator. Both the transient
+    /// `sect_sfb_offset` band-offset table (`Vec<Vec<u32>>`, consumed inside this function and
+    /// dropped) and the decoded `x_quant` come from `scratch`: the pipeline passes its
+    /// per-`process()` arena, so the offset table AND the per-group coefficient buffers cost no
+    /// heap malloc/free per channel per frame. The returned [`SpectralData<A>`] borrows the arena
+    /// for the life of the frame's decode (streamcraft patch). Tests call
+    /// [`parse`](SpectralData::parse), inferring `A = Global`.
     pub fn parse_in<A: std::alloc::Allocator + Copy>(
         reader: &mut BitReader<'_>,
         ics_info: &IcsInfo,
         section_data: &SectionData,
         fs_index: u8,
         scratch: A,
-    ) -> Result<Self> {
+    ) -> Result<SpectralData<A>> {
         let offsets = sect_sfb_offset_in(scratch, ics_info, fs_index)?;
         let num_groups = ics_info.num_window_groups as usize;
         if section_data.sections.len() != num_groups {
             return Err(Error::SpectralDataInvalid);
         }
 
-        let mut x_quant = Vec::with_capacity(num_groups);
+        let mut x_quant: Vec<Vec<i32, A>, A> = Vec::with_capacity_in(num_groups, scratch);
         for (g, group_offsets) in offsets.iter().enumerate() {
-            let mut buf = vec![0i32; Self::group_len(ics_info, g)];
+            let mut buf: Vec<i32, A> = Vec::with_capacity_in(group_len(ics_info, g), scratch);
+            buf.resize(group_len(ics_info, g), 0i32);
             for sec in &section_data.sections[g] {
                 let (cb, dim) = match section_codebook(sec)? {
                     Some(pair) => pair,
@@ -328,7 +344,9 @@ impl SpectralData {
         }
         Ok(SpectralData { x_quant })
     }
+}
 
+impl<A: std::alloc::Allocator> SpectralData<A> {
     /// Write a Table 4.56 `spectral_data()` block — the bit-exact
     /// inverse of [`SpectralData::parse`] under the same `ics_info`
     /// / `section_data` / `fs_index`.
@@ -365,7 +383,7 @@ impl SpectralData {
 
         for (g, group_offsets) in offsets.iter().enumerate() {
             let buf = &self.x_quant[g];
-            if buf.len() != Self::group_len(ics_info, g) {
+            if buf.len() != group_len(ics_info, g) {
                 return Err(Error::SpectralDataEncodeInvalid);
             }
             // Bands that transmit no spectrum must hold zeros:

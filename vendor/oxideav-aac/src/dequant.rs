@@ -157,10 +157,14 @@ pub fn rescale_spectrum(
 /// `quant_to_spec` and immediately dropped — comes from the frame arena instead of the heap
 /// (streamcraft patch). `A: Copy` because a `Vec<Vec<f64, A>, A>` needs the same allocator for
 /// the outer vec and each inner vec; `Global` and `&Bump` are both `Copy`.
-pub fn rescale_spectrum_in<A: std::alloc::Allocator + Copy>(
+pub fn rescale_spectrum_in<
+    A: std::alloc::Allocator + Copy,
+    S: std::alloc::Allocator,
+    P: std::alloc::Allocator,
+>(
     alloc: A,
-    spectral: &SpectralData,
-    scale_factors: &AbsoluteScaleFactors,
+    spectral: &SpectralData<P>,
+    scale_factors: &AbsoluteScaleFactors<S>,
     sfb_cb: &[Vec<u8>],
     ics_info: &IcsInfo,
     fs_index: u8,
