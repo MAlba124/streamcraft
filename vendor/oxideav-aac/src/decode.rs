@@ -232,7 +232,7 @@ impl StreamDecoder {
                         kind: kind @ (IdSynEle::Sce | IdSynEle::Lfe),
                         element_instance_tag,
                     } => {
-                        let body = IcsBody::parse(&mut reader, aot, fs, false)?;
+                        let body = IcsBody::parse_in(&mut reader, aot, fs, false, scratch)?;
                         let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
                         let spectral =
                             SpectralData::parse_in(&mut reader, &ics, &body.section_data, fs, scratch)?;
@@ -456,9 +456,9 @@ impl StreamDecoder {
                     ms_used.push(row);
                 }
             }
-            let left_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
+            let left_body = IcsBody::parse_with_ics_info_in(reader, &ics, aot, false, scratch)?;
             let left_spectral = SpectralData::parse_in(reader, &ics, &left_body.section_data, fs, scratch)?;
-            let right_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
+            let right_body = IcsBody::parse_with_ics_info_in(reader, &ics, aot, false, scratch)?;
             let right_spectral = SpectralData::parse_in(reader, &ics, &right_body.section_data, fs, scratch)?;
             let left = ChannelInput {
                 body: &left_body,
@@ -479,14 +479,14 @@ impl StreamDecoder {
         } else {
             // Non-shared CPE: each channel carries its own ics_info; no
             // M/S mask, so the joint-stereo tools do not run.
-            let left_body = IcsBody::parse(reader, aot, fs, false)?;
+            let left_body = IcsBody::parse_in(reader, aot, fs, false, scratch)?;
             let left_ics = left_body
                 .ics_info
                 .clone()
                 .ok_or(Error::ElementDecodeInvalid)?;
             let left_spectral =
                 SpectralData::parse_in(reader, &left_ics, &left_body.section_data, fs, scratch)?;
-            let right_body = IcsBody::parse(reader, aot, fs, false)?;
+            let right_body = IcsBody::parse_in(reader, aot, fs, false, scratch)?;
             let right_ics = right_body
                 .ics_info
                 .clone()

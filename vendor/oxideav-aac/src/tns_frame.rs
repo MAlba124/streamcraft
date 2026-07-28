@@ -228,12 +228,25 @@ fn tns_frame_filter(
             //                  coef_compress[w][f], coef[w][f], lpc[] )
             // — only the first `tns_order` transmitted magnitudes
             // participate when the wire `order` exceeded the cap.
-            let coef: Vec<u32> = filter.coef[..tns_order]
-                .iter()
-                .map(|&c| u32::from(c))
-                .collect();
+            //
+            // `clamp_tns_order` bounds `tns_order` by Table 4.102's
+            // `TNS_MAX_ORDER` (≤ 20, AAC Main / other AOTs > 32 kHz), so
+            // the widened `coef` lives in a fixed-size stack buffer — no
+            // per-filter heap alloc on the TNS decode path (streamcraft
+            // patch). The `<= TNS_ORDER_STACK_CAP` guard is a defensive
+            // belt-and-braces against a future table growth; the clamp
+            // makes it unreachable today.
+            const TNS_ORDER_STACK_CAP: usize = 20;
+            if tns_order > TNS_ORDER_STACK_CAP {
+                return Err(Error::TnsFrameInvalid);
+            }
+            let mut coef_buf = [0u32; TNS_ORDER_STACK_CAP];
+            for (dst, &c) in coef_buf.iter_mut().zip(&filter.coef[..tns_order]) {
+                *dst = u32::from(c);
+            }
+            let coef = &coef_buf[..tns_order];
             let lpc =
-                tns_decode_coef_to_lpc(coef_res_bits, u32::from(filter.coef_compress), &coef)?;
+                tns_decode_coef_to_lpc(coef_res_bits, u32::from(filter.coef_compress), coef)?;
 
             // Band indices are at most `num_swb` (bottom/top start
             // there and only decrease), so the u8 narrowing is exact:

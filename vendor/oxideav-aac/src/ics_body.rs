@@ -130,8 +130,19 @@ pub const AOT_AAC_SSR: u8 = 3;
 ///
 /// The trailing `spectral_data()` block is the caller's
 /// responsibility — see the module docs for the rationale.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IcsBody {
+///
+/// Generic over an allocator `A` (defaulting to [`std::alloc::Global`]
+/// so existing callers and tests are unchanged): `A` threads only into
+/// the two high-count fields on the hot decode path —
+/// [`Self::section_data`]'s per-group `sections` and
+/// [`Self::scale_factor_data`]'s per-group `entries` — which come from
+/// the caller's per-`process()` bump arena rather than the heap
+/// (streamcraft patch). Every other field (`ics_info` and the tool
+/// records) stays [`std::alloc::Global`]: they do not allocate on the
+/// hot ≤32B path, and a generic struct freely mixes `A`-backed and
+/// `Global` fields.
+#[derive(Debug, Clone)]
+pub struct IcsBody<A: std::alloc::Allocator = std::alloc::Global> {
     /// `global_gain` — 8-bit `uimsbf` per Table 4.50. The seed for
     /// the §4.6.2.3.2 scalefactor DPCM accumulator
     /// (`last_sf = global_gain` at the top of every frame).
@@ -142,9 +153,9 @@ pub struct IcsBody {
     /// struct (CPE shared-info form).
     pub ics_info: Option<IcsInfo>,
     /// `section_data()` (ISO/IEC 13818-7 §6.3 Table 17).
-    pub section_data: SectionData,
+    pub section_data: SectionData<A>,
     /// `scale_factor_data()` (Table 4.53, non-resilient branch).
-    pub scale_factor_data: ScaleFactorData,
+    pub scale_factor_data: ScaleFactorData<A>,
     /// `pulse_data_present` (1 bit). When `true`, [`Self::pulse_data`]
     /// carries the dispatched Table 4.7 record.
     pub pulse_data_present: bool,
@@ -192,6 +203,30 @@ pub struct IcsBody {
     pub reordered_spectral_lengths: Option<(u16, u8)>,
 }
 
+// Hand-written PartialEq / Eq (as for `SectionData` / `ScaleFactorData` / `SpectralData`): a
+// derive would bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. The
+// two `A`-backed fields (`section_data`, `scale_factor_data`) compare cross-allocator via their
+// own hand-written `PartialEq`; the rest are plain `Global`/`Copy` fields (streamcraft patch).
+impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<IcsBody<A2>> for IcsBody<A1> {
+    fn eq(&self, other: &IcsBody<A2>) -> bool {
+        self.global_gain == other.global_gain
+            && self.ics_info == other.ics_info
+            && self.section_data == other.section_data
+            && self.scale_factor_data == other.scale_factor_data
+            && self.pulse_data_present == other.pulse_data_present
+            && self.pulse_data == other.pulse_data
+            && self.tns_data_present == other.tns_data_present
+            && self.tns_data == other.tns_data
+            && self.gain_control_data_present == other.gain_control_data_present
+            && self.gain_control_data == other.gain_control_data
+            && self.spectral_data_bit_offset == other.spectral_data_bit_offset
+            && self.er_scale_factor_data == other.er_scale_factor_data
+            && self.reordered_spectral_lengths == other.reordered_spectral_lengths
+    }
+}
+
+impl<A: std::alloc::Allocator> Eq for IcsBody<A> {}
+
 impl IcsBody {
     /// Parse a Table 4.50 channel-element body whose `ics_info()` is
     /// inline (the single-channel `SCE` / `LFE` form, or the
@@ -222,15 +257,12 @@ impl IcsBody {
         sampling_frequency_index: u8,
         scale_flag: bool,
     ) -> Result<Self> {
-        // CPE-shared-info form is handled by parse_with_ics_info; the
-        // public `parse` always reads its own ics_info, which matches
-        // the SCE / LFE / non-common-window CPE case.
-        Self::parse_inner(
+        Self::parse_in(
             reader,
             audio_object_type,
             sampling_frequency_index,
-            false,
             scale_flag,
+            std::alloc::Global,
         )
     }
 
@@ -250,18 +282,65 @@ impl IcsBody {
         audio_object_type: u8,
         scale_flag: bool,
     ) -> Result<Self> {
+        Self::parse_with_ics_info_in(
+            reader,
+            ics_info,
+            audio_object_type,
+            scale_flag,
+            std::alloc::Global,
+        )
+    }
+}
+
+impl<A: std::alloc::Allocator + Copy> IcsBody<A> {
+    /// [`parse`](IcsBody::parse) with an explicit `scratch` allocator. On the hot decode path the
+    /// `section_data()` per-group `sections` and the `scale_factor_data()` per-group `entries`
+    /// come from the caller's per-`process()` arena rather than the heap; every other field stays
+    /// [`std::alloc::Global`] (streamcraft patch). Tests call [`parse`](IcsBody::parse), inferring
+    /// `A = Global`.
+    pub fn parse_in(
+        reader: &mut BitReader<'_>,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        scale_flag: bool,
+        scratch: A,
+    ) -> Result<Self> {
+        // CPE-shared-info form is handled by parse_with_ics_info_in; the
+        // public `parse` always reads its own ics_info, which matches
+        // the SCE / LFE / non-common-window CPE case.
+        Self::parse_inner(
+            reader,
+            audio_object_type,
+            sampling_frequency_index,
+            false,
+            scale_flag,
+            scratch,
+        )
+    }
+
+    /// [`parse_with_ics_info`](IcsBody::parse_with_ics_info) with an explicit `scratch` allocator
+    /// (see [`IcsBody::parse_in`]).
+    pub fn parse_with_ics_info_in(
+        reader: &mut BitReader<'_>,
+        ics_info: &IcsInfo,
+        audio_object_type: u8,
+        scale_flag: bool,
+        scratch: A,
+    ) -> Result<Self> {
         if scale_flag {
             return Err(Error::NotImplemented);
         }
         let start = reader.bit_position();
         let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
-        let section_data = SectionData::parse(
+        let section_data = SectionData::parse_in(
             reader,
             ics_info.window_sequence,
             ics_info.num_window_groups,
             ics_info.max_sfb,
+            scratch,
         )?;
-        let scale_factor_data = ScaleFactorData::parse(reader, &section_data.sfb_cb)?;
+        let scale_factor_data =
+            ScaleFactorData::parse_in(reader, &section_data.sfb_cb, scratch)?;
 
         let tools = parse_tools(reader, ics_info, audio_object_type, start)?;
 
@@ -288,6 +367,7 @@ impl IcsBody {
         sampling_frequency_index: u8,
         common_window: bool,
         scale_flag: bool,
+        scratch: A,
     ) -> Result<Self> {
         if scale_flag {
             return Err(Error::NotImplemented);
@@ -303,13 +383,15 @@ impl IcsBody {
             sampling_frequency_index,
             common_window,
         )?;
-        let section_data = SectionData::parse(
+        let section_data = SectionData::parse_in(
             reader,
             ics_info.window_sequence,
             ics_info.num_window_groups,
             ics_info.max_sfb,
+            scratch,
         )?;
-        let scale_factor_data = ScaleFactorData::parse(reader, &section_data.sfb_cb)?;
+        let scale_factor_data =
+            ScaleFactorData::parse_in(reader, &section_data.sfb_cb, scratch)?;
 
         let tools = parse_tools(reader, &ics_info, audio_object_type, start)?;
 
@@ -329,7 +411,9 @@ impl IcsBody {
             reordered_spectral_lengths: None,
         })
     }
+}
 
+impl IcsBody {
     /// Parse an **error-resilient** Table 4.50 channel-element body
     /// (the ER General Audio object types — AOTs 17 / 19 / 20 / 23 —
     /// whose ASC carries the [`AacResilienceFlags`] triplet).

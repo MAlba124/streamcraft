@@ -252,17 +252,44 @@ impl Section {
 /// The per-group section lists plus the flattened `sfb_cb[g][sfb]`
 /// map are surfaced; `scale_factor_data()` (next round) consumes
 /// `sfb_cb` to decide which bands carry a transmitted scalefactor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SectionData {
+///
+/// The `sections` field is generic over an allocator `A` (defaulting
+/// to [`std::alloc::Global`] so existing callers and tests are
+/// unchanged): on the hot decode path the per-group section lists —
+/// pure per-frame scratch, built here and consumed once by
+/// [`crate::spectral_data::SpectralData::parse_in`] — come from the
+/// caller's per-`process()` bump arena rather than the heap
+/// (streamcraft patch). `sfb_cb` is deliberately **left on the heap**
+/// (`Global`): it is read as `&[Vec<u8>]` by ~19 downstream tools
+/// (pns, cce, dequant, ms/intensity stereo, scale_factor_data,
+/// element_decode), and threading `A` through all of them buys
+/// nothing — `sfb_cb`'s allocation profile is dwarfed by `sections`.
+#[derive(Debug, Clone)]
+pub struct SectionData<A: std::alloc::Allocator = std::alloc::Global> {
     /// `sect[g]` — the ordered sections of window group `g`. The
     /// outer index runs `0..num_window_groups`; `sect[g].len()` is
     /// `num_sec[g]`.
-    pub sections: Vec<Vec<Section>>,
+    pub sections: Vec<Vec<Section, A>, A>,
     /// `sfb_cb[g][sfb]` — the codebook assigned to scalefactor band
     /// `sfb` of group `g`, for `sfb in 0..max_sfb`. Flattened per
-    /// group; the outer index runs `0..num_window_groups`.
+    /// group; the outer index runs `0..num_window_groups`. Kept on
+    /// the heap (`Global`) regardless of `A` — see the struct docs.
     pub sfb_cb: Vec<Vec<u8>>,
 }
+
+// Hand-written PartialEq / Eq (as for `SpectralData` / `AbsoluteScaleFactors`): a derive would
+// bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
+// PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
+// allocators — including the always-`Global` `sfb_cb` (streamcraft patch).
+impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<SectionData<A2>>
+    for SectionData<A1>
+{
+    fn eq(&self, other: &SectionData<A2>) -> bool {
+        self.sections == other.sections && self.sfb_cb == other.sfb_cb
+    }
+}
+
+impl<A: std::alloc::Allocator> Eq for SectionData<A> {}
 
 impl SectionData {
     /// Parse a `section_data()` from the bit-reader.
@@ -286,6 +313,52 @@ impl SectionData {
         num_window_groups: u8,
         max_sfb: u8,
     ) -> Result<Self> {
+        Self::parse_in(
+            reader,
+            window_sequence,
+            num_window_groups,
+            max_sfb,
+            std::alloc::Global,
+        )
+    }
+
+    /// Parse the error-resilient `section_data()` branch
+    /// (`aacSectionDataResilienceFlag == 1`, Table 4.52).
+    ///
+    /// See [`SectionData::parse_in`] for the allocator story; this is
+    /// the [`std::alloc::Global`] wrapper the non-arena callers use.
+    /// The ER branch differences are documented on
+    /// [`SectionData::parse_er_in`].
+    ///
+    /// Returns [`Error::SectionDataOverrun`] on a run past `max_sfb`
+    /// and [`Error::UnexpectedEnd`] on bit-reader underflow.
+    pub fn parse_er(
+        reader: &mut BitReader<'_>,
+        window_sequence: WindowSequence,
+        num_window_groups: u8,
+        max_sfb: u8,
+    ) -> Result<Self> {
+        Self::parse_er_in(
+            reader,
+            window_sequence,
+            num_window_groups,
+            max_sfb,
+            std::alloc::Global,
+        )
+    }
+}
+
+impl<A: std::alloc::Allocator + Copy> SectionData<A> {
+    /// [`parse`](SectionData::parse) with an explicit `scratch` allocator for the per-group
+    /// `sections` lists (the pipeline passes its per-`process()` arena; tests infer `A = Global`).
+    /// `sfb_cb` stays on the heap regardless of `A` — see the struct docs (streamcraft patch).
+    pub fn parse_in(
+        reader: &mut BitReader<'_>,
+        window_sequence: WindowSequence,
+        num_window_groups: u8,
+        max_sfb: u8,
+        scratch: A,
+    ) -> Result<Self> {
         // Table 17: sect_esc_val and sect_len_incr field width.
         let (sect_esc_val, len_bits) = if window_sequence.is_eight_short() {
             ((1u32 << 3) - 1, 3u32) // 7, 3-bit field
@@ -293,11 +366,12 @@ impl SectionData {
             ((1u32 << 5) - 1, 5u32) // 31, 5-bit field
         };
 
-        let mut sections: Vec<Vec<Section>> = Vec::with_capacity(num_window_groups as usize);
+        let mut sections: Vec<Vec<Section, A>, A> =
+            Vec::with_capacity_in(num_window_groups as usize, scratch);
         let mut sfb_cb: Vec<Vec<u8>> = Vec::with_capacity(num_window_groups as usize);
 
         for _g in 0..num_window_groups {
-            let mut group_sections: Vec<Section> = Vec::new();
+            let mut group_sections: Vec<Section, A> = Vec::new_in(scratch);
             let mut group_sfb_cb: Vec<u8> = vec![ZERO_HCB; max_sfb as usize];
 
             let mut k: u32 = 0;
@@ -343,10 +417,9 @@ impl SectionData {
         Ok(SectionData { sections, sfb_cb })
     }
 
-    /// Parse the error-resilient `section_data()` branch
-    /// (`aacSectionDataResilienceFlag == 1`, Table 4.52).
-    ///
-    /// Two differences from the non-resilient [`SectionData::parse`]:
+    /// [`parse_er`](SectionData::parse_er) with an explicit `scratch` allocator for the per-group
+    /// `sections` lists (see [`SectionData::parse_in`]). The error-resilient branch differs from
+    /// the non-resilient [`SectionData::parse_in`] in two spec-driven ways (Table 4.52):
     ///
     /// * `sect_cb[g][i]` is read as a **5-bit** field (so it can carry
     ///   the §4.6.16.4 virtual codebooks 16..=31, the per-band VCB11
@@ -366,11 +439,12 @@ impl SectionData {
     ///
     /// Returns [`Error::SectionDataOverrun`] on a run past `max_sfb`
     /// and [`Error::UnexpectedEnd`] on bit-reader underflow.
-    pub fn parse_er(
+    pub fn parse_er_in(
         reader: &mut BitReader<'_>,
         window_sequence: WindowSequence,
         num_window_groups: u8,
         max_sfb: u8,
+        scratch: A,
     ) -> Result<Self> {
         // Table 4.52: sect_esc_val / sect_len_incr field width are the
         // same as the non-resilient branch; only sect_cb widens to 5
@@ -381,11 +455,12 @@ impl SectionData {
             ((1u32 << 5) - 1, 5u32)
         };
 
-        let mut sections: Vec<Vec<Section>> = Vec::with_capacity(num_window_groups as usize);
+        let mut sections: Vec<Vec<Section, A>, A> =
+            Vec::with_capacity_in(num_window_groups as usize, scratch);
         let mut sfb_cb: Vec<Vec<u8>> = Vec::with_capacity(num_window_groups as usize);
 
         for _g in 0..num_window_groups {
-            let mut group_sections: Vec<Section> = Vec::new();
+            let mut group_sections: Vec<Section, A> = Vec::new_in(scratch);
             let mut group_sfb_cb: Vec<u8> = vec![ZERO_HCB; max_sfb as usize];
 
             let mut k: u32 = 0;

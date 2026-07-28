@@ -372,13 +372,33 @@ pub enum ScaleFactorEntry {
 /// [`SectionData::sfb_cb`](crate::section_data::SectionData::sfb_cb)
 /// and skipping `ZERO_HCB` bands — the same walk the parser
 /// performed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScaleFactorData {
+/// The `entries` field is generic over an allocator `A` (defaulting
+/// to [`std::alloc::Global`] so existing callers and tests are
+/// unchanged): on the hot decode path the per-group record lists —
+/// built here and consumed once by [`accumulate_in`] within the same
+/// frame — come from the caller's per-`process()` bump arena rather
+/// than the heap (streamcraft patch).
+#[derive(Debug, Clone)]
+pub struct ScaleFactorData<A: std::alloc::Allocator = std::alloc::Global> {
     /// `entries[g]` — the per-band records of window group `g` in
     /// wire order. `entries.len()` equals `sfb_cb.len()`
     /// (`num_window_groups`).
-    pub entries: Vec<Vec<ScaleFactorEntry>>,
+    pub entries: Vec<Vec<ScaleFactorEntry, A>, A>,
 }
+
+// Hand-written PartialEq / Eq (as for `SpectralData` / `AbsoluteScaleFactors`): a derive would
+// bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
+// PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
+// allocators (streamcraft patch).
+impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<ScaleFactorData<A2>>
+    for ScaleFactorData<A1>
+{
+    fn eq(&self, other: &ScaleFactorData<A2>) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl<A: std::alloc::Allocator> Eq for ScaleFactorData<A> {}
 
 impl ScaleFactorData {
     /// Parse a non-resilient `scale_factor_data()` from `reader`.
@@ -395,12 +415,28 @@ impl ScaleFactorData {
     /// codebook is a complete 19-bit prefix code so a fully-read
     /// Huffman value is guaranteed to match an entry.
     pub fn parse(reader: &mut BitReader<'_>, sfb_cb: &[Vec<u8>]) -> Result<Self> {
+        Self::parse_in(reader, sfb_cb, std::alloc::Global)
+    }
+}
+
+impl<A: std::alloc::Allocator + Copy> ScaleFactorData<A> {
+    /// [`parse`](ScaleFactorData::parse) with an explicit `scratch` allocator for the per-group
+    /// `entries` lists (the pipeline passes its per-`process()` arena; tests infer `A = Global`).
+    /// The returned records are transient side info consumed by [`accumulate_in`] within the same
+    /// frame, so on the hot path they cost no heap malloc/free per channel (streamcraft patch).
+    pub fn parse_in(
+        reader: &mut BitReader<'_>,
+        sfb_cb: &[Vec<u8>],
+        scratch: A,
+    ) -> Result<Self> {
         let mut noise_pcm_flag = true;
-        let mut entries: Vec<Vec<ScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
+        let mut entries: Vec<Vec<ScaleFactorEntry, A>, A> =
+            Vec::with_capacity_in(sfb_cb.len(), scratch);
         for group in sfb_cb {
             // At most one entry per band — pre-size so the per-band pushes don't realloc-grow
             // (grow_one profiled as a chunk of the 16/32-byte allocations; streamcraft patch).
-            let mut group_entries: Vec<ScaleFactorEntry> = Vec::with_capacity(group.len());
+            let mut group_entries: Vec<ScaleFactorEntry, A> =
+                Vec::with_capacity_in(group.len(), scratch);
             for &cb in group {
                 if cb == ZERO_HCB {
                     continue;
@@ -657,7 +693,7 @@ pub fn accumulate(
 /// (streamcraft patch). `A: Copy` because the outer and inner vecs share one allocator; `Global`
 /// and `&Bump` are both `Copy`.
 pub fn accumulate_in<A: std::alloc::Allocator + Copy>(
-    sfd: &ScaleFactorData,
+    sfd: &ScaleFactorData<A>,
     sfb_cb: &[Vec<u8>],
     global_gain: u8,
     scratch: A,

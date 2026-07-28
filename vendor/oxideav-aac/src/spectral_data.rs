@@ -291,7 +291,7 @@ impl SpectralData {
     pub fn parse_in<A: std::alloc::Allocator + Copy>(
         reader: &mut BitReader<'_>,
         ics_info: &IcsInfo,
-        section_data: &SectionData,
+        section_data: &SectionData<A>,
         fs_index: u8,
         scratch: A,
     ) -> Result<SpectralData<A>> {

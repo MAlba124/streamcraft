@@ -98,8 +98,10 @@ use crate::{Error, Result};
 #[derive(Debug)]
 pub struct ChannelInput<'a, A: std::alloc::Allocator = std::alloc::Global> {
     /// The parsed `individual_channel_stream()` body
-    /// ([`IcsBody::parse`] / [`IcsBody::parse_with_ics_info`]).
-    pub body: &'a IcsBody,
+    /// ([`IcsBody::parse`] / [`IcsBody::parse_with_ics_info`]). Its
+    /// arena-backed `section_data` / `scale_factor_data` share the same
+    /// allocator `A` as [`Self::spectral`] on the hot decode path.
+    pub body: &'a IcsBody<A>,
     /// The channel's `ics_info()`. For an SCE / LFE or a non-shared
     /// CPE this is `body.ics_info`; for a `common_window == 1` CPE this
     /// is the shared `ics_info` the caller parsed once.
@@ -272,9 +274,9 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
 /// `ltp_data_present == 0`, in which case no prediction is added but the
 /// history is still advanced so it stays continuous across frames.
 #[allow(clippy::too_many_arguments)]
-fn finish_channel(
+fn finish_channel<A: std::alloc::Allocator>(
     spec: &mut [f64],
-    body: &IcsBody,
+    body: &IcsBody<A>,
     ics_info: &IcsInfo,
     ltp: Option<&crate::ics_info::LtpData>,
     aot: u8,
