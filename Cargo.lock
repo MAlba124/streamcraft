@@ -958,7 +958,6 @@ dependencies = [
  "sc-ogg",
  "sc-pipewire",
  "sc-present",
- "sc-sdl3",
  "sc-text",
  "sc-vaapi",
  "sc-vp8",

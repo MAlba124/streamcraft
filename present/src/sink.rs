@@ -26,10 +26,9 @@ use streamcraft_core::log;
 use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
-use sc_text::{font, pgs};
+use sc_text::pgs;
 use sc_vaapi::gpuframe::{GpuFrame, GpuFrameChannel, GpuFrameHeader, GPU_OFFER};
 
-use crate::raster::Canvas;
 use crate::window::{DmabufVideo, Plane, Window};
 
 /// The video (metronome) pad and the subtitle-bitmap side pad.
@@ -83,35 +82,11 @@ pub struct WaylandVideoSink {
     disabled: bool,
     /// The next frame after a flush presents immediately (no clock wait) — preroll.
     preroll_next: bool,
-    /// Frames presented — drives the GUI overlay's decoupled (lower-rate) update cadence.
+    /// Frames presented.
     frames: u64,
-    /// The current subtitle caption (latest-wins), shown for `[start, end)` (its own subsurface).
-    subtitle: Option<SubCue>,
-    /// The window↔app control channel (clicks → pause/seek; duration/paused → HUD). Set by the
-    /// player; `None` = display-only (no interactive controls).
-    control: Option<Arc<crate::control::PlayerControl>>,
-    /// HUD auto-hide: stay visible until this instant (bumped on pointer activity); hidden when
-    /// elapsed *and* playing (a paused player always shows its controls). `None` = never shown.
-    hud_deadline: Option<std::time::Instant>,
-    /// Whether the HUD subsurface is currently mapped — the redraw/hide edge trigger.
-    hud_mapped: bool,
-    /// The wall-second and pause state the HUD was last drawn at, so it redraws only on a real
-    /// content change (the clock ticking or a play/pause flip), not every pump — the overlay
-    /// was previously re-rendered ~15×/s for nothing (the "2% CPU while playing").
-    hud_sec: u64,
-    hud_paused: bool,
-    /// The `[start, end)` span of the caption currently committed to the subtitle subsurface, so
-    /// it is re-rendered only when the visible cue changes — not every pump while one is up.
-    sub_shown: Option<(Timestamp, Timestamp)>,
-    /// `Quit` was pushed to the control channel on window close — once only.
-    quit_sent: bool,
-}
-
-/// One decoded PGS caption + its on-screen span.
-struct SubCue {
-    start: Timestamp,
-    end: Timestamp,
-    ds: pgs::DisplaySet,
+    /// The shared interactive overlay layer (controls, HUD, caption, close) — driven from the
+    /// clock-wait pump.
+    ui: crate::ui::WindowUi,
 }
 
 impl Default for WaylandVideoSink {
@@ -131,14 +106,7 @@ impl WaylandVideoSink {
             disabled: false,
             preroll_next: false,
             frames: 0,
-            subtitle: None,
-            control: None,
-            hud_deadline: None,
-            hud_mapped: false,
-            hud_sec: u64::MAX,
-            hud_paused: false,
-            sub_shown: None,
-            quit_sent: false,
+            ui: crate::ui::WindowUi::new(),
         }
     }
 
@@ -150,7 +118,7 @@ impl WaylandVideoSink {
 
     /// Attach the window↔app control channel for interactive controls (clicks → pause/seek).
     pub fn with_control(mut self, control: Arc<crate::control::PlayerControl>) -> Self {
-        self.control = Some(control);
+        self.ui.set_control(control);
         self
     }
 
@@ -191,7 +159,7 @@ impl WaylandVideoSink {
                     self.window = Some(w);
                     // Reveal the controls briefly on open (then they auto-hide) so the user
                     // sees them without having to move the pointer first.
-                    self.hud_deadline = Some(std::time::Instant::now() + HUD_LINGER);
+                    self.ui.arm_hud();
                 }
                 Err(e) => {
                     let element = ctx.element();
@@ -262,109 +230,22 @@ impl WaylandVideoSink {
         Ok(())
     }
 
-    /// One unit of window upkeep, decoupled from the video rate — run every clock-wait slice
-    /// (so the window stays live between frames and while paused) and once per presented frame:
-    /// pump the socket, free compositor-released decoder surfaces, re-letterbox on resize, route
-    /// clicks to pause/seek, signal `Quit` on close, and refresh the HUD + caption. `pos_ns` is
-    /// the running position to show. All hits are throttled/idempotent, so calling this at the
-    /// ~8 ms slice rate is cheap. No `ctx` — nothing here needs the scheduler.
+    /// One unit of window upkeep, decoupled from the video rate — run every clock-wait slice (so
+    /// the window stays live between frames and while paused) and once per presented frame. Frees
+    /// the compositor-released decoder surfaces (deferred token release, the anti-tear contract),
+    /// then hands off to the shared [`WindowUi`](crate::ui::WindowUi) for input/HUD/caption/close.
     fn pump_window(&mut self, pos_ns: u64) {
-        let Self {
-            window,
-            subtitle,
-            channel,
-            control,
-            hud_deadline,
-            hud_mapped,
-            hud_sec,
-            hud_paused,
-            sub_shown,
-            quit_sent,
-            ..
-        } = self;
+        let Self { window, channel, ui, .. } = self;
         let Some(w) = window.as_mut() else { return };
+        // Deferred token release (before the UI pump's own dispatch also runs): hand back the
+        // surfaces the compositor is done sampling so the decoder can reuse them.
         let _ = w.dispatch(false);
-        // Deferred token release: hand back the surfaces the compositor is done sampling.
         if let Some(ch) = channel.as_ref() {
             while let Some(tok) = w.next_released_token() {
                 ch.release(tok);
             }
         }
-        // A resize while paused draws no new frame — re-fit the retained one here.
-        let _ = w.reflow();
-        // Route left-clicks: the timeline rail → seek, elsewhere → pause toggle.
-        if let Some(ctrl) = control.as_ref() {
-            let (ww, wh) = w.size();
-            while let Some((cx, cy)) = w.take_click() {
-                if cy >= wh - BAR_H && cx >= TRACK_X && cx <= ww - TRACK_PAD {
-                    let tw = (ww - TRACK_X - TRACK_PAD).max(1);
-                    let frac = ((cx - TRACK_X) as f32 / tw as f32).clamp(0.0, 1.0);
-                    ctrl.push(crate::control::UiCommand::SeekFraction(frac));
-                } else {
-                    ctrl.push(crate::control::UiCommand::TogglePause);
-                }
-            }
-            // Window close → tell the app to quit (once); the pipeline stop unwinds everything.
-            if w.should_close() && !*quit_sent {
-                ctrl.push(crate::control::UiCommand::Quit);
-                *quit_sent = true;
-            }
-        }
-        // HUD: shown while paused or for a few seconds after pointer activity, then auto-hidden
-        // so idle playback pays nothing for it. While visible, redraw only when the content
-        // actually changes (the wall-second ticks or play/pause flips) — not every pump.
-        if w.has_gui() {
-            if w.take_pointer_activity() {
-                *hud_deadline = Some(std::time::Instant::now() + HUD_LINGER);
-            }
-            let (dur_ns, paused) = control
-                .as_ref()
-                .map(|c| (c.duration_ns(), c.paused()))
-                .unwrap_or((0, false));
-            let show = paused || hud_deadline.is_some_and(|d| std::time::Instant::now() < d);
-            let sec = pos_ns / 1_000_000_000;
-            if show {
-                if !*hud_mapped || paused != *hud_paused || sec != *hud_sec {
-                    *hud_mapped = true;
-                    *hud_paused = paused;
-                    *hud_sec = sec;
-                    let (ww, wh) = w.size();
-                    let hud = Hud { width: ww, pos_ns, dur_ns, paused };
-                    let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, &hud));
-                }
-            } else if *hud_mapped {
-                *hud_mapped = false;
-                let _ = w.hide_gui();
-            }
-        }
-        // Caption for the current position — (re)rendered only when the visible cue changes, not
-        // every pump (present_subtitle rasterizes + uploads the bitmap; doing it at the pump rate
-        // was a second constant-redraw cost whenever a subtitle was on screen).
-        let pts = Timestamp::from_nanos(pos_ns);
-        let want = subtitle
-            .as_ref()
-            .filter(|c| pts >= c.start && pts < c.end)
-            .map(|c| (c.start, c.end));
-        if want != *sub_shown {
-            match subtitle.as_ref().filter(|_| want.is_some()) {
-                Some(c) => {
-                    let ds = &c.ds;
-                    let _ = w.present_subtitle(
-                        ds.video_width as i32,
-                        ds.video_height as i32,
-                        ds.x as i32,
-                        ds.y as i32,
-                        ds.width as i32,
-                        ds.height as i32,
-                        &ds.rgba,
-                    );
-                }
-                None => {
-                    let _ = w.hide_subtitle();
-                }
-            }
-            *sub_shown = want;
-        }
+        ui.pump(w, pos_ns);
     }
 
     /// Take the frame for `token` from the channel (if wired + arrived).
@@ -387,22 +268,6 @@ impl WaylandVideoSink {
         self.release(token);
     }
 
-    /// Update the current subtitle caption from a `subtitle/bitmap` buffer (latest-wins; a
-    /// clear erases it). Timed by the buffer's pts + duration.
-    fn push_subtitle(&mut self, ds: pgs::DisplaySet, pts: Timestamp, duration: Timestamp) {
-        if ds.is_clear() {
-            self.subtitle = None;
-            return;
-        }
-        let Some(start_ns) = pts.nanos() else { return };
-        // A PGS composition stays until the next composition/clear; use its duration when set,
-        // else a generous default so a lost clear doesn't strand a caption forever.
-        let dur_ns = duration.nanos().filter(|&d| d > 0).unwrap_or(10_000_000_000);
-        let start = Timestamp::from_nanos(start_ns);
-        let end = Timestamp::from_nanos(start_ns.saturating_add(dur_ns));
-        self.subtitle = Some(SubCue { start, end, ds });
-    }
-
     /// The window was closed by the user — warn on the bus (the app ends playback) and disable.
     fn on_close(&mut self, ctx: &mut Ctx) {
         log!(&*ctx, Level::Debug, "window_closed");
@@ -414,75 +279,6 @@ impl WaylandVideoSink {
         self.window = None;
         self.disabled = true;
     }
-}
-
-/// The control-bar overlay height in px.
-const BAR_H: i32 = 40;
-
-/// How long the HUD lingers after the last pointer activity before auto-hiding (playing only —
-/// a paused player keeps its controls up).
-const HUD_LINGER: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Where the timeline rail starts (after the play glyph + the `MM:SS` time) and its right pad.
-const TRACK_X: i32 = 108;
-const TRACK_PAD: i32 = 16;
-
-/// The HUD's per-frame state (position/duration/pause) for [`draw_controls`].
-struct Hud {
-    width: i32,
-    pos_ns: u64,
-    dur_ns: u64,
-    paused: bool,
-}
-
-/// Draw the player HUD control bar into `c` — a `width×BAR_H` ARGB canvas, `0` alpha where the
-/// video shows through. Anti-aliased shapes + text (the compositor blends this `wl_subsurface`
-/// over the video, no GPU): a play/pause glyph, the elapsed time, and a live timeline with a
-/// progress fill + seek knob.
-fn draw_controls(c: &mut Canvas, h: &Hud) {
-    const ACCENT: u32 = 0xff30_ffa0; // streamcraft green
-    const INK: u32 = 0xffe6_edf5;
-    let width = h.width;
-    c.clear(0); // fully transparent — video shows through everywhere we don't draw
-    c.blend_rect(0, 0, width, BAR_H, 0xd010_1822); // translucent dark bar
-
-    // Transport glyph: show the action the click performs, not the current state — a play
-    // triangle while paused (click resumes), pause bars while playing (click pauses).
-    if h.paused {
-        c.fill_triangle((16, 11), (16, 29), (34, 20), ACCENT);
-    } else {
-        c.fill_rect(16, 11, 5, 18, ACCENT);
-        c.fill_rect(26, 11, 5, 18, ACCENT);
-    }
-
-    // Elapsed time "MM:SS", anti-aliased text — formatted into a stack buffer (no heap).
-    let secs = h.pos_ns / 1_000_000_000;
-    let (mm, ss) = (secs / 60, secs % 60);
-    let buf = [
-        b'0' + ((mm / 10) % 10) as u8,
-        b'0' + (mm % 10) as u8,
-        b':',
-        b'0' + (ss / 10) as u8,
-        b'0' + (ss % 10) as u8,
-    ];
-    let text = std::str::from_utf8(&buf).unwrap_or("00:00");
-    let s = font::size_nearest(18.0);
-    let bm = font::rasterize_line(s, text);
-    let ty = ((BAR_H - bm.h as i32) / 2).max(0);
-    c.blit_a8(46, ty, &bm.cov, bm.w as u32, bm.h as u32, bm.w as u32, INK);
-
-    // Timeline: rail, progress fill (position/duration), and the seek knob.
-    let (tx, cy) = (TRACK_X, BAR_H / 2);
-    let tw = (width - tx - TRACK_PAD).max(1);
-    c.blend_rect(tx, cy - 1, tw, 2, 0x6050_6274); // rail
-    let frac = if h.dur_ns > 0 {
-        (h.pos_ns as f64 / h.dur_ns as f64).clamp(0.0, 1.0) as f32
-    } else {
-        0.0
-    };
-    let fill = (tw as f32 * frac) as i32;
-    c.fill_rect(tx, cy - 1, fill, 2, ACCENT); // progress
-    c.fill_circle((tx + fill) as f32, cy as f32, 5.0, ACCENT); // seek knob
 }
 
 impl Element for WaylandVideoSink {
@@ -502,7 +298,7 @@ impl Element for WaylandVideoSink {
         let mut sub_batch = ctx.take_input_on(SUBTITLE);
         while let Some(buf) = sub_batch.pop_front() {
             if let Some(ds) = pgs::decode_bitmap(buf.memory.data()) {
-                self.push_subtitle(ds, buf.pts, buf.duration);
+                self.ui.push_subtitle(ds, buf.pts, buf.duration);
             }
         }
         ctx.recycle_input(sub_batch);
@@ -537,7 +333,7 @@ impl Element for WaylandVideoSink {
                 }
                 // Drop the pre-seek caption; the subtitle track re-emits for the new position
                 // (the pump hides it next pass when `pts` no longer falls in its span).
-                self.subtitle = None;
+                self.ui.on_flush();
                 self.preroll_next = true;
             }
             Event::Eos => {

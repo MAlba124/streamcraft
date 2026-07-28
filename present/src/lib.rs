@@ -25,9 +25,12 @@ pub mod conn;
 pub mod control;
 pub mod protocol;
 pub mod raster;
+pub mod rawsink;
 pub mod sink;
+pub mod ui;
 pub mod window;
 pub mod wire;
 
 pub use control::{PlayerControl, UiCommand};
+pub use rawsink::WaylandRawSink;
 pub use sink::WaylandVideoSink;

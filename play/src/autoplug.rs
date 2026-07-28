@@ -613,13 +613,17 @@ fn wire_video(
 
     match sink {
         SinkChoice::Device => {
+            // The raw-wire Wayland software sink (`waylandrawsink`) — no SDL. The decoder/overlay
+            // emits `video/raw` (i420/gray8/nv12, subtitles already burned in by the overlay); the
+            // sink CPU-converts to ARGB and presents via `wl_shm`. Its own control channel feeds
+            // the same clicks→pause/seek + HUD as the zero-copy sink.
+            let ctrl = sc_present::PlayerControl::new();
             let s = p.add_boxed(Box::new(
-                sc_sdl3::Sdl3VideoSink::new().with_title("streamcraft — scplay"),
+                sc_present::WaylandRawSink::new().with_control(std::sync::Arc::clone(&ctrl)),
             ));
-            // The decoder/overlay emits `video/raw`; the SDL sink takes i420/gray8/nv12.
-            // Direct link — the renderer owns any CSC, so no CPU convert element is needed.
-            p.link((out_el, out_pad), (s, "sink")).expect("video ! sdl3videosink");
+            p.link((out_el, out_pad), (s, "sink")).expect("video ! waylandrawsink");
             w.video_sink = Some(s);
+            w.player_control = Some(ctrl);
         }
         SinkChoice::Drop => {
             // A decoded frame is `video/raw`, which `TestSink` (bytes only) cannot take —

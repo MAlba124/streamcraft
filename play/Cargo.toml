@@ -49,9 +49,8 @@ sc-h265 = { path = "../h265" }
 sc-mpeg4p2 = { path = "../mpeg4p2" }
 # Hardware-first video decode, capability-gated (respects SC_NO_VAAPI).
 sc-vaapi = { path = "../vaapi" }
-# The window and the audio device (the pipewire sink provides the pipeline clock).
-sc-sdl3 = { path = "../sdl3" }
-# The raw-wire Wayland presenter (SC_PRESENT): an internal zero-copy waylandvideosink.
+# The raw-wire Wayland presenter: `waylandvideosink` (zero-copy dmabuf) + `waylandrawsink`
+# (software video/raw → wl_shm). No SDL — this is the whole window path now.
 sc-present = { path = "../present" }
 sc-pipewire = { path = "../pipewire" }
 # The h264 decoder churns malloc internally (see sdl3/examples/play_file.rs) — the `scplay`

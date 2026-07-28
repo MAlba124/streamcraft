@@ -493,6 +493,73 @@ impl Window {
         self.conn.flush()
     }
 
+    /// Present a **software** (`wl_shm`) video frame — the CPU analog of
+    /// [`present_dmabuf`](Self::present_dmabuf) for the non-zero-copy path (software codecs). The
+    /// caller supplies the frame already converted to `wl_shm` ARGB8888 (little-endian `[B,G,R,A]`,
+    /// opaque), `src_w × src_h`, tightly packed. It rides the same centered + aspect-scaled video
+    /// subsurface over the black root, scaled to the letterbox fit by `wp_viewport`, so the whole
+    /// HUD/subtitle/resize machinery works unchanged. Requires `wl_subcompositor` + `wp_viewporter`
+    /// (present on all mainstream compositors); errors otherwise so the sink degrades to headless.
+    pub fn present_raw(&mut self, argb: &[u8], src_w: i32, src_h: i32) -> io::Result<()> {
+        if self.subcompositor == 0 || self.viewporter == 0 {
+            return Err(io::Error::other("compositor lacks wl_subcompositor / wp_viewporter"));
+        }
+        let (src_w, src_h) = (src_w.max(1), src_h.max(1));
+        self.ensure_video_subsurface();
+        let target = self.video_surface;
+
+        // Upload the frame into a recycled shm buffer (buffer stride == src_w*4 == packed row).
+        let idx = self.acquire(src_w, src_h)?;
+        {
+            let b = &mut self.pool[idx];
+            let dst = b.pixels();
+            let n = argb.len().min(dst.len());
+            dst[..n].copy_from_slice(&argb[..n]);
+        }
+        let (buffer, bw, bh) = {
+            let b = &self.pool[idx];
+            (b.buffer, b.width, b.height)
+        };
+        self.pool[idx].busy = true;
+
+        // Fit rect: aspect-preserving letterbox into the window.
+        let (win_w, win_h) = (self.width.max(1), self.height.max(1));
+        let (fit_x, fit_y, fit_w, fit_h) = letterbox(src_w, src_h, win_w, win_h);
+        self.fit = (fit_x, fit_y, fit_w, fit_h);
+        self.last_src = (0, 0, src_w, src_h);
+        self.last_coded = (src_w, src_h);
+
+        self.ensure_viewport(target);
+        if self.viewport != 0 {
+            self.conn
+                .request(self.viewport, p::viewport::SET_SOURCE)
+                .fixed(fx(0))
+                .fixed(fx(0))
+                .fixed(fx(src_w))
+                .fixed(fx(src_h))
+                .finish();
+            self.conn
+                .request(self.viewport, p::viewport::SET_DESTINATION)
+                .i32(fit_w.max(1))
+                .i32(fit_h.max(1))
+                .finish();
+        }
+        self.conn.request(target, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        self.conn.request(target, p::surface::DAMAGE_BUFFER).i32(0).i32(0).i32(bw).i32(bh).finish();
+        self.conn.request(target, p::surface::COMMIT).finish();
+
+        // First frame / resize: (re)paint the black background + (re)position the video subsurface.
+        if self.bg_w != win_w || self.bg_h != win_h {
+            self.render_background(win_w, win_h)?;
+            let sub = self.video_subsurface;
+            self.conn.request(sub, p::subsurface::SET_POSITION).i32(fit_x).i32(fit_y).finish();
+            self.conn.request(self.surface, p::surface::COMMIT).finish();
+            self.bg_w = win_w;
+            self.bg_h = win_h;
+        }
+        self.conn.flush()
+    }
+
     /// Import a dmabuf frame's planes as a `wl_buffer` (synchronous `create_immed`).
     fn import_dmabuf(&mut self, v: &DmabufVideo<'_>) -> io::Result<u32> {
         let params = self.conn.alloc_id();
