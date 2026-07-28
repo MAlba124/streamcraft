@@ -394,12 +394,13 @@ fn draw_controls(c: &mut Canvas, h: &Hud) {
     c.clear(0); // fully transparent — video shows through everywhere we don't draw
     c.blend_rect(0, 0, width, BAR_H, 0xd010_1822); // translucent dark bar
 
-    // Play / pause glyph (AA).
+    // Transport glyph: show the action the click performs, not the current state — a play
+    // triangle while paused (click resumes), pause bars while playing (click pauses).
     if h.paused {
+        c.fill_triangle((16, 11), (16, 29), (34, 20), ACCENT);
+    } else {
         c.fill_rect(16, 11, 5, 18, ACCENT);
         c.fill_rect(26, 11, 5, 18, ACCENT);
-    } else {
-        c.fill_triangle((16, 11), (16, 29), (34, 20), ACCENT);
     }
 
     // Elapsed time "MM:SS", anti-aliased text — formatted into a stack buffer (no heap).
