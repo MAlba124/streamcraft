@@ -577,24 +577,42 @@ fn parse_short_term_rps(
 
         // Reconstruct the reference set's full DeltaPoc list, S0 (neg) then S1 (pos),
         // then the terminating 0 (§7.4.8). We build used/refined per the spec loop.
-        let mut ref_deltas: Vec<i32> = Vec::with_capacity(num_ref + 1);
-        let mut ref_used: Vec<bool> = Vec::with_capacity(num_ref + 1);
+        // num_ref ≤ 32 (16 neg + 16 pos, HEVC max), so a fixed stack array replaces the
+        // per-slice heap Vec; `rd_len` tracks the filled length exactly as `.push` did.
+        let mut ref_deltas = [0i32; 33];
+        let mut ref_used = [false; 33];
+        let mut rd_len = 0usize;
         for j in (0..ref_rps.num_negative()).rev() {
-            ref_deltas.push(ref_rps.delta_poc_s0[j]);
-            ref_used.push(ref_rps.used_s0[j]);
+            if rd_len < ref_deltas.len() {
+                ref_deltas[rd_len] = ref_rps.delta_poc_s0[j];
+                ref_used[rd_len] = ref_rps.used_s0[j];
+                rd_len += 1;
+            }
         }
         for j in 0..ref_rps.num_positive() {
-            ref_deltas.push(ref_rps.delta_poc_s1[j]);
-            ref_used.push(ref_rps.used_s1[j]);
+            if rd_len < ref_deltas.len() {
+                ref_deltas[rd_len] = ref_rps.delta_poc_s1[j];
+                ref_used[rd_len] = ref_rps.used_s1[j];
+                rd_len += 1;
+            }
         }
 
-        let mut used_by_curr = vec![false; num_ref + 1];
-        let mut use_delta = vec![true; num_ref + 1];
+        // used_by_curr / use_delta are indexed by 0..=num_ref (num_ref ≤ 32 refs, HEVC
+        // max), so a fixed stack array replaces the per-slice heap Vec. The same
+        // num_ref+1 flags are still read (bit-for-bit); array writes clamp to the
+        // capacity so a corrupt over-large count cannot index out of bounds.
+        let mut used_by_curr = [false; 33];
+        let mut use_delta = [true; 33];
         for j in 0..=num_ref {
             let u = r.flag();
-            used_by_curr[j] = u;
+            if j < used_by_curr.len() {
+                used_by_curr[j] = u;
+            }
             if !u {
-                use_delta[j] = r.flag();
+                let d = r.flag();
+                if j < use_delta.len() {
+                    use_delta[j] = d;
+                }
             }
         }
 
@@ -652,6 +670,7 @@ fn parse_short_term_rps(
         }
         let _ = ref_deltas;
         let _ = ref_used;
+        let _ = rd_len;
         out
     } else {
         // Explicit form (§7.3.7): num_negative_pics, num_positive_pics, then deltas.

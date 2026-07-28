@@ -629,14 +629,29 @@ impl VaapiH265Dec {
         let max_poc_lsb = sps.max_poc_lsb();
 
         // Short-term "before" (POC < cur) and "after" (POC > cur), by delta (§8.3.2).
-        for delta in sh.st_rps.curr_before() {
+        // Iterate the RPS fields directly (same used-by-curr filter as `curr_before()` /
+        // `curr_after()`) so no per-frame `Vec<i32>` is allocated; the deltas visited and
+        // their order are identical to the helper's output.
+        for (delta, _) in sh
+            .st_rps
+            .delta_poc_s0
+            .iter()
+            .zip(sh.st_rps.used_s0.iter())
+            .filter(|(_, u)| **u)
+        {
             let ref_poc = cur_poc + delta; // delta is negative here
             if let Some(e) = self.dpb.iter_mut().find(|e| e.poc == ref_poc) {
                 e.rps_flag = ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
                 e.long_term = false;
             }
         }
-        for delta in sh.st_rps.curr_after() {
+        for (delta, _) in sh
+            .st_rps
+            .delta_poc_s1
+            .iter()
+            .zip(sh.st_rps.used_s1.iter())
+            .filter(|(_, u)| **u)
+        {
             let ref_poc = cur_poc + delta; // delta is positive here
             if let Some(e) = self.dpb.iter_mut().find(|e| e.poc == ref_poc) {
                 e.rps_flag = ffi::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER;
@@ -740,8 +755,11 @@ impl VaapiH265Dec {
         // carry a live flag; the rest are INVALID (the driver ignores them). A stable
         // DPB→ReferenceFrames index map lets per-slice RefPicList point back in.
         pic.ReferenceFrames = [ffi::VAPictureHEVC::invalid(); 15];
-        let mut ref_index: std::collections::HashMap<ffi::VASurfaceID, u8> =
-            std::collections::HashMap::new();
+        // DPB→ReferenceFrames index map. At most 15 entries (the `.take(15)` below), so a
+        // fixed (surface, index) stack array replaces the per-picture heap HashMap; the
+        // per-slice lookup is a linear scan over ≤ 15 pairs (see `build_ref_pic_list`).
+        let mut ref_index: [(ffi::VASurfaceID, u8); 15] = [(0, 0); 15];
+        let mut ref_index_len = 0usize;
         for (i, e) in self.dpb.iter().filter(|e| e.rps_flag != 0).take(15).enumerate() {
             let mut flags = e.rps_flag;
             if e.long_term {
@@ -753,8 +771,10 @@ impl VaapiH265Dec {
                 flags,
                 va_reserved: [0; ffi::VA_PADDING_LOW],
             };
-            ref_index.insert(e.surface, i as u8);
+            ref_index[ref_index_len] = (e.surface, i as u8);
+            ref_index_len += 1;
         }
+        let ref_index = &ref_index[..ref_index_len];
 
         pic.pic_width_in_luma_samples = sps.pic_width_in_luma_samples as u16;
         pic.pic_height_in_luma_samples = sps.pic_height_in_luma_samples as u16;
@@ -817,7 +837,7 @@ impl VaapiH265Dec {
         let mut keep: Vec<VaBuffer> = Vec::with_capacity(slice_nals.len() * 2);
         let last = headers.len().saturating_sub(1);
         for (i, (sh, nal)) in headers.iter().zip(slice_nals.iter()).enumerate() {
-            let sp = self.build_slice_param(sps, sh, nal.raw, i == last, &ref_index);
+            let sp = self.build_slice_param(sps, sh, nal.raw, i == last, ref_index);
             let sp_buf =
                 VaBuffer::new_struct(display, context, ffi::VASliceParameterBufferType, &sp)?;
             let data_buf = VaBuffer::new_data(display, context, nal.raw)?;
@@ -837,7 +857,7 @@ impl VaapiH265Dec {
         sh: &SliceHeader,
         raw_nal: &[u8],
         last_slice: bool,
-        ref_index: &std::collections::HashMap<ffi::VASurfaceID, u8>,
+        ref_index: &[(ffi::VASurfaceID, u8)],
     ) -> ffi::VASliceParameterBufferHEVC {
         // RefPicList0/1 (§8.3.4): concatenate the RPS current-before/after/long lists
         // in spec order, cycle to fill the active count, then apply any explicit
@@ -918,7 +938,7 @@ impl VaapiH265Dec {
     fn build_ref_pic_list(
         &self,
         sh: &SliceHeader,
-        ref_index: &std::collections::HashMap<ffi::VASurfaceID, u8>,
+        ref_index: &[(ffi::VASurfaceID, u8)],
     ) -> ([[u8; 15]; 2], u8) {
         let mut list = [[0xFFu8; 15]; 2];
         if !sh.slice_type.is_inter() {
@@ -929,48 +949,83 @@ impl VaapiH265Dec {
         //   before: RPS_ST_CURR_BEFORE, POC descending toward cur (nearest first)
         //   after:  RPS_ST_CURR_AFTER,  POC ascending away from cur
         //   long:   RPS_LT_CURR
-        let mut before: Vec<(i32, u8)> = self
-            .dpb
-            .iter()
-            .filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE)
-            .filter_map(|e| ref_index.get(&e.surface).map(|&i| (e.poc, i)))
-            .collect();
+        // Every pool is drawn through `ref_index` (≤ 15 entries, built with .take(15) in
+        // submit_picture), so the combined candidate list is ≤ 15. Fixed stack buffers
+        // (with a filled-length counter) replace the per-slice heap Vecs; a defensive
+        // capacity guard keeps the same overflow-free behavior the Vecs had.
+        let mut before: [(i32, u8); 16] = [(0, 0); 16];
+        let mut before_len = 0usize;
+        for e in self.dpb.iter().filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
+            if let Some(&(_, i)) = ref_index.iter().find(|(s, _)| *s == e.surface) {
+                if before_len < before.len() {
+                    before[before_len] = (e.poc, i);
+                    before_len += 1;
+                }
+            }
+        }
+        let before = &mut before[..before_len];
         before.sort_by_key(|a| std::cmp::Reverse(a.0)); // descending (nearest below cur first)
-        let mut after: Vec<(i32, u8)> = self
-            .dpb
-            .iter()
-            .filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER)
-            .filter_map(|e| ref_index.get(&e.surface).map(|&i| (e.poc, i)))
-            .collect();
+        let mut after: [(i32, u8); 16] = [(0, 0); 16];
+        let mut after_len = 0usize;
+        for e in self.dpb.iter().filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) {
+            if let Some(&(_, i)) = ref_index.iter().find(|(s, _)| *s == e.surface) {
+                if after_len < after.len() {
+                    after[after_len] = (e.poc, i);
+                    after_len += 1;
+                }
+            }
+        }
+        let after = &mut after[..after_len];
         after.sort_by_key(|a| a.0); // ascending (nearest above cur first)
-        let long: Vec<u8> = self
-            .dpb
-            .iter()
-            .filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_LT_CURR)
-            .filter_map(|e| ref_index.get(&e.surface).copied())
-            .collect();
+        let mut long: [u8; 16] = [0; 16];
+        let mut long_len = 0usize;
+        for e in self.dpb.iter().filter(|e| e.rps_flag == ffi::VA_PICTURE_HEVC_RPS_LT_CURR) {
+            if let Some(&(_, i)) = ref_index.iter().find(|(s, _)| *s == e.surface) {
+                if long_len < long.len() {
+                    long[long_len] = i;
+                    long_len += 1;
+                }
+            }
+        }
+        let long = &long[..long_len];
 
         // RefPicListTemp0 = before ++ after ++ long ; Temp1 = after ++ before ++ long.
-        let temp0: Vec<u8> = before
+        let mut temp0: [u8; 48] = [0; 48];
+        let mut temp0_len = 0usize;
+        for i in before
             .iter()
             .map(|(_, i)| *i)
             .chain(after.iter().map(|(_, i)| *i))
             .chain(long.iter().copied())
-            .collect();
-        let temp1: Vec<u8> = after
+        {
+            if temp0_len < temp0.len() {
+                temp0[temp0_len] = i;
+                temp0_len += 1;
+            }
+        }
+        let temp0 = &temp0[..temp0_len];
+        let mut temp1: [u8; 48] = [0; 48];
+        let mut temp1_len = 0usize;
+        for i in after
             .iter()
             .map(|(_, i)| *i)
             .chain(before.iter().map(|(_, i)| *i))
             .chain(long.iter().copied())
-            .collect();
+        {
+            if temp1_len < temp1.len() {
+                temp1[temp1_len] = i;
+                temp1_len += 1;
+            }
+        }
+        let temp1 = &temp1[..temp1_len];
 
         let n0 = (sh.num_ref_idx_l0_active_minus1 as usize + 1).min(15);
-        fill_ref_list(&mut list[0], &temp0, n0, &sh.ref_list_mods.l0, sh.ref_list_mods.l0_present);
+        fill_ref_list(&mut list[0], temp0, n0, &sh.ref_list_mods.l0, sh.ref_list_mods.l0_present);
         if sh.slice_type == SliceType::B {
             let n1 = (sh.num_ref_idx_l1_active_minus1 as usize + 1).min(15);
             fill_ref_list(
                 &mut list[1],
-                &temp1,
+                temp1,
                 n1,
                 &sh.ref_list_mods.l1,
                 sh.ref_list_mods.l1_present,
@@ -1480,8 +1535,8 @@ fn peek_pps_id(nal: &[u8], is_irap: bool) -> Option<u32> {
     if nal.len() < 3 {
         return None;
     }
-    let body = de_emulate_prefix(&nal[2..]);
-    let mut r = crate::h264parse::BitReader::new(&body);
+    let (body, body_len) = de_emulate_prefix(&nal[2..]);
+    let mut r = crate::h264parse::BitReader::new(&body[..body_len]);
     let _first = r.flag();
     if is_irap {
         let _no_output = r.flag();
@@ -1489,23 +1544,28 @@ fn peek_pps_id(nal: &[u8], is_irap: bool) -> Option<u32> {
     Some(r.ue())
 }
 
-/// De-emulate just enough of an RBSP body for the pps_id peek (§7.3.1.1).
-fn de_emulate_prefix(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len().min(16));
+/// De-emulate just enough of an RBSP body for the pps_id peek (§7.3.1.1). Returns a
+/// fixed 16-byte buffer and the filled length (the peek never needs more than the first
+/// 16 de-emulated bytes), so the per-AU heap `Vec` is gone — allocation source only, the
+/// bytes produced are identical.
+fn de_emulate_prefix(body: &[u8]) -> ([u8; 16], usize) {
+    let mut out = [0u8; 16];
+    let mut out_len = 0usize;
     let mut zeros = 0;
     let mut i = 0;
-    while i < body.len() && out.len() < 16 {
+    while i < body.len() && out_len < 16 {
         let b = body[i];
         if zeros >= 2 && b == 0x03 && i + 1 < body.len() && body[i + 1] <= 0x03 {
             zeros = 0;
             i += 1;
             continue;
         }
-        out.push(b);
+        out[out_len] = b;
+        out_len += 1;
         zeros = if b == 0 { zeros + 1 } else { 0 };
         i += 1;
     }
-    out
+    (out, out_len)
 }
 
 fn zeroed_pic_param_hevc() -> ffi::VAPictureParameterBufferHEVC {
