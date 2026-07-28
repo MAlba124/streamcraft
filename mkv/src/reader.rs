@@ -784,6 +784,26 @@ fn block_pts_ns(cluster_base_tick: i64, rel_ts: i16, scale: u64) -> u64 {
     abs_tick.saturating_mul(scale)
 }
 
+/// Take a recycled payload buffer that already has room for `needed` bytes, so the caller's
+/// `extend_from_slice` never reallocates. The demux interleaves small (audio) and large
+/// (video-keyframe) frames through one free-list, so a plain LIFO `pop()` hands a large frame a
+/// small buffer and forces a grow every time; picking a buffer that already fits — else the
+/// largest one (it grows once, then stays large and is recycled) — makes the steady state
+/// realloc-free. Linear over a bounded (`MAX_FREE` = 64) list, so cheap.
+// The `Vec::new()` fallback is an empty (zero-heap) buffer, hit only before the free-list has
+// warmed; the actual copy allocation is the caller's `extend_from_slice`, which reuses a
+// recycled buffer in steady state.
+#[allow(clippy::disallowed_methods)]
+fn take_fit(free: &mut Vec<Vec<u8>>, needed: usize) -> Vec<u8> {
+    if let Some(i) = free.iter().position(|b| b.capacity() >= needed) {
+        return free.swap_remove(i);
+    }
+    match free.iter().enumerate().max_by_key(|(_, b)| b.capacity()) {
+        Some((i, _)) => free.swap_remove(i),
+        None => Vec::new(),
+    }
+}
+
 /// Queue one decoded frame, copying its bytes out of the shared buffer window into a payload
 /// buffer drawn from `free` (a recycled buffer when the consumer returns them via
 /// [`MatroskaReader::recycle`], else a fresh allocation).
@@ -796,7 +816,7 @@ fn push_frame(
     keyframe: bool,
     data: &[u8],
 ) {
-    let mut buf = free.pop().unwrap_or_default();
+    let mut buf = take_fit(free, data.len());
     buf.clear();
     buf.extend_from_slice(data);
     out.push_back(Frame {
