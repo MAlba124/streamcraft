@@ -87,6 +87,9 @@ pub struct WaylandVideoSink {
     frames: u64,
     /// The current subtitle caption (latest-wins), shown for `[start, end)` (its own subsurface).
     subtitle: Option<SubCue>,
+    /// The window↔app control channel (clicks → pause/seek; duration/paused → HUD). Set by the
+    /// player; `None` = display-only (no interactive controls).
+    control: Option<Arc<crate::control::PlayerControl>>,
 }
 
 /// One decoded PGS caption + its on-screen span.
@@ -114,12 +117,19 @@ impl WaylandVideoSink {
             preroll_next: false,
             frames: 0,
             subtitle: None,
+            control: None,
         }
     }
 
     /// Attach the shared [`GpuFrameChannel`] (the same `Arc` the zero-copy decoder holds).
     pub fn with_channel(mut self, channel: Arc<GpuFrameChannel>) -> Self {
         self.channel = Some(channel);
+        self
+    }
+
+    /// Attach the window↔app control channel for interactive controls (clicks → pause/seek).
+    pub fn with_control(mut self, control: Arc<crate::control::PlayerControl>) -> Self {
+        self.control = Some(control);
         self
     }
 
@@ -203,9 +213,11 @@ impl WaylandVideoSink {
                 self.frames = self.frames.wrapping_add(1);
                 let n = self.frames;
                 let channel = self.channel.clone();
+                let control = self.control.clone();
+                let pos_ns = pts.nanos().unwrap_or(0);
                 let mut close = false;
                 // Pump window events, free compositor-released surfaces (deferred token release),
-                // refresh the GUI overlay, and show/clear the subtitle caption for this pts.
+                // route HUD clicks to pause/seek, refresh the overlay, and show/clear the caption.
                 // Destructure `self` so `window` and `subtitle` are borrowed disjointly.
                 {
                     let Self { window, subtitle, .. } = self;
@@ -216,10 +228,27 @@ impl WaylandVideoSink {
                                 ch.release(tok);
                             }
                         }
+                        // Route left-clicks: the timeline area → seek, elsewhere → pause toggle.
+                        if let Some(ctrl) = &control {
+                            let (ww, wh) = w.size();
+                            while let Some((cx, cy)) = w.take_click() {
+                                if cy >= wh - BAR_H && cx >= TRACK_X && cx <= ww - TRACK_PAD {
+                                    let tw = (ww - TRACK_X - TRACK_PAD).max(1);
+                                    let frac = ((cx - TRACK_X) as f32 / tw as f32).clamp(0.0, 1.0);
+                                    ctrl.push(crate::control::UiCommand::SeekFraction(frac));
+                                } else {
+                                    ctrl.push(crate::control::UiCommand::TogglePause);
+                                }
+                            }
+                        }
                         if w.has_gui() && n % 6 == 0 {
                             let (ww, wh) = w.size();
-                            let secs = pts.nanos().unwrap_or(0) / 1_000_000_000;
-                            let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, secs));
+                            let (dur_ns, paused) = control
+                                .as_ref()
+                                .map(|c| (c.duration_ns(), c.paused()))
+                                .unwrap_or((0, false));
+                            let hud = Hud { width: ww, pos_ns, dur_ns, paused };
+                            let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, &hud));
                         }
                         match subtitle.as_ref().filter(|c| pts >= c.start && pts < c.end) {
                             Some(c) => {
@@ -311,21 +340,40 @@ impl WaylandVideoSink {
 /// The control-bar overlay height in px.
 const BAR_H: i32 = 40;
 
+/// Where the timeline rail starts (after the play glyph + the `MM:SS` time) and its right pad.
+const TRACK_X: i32 = 108;
+const TRACK_PAD: i32 = 16;
+
+/// The HUD's per-frame state (position/duration/pause) for [`draw_controls`].
+struct Hud {
+    width: i32,
+    pos_ns: u64,
+    dur_ns: u64,
+    paused: bool,
+}
+
 /// Draw the player HUD control bar into `c` — a `width×BAR_H` ARGB canvas, `0` alpha where the
 /// video shows through. Anti-aliased shapes + text (the compositor blends this `wl_subsurface`
-/// over the video, no GPU). This is the seam where the full scope UI / controls land; today it
-/// carries the play state, the elapsed time, and a timeline rail (seek head lands here once
-/// duration + seek plumbing is wired).
-fn draw_controls(c: &mut Canvas, width: i32, elapsed_secs: u64) {
+/// over the video, no GPU): a play/pause glyph, the elapsed time, and a live timeline with a
+/// progress fill + seek knob.
+fn draw_controls(c: &mut Canvas, h: &Hud) {
     const ACCENT: u32 = 0xff30_ffa0; // streamcraft green
     const INK: u32 = 0xffe6_edf5;
+    let width = h.width;
     c.clear(0); // fully transparent — video shows through everywhere we don't draw
     c.blend_rect(0, 0, width, BAR_H, 0xd010_1822); // translucent dark bar
-    // Play indicator (AA triangle).
-    c.fill_triangle((16, 11), (16, 29), (34, 20), ACCENT);
+
+    // Play / pause glyph (AA).
+    if h.paused {
+        c.fill_rect(16, 11, 5, 18, ACCENT);
+        c.fill_rect(26, 11, 5, 18, ACCENT);
+    } else {
+        c.fill_triangle((16, 11), (16, 29), (34, 20), ACCENT);
+    }
 
     // Elapsed time "MM:SS", anti-aliased text — formatted into a stack buffer (no heap).
-    let (mm, ss) = (elapsed_secs / 60, elapsed_secs % 60);
+    let secs = h.pos_ns / 1_000_000_000;
+    let (mm, ss) = (secs / 60, secs % 60);
     let buf = [
         b'0' + ((mm / 10) % 10) as u8,
         b'0' + (mm % 10) as u8,
@@ -337,16 +385,20 @@ fn draw_controls(c: &mut Canvas, width: i32, elapsed_secs: u64) {
     let s = font::size_nearest(18.0);
     let bm = font::rasterize_line(s, text);
     let ty = ((BAR_H - bm.h as i32) / 2).max(0);
-    c.blit_a8(48, ty, &bm.cov, bm.w as u32, bm.h as u32, bm.w as u32, INK);
+    c.blit_a8(46, ty, &bm.cov, bm.w as u32, bm.h as u32, bm.w as u32, INK);
 
-    // Timeline rail (the seek head lands here once duration + seek are wired).
-    let tx = 48 + bm.w as i32 + 18;
-    let tw = width - tx - 16;
-    if tw > 0 {
-        c.blend_rect(tx, BAR_H / 2 - 1, tw, 2, 0x6050_6274);
-        let kx = tx + (elapsed_secs % 60) as i32 * tw / 60; // decorative until seek exists
-        c.fill_circle(kx as f32, (BAR_H / 2) as f32, 5.0, ACCENT);
-    }
+    // Timeline: rail, progress fill (position/duration), and the seek knob.
+    let (tx, cy) = (TRACK_X, BAR_H / 2);
+    let tw = (width - tx - TRACK_PAD).max(1);
+    c.blend_rect(tx, cy - 1, tw, 2, 0x6050_6274); // rail
+    let frac = if h.dur_ns > 0 {
+        (h.pos_ns as f64 / h.dur_ns as f64).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    let fill = (tw as f32 * frac) as i32;
+    c.fill_rect(tx, cy - 1, fill, 2, ACCENT); // progress
+    c.fill_circle((tx + fill) as f32, cy as f32, 5.0, ACCENT); // seek knob
 }
 
 impl Element for WaylandVideoSink {

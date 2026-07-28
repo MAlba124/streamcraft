@@ -957,6 +957,7 @@ dependencies = [
  "sc-mpeg4p2",
  "sc-ogg",
  "sc-pipewire",
+ "sc-present",
  "sc-sdl3",
  "sc-text",
  "sc-vaapi",
@@ -966,6 +967,16 @@ dependencies = [
  "streamcraft-core",
  "streamcraft-elements",
  "streamcraft-video",
+]
+
+[[package]]
+name = "sc-present"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sc-text",
+ "sc-vaapi",
+ "streamcraft-core",
 ]
 
 [[package]]

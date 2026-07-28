@@ -127,6 +127,7 @@ fn main() -> ExitCode {
     install_stats(&mut player, opts.stats);
     install_max_secs(&mut player, opts.max_secs);
     install_stdin_controls(&mut player);
+    install_window_controls(&mut player);
 
     println!(
         "playing {} — 'p'⏎ pause/resume, 'q'⏎ quit, 0-9⏎ seek (or Ctrl-C)…",
@@ -258,5 +259,43 @@ fn install_stdin_controls(player: &mut Player) {
                 _ => {}
             }
         }
+    });
+}
+
+/// Window transport: drain the raw-wire presenter's [`PlayerControl`] (clicks from the video
+/// window) into the same pause/seek/stop handles, and publish duration + pause state back for
+/// the HUD. No-op unless `SC_PRESENT`'s `waylandvideosink` is in use. Polls at ~33 Hz; the
+/// thread dies with the process (none is joined).
+fn install_window_controls(player: &mut Player) {
+    let Some(control) = player.player_control() else {
+        return;
+    };
+    let pause = player.pipeline.pause_handle();
+    let stop = player.pipeline.stop_handle();
+    let seek = player.pipeline.seek_handle();
+    let index = player.seek_index().clone();
+    let duration = player.duration().unwrap_or(Timestamp::NONE);
+    control.set_duration_ns(duration.nanos().unwrap_or(0));
+    std::thread::spawn(move || loop {
+        for cmd in control.drain() {
+            match cmd {
+                sc_present::UiCommand::TogglePause => {
+                    let paused = pause.toggle();
+                    control.set_paused(paused);
+                }
+                sc_present::UiCommand::Quit => {
+                    stop.stop();
+                    return;
+                }
+                sc_present::UiCommand::SeekFraction(f) => {
+                    let Some(dur) = duration.nanos() else { continue };
+                    let target = Timestamp((dur as f64 * f as f64) as u64);
+                    if let Some((byte, landed)) = index.resolve(target, duration) {
+                        seek.seek(byte, landed);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
     });
 }

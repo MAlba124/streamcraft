@@ -63,6 +63,14 @@ pub struct Window {
     subcompositor: u32,
     seat: u32,
     keyboard: u32,
+    pointer: u32,
+    /// The surface the pointer is currently over + its surface-local position (px), tracked so
+    /// a button press can be mapped to a window-relative click.
+    pointer_surface: u32,
+    pointer_x: i32,
+    pointer_y: i32,
+    /// Window-relative left-click positions, drained by the sink for HUD hit-testing.
+    clicks: Vec<(i32, i32)>,
     // Window objects.
     surface: u32,
     xdg_surface: u32,
@@ -183,6 +191,11 @@ impl Window {
             subcompositor: 0,
             seat: 0,
             keyboard: 0,
+            pointer: 0,
+            pointer_surface: 0,
+            pointer_x: 0,
+            pointer_y: 0,
+            clicks: Vec::new(),
             video_surface: 0,
             video_subsurface: 0,
             viewport: 0,
@@ -567,6 +580,29 @@ impl Window {
         self.subcompositor != 0
     }
 
+    /// The window-relative origin of a surface (so a surface-local pointer position maps to a
+    /// window position for HUD hit-testing).
+    fn surface_origin(&self, surface: u32) -> (i32, i32) {
+        if surface == self.video_surface {
+            (self.fit.0, self.fit.1)
+        } else if surface == self.gui_surface {
+            (self.gui_x, self.gui_y)
+        } else if surface == self.sub_surface {
+            (self.sub_place.0, self.sub_place.1)
+        } else {
+            (0, 0) // root
+        }
+    }
+
+    /// Pop the next window-relative left-click, for HUD hit-testing.
+    pub fn take_click(&mut self) -> Option<(i32, i32)> {
+        if self.clicks.is_empty() {
+            None
+        } else {
+            Some(self.clicks.remove(0))
+        }
+    }
+
     /// Show a subtitle caption: a straight-alpha RGBA `w×h` bitmap whose `(x, y, w, h)`
     /// placement is in a `ref_w×ref_h` reference frame (the PGS composition size). It rides its
     /// own `wl_subsurface` over the video, scaled + positioned into the current letterbox fit
@@ -727,12 +763,41 @@ impl Window {
         } else if obj == self.toplevel && op == p::xdg_toplevel::EV_CLOSE {
             self.closed = true;
         } else if obj == self.seat && op == p::seat::EV_CAPABILITIES {
-            // Grab a keyboard once the seat advertises one (for Esc/q → close).
+            // Grab a keyboard (Esc/q → close) and a pointer (clicks → HUD) as advertised.
             let caps = self.conn.args().u32().unwrap_or(0);
             if caps & p::seat::CAP_KEYBOARD != 0 && self.keyboard == 0 {
                 self.keyboard = self.conn.alloc_id();
                 let (kb, seat) = (self.keyboard, self.seat);
                 self.conn.request(seat, p::seat::GET_KEYBOARD).u32(kb).finish();
+            }
+            if caps & p::seat::CAP_POINTER != 0 && self.pointer == 0 {
+                self.pointer = self.conn.alloc_id();
+                let (pt, seat) = (self.pointer, self.seat);
+                self.conn.request(seat, p::seat::GET_POINTER).u32(pt).finish();
+            }
+        } else if obj == self.pointer && op == p::pointer::EV_ENTER {
+            // enter(serial, surface, x, y): remember which surface + the local position.
+            let mut a = self.conn.args();
+            let _serial = a.u32();
+            self.pointer_surface = a.u32().unwrap_or(0);
+            self.pointer_x = a.fixed().map(|f| f.to_int()).unwrap_or(0);
+            self.pointer_y = a.fixed().map(|f| f.to_int()).unwrap_or(0);
+        } else if obj == self.pointer && op == p::pointer::EV_MOTION {
+            // motion(time, x, y): update the local position.
+            let mut a = self.conn.args();
+            let _time = a.u32();
+            self.pointer_x = a.fixed().map(|f| f.to_int()).unwrap_or(self.pointer_x);
+            self.pointer_y = a.fixed().map(|f| f.to_int()).unwrap_or(self.pointer_y);
+        } else if obj == self.pointer && op == p::pointer::EV_BUTTON {
+            // button(serial, time, button, state): on a left press, record a window click.
+            let mut a = self.conn.args();
+            let _serial = a.u32();
+            let _time = a.u32();
+            let button = a.u32().unwrap_or(0);
+            let state = a.u32().unwrap_or(0);
+            if button == p::pointer::BTN_LEFT && state == p::pointer::STATE_PRESSED {
+                let (ox, oy) = self.surface_origin(self.pointer_surface);
+                self.clicks.push((ox + self.pointer_x, oy + self.pointer_y));
             }
         } else if obj == self.keyboard && op == p::keyboard::EV_KEY {
             // key(serial, time, key, state): Esc / q closes the window.

@@ -22,10 +22,12 @@
 //! `SCM_RIGHTS` fd passing and [`protocol`] for the interface opcodes.
 
 pub mod conn;
+pub mod control;
 pub mod protocol;
 pub mod raster;
 pub mod sink;
 pub mod window;
 pub mod wire;
 
+pub use control::{PlayerControl, UiCommand};
 pub use sink::WaylandVideoSink;

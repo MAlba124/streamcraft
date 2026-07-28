@@ -328,6 +328,13 @@ impl Player {
         &self.wiring.tracks
     }
 
+    /// The raw-wire presenter's window↔app control channel (`SC_PRESENT`), if the
+    /// `waylandvideosink` is in use — the CLI drains its clicks into pause/seek and publishes
+    /// duration/pause back for the HUD.
+    pub fn player_control(&self) -> Option<std::sync::Arc<sc_present::PlayerControl>> {
+        self.wiring.player_control.clone()
+    }
+
     /// Whether any track linked to a decoder/sink — the CLI's success predicate (audio-only
     /// and video-only files both count; only *zero* linked tracks is a failure).
     pub fn any_track_linked(&self) -> bool {

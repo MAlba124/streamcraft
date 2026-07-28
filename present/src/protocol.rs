@@ -101,11 +101,25 @@ pub mod xdg_toplevel {
 /// `wl_seat` — input device hub (pointer/keyboard for controls).
 pub mod seat {
     pub const NAME: &str = "wl_seat";
+    pub const GET_POINTER: u16 = 0; // -> new_id wl_pointer
     pub const GET_KEYBOARD: u16 = 1; // -> new_id wl_keyboard
     pub const EV_CAPABILITIES: u16 = 0; // capabilities (bitmask)
     pub const EV_NAME: u16 = 1; // name
-    /// Capability bit: a keyboard is available.
+    /// Capability bits.
+    pub const CAP_POINTER: u32 = 1;
     pub const CAP_KEYBOARD: u32 = 2;
+}
+
+/// `wl_pointer` — cursor position + buttons. Coordinates are surface-local `wl_fixed`.
+pub mod pointer {
+    pub const EV_ENTER: u16 = 0; // serial, surface, x, y
+    pub const EV_LEAVE: u16 = 1; // serial, surface
+    pub const EV_MOTION: u16 = 2; // time, x, y
+    pub const EV_BUTTON: u16 = 3; // serial, time, button, state
+    /// Left mouse button (`<linux/input-event-codes.h>` `BTN_LEFT`).
+    pub const BTN_LEFT: u32 = 0x110;
+    /// `state == 1` ⇒ pressed.
+    pub const STATE_PRESSED: u32 = 1;
 }
 
 /// `wl_keyboard` — key events. Keys are raw Linux evdev codes (`<linux/input-event-codes.h>`):

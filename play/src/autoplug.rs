@@ -105,6 +105,10 @@ pub struct Wiring {
     /// the presenter must be the EGL frame-slot sink. `false` for the CPU/software path
     /// (including a [`SinkChoice::ExternalZeroCopy`] that fell back to readback).
     pub video_zerocopy: bool,
+    /// The window↔app control channel of the raw-wire presenter (`SC_PRESENT`): the app reads
+    /// it to drive pause/seek from window clicks + publish duration/pause to the HUD. `None`
+    /// unless the waylandvideosink is in use.
+    pub player_control: Option<std::sync::Arc<sc_present::PlayerControl>>,
 }
 
 impl Wiring {
@@ -263,11 +267,16 @@ pub fn autoplug_container(
                 {
                     p.set_element_pool(dec_id, VIDEO_SLOT, VIDEO_SLOTS);
                     p.set_queue_capacity(dec_id, VIDEO_QUEUE);
+                    // The window↔app control channel: clicks → pause/seek, duration/pause → HUD.
+                    let ctrl = sc_present::PlayerControl::new();
                     let sink = p.add_boxed(Box::new(
-                        sc_present::WaylandVideoSink::new().with_channel(ch),
+                        sc_present::WaylandVideoSink::new()
+                            .with_channel(ch)
+                            .with_control(std::sync::Arc::clone(&ctrl)),
                     ));
                     p.link((dec_id, "src"), (sink, "sink"))
                         .expect("video/gpu ! waylandvideosink");
+                    w.player_control = Some(ctrl);
                     w.video_sink = Some(sink);
                     w.video_dec = Some(dec_id);
                     w.video_zerocopy = true;
