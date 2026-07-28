@@ -96,11 +96,26 @@ use crate::{Error, Result};
 /// * [`Error::QuantToSpecInvalid`] — group count or a group buffer
 ///   length disagreeing with the `ics_info` grouping, or a grouping
 ///   whose `window_group_length` sum is not `num_windows`.
-pub fn quant_to_spec<A: std::alloc::Allocator>(
-    groups: &[Vec<f64, A>],
+pub fn quant_to_spec<S: std::alloc::Allocator>(
+    groups: &[Vec<f64, S>],
     ics_info: &IcsInfo,
     fs_index: u8,
 ) -> Result<Vec<f64>> {
+    quant_to_spec_in(groups, ics_info, fs_index, std::alloc::Global)
+}
+
+/// [`quant_to_spec`] with the window-major `spec` drawn from a caller `scratch` allocator (the
+/// pipeline's per-`process()` arena) instead of the heap. `spec` is a per-channel transient
+/// consumed by the PNS/TNS/filterbank tail *within the same decode call* — it never escapes
+/// `process()` — so arena-backing it removes a per-channel heap allocation (streamcraft patch).
+/// `S` is the (arena-backed) input-group allocator; `A` the output allocator (tests infer both
+/// `Global`).
+pub fn quant_to_spec_in<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(
+    groups: &[Vec<f64, S>],
+    ics_info: &IcsInfo,
+    fs_index: u8,
+    scratch: A,
+) -> Result<Vec<f64, A>> {
     let (window_len, offsets) = if ics_info.window_sequence.is_eight_short() {
         (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
     } else {
@@ -122,7 +137,8 @@ pub fn quant_to_spec<A: std::alloc::Allocator>(
         return Err(Error::QuantToSpecInvalid);
     }
 
-    let mut spec = vec![0.0f64; num_windows * window_len];
+    let mut spec = Vec::with_capacity_in(num_windows * window_len, scratch);
+    spec.resize(num_windows * window_len, 0.0f64);
     // `k` in the pseudocode: index of the group's first window.
     let mut window_base = 0usize;
     for (g, group) in groups.iter().enumerate() {

@@ -74,7 +74,7 @@
 //!   [`crate::pns::gen_rand_vector`] LCG, seeded once per decoder so the
 //!   noise is reproducible across a decode run.
 
-use crate::decoded_spectrum::quant_to_spec;
+use crate::decoded_spectrum::quant_to_spec_in;
 use crate::dequant::rescale_spectrum_in;
 use crate::filterbank::Filterbank;
 use crate::ics_body::IcsBody;
@@ -205,7 +205,7 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
     ch: &ChannelInput<'_, A>,
     fs_index: u8,
     scratch: A,
-) -> Result<(Vec<f64>, AbsoluteScaleFactors<A>)> {
+) -> Result<(Vec<f64, A>, AbsoluteScaleFactors<A>)> {
     // 2. §4.6.3.3 pulse fix-up on the quantised spectrum (long windows
     //    only — the parser already rejects pulse on EIGHT_SHORT, and a
     //    long sequence has exactly one group).
@@ -249,8 +249,9 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
         fs_index,
     )?;
 
-    // 4. §4.6.3.3 quant_to_spec() de-interleaving.
-    let spec = quant_to_spec(&rescaled, ch.ics_info, fs_index)?;
+    // 4. §4.6.3.3 quant_to_spec() de-interleaving. `spec` is a per-channel transient consumed by
+    //    the PNS/TNS/filterbank tail within this decode call, so it comes from `scratch` too.
+    let spec = quant_to_spec_in(&rescaled, ch.ics_info, fs_index, scratch)?;
     Ok((spec, abs))
 }
 
