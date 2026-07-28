@@ -22,4 +22,34 @@ disallowed-methods = [
     { path = "std::fs::read", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
     { path = "std::fs::write", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
     { path = "std::fs::read_to_string", reason = "elements ride the reactor (ctx.io()); app/test setup may #[allow] with a justification" },
+
+    # ---------------------------------------------------------------------------
+    # Allocation discipline (spec: performance #1 — no steady-state heap traffic).
+    # An `Element::process()` hot path and its per-frame callees allocate ONLY from
+    # `ctx.scratch()` (the per-`process()` bump arena) or the buffer pool — never the
+    # global heap. Heap allocation per frame is a bug: it fragments, blocks on the
+    # allocator, and defeats the pool/arena accounting. The constructors below are
+    # therefore lint-banned workspace-wide.
+    #
+    # clippy cannot scope a method ban to `process()`, so this fires everywhere. A
+    # ONE-TIME allocation is the legitimate exception — element `new()`/`start()`
+    # building fixed state, a muxer/writer assembling a header, a parser that runs
+    # once per stream, app `main()` setup, and tests. Annotate the item (or, for a
+    # whole non-hot-path file, the module) with `#[allow(clippy::disallowed_methods)]`
+    # and a one-line justification. An UNannotated allocation in the hot path is the
+    # error this catches — move it to `ctx.scratch()`/the pool.
+    { path = "std::vec::Vec::new", reason = "hot path allocates from ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
+    { path = "std::vec::Vec::with_capacity", reason = "hot path allocates from ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
+    { path = "std::vec::Vec::from", reason = "hot path allocates from ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
+    { path = "slice::to_vec", reason = "hot path copies into ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
+    { path = "std::borrow::ToOwned::to_owned", reason = "hot path copies into ctx.scratch()/pool; one-time setup #[allow]s with a justification" },
+    { path = "std::string::ToString::to_string", reason = "hot path avoids heap strings; one-time setup #[allow]s with a justification" },
+    { path = "std::string::String::new", reason = "hot path avoids heap strings; one-time setup #[allow]s with a justification" },
+    { path = "std::string::String::with_capacity", reason = "hot path avoids heap strings; one-time setup #[allow]s with a justification" },
+    { path = "std::boxed::Box::new", reason = "hot path avoids per-frame boxing; one-time setup #[allow]s with a justification" },
+    # NOTE: `Clone::clone` is deliberately NOT banned — clippy can't see the receiver
+    # type, so it fires on cheap Arc/Rc/Copy clones that allocate nothing (the vast
+    # majority). A `Vec`/`String`/`Box` clone in the hot path is caught by review and
+    # the existing `clippy::clone_on_*` lints; banning `clone` wholesale would drown the
+    # signal in boilerplate `#[allow]`s. Ban only methods that always touch the heap.
 ]
