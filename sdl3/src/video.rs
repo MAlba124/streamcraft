@@ -95,6 +95,9 @@ impl VideoWindow {
     #[allow(clippy::disallowed_methods)]
     pub fn open_windowed(title: &str, width: u32, height: u32) -> Result<Self, Error> {
         let title = CString::new(title).unwrap_or_default();
+        // Prefer Wayland (fall back to X11) — must precede the video-subsystem init that
+        // selects the driver.
+        crate::prefer_wayland_driver();
         // SAFETY: plain C calls; SDL_InitSubSystem is refcounted per subsystem.
         unsafe {
             if !SDL_InitSubSystem(SDL_INIT_VIDEO) {

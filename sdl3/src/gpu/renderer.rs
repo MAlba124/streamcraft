@@ -139,6 +139,8 @@ impl GpuRenderer {
     /// Returns `Err` on any device / pipeline failure so the test can skip cleanly.
     #[cfg(test)]
     pub fn new_headless() -> Result<Self, Error> {
+        // Prefer Wayland (fall back to X11) before the driver-selecting init.
+        crate::prefer_wayland_driver();
         // SAFETY: init the video subsystem (refcounted), then create the device.
         unsafe {
             if !SDL_InitSubSystem(SDL_INIT_VIDEO) {

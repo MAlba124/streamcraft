@@ -38,3 +38,19 @@ use streamcraft_core::registry::Registry;
 pub fn register(registry: &mut Registry) {
     registry.register(Sdl3VideoSink::new().desc());
 }
+
+/// Ask SDL to prefer the **Wayland** video driver when it is available, falling back to X11.
+/// SDL picks its video driver at video-subsystem init by walking this comma-separated priority
+/// list, so this MUST run before `SDL_InitSubSystem(SDL_INIT_VIDEO)` (every init site calls it).
+/// Set at the default hint priority, so an explicit `SDL_VIDEO_DRIVER` environment variable
+/// still wins — a user who forces `x11` (or anything else) is honoured. Idempotent.
+pub(crate) fn prefer_wayland_driver() {
+    // SAFETY: a plain C call taking two `'static` NUL-terminated strings; SDL reads the hint
+    // registry lazily at init and this needs no prior `SDL_Init`.
+    unsafe {
+        sdl3_sys::everything::SDL_SetHint(
+            sdl3_sys::everything::SDL_HINT_VIDEO_DRIVER,
+            c"wayland,x11".as_ptr(),
+        );
+    }
+}
