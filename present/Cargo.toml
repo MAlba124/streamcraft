@@ -15,6 +15,9 @@ streamcraft-core = { path = "../core" }
 # GpuFrameChannel hand-off + the dmabuf geometry types live here. (The presenter *core*
 # — wire/conn/window/raster — stays free of it; only `sink` pulls it in.)
 sc-vaapi = { path = "../vaapi" }
+# The subtitle sink pad decodes pgsdec's `subtitle/bitmap` (straight-alpha RGBA + placement)
+# into its own overlay subsurface — no compositing onto the GPU frame needed.
+sc-text = { path = "../text" }
 # The Wayland wire protocol is spoken directly over the display socket to avoid
 # libwayland-client's per-message `wl_closure` heap allocation (the whole reason
 # this crate exists). `libc` is only for the socket syscalls + `SCM_RIGHTS` fd

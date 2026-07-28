@@ -20,23 +20,40 @@ use streamcraft_core::element::{
 };
 use streamcraft_core::error::Error;
 use streamcraft_core::event::Event;
+use streamcraft_core::format::OfferDesc;
+use streamcraft_core::id::PadId;
 use streamcraft_core::log;
 use streamcraft_core::log::Level;
 use streamcraft_core::time::Timestamp;
 
+use sc_text::pgs;
 use sc_vaapi::gpuframe::{GpuFrame, GpuFrameChannel, GpuFrameHeader, GPU_OFFER};
 
 use crate::raster::Canvas;
 use crate::window::{DmabufVideo, Plane, Window};
 
-static SINK_OFFERS: [streamcraft_core::format::OfferDesc; 1] = [GPU_OFFER];
-static PADS: [PadDesc; 1] = [PadDesc {
-    name: "sink",
-    direction: Direction::Sink,
-    offers: &SINK_OFFERS,
-    dynamic: false,
-    validate: None,
-}];
+/// The video (metronome) pad and the subtitle-bitmap side pad.
+const VIDEO: PadId = PadId(0);
+const SUBTITLE: PadId = PadId(1);
+
+static VIDEO_OFFERS: [OfferDesc; 1] = [GPU_OFFER];
+static SUB_OFFERS: [OfferDesc; 1] = [OfferDesc::any(sc_text::BITMAP_FAMILY)];
+static PADS: [PadDesc; 2] = [
+    PadDesc {
+        name: "sink",
+        direction: Direction::Sink,
+        offers: &VIDEO_OFFERS,
+        dynamic: false,
+        validate: None,
+    },
+    PadDesc {
+        name: "subtitle",
+        direction: Direction::Sink,
+        offers: &SUB_OFFERS,
+        dynamic: false,
+        validate: None,
+    },
+];
 
 static DESC: ElementDesc = ElementDesc {
     name: "waylandvideosink",
@@ -44,7 +61,8 @@ static DESC: ElementDesc = ElementDesc {
     props: &[],
     // Its own thread; paces the graph on the clock (spec: Scheduling — a windowed sink).
     sched: SchedHint::Active,
-    inputs: InputPolicy::Single,
+    // Any: the video pad is the metronome; the subtitle pad is a side input read per-pass.
+    inputs: InputPolicy::Any,
     latency: LatencyDesc {
         min: Timestamp::ZERO,
         max: Timestamp::ZERO,
@@ -67,6 +85,15 @@ pub struct WaylandVideoSink {
     preroll_next: bool,
     /// Frames presented — drives the GUI overlay's decoupled (lower-rate) update cadence.
     frames: u64,
+    /// The current subtitle caption (latest-wins), shown for `[start, end)` (its own subsurface).
+    subtitle: Option<SubCue>,
+}
+
+/// One decoded PGS caption + its on-screen span.
+struct SubCue {
+    start: Timestamp,
+    end: Timestamp,
+    ds: pgs::DisplaySet,
 }
 
 impl Default for WaylandVideoSink {
@@ -80,7 +107,14 @@ impl WaylandVideoSink {
     // COLD: constructor.
     #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
-        WaylandVideoSink { channel: None, window: None, disabled: false, preroll_next: false, frames: 0 }
+        WaylandVideoSink {
+            channel: None,
+            window: None,
+            disabled: false,
+            preroll_next: false,
+            frames: 0,
+            subtitle: None,
+        }
     }
 
     /// Attach the shared [`GpuFrameChannel`] (the same `Arc` the zero-copy decoder holds).
@@ -169,23 +203,45 @@ impl WaylandVideoSink {
                 self.frames = self.frames.wrapping_add(1);
                 let n = self.frames;
                 let channel = self.channel.clone();
-                // Pump window events (close/ping/buffer-release) without blocking the graph,
-                // free the surfaces the compositor just released (deferred token release), and
-                // refresh the GUI overlay at ~1/6 the video rate (a decoupled wl_subsurface).
-                if let Some(w) = self.window.as_mut() {
-                    let _ = w.dispatch(false);
-                    if let Some(ch) = &channel {
-                        while let Some(tok) = w.next_released_token() {
-                            ch.release(tok);
+                let mut close = false;
+                // Pump window events, free compositor-released surfaces (deferred token release),
+                // refresh the GUI overlay, and show/clear the subtitle caption for this pts.
+                // Destructure `self` so `window` and `subtitle` are borrowed disjointly.
+                {
+                    let Self { window, subtitle, .. } = self;
+                    if let Some(w) = window.as_mut() {
+                        let _ = w.dispatch(false);
+                        if let Some(ch) = &channel {
+                            while let Some(tok) = w.next_released_token() {
+                                ch.release(tok);
+                            }
                         }
+                        if w.has_gui() && n % 6 == 0 {
+                            let (ww, wh) = w.size();
+                            let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, n));
+                        }
+                        match subtitle.as_ref().filter(|c| pts >= c.start && pts < c.end) {
+                            Some(c) => {
+                                let ds = &c.ds;
+                                let _ = w.present_subtitle(
+                                    ds.video_width as i32,
+                                    ds.video_height as i32,
+                                    ds.x as i32,
+                                    ds.y as i32,
+                                    ds.width as i32,
+                                    ds.height as i32,
+                                    &ds.rgba,
+                                );
+                            }
+                            None => {
+                                let _ = w.hide_subtitle();
+                            }
+                        }
+                        close = w.should_close();
                     }
-                    if w.has_gui() && n % 6 == 0 {
-                        let (ww, wh) = w.size();
-                        let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, n));
-                    }
-                    if w.should_close() {
-                        self.on_close(ctx);
-                    }
+                }
+                if close {
+                    self.on_close(ctx);
                 }
             }
             Err(e) => {
@@ -220,6 +276,22 @@ impl WaylandVideoSink {
             f.close_fds();
         }
         self.release(token);
+    }
+
+    /// Update the current subtitle caption from a `subtitle/bitmap` buffer (latest-wins; a
+    /// clear erases it). Timed by the buffer's pts + duration.
+    fn push_subtitle(&mut self, ds: pgs::DisplaySet, pts: Timestamp, duration: Timestamp) {
+        if ds.is_clear() {
+            self.subtitle = None;
+            return;
+        }
+        let Some(start_ns) = pts.nanos() else { return };
+        // A PGS composition stays until the next composition/clear; use its duration when set,
+        // else a generous default so a lost clear doesn't strand a caption forever.
+        let dur_ns = duration.nanos().filter(|&d| d > 0).unwrap_or(10_000_000_000);
+        let start = Timestamp::from_nanos(start_ns);
+        let end = Timestamp::from_nanos(start_ns.saturating_add(dur_ns));
+        self.subtitle = Some(SubCue { start, end, ds });
     }
 
     /// The window was closed by the user — warn on the bus (the app ends playback) and disable.
@@ -262,14 +334,29 @@ impl Element for WaylandVideoSink {
         Ok(())
     }
 
-    fn process(&mut self, ctx: &mut Ctx, mut inputs: streamcraft_core::batch::Inputs<'_>) -> Result<Flow, Error> {
+    fn process(&mut self, ctx: &mut Ctx, _inputs: streamcraft_core::batch::Inputs<'_>) -> Result<Flow, Error> {
+        // Subtitle side-input first: update the current caption before this pass's frames (so a
+        // caption landing in the same batch as its first video frame is already visible). A
+        // malformed bitmap is dropped — untrusted peer data never panics.
+        let mut sub_batch = ctx.take_input_on(SUBTITLE);
+        while let Some(buf) = sub_batch.pop_front() {
+            if let Some(ds) = pgs::decode_bitmap(buf.memory.data()) {
+                self.push_subtitle(ds, buf.pts, buf.duration);
+            }
+        }
+        ctx.recycle_input(sub_batch);
+
+        // The video pad — the metronome.
         let entry_gen = ctx.seek_gen();
-        while let Some(buf) = inputs.pop() {
+        let mut vbatch = ctx.take_input_on(VIDEO);
+        while let Some(buf) = vbatch.pop_front() {
             if ctx.seek_gen() != entry_gen {
+                ctx.recycle_input(vbatch);
                 return Ok(Flow::Ok); // a mid-batch seek staled the rest (spec: flush/seek)
             }
             self.present(ctx, buf.memory.data(), buf.pts)?;
         }
+        ctx.recycle_input(vbatch);
         Ok(Flow::Ok)
     }
 

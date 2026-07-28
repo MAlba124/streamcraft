@@ -348,6 +348,32 @@ pub fn autoplug_container(
             }
         }
 
+        // SC_PRESENT: the raw-wire sink shows the first PGS subtitle in its OWN subsurface
+        // (no overlay — a CPU overlay can't touch the GPU frame). Route `queue → pgsdec →
+        // waylandvideosink.subtitle`; the sink renders the RGBA bitmap over the video. (Text
+        // subtitles still need the overlay's rasterizer — a follow-up.)
+        if Some(i) == sub_idx
+            && family == "subtitle/pgs"
+            && w.video_zerocopy
+            && std::env::var_os("SC_PRESENT").is_some()
+        {
+            if let Some(sink) = w.video_sink {
+                let q = p.add(Queue::new());
+                let dec = p.add(PgsDec::new());
+                if p.link((ap.element, &ap.name), (q, "sink")).is_ok()
+                    && p.link((q, "src"), (dec, "sink")).is_ok()
+                    && p.link((dec, "src"), (sink, "subtitle")).is_ok()
+                {
+                    w.tracks.push(TrackOutcome {
+                        pad: ap.name.clone(),
+                        summary: format!("{family} → pgsdec → waylandvideosink.subtitle"),
+                        linked: true,
+                    });
+                    continue;
+                }
+            }
+        }
+
         // The chosen text-subtitle track, when an overlay is present: route it through a
         // `queue → subparse → overlay.text` branch so it burns into the video (spec: subtitle
         // support — the overlay is a non-blocking fan-in; the `queue` heads its own active

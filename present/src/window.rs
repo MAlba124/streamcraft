@@ -85,6 +85,18 @@ pub struct Window {
     /// The GUI subsurface's last position, so it re-places only on change (e.g. resize).
     gui_x: i32,
     gui_y: i32,
+    /// The subtitle overlay `wl_surface` + `wl_subsurface` + its own `wp_viewport` (scales the
+    /// native PGS bitmap to the on-screen size). Created lazily on the first caption.
+    sub_surface: u32,
+    sub_subsurface: u32,
+    sub_viewport: u32,
+    /// The subtitle's last on-screen placement (position + scaled size), so it only re-issues
+    /// viewport/position requests on change; and whether a caption is currently shown.
+    sub_place: (i32, i32, i32, i32),
+    sub_visible: bool,
+    /// The video's current on-screen rect (the letterbox fit), so a caption places relative to
+    /// it. Updated every [`present_dmabuf`](Self::present_dmabuf).
+    fit: (i32, i32, i32, i32),
     // Geometry (compositor-configured; falls back to the requested default until then).
     width: i32,
     height: i32,
@@ -180,6 +192,12 @@ impl Window {
             gui_subsurface: 0,
             gui_x: i32::MIN,
             gui_y: i32::MIN,
+            sub_surface: 0,
+            sub_subsurface: 0,
+            sub_viewport: 0,
+            sub_place: (i32::MIN, i32::MIN, 0, 0),
+            sub_visible: false,
+            fit: (0, 0, 0, 0),
             width,
             height,
             configured: false,
@@ -361,6 +379,7 @@ impl Window {
         } else {
             (0, 0, win_w, win_h)
         };
+        self.fit = (fit_x, fit_y, fit_w, fit_h); // remembered for subtitle placement
 
         // Crop the coded surface to the display rect and scale it to the fit size.
         self.ensure_viewport(target);
@@ -548,6 +567,107 @@ impl Window {
         self.subcompositor != 0
     }
 
+    /// Show a subtitle caption: a straight-alpha RGBA `w×h` bitmap whose `(x, y, w, h)`
+    /// placement is in a `ref_w×ref_h` reference frame (the PGS composition size). It rides its
+    /// own `wl_subsurface` over the video, scaled + positioned into the current letterbox fit
+    /// rect via `wp_viewport` — so it tracks the video's on-screen size. No-op without
+    /// subcompositor/viewporter.
+    pub fn present_subtitle(
+        &mut self,
+        ref_w: i32,
+        ref_h: i32,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+    ) -> io::Result<()> {
+        if self.subcompositor == 0 || self.viewporter == 0 || w <= 0 || h <= 0 {
+            return Ok(());
+        }
+        let (ref_w, ref_h) = (ref_w.max(1), ref_h.max(1));
+        self.ensure_sub_subsurface();
+
+        // On-screen rect: scale the placement from the PGS reference frame into the video fit.
+        let (fx0, fy0, fw, fh) = self.fit;
+        let (fw, fh) = (fw.max(1), fh.max(1));
+        let sx = fx0 + x * fw / ref_w;
+        let sy = fy0 + y * fh / ref_h;
+        let sw = (w * fw / ref_w).max(1);
+        let sh = (h * fh / ref_h).max(1);
+
+        // Render the native-size caption into a recycled shm buffer (straight→premultiplied).
+        let idx = self.acquire(w, h)?;
+        {
+            let b = &mut self.pool[idx];
+            let stride = (b.width * 4) as usize;
+            let (bw, bh) = (b.width as usize, b.height as usize);
+            let dst = b.pixels();
+            rgba_to_premul_argb(rgba, dst, stride, bh, bw);
+        }
+        let (buffer, bw, bh) = {
+            let b = &self.pool[idx];
+            (b.buffer, b.width, b.height)
+        };
+        self.pool[idx].busy = true;
+        let (ss, sub) = (self.sub_surface, self.sub_subsurface);
+        // Viewport: scale the native `w×h` buffer to the on-screen `sw×sh`.
+        if self.sub_viewport != 0 {
+            self.conn
+                .request(self.sub_viewport, p::viewport::SET_SOURCE)
+                .fixed(fx(0))
+                .fixed(fx(0))
+                .fixed(fx(w))
+                .fixed(fx(h))
+                .finish();
+            self.conn.request(self.sub_viewport, p::viewport::SET_DESTINATION).i32(sw).i32(sh).finish();
+        }
+        self.conn.request(ss, p::surface::ATTACH).object(buffer).i32(0).i32(0).finish();
+        self.conn.request(ss, p::surface::DAMAGE_BUFFER).i32(0).i32(0).i32(bw).i32(bh).finish();
+        self.conn.request(ss, p::surface::COMMIT).finish();
+        if self.sub_place != (sx, sy, sw, sh) {
+            self.conn.request(sub, p::subsurface::SET_POSITION).i32(sx).i32(sy).finish();
+            self.conn.request(self.surface, p::surface::COMMIT).finish();
+            self.sub_place = (sx, sy, sw, sh);
+        }
+        self.sub_visible = true;
+        self.conn.flush()
+    }
+
+    /// Clear the current subtitle caption (unmap its subsurface via a null buffer attach).
+    pub fn hide_subtitle(&mut self) -> io::Result<()> {
+        if !self.sub_visible || self.sub_surface == 0 {
+            return Ok(());
+        }
+        self.conn.request(self.sub_surface, p::surface::ATTACH).object(0).i32(0).i32(0).finish();
+        self.conn.request(self.sub_surface, p::surface::COMMIT).finish();
+        self.sub_visible = false;
+        self.conn.flush()
+    }
+
+    /// Lazily create the subtitle `wl_surface` + `wl_subsurface` + `wp_viewport`, once.
+    fn ensure_sub_subsurface(&mut self) {
+        if self.sub_subsurface != 0 || self.subcompositor == 0 {
+            return;
+        }
+        self.sub_surface = self.conn.alloc_id();
+        self.conn.request(self.compositor, p::compositor::CREATE_SURFACE).u32(self.sub_surface).finish();
+        self.sub_subsurface = self.conn.alloc_id();
+        let (sub, ss, parent) = (self.sub_subsurface, self.sub_surface, self.surface);
+        self.conn
+            .request(self.subcompositor, p::subcompositor::GET_SUBSURFACE)
+            .u32(sub)
+            .object(ss)
+            .object(parent)
+            .finish();
+        self.conn.request(sub, p::subsurface::SET_DESYNC).finish();
+        if self.viewporter != 0 {
+            self.sub_viewport = self.conn.alloc_id();
+            let (vp, s) = (self.sub_viewport, self.sub_surface);
+            self.conn.request(self.viewporter, p::viewporter::GET_VIEWPORT).u32(vp).object(s).finish();
+        }
+    }
+
     /// Lazily create the GUI `wl_surface` + `wl_subsurface` over the video, once. Created after
     /// the video subsurface, so it stacks above the video. Position is set by
     /// [`present_gui`](Self::present_gui).
@@ -685,6 +805,27 @@ pub struct DmabufVideo<'a> {
 /// Integer → `wl_fixed` (24.8) for the viewport source rect.
 fn fx(n: i32) -> crate::wire::Fixed {
     crate::wire::Fixed::from_int(n)
+}
+
+/// Convert straight-alpha RGBA8888 (`[R,G,B,A]` rows) to **premultiplied** ARGB8888 for
+/// `wl_shm` (little-endian bytes `[B,G,R,A]`, premultiplied — the compositor blends assuming
+/// premultiplied). `src` is `w*h*4` bytes; `dst` is the shm buffer (`dst_stride` bytes/row).
+fn rgba_to_premul_argb(src: &[u8], dst: &mut [u8], dst_stride: usize, h: usize, w: usize) {
+    for row in 0..h {
+        let s0 = row * w * 4;
+        let d0 = row * dst_stride;
+        for col in 0..w {
+            let (s, d) = (s0 + col * 4, d0 + col * 4);
+            if s + 3 >= src.len() || d + 3 >= dst.len() {
+                break;
+            }
+            let (r, g, b, a) = (src[s] as u32, src[s + 1] as u32, src[s + 2] as u32, src[s + 3] as u32);
+            dst[d] = (b * a / 255) as u8; // B
+            dst[d + 1] = (g * a / 255) as u8; // G
+            dst[d + 2] = (r * a / 255) as u8; // R
+            dst[d + 3] = a as u8; // A
+        }
+    }
 }
 
 /// Aspect-preserving fit of a `vw×vh` video into a `ww×wh` window: the centered `(x, y, w, h)`
