@@ -23,6 +23,11 @@
 //! base64, and RFC 2617 §2 Basic credentials are base64 too, so the client
 //! module borrows the encoder.
 
+// COLD: SDP is parsed from a DESCRIBE body and base64 (SPS/PPS, Basic creds)
+// is coded per control message — the control plane, never the per-packet media
+// path; every allocation here is one-time per stream setup.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::fmt;
 

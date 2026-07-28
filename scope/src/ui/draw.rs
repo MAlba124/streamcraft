@@ -287,6 +287,8 @@ impl DrawList {
         // Each quad = 4 verts, 6 indices. Runs break when (tex, clip) changes.
         let n = self.prims.len();
         if n == 0 {
+            // Empty no-prims frame: an empty Vec allocates nothing (clippy.toml).
+            #[allow(clippy::disallowed_methods)]
             return Vec::new();
         }
         let total_verts = n * 4;

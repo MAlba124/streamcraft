@@ -106,6 +106,8 @@ pub fn build_seek_index(header: &[u8], idx1_payload: &[u8], file_len: u64) -> Op
 /// `--list`/help and descriptor queries meanwhile — the same shape as `mkvdemux`.
 ///
 /// The `&'static ElementDesc` is taken from a throwaway instance — only `desc()` is called.
+// COLD: one-time registration; the empty header vec seeds a throwaway instance for its desc().
+#[allow(clippy::disallowed_methods)]
 pub fn register(registry: &mut Registry) {
     registry.register(AviDemux::new(Vec::new()).desc());
 }

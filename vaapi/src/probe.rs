@@ -8,6 +8,10 @@
 //! `SC_NO_VAAPI=1` forces "no device" (honored before any hardware is touched);
 //! `SC_VAAPI_DEVICE=/dev/dri/renderDNNN` pins the node instead of scanning.
 
+// Entire module is one-time, process-lifetime capability probing (cached in a
+// OnceLock); no per-frame work here, so heap allocation for the caps tables is fine.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 

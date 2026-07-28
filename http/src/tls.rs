@@ -40,6 +40,9 @@ const CA_BUNDLE_PATHS: &[&str] = &[
 /// Handshake a TLS client session over `stream` (blocking — `start()`-time setup),
 /// verifying `host` against the system trust roots. Returns the established
 /// [`ClientConnection`] for the element to keep as its sans-IO decrypt state.
+// COLD: the whole handshake runs once per connection in `start()`; the ALPN Vec and SNI
+// name string are one-time session config, not per-chunk body-path allocations.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn connect(
     host: &str,
     stream: &mut TcpStream,
@@ -120,6 +123,9 @@ fn load_roots(url: &str) -> Result<RootCertStore, Error> {
 /// Comment lines and other block types (bundles sometimes interleave plain-text
 /// descriptions) are skipped; a block whose base64 fails to decode is dropped —
 /// [`load_roots`] treats per-entry damage as skippable.
+// COLD: parses the CA bundle once per connection at `start()` (via `load_roots`); the
+// cert list and per-block accumulator are setup allocations, not the body path.
+#[allow(clippy::disallowed_methods)]
 fn pem_certificates(pem: &[u8]) -> Vec<CertificateDer<'static>> {
     let mut out = Vec::new();
     let mut body: Option<Vec<u8>> = None;
@@ -174,6 +180,9 @@ fn base64_value(b: u8) -> Option<u32> {
 /// with no interior whitespace (PEM body lines are concatenated before the call).
 /// Returns `None` on any symbol outside the alphabet or an impossible length
 /// (a final group of one symbol encodes fewer than 8 bits — §4: invalid).
+// COLD: decodes each CA-bundle cert once per connection at `start()`; the output DER
+// buffer is a setup allocation, not the per-chunk body path.
+#[allow(clippy::disallowed_methods)]
 fn decode_base64(mut s: &[u8]) -> Option<Vec<u8>> {
     // Strip trailing `=` padding; the leftover symbol count encodes the tail length.
     while let [rest @ .., b'='] = s {

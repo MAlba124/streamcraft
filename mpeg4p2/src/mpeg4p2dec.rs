@@ -75,6 +75,8 @@ static PADS: [PadDesc; 2] = [
     PadDesc { name: "src", direction: Direction::Src, offers: &SRC_OFFERS, dynamic: true, validate: None },
 ];
 
+// `make_default` boxes the element once at registry construction (spec: Plugins) — cold.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "mpeg4p2dec",
     pads: &PADS,
@@ -150,6 +152,10 @@ impl Mpeg4p2Dec {
     }
 
     /// Warn once about VOL tools this decoder does not implement.
+    //
+    // Runs at most once per stream (guarded by `warned_unsupported`); `notes` holds a
+    // few `&'static str` labels — a one-time setup allocation, not per-frame — cold.
+    #[allow(clippy::disallowed_methods)]
     fn warn_unsupported(&mut self, ctx: &mut Ctx) {
         if self.warned_unsupported {
             return;
@@ -310,12 +316,13 @@ impl Element for Mpeg4p2Dec {
             if !self.vol_parsed {
                 continue; // no VOL yet — cannot decode; drop until headers arrive
             }
-            // Split into coded VOP units (packed-bitstream aware), each with its
-            // preceding stream headers. Copy the VOP bytes out so `self` can be
-            // mutably borrowed across decode without holding the input borrow.
-            let units = packed::split_units(inbuf.memory.data());
-            let owned: Vec<Vec<u8>> = units.iter().map(|u| u.vop.to_vec()).collect();
-            for vop in &owned {
+            // Walk the coded VOP units (packed-bitstream aware) straight out of the
+            // input buffer and decode each in place — no copy, no allocation. The
+            // cursor holds only offsets; `decode_one`/`drain_pending` borrow `self`
+            // and `ctx`, disjoint from the input buffer `data` borrows.
+            let data = inbuf.memory.data();
+            let mut cursor = packed::VopCursor::new(data);
+            while let Some(vop) = cursor.next(data) {
                 if vop.len() < 5 {
                     continue;
                 }

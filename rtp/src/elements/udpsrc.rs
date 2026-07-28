@@ -90,6 +90,8 @@ pub struct UdpSrc {
 impl UdpSrc {
     /// A source bound to `bind` (typed construction — resolution is the
     /// caller's concern; an SDP/RTSP layer knows real addresses already).
+    // COLD: the diagnostic `label` is built once at construction, never per packet.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(bind: SocketAddr) -> UdpSrc {
         UdpSrc {
             sock: Sock::Bind(bind),
@@ -104,6 +106,8 @@ impl UdpSrc {
     /// A source over an already-bound socket — the RTSP path: the port was
     /// negotiated in SETUP against this exact socket, so it must be used, not
     /// re-bound.
+    // COLD: the diagnostic `label` is built once at construction, never per packet.
+    #[allow(clippy::disallowed_methods)]
     pub fn from_socket(sock: UdpSocket) -> UdpSrc {
         let label = sock.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
         UdpSrc {

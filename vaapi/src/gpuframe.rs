@@ -164,6 +164,8 @@ struct ChannelInner {
 
 impl GpuFrameChannel {
     /// A fresh channel. Share via `Arc` between the decoder and the sink.
+    // Cold: constructor, one channel per zero-copy pipeline; buffers grow in-place.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(ChannelInner {

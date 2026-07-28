@@ -92,6 +92,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
+    // COLD: registry make_default — boxes one element instance at plugin-registration time.
+    #[allow(clippy::disallowed_methods)]
     make_default: Some(|| Box::new(SubParse::new())),
 };
 
@@ -116,6 +118,10 @@ impl Dialect {
     }
 
     /// Strip one cue's Block body to plain UTF-8 per this dialect.
+    // COLD: one owned cue string per sparse subtitle Block (a cue every few seconds), never per
+    // video frame — the natural shape of a text cue (the srt/vtt/ass arms allocate likewise). The
+    // element then copies this into a pool buffer (`ctx.alloc_exact`) for the wire.
+    #[allow(clippy::disallowed_methods)]
     fn strip(self, body: &str) -> String {
         match self {
             Dialect::Srt => parse::cue_body_srt(body),

@@ -92,6 +92,8 @@ static EAC3_PADS: [PadDesc; 2] = [
     PadDesc { name: "src", direction: Direction::Src, offers: &SRC_OFFERS, dynamic: true, validate: None },
 ];
 
+// `make_default` boxes the element once at registry construction (spec: Plugins) — cold.
+#[allow(clippy::disallowed_methods)]
 static AC3_DESC: ElementDesc = ElementDesc {
     name: "ac3dec",
     pads: &AC3_PADS,
@@ -101,6 +103,8 @@ static AC3_DESC: ElementDesc = ElementDesc {
     latency: LatencyDesc { min: Timestamp::ZERO, max: Timestamp::ZERO, is_live: false, jitter: Timestamp::ZERO },
     make_default: Some(|| Box::new(Ac3Dec::new())),
 };
+// `make_default` boxes the element once at registry construction (spec: Plugins) — cold.
+#[allow(clippy::disallowed_methods)]
 static EAC3_DESC: ElementDesc = ElementDesc {
     name: "eac3dec",
     pads: &EAC3_PADS,
@@ -137,6 +141,9 @@ struct Core {
 }
 
 impl Core {
+    // One-time element setup: `buf`/`pending` are reused-and-cleared across frames, not
+    // re-allocated per frame (spec: performance #1) — cold.
+    #[allow(clippy::disallowed_methods)]
     fn new() -> Self {
         Self {
             dec: Frame::new(),
@@ -217,6 +224,11 @@ impl Core {
     /// interleaved PCM to `self.pending`. Returns `Ok(true)` if a frame was
     /// consumed (whether it decoded or was dropped), `Ok(false)` if more input is
     /// needed. `element_name` labels warnings.
+    //
+    // The only heap allocation here is the once-per-stream approx-tool warning string
+    // (`.to_string()`, guarded by `reported_approx`); the per-frame decode copies nothing
+    // to the heap — cold.
+    #[allow(clippy::disallowed_methods)]
     fn frame_and_decode_one(&mut self, ctx: &mut Ctx) -> Result<bool, Error> {
         let (offset, len) = match next_frame(&self.buf) {
             Framed::Frame { offset, len, .. } => (offset, len),
@@ -234,14 +246,15 @@ impl Core {
                 return Ok(false);
             }
         };
-        // Copy out the frame's bytes and consume through its end (drop pre-sync
-        // junk). One small owned copy per frame; the decode is the cost center.
-        let frame_bytes = self.buf[offset..offset + len].to_vec();
+        // Decode straight from the framed slice — `decode` returns an owned
+        // `Decoded`, so no borrow of `self.buf` survives it — then consume through
+        // the frame's end (dropping pre-sync junk). No per-frame heap copy.
+        let decoded = self.dec.decode(&self.buf[offset..offset + len]);
         self.buf.drain(..offset + len);
 
         let fi = self.frame_index;
         self.frame_index += 1;
-        match self.dec.decode(&frame_bytes) {
+        match decoded {
             Ok(decoded) => {
                 self.consecutive_errors = 0;
                 if !self.announced {
@@ -290,7 +303,7 @@ impl Core {
                         },
                     });
                 }
-                self.pending.extend_from_slice(&decoded.pcm);
+                self.pending.extend_from_slice(decoded.pcm);
                 Ok(true)
             }
             Err(e) => {

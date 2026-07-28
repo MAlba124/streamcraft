@@ -13,6 +13,11 @@
 //! `RR + SDES`, with the report-block fields computed by appendix A.3's
 //! arithmetic over two [`JitterStats`] snapshots.
 
+// COLD: RTCP is a control channel — reports parse/build on the §6.2 timing
+// interval (seconds apart per participant), never on the per-media-packet path;
+// every allocation here is once per periodic report.
+#![allow(clippy::disallowed_methods)]
+
 use crate::jitter::JitterStats;
 
 /// §6.4.1: "PT=SR=200".

@@ -37,7 +37,7 @@ fn decode_all(data: &[u8], max_frames: usize) -> (Vec<i16>, usize) {
                 let start = pos + offset;
                 if let Ok(dec) = frame.decode(&data[start..start + len]) {
                     nch = dec.info.channels;
-                    out.extend_from_slice(&dec.pcm);
+                    out.extend_from_slice(dec.pcm);
                     n += 1;
                 }
                 pos = start + len;

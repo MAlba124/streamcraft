@@ -43,6 +43,8 @@ static PADS: [PadDesc; 1] = [PadDesc {
     validate: None,
 }];
 
+// COLD: make_default boxes one instance per registry-created element, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "videocksink",
     pads: &PADS,
@@ -127,6 +129,8 @@ pub struct VideoCkSink {
 
 impl VideoCkSink {
     /// Returns the sink (to `add` to a pipeline) and a stats handle to read after `run()`.
+    // COLD: one-time constructor building the shared record store (a check sink for tests).
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> (Self, VideoCkSinkStats) {
         let shared = Arc::new(SinkShared {
             renders: Mutex::new(Vec::new()),

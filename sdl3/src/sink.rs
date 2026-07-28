@@ -87,6 +87,8 @@ static PADS: [PadDesc; 1] = [PadDesc {
     dynamic: true, // dimensions/fps announced at runtime
     validate: None,
 }];
+// COLD: `make_default` boxes one element instance at pipeline construction, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "sdl3videosink",
     pads: &PADS,
@@ -203,6 +205,8 @@ pub struct Sdl3VideoSink {
 }
 
 impl Sdl3VideoSink {
+    // COLD: one-time element construction — sets the default window title string once.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             title: "streamcraft".to_string(),

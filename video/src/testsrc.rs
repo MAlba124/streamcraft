@@ -54,6 +54,8 @@ static PROPS: [PropDesc; 6] = [
     PropDesc { name: "seed", allowed: Constraint::Any, live: false },
 ];
 
+// COLD: make_default boxes one instance per registry-created element, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "videotestsrc",
     pads: &PADS,

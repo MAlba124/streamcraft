@@ -130,6 +130,8 @@ pub struct RtpSession {
 impl RtpSession {
     /// A session expecting the given streams (one src pad each, added at
     /// preroll, named `src_pt<N>`).
+    // COLD: one-time constructor; `streams` is populated at preroll, not per packet.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(descs: Vec<RtpStreamDesc>) -> RtpSession {
         RtpSession { descs, streams: Vec::new(), unknown_pt: 0 }
     }

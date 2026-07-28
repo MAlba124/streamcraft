@@ -38,6 +38,8 @@ static PROPS: [PropDesc; 1] = [PropDesc {
     live: false,
 }];
 
+// COLD: make_default boxes one instance per registry-created element, never per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "filesink",
     pads: &PADS,

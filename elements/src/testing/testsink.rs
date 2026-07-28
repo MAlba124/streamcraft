@@ -27,6 +27,8 @@ static PADS: [PadDesc; 1] = [PadDesc {
     validate: None,
 }];
 
+// COLD: make_default boxes one instance per registry-created element, never per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "testsink",
     pads: &PADS,

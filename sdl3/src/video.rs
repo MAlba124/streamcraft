@@ -90,6 +90,9 @@ impl VideoWindow {
     /// Init SDL video and open a resizable window with **no** classic renderer — for
     /// the owned GPU backend, which claims the window with its own device. The caller
     /// must attach a [`GpuRenderer`](crate::gpu::GpuRenderer) via [`raw_window`].
+    // COLD: one-time window construction — `flat_chroma` starts empty and is grown
+    // on demand (and reused) in `present_gray8`, never reallocated per frame.
+    #[allow(clippy::disallowed_methods)]
     pub fn open_windowed(title: &str, width: u32, height: u32) -> Result<Self, Error> {
         let title = CString::new(title).unwrap_or_default();
         // SAFETY: plain C calls; SDL_InitSubSystem is refcounted per subsystem.

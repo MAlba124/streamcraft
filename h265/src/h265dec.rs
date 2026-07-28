@@ -120,6 +120,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: `make_default` boxes one element instance at pipeline construction, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "h265dec",
     pads: &PADS,
@@ -173,6 +175,16 @@ pub struct H265Dec {
     /// rebuild after an error would otherwise lose them and doom every following AU.
     /// Re-injected after each rebuild.
     param_cache: Vec<u8>,
+    /// Reused output buffer for [`Self::extract_parameter_sets`] — refilled
+    /// (cleared + extended) each access unit and swapped into `param_cache` only
+    /// when it holds parameter NALs, so the per-frame extraction adds no heap
+    /// allocation once its storage has grown to the largest parameter-set blob.
+    param_scratch: Vec<u8>,
+    /// Reused start-code index list for [`Self::extract_parameter_sets`] — cleared
+    /// and refilled each access unit rather than allocated per call (a struct-held
+    /// scratch keeps the extraction off the heap without needing the arena's
+    /// unstable allocator API in this crate). `(code start, payload start)`.
+    starts_scratch: Vec<(usize, usize)>,
     /// Consecutive access units the decoder rejected (reset by any success). Guards
     /// the give-up below.
     failures: u32,
@@ -191,6 +203,9 @@ pub struct H265Dec {
 const GIVE_UP_AFTER: u32 = 120;
 
 impl H265Dec {
+    // COLD: one-time element setup — these buffers are constructed once at
+    // pipeline build and thereafter reused/refilled in place, never per frame.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             seq: SequenceDecoder::new(),
@@ -199,6 +214,8 @@ impl H265Dec {
             pts_queue: BinaryHeap::new(),
             ready: std::collections::VecDeque::new(),
             param_cache: Vec::new(),
+            param_scratch: Vec::new(),
+            starts_scratch: Vec::new(),
             failures: 0,
             dead: false,
         }
@@ -206,18 +223,24 @@ impl H265Dec {
 
     /// Extract only the parameter-set NALs (VPS/SPS/PPS — nal_unit_type 32/33/34,
     /// bits 1..7 of the first byte after the start code; H.265 §7.3.1.2) from an
-    /// Annex B access unit, as a re-injectable Annex B blob. Slice NALs are excluded
-    /// on purpose: a typical stream packs parameter sets *and* the IDR slice into one
-    /// AU, and re-injecting the whole AU after a decoder rebuild would decode that
-    /// frame twice. Empty when the AU carries none. Total: malformed data yields
+    /// Annex B access unit into the reused `param_scratch` buffer, as a
+    /// re-injectable Annex B blob. Returns `true` when at least one parameter-set
+    /// NAL was found (the caller then swaps the blob into `param_cache`). Slice
+    /// NALs are excluded on purpose: a typical stream packs parameter sets *and*
+    /// the IDR slice into one AU, and re-injecting the whole AU after a decoder
+    /// rebuild would decode that frame twice. Total: malformed data yields
     /// whatever well-formed NALs it contains, never a panic.
-    fn extract_parameter_sets(au: &[u8]) -> Vec<u8> {
-        // Collect every start-code position first (3- or 4-byte; Annex B §B.2.2).
-        let mut starts: Vec<(usize, usize)> = Vec::new(); // (code start, payload start)
+    ///
+    /// Both working buffers (`starts_scratch`, `param_scratch`) are struct-held and
+    /// reused, so this per-access-unit call imposes no steady-state heap traffic.
+    fn extract_parameter_sets(&mut self, au: &[u8]) -> bool {
+        // Collect every start-code position first (3- or 4-byte; Annex B §B.2.2)
+        // into the reused index buffer.
+        self.starts_scratch.clear();
         let mut i = 0;
         while i + 3 <= au.len() {
             if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-                starts.push((i, i + 3));
+                self.starts_scratch.push((i, i + 3));
                 i += 3;
             } else if i + 4 <= au.len()
                 && au[i] == 0
@@ -225,24 +248,26 @@ impl H265Dec {
                 && au[i + 2] == 0
                 && au[i + 3] == 1
             {
-                starts.push((i, i + 4));
+                self.starts_scratch.push((i, i + 4));
                 i += 4;
             } else {
                 i += 1;
             }
         }
-        let mut out = Vec::new();
-        for (k, &(code, payload)) in starts.iter().enumerate() {
-            let end = starts.get(k + 1).map_or(au.len(), |&(next_code, _)| next_code);
+        self.param_scratch.clear();
+        for k in 0..self.starts_scratch.len() {
+            let (code, payload) = self.starts_scratch[k];
+            let end =
+                self.starts_scratch.get(k + 1).map_or(au.len(), |&(next_code, _)| next_code);
             if payload < end {
                 let nal_type = (au[payload] >> 1) & 0x3F;
                 if (32..=34).contains(&nal_type) {
                     let _ = code; // keep the NAL's own start code form
-                    out.extend_from_slice(&au[code..end]);
+                    self.param_scratch.extend_from_slice(&au[code..end]);
                 }
             }
         }
-        out
+        !self.param_scratch.is_empty()
     }
 
     /// Move newly decoded pictures into the reorder window and release every frame
@@ -372,9 +397,10 @@ impl Element for H265Dec {
             // One buffer = one Annex B access unit. Remember the latest parameter
             // sets (the demuxer's out-of-band head, or in-band repeats) so a decoder
             // rebuild below can re-inject them — parameter NALs only, never slices.
-            let params = Self::extract_parameter_sets(inbuf.memory.data());
-            if !params.is_empty() {
-                self.param_cache = params;
+            // The extraction refills `param_scratch` in place; on a hit we swap it
+            // into `param_cache` (the old cache storage is then reused next call).
+            if self.extract_parameter_sets(inbuf.memory.data()) {
+                std::mem::swap(&mut self.param_cache, &mut self.param_scratch);
             }
             // Record its pts for output-order re-attachment, then decode.
             if let Some(ns) = inbuf.pts.nanos() {

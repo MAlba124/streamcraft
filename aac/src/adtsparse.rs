@@ -41,6 +41,8 @@ static PADS: [PadDesc; 2] = [
     PadDesc { name: "src", direction: Direction::Src, offers: &SRC_OFFERS, dynamic: false, validate: None },
 ];
 
+// COLD: `make_default` boxes one element instance at pipeline construction, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "adtsparse",
     pads: &PADS,
@@ -213,6 +215,8 @@ impl Element for AdtsParse {
         Ok(())
     }
 
+    // COLD: teardown, once per stream — releases the carry buffer's backing storage.
+    #[allow(clippy::disallowed_methods)]
     fn stop(&mut self, _ctx: &mut Ctx) {
         self.buf = Vec::new();
     }

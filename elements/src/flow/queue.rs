@@ -73,6 +73,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: make_default boxes one instance per registry-created element, never per buffer.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "queue",
     pads: &PADS,

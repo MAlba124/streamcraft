@@ -98,6 +98,8 @@ static PROPS: [PropDesc; 5] = [
     PropDesc { name: "hrd", allowed: Constraint::Any, live: true },
 ];
 
+// Cold: make_default boxes one element when the registry builds the default, not per-frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "vaapivp8enc",
     pads: &PADS,

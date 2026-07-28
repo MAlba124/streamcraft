@@ -104,6 +104,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// Cold: make_default boxes one element when the registry builds the default, not per-frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "vaapih265dec",
     pads: &PADS,
@@ -259,6 +261,8 @@ impl VaapiH265Dec {
         Self::with_zerocopy(Some(channel))
     }
 
+    // Cold: constructor, runs once per element; DPB grows in-place afterward.
+    #[allow(clippy::disallowed_methods)]
     fn with_zerocopy(zerocopy: Option<Arc<GpuFrameChannel>>) -> Self {
         VaapiH265Dec {
             device: None,
@@ -325,6 +329,8 @@ impl VaapiH265Dec {
     }
 
     /// Build (or rebuild) the VA config/context/surfaces for an SPS's dimensions.
+    // Cold: VA config/context/surface setup, done once per dimension at announce.
+    #[allow(clippy::disallowed_methods)]
     fn ensure_va(&mut self, ctx: &mut Ctx, sps: &Sps) -> bool {
         // Announced / emitted dims are the conformance-cropped *display* size (matching
         // the software decoder + reference); the surface allocation is the CTB-aligned

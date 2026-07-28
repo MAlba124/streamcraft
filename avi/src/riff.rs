@@ -362,6 +362,8 @@ fn parse_avih(b: &[u8], header: &mut AviHeader) {
 /// Parse a `LIST 'strl'` body: its `strh` (timing) + `strf` (format). Returns `None` only
 /// if the `strh` is missing/truncated (a stream with no header is unroutable). `strf` is
 /// tolerated absent (fields stay zero). AVI RIFF Reference, "Stream headers".
+// COLD: runs once per stream during the up-front header parse (never per media chunk).
+#[allow(clippy::disallowed_methods)]
 fn parse_strl(body: &[u8], index: usize) -> Option<Stream> {
     let mut c = Cursor::new(body);
     let mut strh: Option<(StreamKind, FourCc, u32, u32, u32, u32)> = None;
@@ -553,6 +555,8 @@ impl Idx1 {
     /// index entry marks a random-access point). Requires the video stream's per-sample
     /// duration; entries for other streams advance no video clock but are still counted so
     /// the frame number tracks the video sample ordinal.
+    // COLD: builds the seek index once per stream from the already-parsed idx1 (not per chunk).
+    #[allow(clippy::disallowed_methods)]
     pub fn build_seek_index(
         &self,
         video_stream_index: usize,
@@ -582,6 +586,8 @@ impl Idx1 {
 /// entries: each entry is 16 bytes — ckid(4) dwFlags(4) dwChunkOffset(4) dwChunkLength(4)
 /// (AVI RIFF Reference, "AVI Index"). `movi_data_start` and `file_len` come from the header
 /// probe. Trailing partial bytes are ignored (never sliced oob).
+// COLD: parses the legacy idx1 index once per stream (the app reads it before playback).
+#[allow(clippy::disallowed_methods)]
 pub fn parse_idx1(payload: &[u8], movi_data_start: u64, file_len: u64) -> Idx1 {
     let mut entries = Vec::with_capacity(payload.len() / 16);
     let mut c = Cursor::new(payload);

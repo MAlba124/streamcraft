@@ -81,10 +81,12 @@ pub struct FrameInfo {
     pub used_approx_tool: bool,
 }
 
-/// Result of decoding one syncframe: interleaved S16 PCM plus geometry.
-pub struct Decoded {
+/// Result of decoding one syncframe: interleaved S16 PCM plus geometry. The PCM
+/// borrows the decoder's reused output buffer (no per-frame heap allocation; spec:
+/// performance #1) and stays valid until the next [`Frame::decode`] call.
+pub struct Decoded<'a> {
     /// Interleaved S16, channel order L,R,C,LFE,Ls,Rs (see [`Frame::decode`]).
-    pub pcm: Vec<i16>,
+    pub pcm: &'a [i16],
     pub info: FrameInfo,
 }
 
@@ -94,6 +96,12 @@ pub struct Decoded {
 pub struct Frame {
     overlap: [OverlapState; NUM_CH_SLOTS],
     dither: Dither,
+    /// Reused interleaved-S16 output buffer, handed out (borrowed) by [`decode`].
+    /// Cleared and refilled each frame; its capacity persists so decode allocates
+    /// no per-frame PCM (spec: performance #1).
+    ///
+    /// [`decode`]: Frame::decode
+    pcm: Vec<i16>,
 }
 
 impl Default for Frame {
@@ -103,10 +111,14 @@ impl Default for Frame {
 }
 
 impl Frame {
+    // One-time decoder setup: `pcm` is a reused output buffer (cleared + refilled per
+    // frame, never re-allocated) — cold.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             overlap: std::array::from_fn(|_| OverlapState::new()),
             dither: Dither::new(),
+            pcm: Vec::new(),
         }
     }
 
@@ -166,8 +178,9 @@ impl Frame {
 
     /// Decode one syncframe (A/52 §5–§7). Returns interleaved S16 PCM in
     /// **ITU/SMPTE channel order L, R, C, LFE, Ls, Rs** (the downmix contract)
-    /// plus the frame geometry.
-    pub fn decode(&mut self, data: &[u8]) -> Result<Decoded, DecodeError> {
+    /// plus the frame geometry. The PCM borrows the decoder's reused buffer and is
+    /// valid until the next call.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Decoded<'_>, DecodeError> {
         let (_flen, _rate, is_eac3) = Self::peek_len(data)?;
         let mut r = BitReader::new(data);
         let (cfg, numblks) = if is_eac3 {
@@ -178,7 +191,11 @@ impl Frame {
 
         // Per-frame decode state carried across blocks (§7.1.3 reuse, §7.2.2).
         let mut st = BlockState::new(&cfg);
-        let mut out_pcm: Vec<i16> = Vec::with_capacity(numblks * N * cfg.out_channels());
+        // Reuse the decoder-owned PCM buffer: take it out (leaving an empty Vec),
+        // clear + refill it, then put it back. Its capacity persists across frames,
+        // so decode allocates no per-frame PCM (spec: performance #1).
+        let mut out_pcm = std::mem::take(&mut self.pcm);
+        out_pcm.clear();
         let mut used_approx = cfg.eac3_approx_seen;
 
         for blk in 0..numblks {
@@ -196,14 +213,18 @@ impl Frame {
                         used_approx = true;
                         out_pcm.resize(out_pcm.len() + N * cfg.out_channels(), 0);
                     } else {
+                        // Restore the buffer before the early return so its capacity
+                        // is not lost.
+                        self.pcm = out_pcm;
                         return Err(e);
                     }
                 }
             }
         }
 
+        self.pcm = out_pcm;
         Ok(Decoded {
-            pcm: out_pcm,
+            pcm: &self.pcm,
             info: FrameInfo {
                 sample_rate: cfg.sample_rate,
                 channels: cfg.out_channels(),

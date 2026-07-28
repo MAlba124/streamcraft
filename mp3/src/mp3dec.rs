@@ -115,6 +115,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// `make_default` boxes the element once at registry construction (spec: Plugins) — cold.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "mp3dec",
     pads: &PADS,
@@ -258,9 +260,18 @@ pub struct Mp3Dec {
     /// sink cannot make the decoder run ahead and balloon the pool.
     pending: Vec<i16>,
     pending_pos: usize,
+    /// Reused packet-payload buffer. `oxideav_core::Packet::new` takes an owned
+    /// `Vec<u8>`, so a frame's bytes must live in a `Vec`; this one is moved into the
+    /// packet and reclaimed after `send_packet` (which copies what it needs and keeps
+    /// no reference to the buffer), so its capacity persists — no per-frame heap alloc
+    /// (spec: performance #1).
+    pkt_buf: Vec<u8>,
 }
 
 impl Mp3Dec {
+    // One-time element setup: `buf`/`pending` are reused-and-cleared across frames, not
+    // re-allocated per frame (spec: performance #1) — cold.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             dec: build_decoder(),
@@ -272,6 +283,7 @@ impl Mp3Dec {
             samples_emitted: 0,
             pending: Vec::new(),
             pending_pos: 0,
+            pkt_buf: Vec::new(),
         }
     }
 
@@ -285,6 +297,7 @@ impl Mp3Dec {
         self.samples_emitted = 0;
         self.pending.clear();
         self.pending_pos = 0;
+        self.pkt_buf.clear();
     }
 
     /// PTS in nanoseconds for the current `samples_emitted` on the sample grid from a
@@ -381,15 +394,24 @@ impl Mp3Dec {
                 return Ok(false);
             }
         };
-        // Take the frame's bytes and consume through its end (dropping pre-sync junk).
-        let frame_bytes = self.buf[offset..offset + len].to_vec();
+        // Copy the frame's bytes into the reused packet buffer and consume through its
+        // end (dropping pre-sync junk). `Packet::new` needs an owned `Vec<u8>`; we take
+        // the reused buffer out (leaving an empty Vec), refill it, and reclaim it below —
+        // so its capacity persists and no per-frame heap allocation occurs.
+        let mut pkt_buf = std::mem::take(&mut self.pkt_buf);
+        pkt_buf.clear();
+        pkt_buf.extend_from_slice(&self.buf[offset..offset + len]);
         self.buf.drain(..offset + len);
 
         // Feed the whole frame to the trait decoder as one packet, then drain its
         // frame(s). A frame that fails (bad CRC, corrupt main-data) is dropped with a
         // bus Warning; the reservoir/overlap state stays, and the next syncword resyncs.
-        let pkt = Packet::new(0, TimeBase::from_rate(self.rate.max(1)), frame_bytes);
-        if let Err(e) = self.dec.send_packet(&pkt) {
+        let mut pkt = Packet::new(0, TimeBase::from_rate(self.rate.max(1)), pkt_buf);
+        let send_result = self.dec.send_packet(&pkt);
+        // Reclaim the buffer: `send_packet` copies what it needs and keeps no reference
+        // to the packet payload, so its allocation returns to `self.pkt_buf` for reuse.
+        self.pkt_buf = std::mem::take(&mut pkt.data);
+        if let Err(e) = send_result {
             let element = ctx.element();
             ctx.post(BusMessage::Warning {
                 element,

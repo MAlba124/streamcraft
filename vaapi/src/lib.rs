@@ -105,6 +105,8 @@ pub fn register(registry: &mut Registry) {
 
 /// Construct a hardware video decoder for a negotiated decode family, when the
 /// device supports it. Returns `None` for unsupported/unimplemented families.
+// Cold: one boxing per element construction at autoplug time, not per-frame.
+#[allow(clippy::disallowed_methods)]
 pub fn video_decoder_for(family: &str) -> Option<Box<dyn Element>> {
     let caps = probe::probe()?;
     match family {
@@ -123,6 +125,8 @@ pub fn video_decoder_for(family: &str) -> Option<Box<dyn Element>> {
 /// The `video/gpu` src family a zero-copy decoder announces only intersects a sink that
 /// opts into it, so wiring is explicit: the player builds `vaapi(zerocopy) → framesink` when
 /// its EGL backend is active, else the readback `video_decoder_for` path.
+// Cold: one boxing per element construction at autoplug time, not per-frame.
+#[allow(clippy::disallowed_methods)]
 pub fn video_decoder_zerocopy_for(
     family: &str,
     channel: std::sync::Arc<gpuframe::GpuFrameChannel>,

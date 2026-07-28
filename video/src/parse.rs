@@ -67,6 +67,8 @@ static PROPS: [PropDesc; 4] = [
     PropDesc { name: "fps", allowed: Constraint::Any, live: false },
 ];
 
+// COLD: make_default boxes one instance per registry-created element, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "rawvideoparse",
     pads: &PADS,
@@ -99,6 +101,8 @@ pub struct RawVideoParse {
 
 impl RawVideoParse {
     /// A parser emitting `format` frames from a raw byte stream.
+    // COLD: one-time constructor; `carry` grows via extend_from_slice on the reused buffer after.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(format: VideoFormat) -> Self {
         Self {
             frame_bytes: frame_size(format.pixfmt, format.width, format.height),
@@ -229,8 +233,9 @@ impl Element for RawVideoParse {
     }
 
     fn stop(&mut self, _ctx: &mut Ctx) {
-        // A leftover carry is an incomplete final frame (ragged input) — drop it.
-        self.carry = Vec::new();
+        // A leftover carry is an incomplete final frame (ragged input) — drop it. `clear`
+        // reuses the buffer (matches `start`/`event`) rather than reallocating on teardown.
+        self.carry.clear();
         self.frames_out = 0;
     }
 }

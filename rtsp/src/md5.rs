@@ -12,6 +12,10 @@
 //! four-word state (§3.3), digest 16-word blocks through 4 rounds × 16
 //! operations (§3.4), and emit the state little-endian, A first (§3.5).
 
+// COLD: Digest-auth primitive, run once per RTSP challenge — never per media
+// packet; the padding buffer and hex string are one-time per hash.
+#![allow(clippy::disallowed_methods)]
+
 /// Per-operation left-rotate amounts (RFC 1321 §3.4: the `s` constants of
 /// the four rounds — 7/12/17/22, 5/9/14/20, 4/11/16/23, 6/10/15/21).
 #[rustfmt::skip]

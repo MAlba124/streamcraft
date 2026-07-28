@@ -200,6 +200,8 @@ pub struct TimedTestSink {
 impl TimedTestSink {
     /// Returns the sink (to `add` to a pipeline) and a stats handle to read after
     /// `run()`.
+    // COLD: one-time constructor building the shared record store (a check sink for tests).
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> (Self, TimedSinkStats) {
         let shared = Arc::new(SinkShared {
             renders: Mutex::new(Vec::new()),

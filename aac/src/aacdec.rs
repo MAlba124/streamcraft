@@ -88,6 +88,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: `make_default` boxes one element instance at pipeline construction, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "aacdec",
     pads: &PADS,

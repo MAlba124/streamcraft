@@ -90,6 +90,8 @@ impl H264Depay {
     /// The stream is assumed to begin at an access-unit boundary (a fresh
     /// sender starts clean); a caller joining an in-progress stream should
     /// call [`H264Depay::discontinuity`] first to resynchronize.
+    // COLD: builds the fixed sprop parameter-set state once per stream at setup.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(sprop: Vec<Vec<u8>>) -> H264Depay {
         let mut annexb = Vec::new();
         for nal in &sprop {

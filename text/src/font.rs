@@ -38,6 +38,9 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
+    // Vec::new() allocates nothing (zero capacity) — the empty-coverage fallback for a zero-size
+    // line. `Bitmap` owns a `Vec<u8>` by its public API, so the empty case is a null Vec, no heap.
+    #[allow(clippy::disallowed_methods)]
     fn empty() -> Self {
         Bitmap { w: 0, h: 0, cov: Vec::new() }
     }

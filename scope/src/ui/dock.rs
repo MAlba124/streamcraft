@@ -100,6 +100,8 @@ fn push<P>(nodes: &mut Vec<Node<P>>, n: Node<P>) -> usize {
 
 impl<P: Copy + PartialEq> DockTree<P> {
     /// A single leaf holding `panels` (first is active).
+    // Cold: the dock tree is built once at startup, not per frame (clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     pub fn single(panels: Vec<P>) -> DockTree<P> {
         let mut nodes = Vec::new();
         let root = push(&mut nodes, Node::Leaf { panels, active: 0 });
@@ -108,6 +110,8 @@ impl<P: Copy + PartialEq> DockTree<P> {
 
     /// A leaf per panel: `a | b` side by side above `bottom` (the scope default —
     /// graph | elements over the log).
+    // Cold: the dock tree is built once at startup, not per frame (clippy.toml).
+    #[allow(clippy::disallowed_methods)]
     pub fn two_over_one(a: P, b: P, bottom: P, x_ratio: f32, y_ratio: f32) -> DockTree<P> {
         let mut nodes = Vec::new();
         let la = push(&mut nodes, Node::Leaf { panels: vec![a], active: 0 });
@@ -121,6 +125,8 @@ impl<P: Copy + PartialEq> DockTree<P> {
     /// Every panel docked in the *reachable* tree. Walked from the root, not a
     /// flat node scan: collapses leave orphaned slots in `nodes` by design
     /// (index stability), and orphans must not count.
+    // Cold: a query helper (not on the per-frame draw path; only tests call it here).
+    #[allow(clippy::disallowed_methods)]
     pub fn all_panels(&self) -> Vec<P> {
         let mut ids = Vec::new();
         let mut stack = vec![self.root];
@@ -294,6 +300,9 @@ impl<P: Copy + PartialEq> DockTree<P> {
     /// `nodes`, which is why parents are found by walking the *reachable* tree —
     /// a flat scan could match a dead orphan still recording `empty_leaf` as a
     /// child. (The same invariant simprof's dockspace documents.)
+    // Cold: runs only when a drag-drop empties a leaf (a rare structural mutation),
+    // not per frame (clippy.toml allocation ban).
+    #[allow(clippy::disallowed_methods)]
     fn collapse_leaf(&mut self, empty_leaf: usize) {
         // Reachable-parent map: node index → its parent split index.
         let mut parent_of: Vec<(usize, usize)> = Vec::new();
@@ -337,6 +346,9 @@ impl<P: Copy + PartialEq> DockTree<P> {
 
     /// Move the node at `idx` into a fresh slot, returning the new index; the old
     /// slot is left for the caller to overwrite.
+    // Cold: runs only on a drag-drop panel move, not per frame; `vec![]` is an empty
+    // placeholder that allocates nothing (clippy.toml allocation ban).
+    #[allow(clippy::disallowed_methods)]
     fn move_node_to_new_slot(&mut self, idx: usize) -> usize {
         let taken = std::mem::replace(&mut self.nodes[idx], Node::Leaf { panels: vec![], active: 0 });
         push(&mut self.nodes, taken)

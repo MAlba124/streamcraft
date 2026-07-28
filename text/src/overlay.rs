@@ -148,6 +148,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
+    // COLD: registry make_default — boxes one element instance at plugin-registration time.
+    #[allow(clippy::disallowed_methods)]
     make_default: Some(|| Box::new(SubtitleOverlay::new())),
 };
 
@@ -191,6 +193,8 @@ impl Default for SubtitleOverlay {
 }
 
 impl SubtitleOverlay {
+    // COLD: one-time constructor — the empty cue ring (Vec::new() = zero capacity, no heap yet).
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             cues: Vec::new(),

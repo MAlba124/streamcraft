@@ -140,6 +140,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: `make_default` boxes one element instance at pipeline construction, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "vp9dec",
     pads: &PADS,
@@ -201,13 +203,21 @@ struct PendingFrame {
 pub struct Vp9Dec {
     announced: bool,
     pending: Option<PendingFrame>,
+    /// Reused superframe split buffer — `split_superframe_into` clears and refills it
+    /// each chunk, so the per-frame path allocates no range list once it has grown to
+    /// the largest superframe's frame count (≤ 8, the §B.2.2 3-bit field).
+    ranges: Vec<(usize, usize)>,
 }
 
 impl Vp9Dec {
+    // COLD: one-time element setup — the reused range buffer starts empty and is
+    // refilled in place per chunk, never reallocated on the per-frame path.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             announced: false,
             pending: None,
+            ranges: Vec::new(),
         }
     }
 
@@ -319,9 +329,14 @@ impl Element for Vp9Dec {
             // packet's pts/duration ride the whole chunk; the visible frame (typically
             // the last / only one) carries it downstream.
             let chunk = inbuf.memory.data();
-            let ranges = superframe::split_superframe(chunk);
-            let n = ranges.len();
-            for (i, (start, end)) in ranges.into_iter().enumerate() {
+            // Split into the reused `ranges` buffer (no per-chunk allocation), then
+            // iterate by index so the `&mut self` decode calls below borrow freely —
+            // `(usize, usize)` ranges are `Copy`, and the buffer is not mutated in the
+            // loop body.
+            superframe::split_superframe_into(chunk, &mut self.ranges);
+            let n = self.ranges.len();
+            for i in 0..n {
+                let (start, end) = self.ranges[i];
                 // Emit the carry from a previous enclosed frame before decoding the
                 // next, so a multi-frame superframe never carries more than one
                 // pending picture (bounded heap).
@@ -338,7 +353,7 @@ impl Element for Vp9Dec {
                             element,
                             message: "vp9dec: pool exhausted mid-superframe; \
                                       dropped remaining enclosed frames"
-                                .to_string(),
+                                .into(),
                         },
                     });
                     break;

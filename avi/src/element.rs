@@ -178,6 +178,8 @@ impl AviDemux {
     /// `filesrc`); the full stream — these bytes and all that follow — is then fed on the
     /// sink pad at run time. A few hundred KiB is ample (real files put `hdrl` first, under
     /// 64 KiB). See the type docs for why discovery is constructor-supplied.
+    // COLD: one-time constructor state; `pad_streams` fills once at preroll, not per buffer.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(header: Vec<u8>) -> Self {
         Self {
             header,
@@ -455,6 +457,9 @@ impl Element for AviDemux {
         &DEMUX_DESC
     }
 
+    // COLD: preroll runs once per stream (topology freezes after it); the error strings are
+    // built only on a malformed header, never per buffer.
+    #[allow(clippy::disallowed_methods)]
     fn preroll(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         // Discover streams from the constructor-supplied header, then add one src pad per
         // stream (spec: dynamic pads — topology settles at preroll).

@@ -76,6 +76,12 @@
 //! palette-only update is treated as a no-op refresh (a `warn` is the caller's, see
 //! `pgsdec`). These are documented follow-ups, not silent data loss.
 
+// COLD: PGS decode runs once per sparse subtitle caption (a Display Set every few seconds via
+// `pgsdec`, never per video frame). The RGBA/index/accumulator Vecs are the decoded-caption
+// payload — bounded and one-per-caption, not steady-state heap. (`pgsdec` sends output through
+// the pool; the overlay composites from `ctx`-owned buffers, not these directly.)
+#![allow(clippy::disallowed_methods)]
+
 /// A decoded PGS Display Set ready to composite: the RGBA pixels of the (first) composition
 /// object, its size, and its top-left placement in the reference video frame. A **clear**
 /// Display Set (no composition objects) decodes to [`DisplaySet::clear`] — `rgba` empty.

@@ -127,6 +127,8 @@ impl Display {
     }
 
     /// The driver's vendor string (`vaQueryVendorString`), e.g. the iHD banner.
+    // Cold: driver banner, read once at probe/setup, not per-frame.
+    #[allow(clippy::disallowed_methods)]
     pub fn vendor(&self) -> String {
         // SAFETY: dpy is a live, initialized display; the returned string is
         // driver-owned static storage, copied out immediately.
@@ -341,6 +343,8 @@ pub struct Context {
 
 impl Context {
     /// Create a progressive decode context sized `width`×`height` over `surfaces`.
+    // Cold: context creation, done once per dimension at setup, not per-frame.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(
         display: &Display,
         config: &Config,

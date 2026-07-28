@@ -67,6 +67,9 @@ struct StreamState {
 }
 
 impl StreamState {
+    // COLD: one per logical bitstream (created at its bos, not per page); `partial` is
+    // then reused/grown across that stream's pages.
+    #[allow(clippy::disallowed_methods)]
     fn new() -> Self {
         Self {
             partial: Vec::new(),
@@ -96,6 +99,8 @@ pub struct OggReader {
 }
 
 impl OggReader {
+    // COLD: one-time constructor; `buf` is the reused input buffer grown across pushes.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -340,6 +345,9 @@ fn find_capture(hay: &[u8]) -> Option<usize> {
 /// One-shot demux of a complete in-memory Ogg stream into all its packets, in stream
 /// order (spec §5). Convenience over the streaming [`OggReader`]; resyncs past garbage
 /// exactly the same way and never panics.
+// COLD: one-shot whole-stream convenience API (not the element's per-page path); the
+// output vector is the caller's result, allocated once.
+#[allow(clippy::disallowed_methods)]
 pub fn demux_all(stream: &[u8]) -> Vec<Packet> {
     let mut reader = OggReader::new();
     reader.push(stream);

@@ -90,6 +90,10 @@ impl Demux {
     /// Errors are sticky in effect: the buffer is left untouched, so a
     /// desync keeps reporting until the caller tears the connection down
     /// (there is no resynchronization point in the interleaved stream).
+    // Pure demuxer with no reactor `ctx`/scratch; the returned copy lands in the
+    // fixed public `Item::{Frame,Message}(Vec<u8>)` API. The reactor path (arena
+    // reuse) lives in the future `rtspsrc` element that owns the reads.
+    #[allow(clippy::disallowed_methods)]
     pub fn pop(&mut self) -> Result<Option<Item>, DemuxError> {
         // Robustness: skip stray CRLF bytes between items (some servers pad
         // message ends; harmless, and unambiguous — neither `$` nor a token).

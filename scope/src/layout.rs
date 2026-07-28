@@ -18,6 +18,12 @@
 //! This is a clean-room implementation from the papers named here — nothing is
 //! ported from graphviz/dagre or any other layout library.
 
+// Cold: the whole layout runs once per topology change (see module doc), never per
+// frame — the app caches its `Layout` and only recomputes it when `topo_gen` bumps.
+// The working-graph Vecs here are therefore one-time-per-topology scratch, not
+// steady-state hot-path heap traffic (clippy.toml allocation ban).
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeMap;
 
 /// A node to place. `id` is caller-defined and only needs to be unique; `w`/`h`

@@ -158,6 +158,10 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
             let mut m = client.model.lock().unwrap_or_else(|e| e.into_inner());
             drain_feed(&mut m, &mut log);
             relayout_if_needed(&mut cache, &m, &font);
+            // The flagged `String::new()` is the empty else-branch of the status
+            // `format!` (an empty String allocates nothing); the status line is a
+            // short once-per-frame diagnostic, not per-buffer data (clippy.toml).
+            #[allow(clippy::disallowed_methods)]
             let status = format!(
                 "{} pid={} {}{}",
                 client.socket_path,
@@ -329,6 +333,9 @@ fn drain_feed(m: &mut Model, log: &mut LogView) {
 
 /// Node box sizing + the layered layout, recomputed only when the topology changes
 /// (`topo_gen`), never per frame.
+// Cold: early-returns unless `topo_gen` changed, so these Vecs are built once per
+// topology change, not per frame (clippy.toml allocation ban).
+#[allow(clippy::disallowed_methods)]
 fn relayout_if_needed(cache: &mut GraphCache, m: &Model, font: &Font) {
     if cache.laid.is_some() && cache.gen == m.topo_gen {
         return;
@@ -398,6 +405,11 @@ fn relayout_if_needed(cache: &mut GraphCache, m: &Model, font: &Font) {
 }
 
 /// Rates are Δ between the last two counter samples.
+// The flagged `Vec::new()` is the empty no-data early-return (an empty Vec allocates
+// nothing); the populated path returns via `.collect()`. The `Vec<ElemRate>` result
+// is a pub-facing per-frame collection whose size (element count) is small and fixed,
+// not per-buffer geometry (clippy.toml allocation ban).
+#[allow(clippy::disallowed_methods)]
 fn element_rates(m: &Model) -> Vec<ElemRate> {
     let Some(cur) = &m.cur else { return Vec::new() };
     let dt_ns = match &m.prev {

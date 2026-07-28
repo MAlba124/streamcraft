@@ -53,38 +53,44 @@ const SUPERFRAME_MARKER: u8 = 0b110;
 /// overrun the payload region) is treated as "not a superframe" rather than an error,
 /// exactly as §B.4 specifies — so a corrupt chunk never panics here.
 pub fn split_superframe(chunk: &[u8]) -> Vec<(usize, usize)> {
-    match superframe_frame_sizes(chunk) {
-        Some(sizes) => {
-            let mut out = Vec::with_capacity(sizes.len());
-            let mut off = 0usize;
-            for sz in sizes {
-                out.push((off, off + sz));
-                off += sz;
-            }
-            out
-        }
-        None => {
-            if chunk.is_empty() {
-                Vec::new()
-            } else {
-                vec![(0, chunk.len())]
-            }
-        }
+    // Preserved allocating entry point (public API). The hot path uses
+    // `split_superframe_into` with a reused buffer; this thin wrapper keeps the
+    // original signature for any out-of-crate caller.
+    #[allow(clippy::disallowed_methods)] // COLD: convenience wrapper, not the per-frame path.
+    let mut out = Vec::new();
+    split_superframe_into(chunk, &mut out);
+    out
+}
+
+/// Split a chunk into its enclosed coded-frame ranges (as [`split_superframe`]) but
+/// into a caller-owned buffer: `out` is cleared and refilled, so a decoder can reuse
+/// one allocation across every chunk and keep the per-frame path off the heap.
+pub fn split_superframe_into(chunk: &[u8], out: &mut Vec<(usize, usize)>) {
+    out.clear();
+    if superframe_frame_sizes(chunk, out) {
+        return;
+    }
+    // §B.4 single-frame fallback (and the empty-chunk case: no ranges).
+    if !chunk.is_empty() {
+        out.push((0, chunk.len()));
     }
 }
 
-/// Parse the §B.2.1 index and return the enclosed `frame_sizes[ ]` when the chunk is a
-/// valid superframe, or `None` for the §B.4 single-frame fallback.
-fn superframe_frame_sizes(chunk: &[u8]) -> Option<Vec<usize>> {
+/// Parse the §B.2.1 index, pushing each enclosed frame's `(start, end)` range onto
+/// `out` (which the caller has already cleared) and returning `true` when the chunk is
+/// a valid superframe, or `false` for the §B.4 single-frame fallback. On a `false`
+/// return `out` is left empty (any partial fill is truncated), so the caller can apply
+/// the fallback cleanly.
+fn superframe_frame_sizes(chunk: &[u8], out: &mut Vec<(usize, usize)>) -> bool {
     let len = chunk.len();
     if len == 0 {
-        return None;
+        return false;
     }
 
     // §B.4 step 1 — the final byte must carry the superframe_marker.
     let marker_byte = chunk[len - 1];
     if (marker_byte >> 5) != SUPERFRAME_MARKER {
-        return None;
+        return false;
     }
 
     // §B.2.2 — decode the trailing superframe_header.
@@ -94,20 +100,20 @@ fn superframe_frame_sizes(chunk: &[u8]) -> Option<Vec<usize>> {
     // §B.4 step 2 — SzIndex = 2 + NumFrames * SzBytes.
     let sz_index = 2 + num_frames * bytes_per_framesize;
     if len < sz_index {
-        return None;
+        return false;
     }
 
     // §B.4 step 3 — the leading index byte must equal the trailing one.
     let index_start = len - sz_index;
     if chunk[index_start] != marker_byte {
-        return None;
+        return false;
     }
 
     // §B.2.1 — the NumFrames frame_sizes, little-endian f(SzBytes) each, sit between
-    // the two superframe_header bytes.
-    let mut sizes = Vec::with_capacity(num_frames);
+    // the two superframe_header bytes. Fold the size parse into the range push so no
+    // intermediate size list is allocated.
     let mut p = index_start + 1;
-    let mut total: usize = 0;
+    let mut off = 0usize;
     for _ in 0..num_frames {
         let mut sz = 0usize;
         for b in 0..bytes_per_framesize {
@@ -117,14 +123,18 @@ fn superframe_frame_sizes(chunk: &[u8]) -> Option<Vec<usize>> {
         // Guard a declared size that overruns the payload region (everything before
         // the index); a conforming stream never does, but a corrupt one must not
         // panic the slice in the caller.
-        total = total.checked_add(sz)?;
-        if total > index_start {
-            return None;
-        }
-        sizes.push(sz);
+        let end = match off.checked_add(sz) {
+            Some(e) if e <= index_start => e,
+            _ => {
+                out.clear(); // discard the partial fill; the caller applies §B.4 fallback
+                return false;
+            }
+        };
+        out.push((off, end));
+        off = end;
     }
 
-    Some(sizes)
+    true
 }
 
 #[cfg(test)]

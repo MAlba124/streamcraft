@@ -106,6 +106,8 @@ static DESC: ElementDesc = ElementDesc {
         is_live: false,
         jitter: Timestamp::ZERO,
     },
+    // COLD: registry make_default — boxes one element instance at plugin-registration time.
+    #[allow(clippy::disallowed_methods)]
     make_default: Some(|| Box::new(PgsDec::new())),
 };
 
@@ -132,6 +134,9 @@ impl Default for PgsDec {
 }
 
 impl PgsDec {
+    // COLD: one-time constructor — the empty reassembly accumulator (Vec::new() = zero capacity;
+    // grown once, then `clear()`ed and reused across Blocks, never reallocated per caption).
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             announced: false,

@@ -114,6 +114,8 @@ static PROPS: [PropDesc; 5] = [
     PropDesc { name: "hrd", allowed: Constraint::Any, live: true },
 ];
 
+// Cold: make_default boxes one element when the registry builds the default, not per-frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "vaapih265enc",
     pads: &PADS,
@@ -988,6 +990,8 @@ fn h265_nal_type(raw: &[u8]) -> u8 {
 }
 
 /// Build the `hvcC` record (ISO/IEC 14496-15 §8.3.3.1) from our parameter sets.
+// Cold: codec-config record assembled once at announce, not per-frame.
+#[allow(clippy::disallowed_methods)]
 fn hvcc_record(vps_nal: &[u8], sps_nal: &[u8], pps_nal: &[u8], level_idc: u8) -> Vec<u8> {
     let vps = &vps_nal[4..];
     let sps = &sps_nal[4..];

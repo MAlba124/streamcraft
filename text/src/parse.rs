@@ -21,6 +21,11 @@
 //! grammar is worked from the public format specs (clean-room — no libass/vlc source
 //! consulted); citations sit at each parser.
 
+// COLD: whole-file / one-block-one-cue subtitle parsing — runs once per stream or once per
+// sparse cue Block (seconds apart), never on the per-video-frame overlay path. Every Vec/String
+// here builds owned cue text, the natural shape of a subtitle document; not steady-state heap.
+#![allow(clippy::disallowed_methods)]
+
 use streamcraft_core::time::Timestamp;
 
 /// One parsed subtitle cue: plain UTF-8 text (markup already stripped, `\n` between lines)

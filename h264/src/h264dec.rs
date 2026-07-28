@@ -115,6 +115,8 @@ static PADS: [PadDesc; 2] = [
     },
 ];
 
+// COLD: `make_default` boxes one element instance at pipeline construction, never per frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "h264dec",
     pads: &PADS,
@@ -173,9 +175,17 @@ pub struct H264Dec {
     /// Whether the last `try_alloc` failed — edge-triggers the `alloc_stall`
     /// diagnostic log (once per stall, not once per spin).
     alloc_stalled: bool,
+    /// Reused input packet: `send_packet` borrows a `Packet`, whose `data` we
+    /// refill (`clear` + `extend_from_slice`) each access unit rather than
+    /// allocating a fresh `Vec` per frame. Its backing storage grows to the
+    /// largest AU seen and is then reused, so the hot path adds no heap traffic.
+    packet: Packet,
 }
 
 impl H264Dec {
+    // COLD: one-time element setup — the reused input packet is built once here
+    // (empty `Vec`) and refilled in place per frame; no per-frame heap alloc.
+    #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
             dec: H264CodecDecoder::new(CodecId::new("h264")),
@@ -183,6 +193,10 @@ impl H264Dec {
             pending: None,
             pts_fifo: VecDeque::new(),
             alloc_stalled: false,
+            // `TimeBase` here is cosmetic — streamcraft carries timing on the
+            // buffer, not the packet — so a unit base keeps the library's pts
+            // rescale a no-op. `data` starts empty and is refilled per frame.
+            packet: Packet::new(0, TimeBase::new(1, 1), Vec::new()),
         }
     }
 
@@ -395,11 +409,13 @@ impl Element for H264Dec {
                 return Ok(Flow::Ok);
             }
             let Some(inbuf) = inputs.pop() else { break };
-            // One Annex B access unit per buffer. `TimeBase` here is cosmetic —
-            // streamcraft carries timing on the buffer, not the packet — so a
-            // unit base keeps the library's internal pts rescale a no-op.
-            let packet = Packet::new(0, TimeBase::new(1, 1), inbuf.memory.data().to_vec());
-            if let Err(e) = self.dec.send_packet(&packet) {
+            // One Annex B access unit per buffer. Refill the reused packet's
+            // buffer in place (clear + extend) rather than allocating a fresh
+            // `Vec` per frame — its storage grows once to the max AU size and is
+            // then reused, keeping the hot path off the heap.
+            self.packet.data.clear();
+            self.packet.data.extend_from_slice(inbuf.memory.data());
+            if let Err(e) = self.dec.send_packet(&self.packet) {
                 // Per-buffer error scope (spec: Supervision). A rejected access
                 // unit contributes no picture, so it also contributes no pts.
                 let element = ctx.element();

@@ -121,6 +121,8 @@ static PROPS: [PropDesc; 6] = [
     PropDesc { name: "hrd", allowed: Constraint::Any, live: true },
 ];
 
+// Cold: make_default boxes one element when the registry builds the default, not per-frame.
+#[allow(clippy::disallowed_methods)]
 static DESC: ElementDesc = ElementDesc {
     name: "vaapih264enc",
     pads: &PADS,
@@ -1013,6 +1015,8 @@ fn write_slice_header(is_idr: bool, frame_num: u32, idr_pic_id: u16) -> (Vec<u8>
 // --- Output framing helpers -----------------------------------------------------------
 
 /// Build the `avcC` record (ISO/IEC 14496-15 §5.3.3.1) from our SPS/PPS NALs.
+// Cold: codec-config record assembled once at announce, not per-frame.
+#[allow(clippy::disallowed_methods)]
 fn avcc_record(sps_nal: &[u8], pps_nal: &[u8]) -> Vec<u8> {
     // Strip the 4-byte start codes; keep NAL header + EP bytes (the record stores
     // NAL units verbatim).

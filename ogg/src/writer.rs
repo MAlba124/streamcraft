@@ -64,6 +64,9 @@ pub enum WriteError {
 impl OggWriter {
     /// Start a logical bitstream with the given serial number (§6, field 5). The first
     /// page emitted will carry the bos flag.
+    // COLD: one-time constructor; `seg_table`/`seg_payload` are reused across pages, cleared
+    // (not reallocated) on each `flush_page`.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(serial: u32) -> Self {
         Self {
             serial,
@@ -204,6 +207,9 @@ impl OggWriter {
 /// `Vec`, terminated with an eos page. Small packets are packed together into pages up
 /// to the 255-segment limit, exactly as a streaming caller would get by flushing
 /// rarely.
+// COLD: one-shot whole-stream convenience API (not the element's per-packet path); the
+// output vector is the caller's result, allocated once.
+#[allow(clippy::disallowed_methods)]
 pub fn mux_packets(serial: u32, packets: &[(&[u8], u64)]) -> Vec<u8> {
     let mut w = OggWriter::new(serial);
     let mut out = Vec::new();

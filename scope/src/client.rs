@@ -11,6 +11,12 @@
 //! from the UI thread. Both sides converge on `Arc<Mutex<Model>>`, which the UI
 //! locks briefly once per frame.
 
+// Cold app-side path: connection setup, the reader thread decoding protocol frames
+// into `Model`, and small socket writes of request frames. No `Element::process()`
+// / per-frame draw runs here, so its String/Vec/write_all are one-time-per-message
+// setup, not steady-state hot-path heap traffic (clippy.toml allocation/IO ban).
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::os::unix::net::UnixStream;

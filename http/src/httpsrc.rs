@@ -116,6 +116,9 @@ struct Url {
 /// Parse an `http`/`https` URL by hand (the HTTP layer stays dependency-free).
 /// Extracts host, port (default 80 for `http`, 443 for `https`), and path (default
 /// `/`). Any other scheme is rejected.
+// COLD: runs once per connection in `start()` (not the per-chunk body path); the owned
+// host/path strings become the `Url` returned to the caller.
+#[allow(clippy::disallowed_methods)]
 fn parse_http_url(url: &str) -> Result<Url, Error> {
     let (rest, tls) = if let Some(rest) = url.strip_prefix("http://") {
         (rest, false)
@@ -247,6 +250,8 @@ pub struct HttpSrc {
 }
 
 impl HttpSrc {
+    // COLD: one-time constructor; `inbuf` is the reused body-buffer grown/compacted per read.
+    #[allow(clippy::disallowed_methods)]
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -476,8 +481,10 @@ impl HttpSrc {
                 ChunkState::Size => {
                     // Need a full `chunk-size [ chunk-ext ] CRLF` line before decoding.
                     match self.take_line(MAX_CHUNK_LINE_BYTES)? {
-                        LineResult::Line(line) => {
-                            let size = parse_chunk_size(&line, &self.url)?;
+                        LineResult::Line(len) => {
+                            // Parse the line in place (no copy), then consume it + CRLF.
+                            let size = parse_chunk_size(&self.avail()[..len], &self.url)?;
+                            self.cursor += len + 2;
                             self.framing = Framing::Chunked(if size == 0 {
                                 ChunkState::Trailer // zero = last-chunk (§7.1)
                             } else {
@@ -534,8 +541,9 @@ impl HttpSrc {
                     // zero or more `field-line CRLF` then the terminating empty line
                     // (§7.1.2). We ignore trailer field contents entirely.
                     match self.take_line(MAX_CHUNK_LINE_BYTES)? {
-                        LineResult::Line(line) => {
-                            if line.is_empty() {
+                        LineResult::Line(len) => {
+                            self.cursor += len + 2; // consume the line and its CRLF
+                            if len == 0 {
                                 // The empty line terminates the body.
                                 self.framing = Framing::Chunked(ChunkState::Done);
                                 return Ok(FillOutcome::Done(written, true));
@@ -575,16 +583,16 @@ impl HttpSrc {
         })
     }
 
-    /// Try to take one CRLF-terminated line from buffered input, *without* the CRLF.
-    /// Returns [`LineResult::NeedMore`] if no complete line is buffered yet. Bounds the
-    /// scanned length by `max` (RFC 9112 §7.1: guard against unbounded chunk-size /
-    /// extension lines) — a longer line is a protocol error.
-    fn take_line(&mut self, max: usize) -> Result<LineResult, Error> {
+    /// Locate one CRLF-terminated line in buffered input, *without* the CRLF, returning
+    /// its length (the caller reads `self.avail()[..len]` in place and advances the
+    /// cursor by `len + 2` once done — no heap copy on the hot chunked path). Returns
+    /// [`LineResult::NeedMore`] if no complete line is buffered yet. Bounds the scanned
+    /// length by `max` (RFC 9112 §7.1: guard against unbounded chunk-size / extension
+    /// lines) — a longer line is a protocol error.
+    fn take_line(&self, max: usize) -> Result<LineResult, Error> {
         let buf = self.avail();
         if let Some(i) = find_crlf(buf) {
-            let line = buf[..i].to_vec();
-            self.cursor += i + 2; // consume the line and its CRLF
-            Ok(LineResult::Line(line))
+            Ok(LineResult::Line(i))
         } else {
             if buf.len() > max {
                 return Err(Error::Resource(format!(
@@ -613,10 +621,11 @@ impl HttpSrc {
     }
 }
 
-/// Outcome of trying to read a full line out of buffered input.
+/// Outcome of locating a full line in buffered input.
 enum LineResult {
-    /// A complete line (CRLF stripped).
-    Line(Vec<u8>),
+    /// A complete line is buffered: its length in `self.avail()`, CRLF excluded. The
+    /// caller reads those bytes in place and advances the cursor past the line + CRLF.
+    Line(usize),
     /// No complete line buffered yet — read more from the socket and retry.
     NeedMore,
 }

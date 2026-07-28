@@ -19,57 +19,65 @@
 
 use crate::headers::{find_start_code, startcode};
 
-/// One coded unit from a container buffer: the byte range that begins at (and
-/// includes) a VOP start code, plus any leading stream headers that preceded it.
-pub struct Unit<'a> {
-    /// Header bytes preceding the VOP (VOS/VO/VOL/GOV/user-data), possibly empty.
-    pub headers: &'a [u8],
-    /// The VOP bytes, starting at its `00 00 01 B6` start code.
-    pub vop: &'a [u8],
+/// Streaming walk over the coded VOP units in a container buffer, allocation-free.
+///
+/// Handles the packed case (multiple VOPs in one buffer) and drops the trailing
+/// not-coded stuffing VOP that DivX appends. Each VOP spans from its
+/// `00 00 01 B6` start code up to the next VOP start code (or the buffer end),
+/// exactly as the coded-order decode expects. The cursor holds only byte offsets
+/// (no heap): the decoder pulls one VOP slice at a time and decodes it directly
+/// from the input buffer, so no per-buffer allocation or byte copy is needed
+/// (spec: performance #1).
+///
+/// Leading stream headers (VOS/VO/VOL/GOV/user-data) before the first VOP are
+/// parsed separately by the element (`try_parse_headers`) and are simply not
+/// yielded here. Robust: never panics; a buffer with no VOP yields nothing.
+pub struct VopCursor {
+    /// Start offset of the next VOP to yield (its `00 00 01 B6`), if any.
+    pending: Option<usize>,
+    /// Next byte position to resume the start-code scan from.
+    scan: usize,
 }
 
-/// Split `data` into the coded VOP units it contains. Handles the packed case
-/// (multiple VOPs in one buffer) and the trailing not-coded stuffing VOP that
-/// DivX appends. Robust: never panics; a buffer with no VOP yields an empty vec
-/// (the header bytes are still surfaced via [`leading_headers`]).
-pub fn split_units(data: &[u8]) -> Vec<Unit<'_>> {
-    let mut units = Vec::new();
-    // Find the first VOP start code; everything before it is headers.
-    let mut header_start = 0usize;
-    let mut i = 0usize;
-    // Collect start-code positions of interest.
-    let mut vop_positions = Vec::new();
-    let mut header_end = None;
-    while let Some((off, code)) = find_start_code(data, i) {
-        if code == startcode::VOP_START {
-            if header_end.is_none() {
-                header_end = Some(off);
-            }
-            vop_positions.push(off);
-        }
-        i = off + 3;
+impl VopCursor {
+    /// A cursor positioned at the first VOP start code in `data` (if any).
+    pub fn new(data: &[u8]) -> Self {
+        let mut cur = VopCursor { pending: None, scan: 0 };
+        cur.pending = cur.next_vop_start(data);
+        cur
     }
-    if vop_positions.is_empty() {
-        return units;
-    }
-    let headers = &data[header_start..header_end.unwrap_or(0)];
-    header_start = header_end.unwrap_or(0);
-    let _ = header_start;
 
-    for (n, &start) in vop_positions.iter().enumerate() {
-        let end = vop_positions.get(n + 1).copied().unwrap_or(data.len());
-        let vop = &data[start..end];
-        // Skip a trailing not-coded stuffing VOP: a very short VOP (< a few
-        // bytes of payload after the start code) whose `vop_coded` bit is 0.
-        if is_stuffing_vop(vop) {
-            continue;
+    /// Find the next VOP start code at/after `self.scan`, advancing `self.scan`
+    /// past it. Non-VOP start codes are skipped. `None` when none remain.
+    fn next_vop_start(&mut self, data: &[u8]) -> Option<usize> {
+        let mut i = self.scan;
+        while let Some((off, code)) = find_start_code(data, i) {
+            if code == startcode::VOP_START {
+                self.scan = off + 3;
+                return Some(off);
+            }
+            i = off + 3;
         }
-        units.push(Unit {
-            headers: if n == 0 { headers } else { &data[start..start] },
-            vop,
-        });
+        self.scan = data.len();
+        None
     }
-    units
+
+    /// The next non-stuffing coded VOP slice, or `None` when the buffer is drained.
+    /// The slice borrows `data`; pass the same buffer each call.
+    pub fn next<'a>(&mut self, data: &'a [u8]) -> Option<&'a [u8]> {
+        loop {
+            let start = self.pending?;
+            let next = self.next_vop_start(data);
+            let end = next.unwrap_or(data.len());
+            self.pending = next;
+            let vop = &data[start..end];
+            // Skip a trailing not-coded stuffing VOP.
+            if is_stuffing_vop(vop) {
+                continue;
+            }
+            return Some(vop);
+        }
+    }
 }
 
 /// True if a VOP is a DivX packed-bitstream stuffing (not-coded) VOP: it is very
@@ -85,29 +93,20 @@ fn is_stuffing_vop(vop: &[u8]) -> bool {
     vop.len() < 8
 }
 
-/// The stream headers at the front of `data` (before the first VOP), for priming
-/// the VOL parser from the first buffer. Empty if the buffer begins with a VOP.
-pub fn leading_headers(data: &[u8]) -> &[u8] {
-    match find_start_code_vop(data) {
-        Some(off) => &data[..off],
-        None => data,
-    }
-}
-
-fn find_start_code_vop(data: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while let Some((off, code)) = find_start_code(data, i) {
-        if code == startcode::VOP_START {
-            return Some(off);
-        }
-        i = off + 3;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collect every VOP the cursor yields (test helper only — the hot path pulls
+    /// one at a time and never collects).
+    fn collect_vops(data: &[u8]) -> Vec<&[u8]> {
+        let mut cur = VopCursor::new(data);
+        let mut out = Vec::new();
+        while let Some(vop) = cur.next(data) {
+            out.push(vop);
+        }
+        out
+    }
 
     #[test]
     fn single_vop_one_unit() {
@@ -115,10 +114,9 @@ mod tests {
         let mut data = vec![0x00, 0x00, 0x01, 0x20, 0xAA, 0xBB]; // VOL
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB6]); // VOP
         data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let units = split_units(&data);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].vop[3], 0xB6);
-        assert!(!units[0].headers.is_empty(), "headers surfaced on first unit");
+        let vops = collect_vops(&data);
+        assert_eq!(vops.len(), 1);
+        assert_eq!(vops[0][3], 0xB6, "yielded slice starts at the VOP start code");
     }
 
     #[test]
@@ -132,7 +130,14 @@ mod tests {
         data.extend_from_slice(&[7; 20]);
         // stuffing VOP (short)
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB6, 0x00]);
-        let units = split_units(&data);
-        assert_eq!(units.len(), 2, "two real VOPs, stuffing dropped");
+        let vops = collect_vops(&data);
+        assert_eq!(vops.len(), 2, "two real VOPs, stuffing dropped");
+    }
+
+    #[test]
+    fn no_vop_yields_nothing() {
+        // Only a VOL header, no VOP start code.
+        let data = vec![0x00, 0x00, 0x01, 0x20, 0xAA, 0xBB];
+        assert!(collect_vops(&data).is_empty());
     }
 }

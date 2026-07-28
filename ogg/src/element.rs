@@ -110,6 +110,8 @@ static DEMUX_DESC: ElementDesc = ElementDesc {
         jitter: Timestamp::ZERO,
     },
     // Name-constructible (spec: Plugins): config-free.
+    // COLD: the make_default closure boxes one element at plugin/pipeline construction.
+    #[allow(clippy::disallowed_methods)]
     make_default: Some(|| Box::new(OggDemux::new())),
 };
 
@@ -254,6 +256,8 @@ static MUX_DESC: ElementDesc = ElementDesc {
         jitter: Timestamp::ZERO,
     },
     // Name-constructible (spec: Plugins): the default serial; use `with_serial` in code.
+    // COLD: the make_default closure boxes one element at plugin/pipeline construction.
+    #[allow(clippy::disallowed_methods)]
     make_default: Some(|| Box::new(OggMux::new())),
 };
 
@@ -290,6 +294,8 @@ impl OggMux {
     }
 
     /// A muxer stamping `serial` as the bitstream serial number (§6, field 5).
+    // COLD: one-time constructor; `scratch` is the reused per-`process` byte buffer.
+    #[allow(clippy::disallowed_methods)]
     pub fn with_serial(serial: u32) -> Self {
         Self {
             serial,
@@ -377,6 +383,8 @@ impl Element for OggMux {
         Ok(())
     }
 
+    // COLD: `stop` runs once at end-of-stream; releasing the reused `scratch` buffer here.
+    #[allow(clippy::disallowed_methods)]
     fn stop(&mut self, ctx: &mut Ctx) {
         // Belt-and-braces: if `event(Eos)` did not run (or the runtime does not deliver
         // it yet), guarantee the eos page here. Idempotent via the `Option` take.
