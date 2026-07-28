@@ -144,6 +144,17 @@ use crate::{Error, Result};
 /// the spec's literal `π/2.0` division.
 const HALF_PI: f64 = PI / 2.0;
 
+/// `TNS_MAX_ORDER` per ISO/IEC 14496-3 Table 4.102 — the largest
+/// filter order any AOT permits (AAC Main / other AOTs > 32 kHz cap at
+/// 20; [`crate::tns_max::clamp_tns_order`] enforces it upstream). Every
+/// PARCOR / LPC / history scratch buffer in this module is bounded by
+/// this, so all of them live on the stack (fixed-size arrays) with no
+/// per-filter heap alloc on the TNS decode path (streamcraft patch).
+/// The `_into` entry points guard their `out` slices defensively so a
+/// caller that somehow supplies an over-order slice is rejected rather
+/// than overrunning the stack buffer.
+const TNS_MAX_ORDER: usize = 20;
+
 /// `iqfac` per §4.6.9.3. Branches on a *non-negative* index / PARCOR
 /// value. Defined as `((1 << (coef_res_bits-1)) - 0.5) / (π/2)`.
 ///
@@ -323,28 +334,56 @@ pub fn tns_encode_coef(coef_res_bits: u32, coef_compress: u32, r: &[f64]) -> Res
 /// degenerate `[1.0]` (no filtering — every filter with `order == 0`
 /// is skipped by the §4.6.9.3 outer loop).
 pub fn lpc_step_up(parcor: &[f64]) -> Vec<f64> {
+    let mut a = vec![0.0_f64; parcor.len() + 1];
+    let len = lpc_step_up_into(parcor, &mut a);
+    debug_assert_eq!(len, a.len());
+    a
+}
+
+/// Stack-provided-output form of [`lpc_step_up`]. Writes the
+/// `order + 1` direct-form LPC `a[]` coefficients (`order = parcor.len()`)
+/// into `out` and returns that length. The scratch `b[]` array the
+/// §4.6.9.3 step-up loop needs lives on the stack here — no heap alloc
+/// — so the caller (which already has `order ≤ TNS_MAX_ORDER` from the
+/// upstream clamp) can drive TNS reconstruction allocation-free.
+///
+/// # Panics / errors
+///
+/// `out.len()` must be at least `parcor.len() + 1`; a shorter slice
+/// panics on the first write. `parcor.len()` must not exceed
+/// [`TNS_MAX_ORDER`] (the `b[]` stack scratch is sized for that cap);
+/// an over-order `parcor` returns `0` and writes nothing rather than
+/// overrunning. Legitimate callers never hit either bound — the
+/// §4.6.9.3 order clamp keeps `parcor.len() ≤ TNS_MAX_ORDER`.
+pub fn lpc_step_up_into(parcor: &[f64], out: &mut [f64]) -> usize {
     let order = parcor.len();
-    // `a` is the running LPC coefficient array. Length is `order + 1`
-    // throughout; only the first `m + 1` slots are meaningful at the
-    // start of iteration `m` (the remainder is zeroed and overwritten
-    // by later iterations).
-    let mut a = vec![0.0_f64; order + 1];
-    a[0] = 1.0;
-    // Scratch `b[]` matches the spec's pseudocode literally. Allocated
-    // once and reused across iterations; only the low `m` slots are
-    // consulted per `m`.
-    let mut b = vec![0.0_f64; order + 1];
+    // Defensive: the `b[]` scratch is a `TNS_MAX_ORDER + 1` stack array,
+    // so a fabricated over-order `parcor` (the clamp makes this
+    // unreachable in practice) is refused rather than indexed OOB.
+    if order > TNS_MAX_ORDER {
+        return 0;
+    }
+    // `out[..order + 1]` is the running LPC coefficient array. Length is
+    // `order + 1` throughout; only the first `m + 1` slots are
+    // meaningful at the start of iteration `m` (the remainder is zeroed
+    // and overwritten by later iterations).
+    out[..=order].fill(0.0);
+    out[0] = 1.0;
+    // Scratch `b[]` matches the spec's pseudocode literally. Sized for
+    // the `TNS_MAX_ORDER` cap and reused across iterations; only the low
+    // `m` slots are consulted per `m`.
+    let mut b = [0.0_f64; TNS_MAX_ORDER + 1];
     for m in 1..=order {
         let k = parcor[m - 1];
         for i in 1..m {
-            b[i] = a[i] + k * a[m - i];
+            b[i] = out[i] + k * out[m - i];
         }
         // Copy the m-1 newly-derived `b[1..m]` slots back into a;
         // clippy prefers `copy_from_slice` here over a manual loop.
-        a[1..m].copy_from_slice(&b[1..m]);
-        a[m] = k;
+        out[1..m].copy_from_slice(&b[1..m]);
+        out[m] = k;
     }
-    a
+    order + 1
 }
 
 /// Convenience wrapper that runs [`tns_decode_coef`] then
@@ -359,6 +398,53 @@ pub fn tns_decode_coef_to_lpc(
 ) -> Result<Vec<f64>> {
     let parcor = tns_decode_coef(coef_res_bits, coef_compress, coef)?;
     Ok(lpc_step_up(&parcor))
+}
+
+/// Stack-provided-output form of [`tns_decode_coef_to_lpc`]. Runs the
+/// §4.6.9.3 inverse-quantisation into a `TNS_MAX_ORDER`-sized stack
+/// PARCOR array, then [`lpc_step_up_into`] over the caller's `out`
+/// slice, returning the `coef.len() + 1` LPC coefficient count. No heap
+/// alloc: the whole `coef → PARCOR → LPC` chain stays on the stack, so
+/// the per-filter TNS decode path allocates nothing (streamcraft
+/// patch).
+///
+/// `out.len()` must be at least `coef.len() + 1`. `coef.len()` must not
+/// exceed [`TNS_MAX_ORDER`] (the internal PARCOR scratch is sized for
+/// that cap); an over-order `coef` returns [`Error::TnsCoefOutOfRange`]
+/// rather than overrunning. The upstream §4.6.9.3 order clamp keeps
+/// legitimate callers within both bounds. Other errors mirror
+/// [`tns_decode_coef`] exactly.
+pub fn tns_decode_coef_to_lpc_into(
+    coef_res_bits: u32,
+    coef_compress: u32,
+    coef: &[u32],
+    out: &mut [f64],
+) -> Result<usize> {
+    if coef_compress > 1 {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    // Defensive: the PARCOR scratch is a fixed `TNS_MAX_ORDER` stack
+    // array; reject an over-order `coef` before writing it (the clamp
+    // makes this unreachable in practice).
+    if coef.len() > TNS_MAX_ORDER {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    let coef_res2 = coef_res_bits
+        .checked_sub(coef_compress)
+        .ok_or(Error::TnsCoefOutOfRange)?;
+    let iq = iqfac(coef_res_bits)?;
+    let iq_m = iqfac_m(coef_res_bits)?;
+
+    // §4.6.9.3 `tmp2[]` — the inverse-quantised PARCOR array, on the
+    // stack (sliced to the transmitted `coef.len()`).
+    let mut parcor = [0.0_f64; TNS_MAX_ORDER];
+    let order = coef.len();
+    for (dst, &c) in parcor[..order].iter_mut().zip(coef) {
+        let signed = sign_extend_coef(c, coef_res2)?;
+        let divisor = if signed >= 0 { iq } else { iq_m };
+        *dst = (signed as f64 / divisor).sin();
+    }
+    Ok(lpc_step_up_into(&parcor[..order], out))
 }
 
 /// §4.6.9.3 `tns_ar_filter()` — the simple all-pole (auto-regressive)
@@ -430,13 +516,22 @@ pub fn tns_ar_filter(
         }
         return Ok(());
     }
+    // Defensive: the history ring is a `TNS_MAX_ORDER` stack array, so
+    // an over-order `lpc` (the §4.6.9.3 order clamp makes this
+    // unreachable) is refused rather than overrunning the buffer.
+    if order > TNS_MAX_ORDER {
+        return Err(Error::TnsCoefOutOfRange);
+    }
 
     walk_bounds_check(spectrum.len(), start, size, inc)?;
 
     // Filter-state ring: the last `order` *output* samples y(n-1) ..
     // y(n-order). Index `0` is the most recent output; the ring is
     // shifted by one each iteration. Seeded with zeros per §4.6.9.3.
-    let mut history = vec![0.0_f64; order];
+    // Stack-allocated to `TNS_MAX_ORDER` and sliced to `order` — no
+    // per-invocation heap alloc (streamcraft patch).
+    let mut history_buf = [0.0_f64; TNS_MAX_ORDER];
+    let history = &mut history_buf[..order];
 
     let mut idx = start as isize;
     for _ in 0..size {
@@ -511,14 +606,23 @@ pub fn tns_ma_filter(
         }
         return Ok(());
     }
+    // Defensive: the history ring is a `TNS_MAX_ORDER` stack array, so
+    // an over-order `lpc` (the §4.6.9.3 order clamp makes this
+    // unreachable) is refused rather than overrunning the buffer.
+    if order > TNS_MAX_ORDER {
+        return Err(Error::TnsCoefOutOfRange);
+    }
 
     walk_bounds_check(spectrum.len(), start, size, inc)?;
 
     // Filter-state ring: the last `order` *input* samples x(n-1) ..
     // x(n-order). Index `0` is the most recent input. Seeded with zeros,
     // matching the all-pole filter's zero-initialised state so the two
-    // are mutual inverses over the region.
-    let mut history = vec![0.0_f64; order];
+    // are mutual inverses over the region. Stack-allocated to
+    // `TNS_MAX_ORDER` and sliced to `order` — no per-invocation heap
+    // alloc (streamcraft patch).
+    let mut history_buf = [0.0_f64; TNS_MAX_ORDER];
+    let history = &mut history_buf[..order];
 
     let mut idx = start as isize;
     for _ in 0..size {

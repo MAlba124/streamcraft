@@ -61,7 +61,7 @@ use crate::ics_info::WindowSequence;
 use crate::swb_offset::{
     long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
 };
-use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc, tns_ma_filter};
+use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc_into, tns_ma_filter};
 use crate::tns_data::{num_windows, TnsData};
 use crate::tns_max::{clamp_tns_band, clamp_tns_order};
 use crate::{Error, Result};
@@ -245,8 +245,18 @@ fn tns_frame_filter(
                 *dst = u32::from(c);
             }
             let coef = &coef_buf[..tns_order];
-            let lpc =
-                tns_decode_coef_to_lpc(coef_res_bits, u32::from(filter.coef_compress), coef)?;
+            // Decode the widened `coef` straight into a stack LPC buffer:
+            // `tns_order ≤ TNS_ORDER_STACK_CAP` so the `order + 1` LPC
+            // coefficients fit `TNS_ORDER_STACK_CAP + 1` slots — no
+            // per-filter Vec on the decode path (streamcraft patch).
+            let mut lpc_buf = [0.0_f64; TNS_ORDER_STACK_CAP + 1];
+            let lpc_len = tns_decode_coef_to_lpc_into(
+                coef_res_bits,
+                u32::from(filter.coef_compress),
+                coef,
+                &mut lpc_buf,
+            )?;
+            let lpc = &lpc_buf[..lpc_len];
 
             // Band indices are at most `num_swb` (bottom/top start
             // there and only decrease), so the u8 narrowing is exact:
@@ -281,6 +291,10 @@ fn tns_frame_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The Vec-returning wrapper is only used by the manual-composition
+    // reference paths in these tests; the production decode path uses the
+    // stack `tns_decode_coef_to_lpc_into` form.
+    use crate::tns_coef::tns_decode_coef_to_lpc;
     use crate::tns_data::{TnsFilter, TnsWindow};
     use crate::tns_max::{tns_max_bands, tns_max_order, AOT_AAC_LC, AOT_AAC_MAIN};
 
