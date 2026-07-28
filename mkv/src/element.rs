@@ -849,9 +849,24 @@ pub struct MkvDemux {
     /// demuxer consumes **no input**, so upstream backs up into the scheduler's gates
     /// instead of this element ballooning. Holds at most a codec head + one frame.
     pending: std::collections::VecDeque<Carry>,
+    /// Recycled [`Carry`] payload buffers. A slow decoder keeps the pool full, so `drain` parks
+    /// a remainder nearly every frame; returning each fully-emitted Carry's buffer here (instead
+    /// of dropping it and `to_vec`-ing a fresh one next park) makes the backpressure path
+    /// zero-alloc in steady state. Bounded (`MAX_PARK_FREE`).
+    park_free: Vec<Vec<u8>>,
     /// `DurationChanged` has been posted this run (once, from `process` — posted at
     /// stream time, not preroll, so an introspection server started at `run()` sees it).
     posted_duration: bool,
+}
+
+/// Cap on retained park buffers — a head plus a few frames is the most that parks at once.
+const MAX_PARK_FREE: usize = 8;
+
+/// Return a fully-emitted [`Carry`]'s buffer to the free-list for the next park (bounded).
+fn recycle_park(free: &mut Vec<Vec<u8>>, buf: Vec<u8>) {
+    if free.len() < MAX_PARK_FREE {
+        free.push(buf);
+    }
 }
 
 /// A partially-emitted blob: `bytes[off..]` still needs pool slots on `pad`.
@@ -867,13 +882,17 @@ struct Carry {
     off: usize,
 }
 
-/// Own a parked remainder's bytes for a [`Carry`]. Called only on pool exhaustion (the
-/// backpressure boundary), at most once per stall — the element then stops consuming input —
-/// so this owned allocation is bounded, not a steady-state per-frame cost.
-// COLD: backpressure park only; the parked remainder must outlive the current `process()`.
+/// Own a parked remainder's bytes for a [`Carry`], reusing a recycled buffer from `free` (a
+/// slow decoder parks nearly every frame, so this is a hot path, not a rare stall — a recycled
+/// buffer keeps it off the heap; `extend_from_slice` reuses the buffer's capacity). The parked
+/// bytes must outlive the current `process()`, so they are copied out of the borrowed source.
+// The `Vec::new()` fallback (empty, zero-heap) is hit only before the free-list warms.
 #[allow(clippy::disallowed_methods)]
-fn own_remainder(bytes: &[u8]) -> Vec<u8> {
-    bytes.to_vec()
+fn own_remainder(free: &mut Vec<Vec<u8>>, bytes: &[u8]) -> Vec<u8> {
+    let mut buf = free.pop().unwrap_or_default();
+    buf.clear();
+    buf.extend_from_slice(bytes);
+    buf
 }
 
 impl MkvDemux {
@@ -892,6 +911,7 @@ impl MkvDemux {
             scratch: Vec::new(),
             reframe_buf: Vec::new(),
             pending: std::collections::VecDeque::new(),
+            park_free: Vec::new(),
             posted_duration: false,
         }
     }
@@ -1030,6 +1050,8 @@ impl MkvDemux {
                 self.pending.push_front(c);
                 return false;
             }
+            // Fully emitted — return its buffer for the next park (zero-alloc backpressure).
+            recycle_park(&mut self.park_free, c.bytes);
         }
         true
     }
@@ -1113,7 +1135,7 @@ impl MkvDemux {
             // A parked remainder must own its bytes (it outlives this `process`); copy it out
             // before the `reframe_buf`/`frame.data` borrows end. Steady state (pool keeping up)
             // parks nothing, so no per-frame owned allocation.
-            let remainder = (off < out_len).then(|| own_remainder(&out_bytes[off..]));
+            let remainder = (off < out_len).then(|| own_remainder(&mut self.park_free, &out_bytes[off..]));
             // `out_bytes` is now unused: its borrow of `reframe_buf`/`frame.data` has ended, so
             // the buffer can be restored (kept for the next frame) and the frame payload recycled.
             self.reframe_buf = reframe_buf;
