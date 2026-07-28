@@ -133,6 +133,30 @@ impl<'a> Canvas<'a> {
         self.buf[o + 3] = blend(255, da); // src coverage is fully opaque *within* alpha a
     }
 
+    /// Source-over blend `src` at a pre-clipped `(x, y)` scaled by a fractional `cov` in
+    /// `[0.0, 1.0]` — the anti-aliasing primitive. Coverage folds into the source alpha
+    /// (`a' = src.a · cov`, rounded), so an edge pixel that a shape covers 40% blends as if the
+    /// color's alpha were 40% of nominal. `cov ≤ 0` is a no-op; `cov ≥ 1` is the plain full blend.
+    /// This keeps every AA path (triangle edges, Wu lines, circle rims) on the same rounded
+    /// integer source-over as the solid primitives — no separate premultiplied bookkeeping.
+    #[inline]
+    fn blend_px_cov(&mut self, x: u32, y: u32, color: &Argb, cov: f32) {
+        if cov <= 0.0 {
+            return;
+        }
+        if cov >= 1.0 {
+            self.blend_px(x, y, color);
+            return;
+        }
+        // a' = round(color.a * cov). color.a ≤ 255 and cov < 1, so this stays in [0, 254].
+        let a = (color.a as f32 * cov + 0.5) as u32;
+        if a == 0 {
+            return;
+        }
+        let src = Argb { a, r: color.r, g: color.g, b: color.b };
+        self.blend_px(x, y, &src);
+    }
+
     /// Fill the entire canvas with an opaque packed color, ignoring its alpha byte.
     pub fn clear(&mut self, argb: u32) {
         // Take the simple per-row path; every pixel is in bounds by construction.
@@ -191,54 +215,112 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draw a 1-pixel line from `(x0, y0)` to `(x1, y1)` with an opaque color, via the integer
-    /// Bresenham midpoint algorithm (Bresenham, *IBM Systems Journal* 4(1), 1965). Each candidate
-    /// pixel is bounds-checked before being written, so any portion of the line off the canvas is
-    /// simply skipped — no pre-clipping arithmetic and no panics.
+    /// Draw an anti-aliased 1-pixel line from `(x0, y0)` to `(x1, y1)` with the color's alpha, via
+    /// **Xiaolin Wu's algorithm** (Wu, *SIGGRAPH '91*, "An Efficient Antialiasing Technique"). The
+    /// line is walked along its major axis one step at a time; at each step the two pixels
+    /// straddling the ideal line get complementary coverage from the fractional part of the minor
+    /// coordinate, so a shallow diagonal fades between rows instead of stair-stepping. Endpoints are
+    /// plotted with the classic Wu endpoint weighting (coverage tapered by the fractional overhang).
+    /// Every candidate pixel is bounds-checked, so any portion off the canvas is simply skipped —
+    /// no panics. A single point (`x0,y0 == x1,y1`) plots one full-coverage pixel.
     pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, argb: u32) {
-        let mut x = x0;
-        let mut y = y0;
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        // Error accumulator; the loop steps whichever axis keeps the point nearest the ideal line.
-        let mut err = dx + dy;
-        loop {
-            if x >= 0 && y >= 0 && (x as u32) < self.width && (y as u32) < self.height {
-                self.put(x as u32, y as u32, argb);
+        let color = Argb::unpack(argb);
+        if color.a == 0 {
+            return;
+        }
+        // Degenerate zero-length line: a single pixel, no fractional weighting.
+        if x0 == x1 && y0 == y1 {
+            if x0 >= 0 && y0 >= 0 && (x0 as u32) < self.width && (y0 as u32) < self.height {
+                self.blend_px(x0 as u32, y0 as u32, &color);
             }
-            if x == x1 && y == y1 {
-                break;
+            return;
+        }
+
+        let mut fx0 = x0 as f32;
+        let mut fy0 = y0 as f32;
+        let mut fx1 = x1 as f32;
+        let mut fy1 = y1 as f32;
+
+        // Wu iterates along the axis of greater extent ("major axis"); if the line is steeper than
+        // 45° we transpose x↔y so the inner loop always steps the major axis by one. `steep` is
+        // remembered so plotting un-transposes the coordinates.
+        let steep = (fy1 - fy0).abs() > (fx1 - fx0).abs();
+        if steep {
+            core::mem::swap(&mut fx0, &mut fy0);
+            core::mem::swap(&mut fx1, &mut fy1);
+        }
+        // Walk left→right along the major axis.
+        if fx0 > fx1 {
+            core::mem::swap(&mut fx0, &mut fx1);
+            core::mem::swap(&mut fy0, &mut fy1);
+        }
+
+        let dx = fx1 - fx0;
+        let dy = fy1 - fy0;
+        // dx > 0 here (equal-endpoint handled above, and dx ≥ |dy| ≥ 0 after the transpose).
+        let gradient = dy / dx;
+
+        // Plot at major coordinate `mx`, minor coordinate `my`, with coverage `cov`, honoring the
+        // transpose. `mx`/`my` are the along-axis / across-axis pixel indices respectively.
+        let plot = |canvas: &mut Self, mx: i32, my: i32, cov: f32| {
+            let (px, py) = if steep { (my, mx) } else { (mx, my) };
+            if px >= 0 && py >= 0 && (px as u32) < canvas.width && (py as u32) < canvas.height {
+                canvas.blend_px_cov(px as u32, py as u32, &color, cov);
             }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                if x == x1 {
-                    break;
-                }
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                if y == y1 {
-                    break;
-                }
-                err += dx;
-                y += sy;
-            }
+        };
+
+        // Fractional part and its complement (`rfpart`) — Wu's coverage weights.
+        let fpart = |v: f32| v - v.floor();
+        let rfpart = |v: f32| 1.0 - fpart(v);
+
+        // --- Start endpoint ---
+        let xend0 = fx0.round();
+        let yend0 = fy0 + gradient * (xend0 - fx0);
+        let xgap0 = rfpart(fx0 + 0.5);
+        let xpxl0 = xend0 as i32;
+        let ypxl0 = yend0.floor() as i32;
+        plot(self, xpxl0, ypxl0, rfpart(yend0) * xgap0);
+        plot(self, xpxl0, ypxl0 + 1, fpart(yend0) * xgap0);
+
+        // --- End endpoint ---
+        let xend1 = fx1.round();
+        let yend1 = fy1 + gradient * (xend1 - fx1);
+        let xgap1 = fpart(fx1 + 0.5);
+        let xpxl1 = xend1 as i32;
+        let ypxl1 = yend1.floor() as i32;
+        plot(self, xpxl1, ypxl1, rfpart(yend1) * xgap1);
+        plot(self, xpxl1, ypxl1 + 1, fpart(yend1) * xgap1);
+
+        // --- Interior span ---
+        // Track the ideal minor coordinate; the two nearest pixels split coverage by its fraction.
+        let mut inter = yend0 + gradient;
+        for mx in (xpxl0 + 1)..xpxl1 {
+            let base = inter.floor() as i32;
+            let f = inter - inter.floor();
+            plot(self, mx, base, 1.0 - f);
+            plot(self, mx, base + 1, f);
+            inter += gradient;
         }
     }
 
-    /// Fill a solid triangle through the three vertices, alpha-blended via the color's alpha byte.
+    /// Fill an **anti-aliased** solid triangle through the three vertices, source-over blended via
+    /// the color's alpha byte.
     ///
-    /// Scanline barycentric rasterization: for each pixel center inside the triangle's bounding
-    /// box (clipped to the canvas) we evaluate the three edge functions `E_i` (the signed area of
-    /// the sub-triangle on each edge; Pineda, *SIGGRAPH '88*, "A Parallel Algorithm for Polygon
-    /// Rasterization"). A pixel is inside when all three have the winding's sign. Shared edges
-    /// between adjacent triangles are disambiguated by a **top-left fill rule**: a pixel exactly on
-    /// an edge is covered only if that edge is a top or left edge, so a seam is painted by exactly
-    /// one of the two triangles (no double-blend, no gap). Edge functions are `f32` — ample for the
-    /// integer pixel coordinates the scope UI uses — but coverage is binary (1 sample per pixel).
+    /// Rasterization is Pineda's edge-function scan (Pineda, *SIGGRAPH '88*, "A Parallel Algorithm
+    /// for Polygon Rasterization"): for each pixel center in the triangle's clipped bounding box we
+    /// evaluate the three signed edge functions `E_i` in exact `i64` (range-safe for the full
+    /// `i32` coordinate space). Instead of a binary inside test, each edge contributes **analytic
+    /// coverage**: the perpendicular signed distance of the pixel center to the edge is
+    /// `E_i / |edge_i|`, and that edge's coverage is `saturate(dist + 0.5)` — 1 well inside, 0 well
+    /// outside, a linear ramp across the ~1-pixel band centered on the true edge. The pixel's
+    /// coverage is the **product** of the three edge coverages, so a corner (near two edges) tapers
+    /// correctly and interior pixels stay at coverage 1. That coverage scales the source-over blend
+    /// (see [`blend_px_cov`](Self::blend_px_cov)), giving smooth slopes and diagonals with no MSAA
+    /// samples and no allocation.
+    ///
+    /// **Seam note:** two AA triangles sharing an edge each paint that edge at partial coverage, so
+    /// the seam blends twice (each side ~50% at the exact diagonal). This is inherent to
+    /// coverage-AA without a coverage-accumulation buffer; interior fill remains exact.
     pub fn fill_triangle(&mut self, p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), argb: u32) {
         let src = Argb::unpack(argb);
         if src.a == 0 {
@@ -252,45 +334,83 @@ impl<'a> Canvas<'a> {
         if area == 0 {
             return;
         }
-        // Normalize to counter-clockwise so the "inside" test is a single comparison. If the input
-        // was clockwise (`area < 0`) we swap two vertices to flip the winding.
+        // Normalize to counter-clockwise so every edge function is ≥ 0 inside. If the input was
+        // clockwise (`area < 0`) we swap two vertices to flip the winding.
         let (a, b, c) = if area > 0 { (p0, p1, p2) } else { (p0, p2, p1) };
 
-        // Bounding box of the triangle, clipped to the canvas. Empty box → nothing to do.
-        let min_x = a.0.min(b.0).min(c.0).max(0);
-        let min_y = a.1.min(b.1).min(c.1).max(0);
-        let max_x = a.0.max(b.0).max(c.0).min(self.width as i32 - 1);
-        let max_y = a.1.max(b.1).max(c.1).min(self.height as i32 - 1);
+        // Bounding box, expanded one pixel on every side so the coverage ramp of an edge that lies
+        // just outside the integer bbox still gets sampled, then clipped to the canvas.
+        let min_x = (a.0.min(b.0).min(c.0) - 1).max(0);
+        let min_y = (a.1.min(b.1).min(c.1) - 1).max(0);
+        let max_x = (a.0.max(b.0).max(c.0) + 1).min(self.width as i32 - 1);
+        let max_y = (a.1.max(b.1).max(c.1) + 1).min(self.height as i32 - 1);
         if min_x > max_x || min_y > max_y {
             return;
         }
 
-        // A top-left edge (for CCW winding): a "top" edge is horizontal and goes right→left
-        // (dy == 0 && dx < 0); a "left" edge goes downward (dy > 0, i.e. y increases). Pixels
-        // exactly on such an edge count as inside; on a bottom/right edge they do not.
-        let top_left = |v0: (i32, i32), v1: (i32, i32)| -> bool {
-            let ex = v1.0 - v0.0;
-            let ey = v1.1 - v0.1;
-            (ey == 0 && ex < 0) || ey > 0
+        // Reciprocal edge lengths convert an edge function (twice-signed-area of pixel vs edge)
+        // into a perpendicular pixel distance: |E_i| / length_i. A zero-length edge can't happen
+        // here (area != 0 ⇒ no two vertices coincide), but guard the divide anyway.
+        let inv_len = |v0: (i32, i32), v1: (i32, i32)| -> f32 {
+            let ex = (v1.0 - v0.0) as f32;
+            let ey = (v1.1 - v0.1) as f32;
+            let len = (ex * ex + ey * ey).sqrt();
+            if len > 0.0 { 1.0 / len } else { 0.0 }
         };
-        let tl_ab = top_left(a, b);
-        let tl_bc = top_left(b, c);
-        let tl_ca = top_left(c, a);
+        let il_ab = inv_len(a, b);
+        let il_bc = inv_len(b, c);
+        let il_ca = inv_len(c, a);
+
+        // saturate(dist + 0.5): coverage of one edge for a pixel whose signed distance (positive
+        // inside) to that edge is `dist`. The 0.5 offset centers the 1-px ramp on the true edge.
+        let edge_cov = |e: i64, il: f32| -> f32 {
+            (e as f32 * il + 0.5).clamp(0.0, 1.0)
+        };
 
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let p = (px, py);
-                // Edge functions at this pixel; for CCW winding a point is inside when all are ≥ 0.
+                // Exact i64 edge functions (positive inside for the CCW-normalized winding).
                 let w_ab = edge(a, b, p);
                 let w_bc = edge(b, c, p);
                 let w_ca = edge(c, a, p);
-                // Strictly inside covers positive; on an edge (== 0), the top-left rule decides.
-                let inside = (w_ab > 0 || (w_ab == 0 && tl_ab))
-                    && (w_bc > 0 || (w_bc == 0 && tl_bc))
-                    && (w_ca > 0 || (w_ca == 0 && tl_ca));
-                if inside {
+                // Per-edge analytic coverage, multiplied for the pixel's total coverage.
+                let cov = edge_cov(w_ab, il_ab) * edge_cov(w_bc, il_bc) * edge_cov(w_ca, il_ca);
+                if cov > 0.0 {
                     // px,py are within [0,width)×[0,height) by the clipped bbox.
-                    self.blend_px(px as u32, py as u32, &src);
+                    self.blend_px_cov(px as u32, py as u32, &src, cov);
+                }
+            }
+        }
+    }
+
+    /// Fill an **anti-aliased** disc centered at `(cx, cy)` with radius `r`, source-over blended via
+    /// the color's alpha byte. Coverage comes from the radial signed distance `r − dist(center)`:
+    /// `saturate(r − dist + 0.5)` gives a 1-pixel-wide smooth rim, so GUI knobs and handles get the
+    /// same soft edge as SDL's. Non-positive `r` and a zero-alpha color are no-ops; the sampled box
+    /// is clipped to the canvas so an off-screen or partly-clipped circle never panics.
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, argb: u32) {
+        let src = Argb::unpack(argb);
+        if src.a == 0 || !(r > 0.0) {
+            return;
+        }
+        // Bounding box of the disc, padded a pixel for the rim ramp, clipped to the canvas.
+        let min_x = ((cx - r - 1.0).floor() as i32).max(0);
+        let min_y = ((cy - r - 1.0).floor() as i32).max(0);
+        let max_x = ((cx + r + 1.0).ceil() as i32).min(self.width as i32 - 1);
+        let max_y = ((cy + r + 1.0).ceil() as i32).min(self.height as i32 - 1);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let dx = px as f32 + 0.5 - cx;
+                let dy = py as f32 + 0.5 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                // Positive inside; the 0.5 offset centers the antialiased rim on radius r.
+                let cov = (r - dist + 0.5).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_px_cov(px as u32, py as u32, &src, cov);
                 }
             }
         }
@@ -479,23 +599,53 @@ mod tests {
         let (w, h) = (5u32, 5u32);
         let mut buf = scratch(w, h);
         let mut c = Canvas::new(&mut buf, w, h, w * 4);
-        // Main diagonal (0,0)..(4,4): a Bresenham line hits exactly the diagonal pixels.
+        // Main diagonal (0,0)..(4,4): gradient == 1, so the *interior* diagonal pixels land at
+        // full coverage; only the two endpoints are Wu-tapered (see the endpoint test below).
         c.draw_line(0, 0, 4, 4, 0xffff0000);
-        for i in 0..5u32 {
+        for i in 1..4u32 {
             assert_eq!(px(&buf, w * 4, i, i), 0xffff0000, "diagonal {i}");
         }
-        // An off-diagonal pixel stays clear.
+        // On a 45° line every step is exact, so no off-diagonal spill on the interior rows.
         assert_eq!(px(&buf, w * 4, 0, 4), 0);
+        assert_eq!(px(&buf, w * 4, 1, 2), 0);
 
-        // A horizontal line covers its whole run inclusive of both endpoints.
+        // A horizontal line sits on one exact row (gradient 0 ⇒ fpart(yend) == 0), so it never
+        // bleeds onto neighbouring rows. Its *interior* pixel (x=2) is full coverage; the two
+        // integer endpoints (x=1, x=3) are Wu-tapered to ~50% (xgap weighting), which is expected.
         let mut buf2 = scratch(w, h);
         let mut c2 = Canvas::new(&mut buf2, w, h, w * 4);
         c2.draw_line(1, 2, 3, 2, 0xff00ff00);
-        for x in 1..=3u32 {
-            assert_eq!(px(&buf2, w * 4, x, 2), 0xff00ff00, "hline {x}");
-        }
+        assert_eq!(px(&buf2, w * 4, 2, 2), 0xff00ff00, "hline interior full");
+        let a_l = px(&buf2, w * 4, 1, 2) >> 24;
+        let a_r = px(&buf2, w * 4, 3, 2) >> 24;
+        assert!(a_l > 0 && a_l < 255, "hline start endpoint Wu-tapered: {a_l:#x}");
+        assert!(a_r > 0 && a_r < 255, "hline end endpoint Wu-tapered: {a_r:#x}");
         assert_eq!(px(&buf2, w * 4, 0, 2), 0);
         assert_eq!(px(&buf2, w * 4, 4, 2), 0);
+        // A horizontal line does not bleed onto the neighbouring rows.
+        assert_eq!(px(&buf2, w * 4, 2, 1), 0);
+        assert_eq!(px(&buf2, w * 4, 2, 3), 0);
+    }
+
+    #[test]
+    fn draw_line_wu_shallow_diagonal_has_partial_coverage() {
+        // A shallow line (gradient 0.5) must split coverage between the two straddling rows on the
+        // off-integer steps — the defining property of Wu antialiasing vs. the old aliased
+        // Bresenham (which put down solid pixels only). (0,0)..(4,2): at x=1 the ideal y is 0.5,
+        // so rows 0 and 1 each get ~50% coverage.
+        let (w, h) = (6u32, 4u32);
+        let mut buf = scratch(w, h);
+        let mut c = Canvas::new(&mut buf, w, h, w * 4);
+        c.draw_line(0, 0, 4, 2, 0xffffffff); // opaque white
+        // Column x=1: both row 0 and row 1 carry intermediate (non-0, non-255) alpha.
+        let a_top = px(&buf, w * 4, 1, 0) >> 24;
+        let a_bot = px(&buf, w * 4, 1, 1) >> 24;
+        assert!(a_top > 0 && a_top < 255, "wu top pixel not partial: {a_top:#x}");
+        assert!(a_bot > 0 && a_bot < 255, "wu bottom pixel not partial: {a_bot:#x}");
+        // Complementary coverage: the two straddling pixels' alphas sum to roughly full (a small
+        // rounding overshoot past 255 is fine — each side rounds its own ~50% independently).
+        let sum = a_top + a_bot;
+        assert!((230..=258).contains(&sum), "wu coverage not complementary: {sum}");
     }
 
     #[test]
@@ -503,15 +653,18 @@ mod tests {
         let (w, h) = (4u32, 4u32);
         let mut buf = scratch(w, h);
         let mut c = Canvas::new(&mut buf, w, h, w * 4);
-        // A line that starts off-screen and ends on-screen paints only the visible tail.
+        // A line that starts off-screen and ends on-screen paints only the visible tail. Interior
+        // span pixels of this horizontal line are full coverage; the on-canvas end *endpoint*
+        // (x=2) is Wu-tapered to ~50% (xgap weighting), so we only assert full on an interior px.
         c.draw_line(-10, 2, 2, 2, 0xff0000ff);
         // Fully off-screen and single-point lines must not panic (drawn before the pixel reads,
         // since the canvas borrows the buffer until then).
         c.draw_line(-5, -5, -1, -1, 0xffffffff);
         c.draw_line(100, 100, 200, 200, 0xffffffff);
         c.draw_line(1, 1, 1, 1, 0xffffff00); // degenerate point, on-canvas
-        assert_eq!(px(&buf, w * 4, 0, 2), 0xff0000ff);
-        assert_eq!(px(&buf, w * 4, 2, 2), 0xff0000ff);
+        assert_eq!(px(&buf, w * 4, 0, 2), 0xff0000ff, "interior span pixel");
+        assert_eq!(px(&buf, w * 4, 1, 2), 0xff0000ff, "interior span pixel");
+        // The degenerate single-point line lands one full-coverage pixel.
         assert_eq!(px(&buf, w * 4, 1, 1), 0xffffff00);
     }
 
@@ -522,7 +675,7 @@ mod tests {
         let mut c = Canvas::new(&mut buf, w, h, w * 4);
         // A right triangle with the right angle at (0,0): interior is where x + y is small.
         c.fill_triangle((0, 0), (7, 0), (0, 7), 0xff00ffff);
-        // Points strictly inside the triangle are filled.
+        // Points well inside the triangle (far from every edge) stay at full coverage under AA.
         assert_eq!(px(&buf, w * 4, 1, 1), 0xff00ffff, "interior");
         assert_eq!(px(&buf, w * 4, 2, 1), 0xff00ffff, "interior");
         assert_eq!(px(&buf, w * 4, 1, 3), 0xff00ffff, "interior");
@@ -532,30 +685,52 @@ mod tests {
     }
 
     #[test]
-    fn fill_triangle_winding_independent_and_covers_a_solid_block() {
-        // Two triangles sharing edge (0,0)-(4,0) and (0,0)-(0,4) etc. tile a 4×4 square with no
-        // gaps and no double-cover; test that both windings fill and the square is solid.
+    fn fill_triangle_edge_is_antialiased() {
+        // The defining AA property: pixels straddling a sloped edge take *intermediate* alpha, not
+        // just 0 or 255. Triangle (0,0),(8,0),(0,8): the hypotenuse x+y=8 runs the diagonal, and a
+        // pixel sitting on it (e.g. (4,4), (3,5)) is ~half-covered → alpha strictly between 0/255.
+        let (w, h) = (10u32, 10u32);
+        let mut buf = scratch(w, h);
+        let mut c = Canvas::new(&mut buf, w, h, w * 4);
+        c.fill_triangle((0, 0), (8, 0), (0, 8), 0xff00ffff); // opaque cyan
+        for &(x, y) in &[(4u32, 4u32), (5, 3), (3, 5)] {
+            let a = px(&buf, w * 4, x, y) >> 24;
+            assert!(a > 0 && a < 255, "edge pixel {x},{y} not antialiased: alpha {a:#x}");
+        }
+        // A deep-interior pixel is still fully opaque (coverage 1).
+        assert_eq!(px(&buf, w * 4, 1, 1) >> 24, 255, "interior must stay solid");
+        // A pixel well outside stays clear.
+        assert_eq!(px(&buf, w * 4, 8, 8), 0, "outside stays clear");
+    }
+
+    #[test]
+    fn fill_triangle_interior_fill_is_exact_seam_is_aa() {
+        // Two triangles sharing the diagonal (0,0)-(4,4) tile a 4×4 square. Under coverage-based AA
+        // the shared diagonal is *not* a clean single 50% blend anymore: each triangle paints the
+        // seam pixels at ~50% coverage (their centers sit exactly on the shared edge), so the seam
+        // is composited as two partial source-over blends. Two 0.5-coverage passes over black give
+        // only ~0.75 combined coverage (0.5 + 0.5·0.5), i.e. the seam is *under-covered* — the
+        // inherent AA seam artifact when there is no coverage-accumulation buffer. We assert:
+        //   1. deep-interior pixels (coverage 1) are an exact single 50% blend (0x808080), and
+        //   2. a seam pixel differs from that clean blend (it is the AA seam, not the top-left rule).
         let (w, h) = (4u32, 4u32);
         let mut buf = scratch(w, h);
         let mut c = Canvas::new(&mut buf, w, h, w * 4);
-        // Cover the whole 4×4 with two triangles split along the diagonal. Use A=128 so a
-        // double-blended seam pixel (a bug) would read a *different* value than a singly-blended
-        // one — this is how the top-left fill rule is validated.
         c.clear(0xff000000);
         c.fill_triangle((0, 0), (4, 0), (4, 4), 0x80ffffff); // upper-right
         c.fill_triangle((0, 0), (4, 4), (0, 4), 0x80ffffff); // lower-left
-        // Every covered pixel must be exactly one 50% blend (0x808080), never two (0xbfbfbf-ish).
-        for y in 0..h {
-            for x in 0..w {
-                let got = px(&buf, w * 4, x, y);
-                assert!(
-                    got == 0xff808080 || got == 0xff000000,
-                    "pixel {x},{y} = {got:#010x}: seam double-blended or gap"
-                );
-            }
-        }
-        // The interior of the shared diagonal must actually be painted (no gap): (1,1) is on it.
-        assert_eq!(px(&buf, w * 4, 1, 1), 0xff808080);
+
+        // (1) Interior fill is exact: a pixel deep inside the upper-right triangle (well below the
+        // top edge, well right of the diagonal) is one exact 50% blend — coverage 1 there.
+        assert_eq!(px(&buf, w * 4, 3, 1), 0xff808080, "upper-right interior");
+        // And one deep inside the lower-left triangle.
+        assert_eq!(px(&buf, w * 4, 1, 3), 0xff808080, "lower-left interior");
+
+        // (2) The shared diagonal is the AA seam: pixel (2,2) is covered ~0.5 by each triangle, so
+        // its composited grey is *not* the clean single 50% blend (0x80) but the partial-coverage
+        // seam value (~0x70) — documenting AA seam behavior instead of the old top-left rule.
+        let seam = px(&buf, w * 4, 2, 2) & 0xff; // blue channel of the grey
+        assert!(seam != 0x80 && seam > 0, "seam should be AA (partial), got {seam:#x}");
     }
 
     #[test]
@@ -574,6 +749,29 @@ mod tests {
                 assert_eq!(px(&buf, w * 4, x, y), 0xff123456, "pixel {x},{y}");
             }
         }
+    }
+
+    #[test]
+    fn fill_circle_center_solid_rim_antialiased_outside_clear() {
+        let (w, h) = (16u32, 16u32);
+        let mut buf = scratch(w, h);
+        let mut c = Canvas::new(&mut buf, w, h, w * 4);
+        // A disc centered at (8,8) radius 5, opaque white.
+        c.fill_circle(8.0, 8.0, 5.0, 0xffffffff);
+        // Degenerate / off-screen circles are no-ops and must not panic — run them now (the canvas
+        // holds the mutable borrow) so the pixel reads below prove they changed nothing.
+        c.fill_circle(8.0, 8.0, 0.0, 0xffff0000); // r == 0
+        c.fill_circle(8.0, 8.0, -3.0, 0xffff0000); // r < 0
+        c.fill_circle(100.0, 100.0, 5.0, 0xffff0000); // off-screen
+        // The center is fully inside → full coverage (and untouched by the no-ops).
+        assert_eq!(px(&buf, w * 4, 8, 8) >> 24, 255, "center solid");
+        // A pixel far outside the disc is untouched.
+        assert_eq!(px(&buf, w * 4, 0, 0), 0, "far outside clear");
+        assert_eq!(px(&buf, w * 4, 15, 15), 0, "far corner clear");
+        // A rim pixel (near dist == r) has intermediate coverage — the AA soft edge. At (13,8) the
+        // center distance is ~5, so coverage tapers to a softened alpha.
+        let rim = px(&buf, w * 4, 13, 8) >> 24;
+        assert!(rim < 255, "rim pixel should be softened, got {rim:#x}");
     }
 
     #[test]
