@@ -90,6 +90,13 @@ pub struct WaylandVideoSink {
     /// The window↔app control channel (clicks → pause/seek; duration/paused → HUD). Set by the
     /// player; `None` = display-only (no interactive controls).
     control: Option<Arc<crate::control::PlayerControl>>,
+    /// Pump-tick counter (throttles the HUD redraw, which runs far faster than the video rate).
+    pumps: u64,
+    /// The pause state the HUD was last drawn at — a change forces an immediate glyph redraw
+    /// (don't wait for the throttle) so play/pause feels instant.
+    hud_paused: bool,
+    /// `Quit` was pushed to the control channel on window close — once only.
+    quit_sent: bool,
 }
 
 /// One decoded PGS caption + its on-screen span.
@@ -118,6 +125,9 @@ impl WaylandVideoSink {
             frames: 0,
             subtitle: None,
             control: None,
+            pumps: 0,
+            hud_paused: false,
+            quit_sent: false,
         }
     }
 
@@ -140,8 +150,12 @@ impl WaylandVideoSink {
             return Ok(());
         };
         let preroll = std::mem::take(&mut self.preroll_next);
+        let pos_ns = pts.nanos().unwrap_or(0);
         if !preroll {
-            match ctx.wait_until(pts) {
+            // Pump the window *throughout* the clock wait (and while paused) — input, HUD,
+            // close and resize stay live instead of freezing until the next frame. `self` and
+            // `ctx` are disjoint borrows, so the pump closure can hold `&mut self`.
+            match ctx.wait_until_pumping(pts, &mut || self.pump_window(pos_ns)) {
                 WaitOutcome::Reached => {}
                 WaitOutcome::Interrupted => return Ok(()),
             }
@@ -211,66 +225,12 @@ impl WaylandVideoSink {
         match present {
             Ok(()) => {
                 self.frames = self.frames.wrapping_add(1);
-                let n = self.frames;
-                let channel = self.channel.clone();
-                let control = self.control.clone();
-                let pos_ns = pts.nanos().unwrap_or(0);
-                let mut close = false;
-                // Pump window events, free compositor-released surfaces (deferred token release),
-                // route HUD clicks to pause/seek, refresh the overlay, and show/clear the caption.
-                // Destructure `self` so `window` and `subtitle` are borrowed disjointly.
-                {
-                    let Self { window, subtitle, .. } = self;
-                    if let Some(w) = window.as_mut() {
-                        let _ = w.dispatch(false);
-                        if let Some(ch) = &channel {
-                            while let Some(tok) = w.next_released_token() {
-                                ch.release(tok);
-                            }
-                        }
-                        // Route left-clicks: the timeline area → seek, elsewhere → pause toggle.
-                        if let Some(ctrl) = &control {
-                            let (ww, wh) = w.size();
-                            while let Some((cx, cy)) = w.take_click() {
-                                if cy >= wh - BAR_H && cx >= TRACK_X && cx <= ww - TRACK_PAD {
-                                    let tw = (ww - TRACK_X - TRACK_PAD).max(1);
-                                    let frac = ((cx - TRACK_X) as f32 / tw as f32).clamp(0.0, 1.0);
-                                    ctrl.push(crate::control::UiCommand::SeekFraction(frac));
-                                } else {
-                                    ctrl.push(crate::control::UiCommand::TogglePause);
-                                }
-                            }
-                        }
-                        if w.has_gui() && n % 6 == 0 {
-                            let (ww, wh) = w.size();
-                            let (dur_ns, paused) = control
-                                .as_ref()
-                                .map(|c| (c.duration_ns(), c.paused()))
-                                .unwrap_or((0, false));
-                            let hud = Hud { width: ww, pos_ns, dur_ns, paused };
-                            let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, &hud));
-                        }
-                        match subtitle.as_ref().filter(|c| pts >= c.start && pts < c.end) {
-                            Some(c) => {
-                                let ds = &c.ds;
-                                let _ = w.present_subtitle(
-                                    ds.video_width as i32,
-                                    ds.video_height as i32,
-                                    ds.x as i32,
-                                    ds.y as i32,
-                                    ds.width as i32,
-                                    ds.height as i32,
-                                    &ds.rgba,
-                                );
-                            }
-                            None => {
-                                let _ = w.hide_subtitle();
-                            }
-                        }
-                        close = w.should_close();
-                    }
-                }
-                if close {
+                // Refresh the window once for this freshly-presented frame: release the surfaces
+                // the compositor just finished with, redraw the HUD/caption, route any clicks.
+                self.pump_window(pos_ns);
+                // The user closed the window (button / Esc / q): stop presenting locally. The
+                // pump has already pushed `Quit` to the app so the whole pipeline unwinds.
+                if self.window.as_ref().is_some_and(|w| w.should_close()) {
                     self.on_close(ctx);
                 }
             }
@@ -286,6 +246,77 @@ impl WaylandVideoSink {
             }
         }
         Ok(())
+    }
+
+    /// One unit of window upkeep, decoupled from the video rate — run every clock-wait slice
+    /// (so the window stays live between frames and while paused) and once per presented frame:
+    /// pump the socket, free compositor-released decoder surfaces, re-letterbox on resize, route
+    /// clicks to pause/seek, signal `Quit` on close, and refresh the HUD + caption. `pos_ns` is
+    /// the running position to show. All hits are throttled/idempotent, so calling this at the
+    /// ~8 ms slice rate is cheap. No `ctx` — nothing here needs the scheduler.
+    fn pump_window(&mut self, pos_ns: u64) {
+        let Self { window, subtitle, channel, control, pumps, hud_paused, quit_sent, .. } = self;
+        let Some(w) = window.as_mut() else { return };
+        *pumps = pumps.wrapping_add(1);
+        let _ = w.dispatch(false);
+        // Deferred token release: hand back the surfaces the compositor is done sampling.
+        if let Some(ch) = channel.as_ref() {
+            while let Some(tok) = w.next_released_token() {
+                ch.release(tok);
+            }
+        }
+        // A resize while paused draws no new frame — re-fit the retained one here.
+        let _ = w.reflow();
+        // Route left-clicks: the timeline rail → seek, elsewhere → pause toggle.
+        if let Some(ctrl) = control.as_ref() {
+            let (ww, wh) = w.size();
+            while let Some((cx, cy)) = w.take_click() {
+                if cy >= wh - BAR_H && cx >= TRACK_X && cx <= ww - TRACK_PAD {
+                    let tw = (ww - TRACK_X - TRACK_PAD).max(1);
+                    let frac = ((cx - TRACK_X) as f32 / tw as f32).clamp(0.0, 1.0);
+                    ctrl.push(crate::control::UiCommand::SeekFraction(frac));
+                } else {
+                    ctrl.push(crate::control::UiCommand::TogglePause);
+                }
+            }
+            // Window close → tell the app to quit (once); the pipeline stop unwinds everything.
+            if w.should_close() && !*quit_sent {
+                ctrl.push(crate::control::UiCommand::Quit);
+                *quit_sent = true;
+            }
+        }
+        // HUD: throttle to a fraction of the pump rate, but redraw at once on a pause-state flip.
+        if w.has_gui() {
+            let (dur_ns, paused) = control
+                .as_ref()
+                .map(|c| (c.duration_ns(), c.paused()))
+                .unwrap_or((0, false));
+            if paused != *hud_paused || *pumps % 8 == 0 {
+                *hud_paused = paused;
+                let (ww, wh) = w.size();
+                let hud = Hud { width: ww, pos_ns, dur_ns, paused };
+                let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, &hud));
+            }
+        }
+        // Show / clear the caption for the current position.
+        let pts = Timestamp::from_nanos(pos_ns);
+        match subtitle.as_ref().filter(|c| pts >= c.start && pts < c.end) {
+            Some(c) => {
+                let ds = &c.ds;
+                let _ = w.present_subtitle(
+                    ds.video_width as i32,
+                    ds.video_height as i32,
+                    ds.x as i32,
+                    ds.y as i32,
+                    ds.width as i32,
+                    ds.height as i32,
+                    &ds.rgba,
+                );
+            }
+            None => {
+                let _ = w.hide_subtitle();
+            }
+        }
     }
 
     /// Take the frame for `token` from the channel (if wired + arrived).

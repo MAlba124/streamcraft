@@ -639,6 +639,52 @@ impl Ctx {
         }
     }
 
+    /// [`wait_until`](Self::wait_until) with a **pump callback**: `pump` is invoked once per
+    /// wait slice — and kept running *while the pipeline is paused* — so a windowed sink can
+    /// keep its display alive (dispatch input, refresh the HUD, answer close/resize) instead of
+    /// freezing on the clock. `wait_until`'s pause branch parks silently until resume; that is
+    /// right for a device sink but leaves an interactive window dead. Same return contract; the
+    /// pump must be cheap and non-blocking. `pump` still runs (once) on the unclocked fast path.
+    pub fn wait_until_pumping(&self, running: Timestamp, pump: &mut dyn FnMut()) -> WaitOutcome {
+        let Some(c) = &self.clock else {
+            pump();
+            return WaitOutcome::Reached;
+        };
+        // A shorter slice than the plain wait: the window's input/redraw latency is this tick.
+        const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(8);
+        let entry_gen = self.seek_gen();
+        let wait = c.new_wait();
+        loop {
+            pump();
+            if self.seek_gen() != entry_gen {
+                return WaitOutcome::Interrupted;
+            }
+            if let Some(p) = &self.pause {
+                if p.stopped() {
+                    return WaitOutcome::Interrupted;
+                }
+            }
+            let deadline = crate::time::deadline(self.base_raw(), running, self.path_latency);
+            let now = c.now();
+            if deadline.is_some() && now >= deadline {
+                // Deadline reached. If paused, DON'T render (pause is a clock op) — keep pumping
+                // the window at the slice rate until resume / stop / seek. Unlike `wait_until`,
+                // we never call `block_while_paused` (which would suspend the pump).
+                if let Some(p) = &self.pause {
+                    if p.maybe_paused() && p.is_paused() {
+                        std::thread::sleep(WAIT_SLICE);
+                        continue;
+                    }
+                }
+                return WaitOutcome::Reached;
+            }
+            match wait.wait_ticked(deadline, WAIT_SLICE) {
+                crate::clock::TickedOutcome::Interrupted => return WaitOutcome::Interrupted,
+                crate::clock::TickedOutcome::Reached | crate::clock::TickedOutcome::Tick => {}
+            }
+        }
+    }
+
     /// The current value of one of this element's declared properties, by name (spec:
     /// Dynamic element properties). `None` while never set — fall back to the
     /// constructor value — and for a name not in `desc().props`. A lock-free seqlock

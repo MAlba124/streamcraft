@@ -105,6 +105,11 @@ pub struct Window {
     /// The video's current on-screen rect (the letterbox fit), so a caption places relative to
     /// it. Updated every [`present_dmabuf`](Self::present_dmabuf).
     fit: (i32, i32, i32, i32),
+    /// The last presented video frame's geometry — viewport source `(crop_x, crop_y, disp_w,
+    /// disp_h)` and coded `(w, h)` — so [`reflow`](Self::reflow) can re-letterbox on a resize
+    /// while paused (no new frame arrives to drive `present_dmabuf`). `(0,0,0,0)` = none yet.
+    last_src: (i32, i32, i32, i32),
+    last_coded: (i32, i32),
     // Geometry (compositor-configured; falls back to the requested default until then).
     width: i32,
     height: i32,
@@ -211,6 +216,8 @@ impl Window {
             sub_place: (i32::MIN, i32::MIN, 0, 0),
             sub_visible: false,
             fit: (0, 0, 0, 0),
+            last_src: (0, 0, 0, 0),
+            last_coded: (0, 0),
             width,
             height,
             configured: false,
@@ -393,6 +400,8 @@ impl Window {
             (0, 0, win_w, win_h)
         };
         self.fit = (fit_x, fit_y, fit_w, fit_h); // remembered for subtitle placement
+        self.last_src = (v.crop_x, v.crop_y, v.disp_w, v.disp_h); // remembered for reflow-on-resize
+        self.last_coded = (v.coded_w, v.coded_h);
 
         // Crop the coded surface to the display rect and scale it to the fit size.
         self.ensure_viewport(target);
@@ -432,6 +441,51 @@ impl Window {
             self.bg_w = win_w;
             self.bg_h = win_h;
         }
+        self.conn.flush()
+    }
+
+    /// Re-letterbox the **last** video frame for the current window size — without a new frame.
+    /// [`present_dmabuf`](Self::present_dmabuf) already re-fits on resize, but only when a frame
+    /// arrives; while paused none does, so a resize would otherwise leave the video at the old
+    /// size until resume. The sink calls this from its pump. The compositor still holds the last
+    /// committed dmabuf `wl_buffer`, so re-issuing the viewport + subsurface position and
+    /// re-committing the video surface rescales it in place. No-op with no frame yet, without
+    /// subcompositor/viewporter, or when the size is unchanged since the last fit.
+    pub fn reflow(&mut self) -> io::Result<()> {
+        let (_, _, disp_w, disp_h) = self.last_src;
+        if disp_w == 0 || self.video_subsurface == 0 || self.subcompositor == 0 || self.viewporter == 0 {
+            return Ok(());
+        }
+        let (win_w, win_h) = (self.width.max(1), self.height.max(1));
+        if self.bg_w == win_w && self.bg_h == win_h {
+            return Ok(()); // no resize since the last present / reflow
+        }
+        let (fit_x, fit_y, fit_w, fit_h) = letterbox(disp_w.max(1), disp_h.max(1), win_w, win_h);
+        self.fit = (fit_x, fit_y, fit_w, fit_h);
+        // Rescale the retained buffer: same viewport source, new destination.
+        if self.viewport != 0 {
+            let (cx, cy) = (self.last_src.0, self.last_src.1);
+            self.conn
+                .request(self.viewport, p::viewport::SET_SOURCE)
+                .fixed(fx(cx))
+                .fixed(fx(cy))
+                .fixed(fx(disp_w))
+                .fixed(fx(disp_h))
+                .finish();
+            self.conn
+                .request(self.viewport, p::viewport::SET_DESTINATION)
+                .i32(fit_w.max(1))
+                .i32(fit_h.max(1))
+                .finish();
+        }
+        self.conn.request(self.video_surface, p::surface::COMMIT).finish();
+        // Repaint the black bars and re-place the video subsurface, then apply via a root commit.
+        self.render_background(win_w, win_h)?;
+        let sub = self.video_subsurface;
+        self.conn.request(sub, p::subsurface::SET_POSITION).i32(fit_x).i32(fit_y).finish();
+        self.conn.request(self.surface, p::surface::COMMIT).finish();
+        self.bg_w = win_w;
+        self.bg_h = win_h;
         self.conn.flush()
     }
 

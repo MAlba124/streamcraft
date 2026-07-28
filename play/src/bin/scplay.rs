@@ -215,6 +215,8 @@ fn install_stdin_controls(player: &mut Player) {
     let tap = player.pipeline.tap_handle();
     let index = player.seek_index().clone();
     let duration = player.duration().unwrap_or(Timestamp::NONE);
+    // Mirror the pause state into the window HUD (if any) so its glyph tracks stdin pauses too.
+    let control = player.player_control();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut line = String::new();
@@ -226,6 +228,9 @@ fn install_stdin_controls(player: &mut Player) {
             match line.trim() {
                 "p" => {
                     let paused = pause.toggle();
+                    if let Some(c) = &control {
+                        c.set_paused(paused);
+                    }
                     println!("{}", if paused { "⏸ paused" } else { "▶ playing" });
                 }
                 "q" => {
@@ -277,6 +282,9 @@ fn install_window_controls(player: &mut Player) {
     let duration = player.duration().unwrap_or(Timestamp::NONE);
     control.set_duration_ns(duration.nanos().unwrap_or(0));
     std::thread::spawn(move || loop {
+        // Coalesce a burst of seeks (a click-drag / rapid clicks) into one: acting on every
+        // fraction would flush + re-preroll N times and thrash. Pause/quit act immediately.
+        let mut seek_to: Option<f32> = None;
         for cmd in control.drain() {
             match cmd {
                 sc_present::UiCommand::TogglePause => {
@@ -287,15 +295,15 @@ fn install_window_controls(player: &mut Player) {
                     stop.stop();
                     return;
                 }
-                sc_present::UiCommand::SeekFraction(f) => {
-                    let Some(dur) = duration.nanos() else { continue };
-                    let target = Timestamp((dur as f64 * f as f64) as u64);
-                    if let Some((byte, landed)) = index.resolve(target, duration) {
-                        seek.seek(byte, landed);
-                    }
-                }
+                sc_present::UiCommand::SeekFraction(f) => seek_to = Some(f),
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        if let (Some(f), Some(dur)) = (seek_to, duration.nanos()) {
+            let target = Timestamp((dur as f64 * f as f64) as u64);
+            if let Some((byte, landed)) = index.resolve(target, duration) {
+                seek.seek(byte, landed);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     });
 }
