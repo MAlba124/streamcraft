@@ -156,21 +156,29 @@ impl WaylandVideoSink {
             crop_y: frame.crop_y as i32,
             disp_w: frame.disp_w as i32,
             disp_h: frame.disp_h as i32,
+            token: header.token,
         };
         let present = window.present_dmabuf(&video);
-        // The compositor now holds its own dmabuf references (the buffer was created), so our
-        // dup'd fds can go; then release the token — the decoder may reuse the surface.
+        // The compositor took its own dmabuf references at import, so our dup'd fds can go. The
+        // frame's TOKEN is now held by the presenter (with the wl_buffer) and released back only
+        // when the compositor is done sampling it — NOT here — so the decoder can't overwrite a
+        // surface mid-scanout (the anti-tear fix for stale/torn frames).
         frame.close_fds();
-        self.release(header.token);
         match present {
             Ok(()) => {
                 self.frames = self.frames.wrapping_add(1);
                 let n = self.frames;
-                // Pump window events (close/ping/release-recycle) without blocking the graph,
-                // and refresh the GUI overlay at ~1/6 the video rate (a wl_subsurface the
-                // compositor blends over the video — decoupled from the frame cadence).
+                let channel = self.channel.clone();
+                // Pump window events (close/ping/buffer-release) without blocking the graph,
+                // free the surfaces the compositor just released (deferred token release), and
+                // refresh the GUI overlay at ~1/6 the video rate (a decoupled wl_subsurface).
                 if let Some(w) = self.window.as_mut() {
                     let _ = w.dispatch(false);
+                    if let Some(ch) = &channel {
+                        while let Some(tok) = w.next_released_token() {
+                            ch.release(tok);
+                        }
+                    }
                     if w.has_gui() && n % 6 == 0 {
                         let (ww, wh) = w.size();
                         let _ = w.present_gui(0, wh - BAR_H, ww, BAR_H, |c| draw_controls(c, ww, n));
@@ -181,6 +189,8 @@ impl WaylandVideoSink {
                 }
             }
             Err(e) => {
+                // Never shown → free the surface now so the decoder is not starved.
+                self.release(header.token);
                 let element = ctx.element();
                 ctx.post(BusMessage::Warning {
                     element,

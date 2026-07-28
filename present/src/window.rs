@@ -91,8 +91,15 @@ pub struct Window {
     // Lifecycle.
     configured: bool,
     closed: bool,
-    /// The dmabuf `wl_buffer`s in flight, awaiting `release` (video path).
-    dmabuf_inflight: Vec<u32>,
+    /// The dmabuf `wl_buffer`s in flight as `(buffer id, frame token)`, awaiting the compositor's
+    /// `wl_buffer.release`. The token is the decoder's surface handle — NOT released back to the
+    /// decoder until `release` fires, so the VA surface stays pinned until the compositor is done
+    /// sampling it (the anti-tear contract; releasing early lets the decoder overwrite a surface
+    /// mid-scanout → torn / stale frames).
+    dmabuf_inflight: Vec<(u32, u64)>,
+    /// Tokens whose `wl_buffer` the compositor just released — the sink drains these
+    /// ([`next_released_token`](Self::next_released_token)) to free the decoder's surfaces.
+    released_tokens: Vec<u64>,
     /// The recycling software-render buffer pool.
     pool: Vec<ShmBuffer>,
 }
@@ -178,6 +185,7 @@ impl Window {
             configured: false,
             closed: false,
             dmabuf_inflight: Vec::new(),
+            released_tokens: Vec::new(),
             pool: Vec::new(),
             conn,
         };
@@ -379,7 +387,8 @@ impl Window {
             .i32(v.coded_h)
             .finish();
         self.conn.request(target, p::surface::COMMIT).finish();
-        self.dmabuf_inflight.push(buffer);
+        // Hold the token with this buffer; released back to the decoder on wl_buffer.release.
+        self.dmabuf_inflight.push((buffer, v.token));
 
         // First frame / resize: (re)paint the black background + (re)position the video
         // subsurface, then commit the root to apply the placement (and map it all together).
@@ -469,6 +478,12 @@ impl Window {
     /// Whether the compositor can import dmabuf video (else the caller must fall back to shm).
     pub fn has_dmabuf(&self) -> bool {
         self.dmabuf != 0
+    }
+
+    /// Pop a frame token the compositor has finished with (its `wl_buffer` was released). The
+    /// sink drains these after each [`dispatch`](Self::dispatch) to free the decoder's surfaces.
+    pub fn next_released_token(&mut self) -> Option<u64> {
+        self.released_tokens.pop()
     }
 
     /// Lazily create `surface`'s `wp_viewport` (once), if the compositor has viewporter.
@@ -615,8 +630,11 @@ impl Window {
             // A pool buffer (recycle) or an in-flight dmabuf buffer (destroy) was released.
             if let Some(b) = self.pool.iter_mut().find(|b| b.buffer == obj) {
                 b.busy = false;
-            } else if let Some(pos) = self.dmabuf_inflight.iter().position(|&b| b == obj) {
-                self.dmabuf_inflight.swap_remove(pos);
+            } else if let Some(pos) = self.dmabuf_inflight.iter().position(|&(b, _)| b == obj) {
+                // The compositor is done sampling this dmabuf: destroy the wl_buffer and hand
+                // its token back so the sink frees the decoder's surface (anti-tear).
+                let (_, token) = self.dmabuf_inflight.swap_remove(pos);
+                self.released_tokens.push(token);
                 self.conn.request(obj, p::buffer::DESTROY).finish();
             }
         } else if obj == DISPLAY_ID && op == p::display::EV_ERROR {
@@ -658,6 +676,10 @@ pub struct DmabufVideo<'a> {
     pub crop_y: i32,
     pub disp_w: i32,
     pub disp_h: i32,
+    /// The decoder's frame token (surface handle). The presenter holds it until the compositor
+    /// releases the imported `wl_buffer`, then hands it back via
+    /// [`Window::next_released_token`] so the sink frees the decoder's surface (anti-tear).
+    pub token: u64,
 }
 
 /// Integer → `wl_fixed` (24.8) for the viewport source rect.
