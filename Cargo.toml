@@ -2,7 +2,7 @@
 resolver = "2"
 exclude = [
     # Vendored oxideav-h264 0.1.7 + the RefPicStore eviction fix (see
-    # vendor/oxideav-h264/STREAMCRAFT-PATCHES.md); wired via [patch.crates-io].
+    # vendor/oxideav-h264/PROFLUENS-PATCHES.md); wired via [patch.crates-io].
     "vendor/oxideav-h264",
     "vendor/oxideav-aac",
     "vendor/oxideav-vp8",
@@ -46,7 +46,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/MAlba124/streamcraft"
+repository = "https://github.com/MAlba124/profluens"
 
 [profile.release]
 # Thin LTO: the adopted decoders (oxideav-*) are allocation- and call-heavy;
@@ -63,15 +63,21 @@ debug = true
 [patch.crates-io]
 # Upstream 0.1.7 leaks every reference picture: RefPicStore has insert() and no
 # eviction, so playback grows ~35 MB/s until OOM. Vendored with a minimal
-# retain_keys sweep (documented in vendor/oxideav-h264/STREAMCRAFT-PATCHES.md,
+# retain_keys sweep (documented in vendor/oxideav-h264/PROFLUENS-PATCHES.md,
 # to be offered upstream).
 oxideav-h264 = { path = "vendor/oxideav-h264" }
 # Upstream 0.1.6 computes the IMDCT as a naive O(N²) sum with a libm cos()
 # per term (~40% of a playback process's CPU; audio couldn't hold realtime).
-# Vendored with a Chebyshev-recurrence patch (STREAMCRAFT-PATCHES.md).
+# Vendored with a Chebyshev-recurrence patch (PROFLUENS-PATCHES.md).
 oxideav-aac = { path = "vendor/oxideav-aac" }
 # Upstream 0.2.6's bool decoder errors instead of feeding the implicit zero
 # bytes real encoders' partition tails rely on (libvpx bool_decoder_fill
 # semantics) — ~30% of Intel-iHD-encoded frames failed at the last macroblock.
-# Vendored with a bounded virtual-zero-padding patch (STREAMCRAFT-PATCHES.md).
+# Vendored with a bounded virtual-zero-padding patch (PROFLUENS-PATCHES.md).
 oxideav-vp8 = { path = "vendor/oxideav-vp8" }
+# oxideav-opus (git master, pinned in opus/Cargo.toml) calls oxideav-core APIs
+# (CodecInfo::payload_magic, RuntimeContext, register!) that only exist in core's git
+# master (0.1.34), not the published 0.1.x. Pin core to the same master rev. 0.1.34
+# satisfies every crate's `oxideav-core = "0.1"`, so mp3/vp8/vendored are unaffected
+# (verified: they build against it). Drop this once oxideav-opus + a matching core publish.
+oxideav-core = { git = "https://github.com/OxideAV/oxideav-core", rev = "052e281831d56699168a554ee7fed156a9a97a92" }

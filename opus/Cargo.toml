@@ -1,17 +1,23 @@
 [package]
-name = "sc-opus"
-description = "Opus (RFC 6716) codec plugin for streamcraft — stub; oxideav-opus 0.0.13 rejected on conformance (see src/lib.rs), pending a publishable version"
+name = "pf-opus"
+description = "Opus (RFC 6716) codec plugin for profluens, backed by the pure-Rust oxideav-opus (git master — the working decoder+encoder the published 0.0.13 scaffold lacks)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_opus"
+name = "pf_opus"
 
 [dependencies]
-streamcraft-core = { path = "../core" }
-# oxideav-opus is intentionally NOT a dependency: the published 0.0.13 does not
-# decode Opus (RFC 6716 test vectors score ≤ 0 dB SNR; CELT/hybrid emit silence,
-# SILK emits noise). See src/lib.rs for the full evaluation and the turnkey
-# re-vetting path once a working version publishes.
+profluens-core = { path = "../core" }
+# Pure-Rust Opus, the one sanctioned kind of plugin dependency (like oxideav-mp3 for
+# pf-mp3): no build.rs, no unsafe, MIT, RFC 6716/7845-annotated. The *published* 0.0.13
+# is an "orphan-rebuild scaffold" that decodes real Opus to silence/noise (see src/lib.rs
+# history), so we pin git master — the working clean-room decoder + encoder — by rev.
+# Its only dependency is oxideav-core (no serde_json, unlike the other OxideAV crates).
+oxideav-opus = { git = "https://github.com/OxideAV/oxideav-opus", rev = "f7dd682d049864d0f12592a90d41af5bedb26823" }
+
+[dev-dependencies]
+# Conformance gate: decode RFC 6716 test vectors and cross-check an ffmpeg/libopus oracle.
+profluens-elements = { path = "../elements" }
