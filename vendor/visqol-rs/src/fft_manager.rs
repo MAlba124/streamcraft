@@ -3,14 +3,22 @@ use crate::math_utils;
 use num::complex::Complex64;
 use num::Zero;
 use rustfft::FftPlanner;
+use std::cell::RefCell;
 
 // Constants
 const MIN_FFT_SIZE: usize = 32;
 
+thread_local! {
+    /// Per-thread shared FFT planner. `rustfft` caches each transform size's plan inside the
+    /// planner, so reusing one planner across every `FftManager` means a given size's plan is built
+    /// once per thread instead of rebuilt on each construction — the per-`FftManager::new` planner
+    /// was ~38K plan-building allocations/song in the alignment path. Thread-local (not a global
+    /// mutex) so the parallel search threads never contend.
+    static PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::<f64>::new());
+}
+
 /// Wrapper around the `rustfft` library to perform basic fft operations.
 pub struct FftManager {
-    /// Planner to perform fft operations
-    planner: FftPlanner<f64>,
     /// Length of the fft
     pub fft_size: usize,
     /// Scale factor to apply after inverse fft
@@ -25,7 +33,6 @@ impl FftManager {
         let fft_size = math_utils::next_pow_two(samples_per_channel).max(MIN_FFT_SIZE);
 
         Self {
-            planner: FftPlanner::<f64>::new(),
             fft_size,
             samples_per_channel,
             inverse_fft_scale: 1.0f64 / (fft_size as f64),
@@ -38,7 +45,7 @@ impl FftManager {
         time_channel: &mut Vec<f64>,
         freq_channel: &mut [Complex64],
     ) {
-        let real_to_complex = self.planner.plan_fft_forward(self.fft_size);
+        let real_to_complex = PLANNER.with(|p| p.borrow_mut().plan_fft_forward(self.fft_size));
         if time_channel.len() == self.fft_size {
             let mut complex_time_domain =
                 audio_utils::float_vec_to_real_valued_complex_vec(time_channel);
@@ -69,7 +76,7 @@ impl FftManager {
         freq_channel: &mut [Complex64],
         time_channel: &mut Vec<f64>,
     ) {
-        let complex_to_real = self.planner.plan_fft_inverse(self.fft_size);
+        let complex_to_real = PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(self.fft_size));
 
         if time_channel.len() == self.fft_size {
             let mut scratch_buffer =
