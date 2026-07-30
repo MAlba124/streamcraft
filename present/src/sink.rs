@@ -12,22 +12,22 @@
 
 use std::sync::Arc;
 
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::clock::WaitOutcome;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::bus::BusMessage;
+use profluens_core::clock::WaitOutcome;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
-use sc_text::pgs;
-use sc_vaapi::gpuframe::{GpuFrame, GpuFrameChannel, GpuFrameHeader, GPU_OFFER};
+use pf_text::pgs;
+use pf_vaapi::gpuframe::{GpuFrame, GpuFrameChannel, GpuFrameHeader, GPU_OFFER};
 
 use crate::window::{DmabufVideo, Plane, Window};
 
@@ -36,7 +36,7 @@ const VIDEO: PadId = PadId(0);
 const SUBTITLE: PadId = PadId(1);
 
 static VIDEO_OFFERS: [OfferDesc; 1] = [GPU_OFFER];
-static SUB_OFFERS: [OfferDesc; 1] = [OfferDesc::any(sc_text::BITMAP_FAMILY)];
+static SUB_OFFERS: [OfferDesc; 1] = [OfferDesc::any(pf_text::BITMAP_FAMILY)];
 static PADS: [PadDesc; 2] = [
     PadDesc {
         name: "sink",
@@ -150,7 +150,7 @@ impl WaylandVideoSink {
 
         // Open the window on the first real frame, sized to the display geometry.
         if self.window.is_none() {
-            match Window::open("streamcraft", header.disp_w.max(1) as i32, header.disp_h.max(1) as i32) {
+            match Window::open("profluens", header.disp_w.max(1) as i32, header.disp_h.max(1) as i32) {
                 Ok(w) => {
                     if !w.has_dmabuf() {
                         log!(&*ctx, Level::Warn, "no_dmabuf", note = "compositor lacks zwp_linux_dmabuf_v1");
@@ -291,7 +291,7 @@ impl Element for WaylandVideoSink {
         Ok(())
     }
 
-    fn process(&mut self, ctx: &mut Ctx, _inputs: streamcraft_core::batch::Inputs<'_>) -> Result<Flow, Error> {
+    fn process(&mut self, ctx: &mut Ctx, _inputs: profluens_core::batch::Inputs<'_>) -> Result<Flow, Error> {
         // Subtitle side-input first: update the current caption before this pass's frames (so a
         // caption landing in the same batch as its first video frame is already visible). A
         // malformed bitmap is dropped — untrusted peer data never panics.

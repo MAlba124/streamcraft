@@ -2,7 +2,7 @@
 //! dynamic caps). AV1 temporal units arrive on the sink pad — **one temporal unit
 //! per buffer**, the container contract (Matroska `V_AV1`, an ISOBMFF `av01` sample,
 //! one IVF record) — and raw video leaves on the src pad, one frame per buffer,
-//! planes packed Y then U then V (the `video/raw` layout the streamcraft-video
+//! planes packed Y then U then V (the `video/raw` layout the profluens-video
 //! helpers describe).
 //!
 //! Frame dimensions and the pixel format live in the sequence / frame headers, not in
@@ -25,28 +25,28 @@
 
 use oxideav_av1::decoder::{SpecDecodeSession, SpecFrame};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_video::color;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_video::color;
+use profluens_core::time::Timestamp;
 
 // `video/raw` family/field/value names. Kept as literals (not a dep on
-// streamcraft-video) so sc-av1 stays core-only, exactly as sc-vp8 does for
+// profluens-video) so pf-av1 stays core-only, exactly as pf-vp8 does for
 // `video/raw`; the pipeline interns by string, so the ids line up with any video
 // peer using the same names.
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";
 const F_HEIGHT: &str = "height";
 const F_PIXFMT: &str = "pixfmt";
-// The two AV1 8-bit output shapes streamcraft-video's vocabulary can name (see the
+// The two AV1 8-bit output shapes profluens-video's vocabulary can name (see the
 // crate docs' capability table): planar 4:2:0 (Y,U,V) and monochrome (Y only).
 const PIXFMT_I420: &str = "i420";
 const PIXFMT_GRAY8: &str = "gray8";
@@ -64,7 +64,7 @@ static SRC_FIELDS: [FieldDesc; 7] = [
     FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_PIXFMT, allowed: ConstraintDesc::Set(&PIXFMT_VALUES), preferred: None },
-    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via streamcraft-video's
+    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via profluens-video's
     // color vocab): announced only when the demuxer declared it upstream.
     FieldDesc { field: color::FIELD_MATRIX, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: color::FIELD_RANGE, allowed: ConstraintDesc::Any, preferred: None },
@@ -326,7 +326,7 @@ impl Element for Av1Dec {
 /// Colorimetry passthrough (spec: Formats — dynamic caps): forward the container's
 /// announced colour fields from the negotiated sink format onto `video/raw`, names
 /// re-anchored to `'static` through the closed color vocabulary (ITU-T H.273 via
-/// `streamcraft_video::color`). Absent/unknown fields stay unannounced — the
+/// `profluens_video::color`). Absent/unknown fields stay unannounced — the
 /// renderer defaults by resolution.
 fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDesc)>) {
     let Some(fmt) = ctx.negotiated(pad) else { return };
@@ -339,7 +339,7 @@ fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDe
     ];
     for (field, statify) in table {
         let Some(fid) = ctx.field_id(field) else { continue };
-        let Some(streamcraft_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
+        let Some(profluens_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
         let Some(stat) = ctx.value_name(vid).and_then(statify) else { continue };
         out.push((field, ValueDesc::Id(stat)));
     }

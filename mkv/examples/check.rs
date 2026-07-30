@@ -3,11 +3,11 @@
 //! tracks), and report timestamps/keyframes/anomalies — the whole file, bounded
 //! memory, unlike a player's opaque "corrupt file detected".
 //!
-//!     cargo run -p sc-mkv --example check -- file.mkv
+//!     cargo run -p pf-mkv --example check -- file.mkv
 
 use std::io::Read;
 
-use sc_mkv::MatroskaReader;
+use pf_mkv::MatroskaReader;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: check <file.mkv>");

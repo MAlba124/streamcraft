@@ -1,13 +1,13 @@
 [package]
-name = "sc-http"
-description = "Hand-written HTTP/1.1 source plugin for streamcraft (https via rustls + graviola)"
+name = "pf-http"
+description = "Hand-written HTTP/1.1 source plugin for profluens (https via rustls + graviola)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_http"
+name = "pf_http"
 
 [dependencies]
 # TLS for `https://` only — the HTTP layer itself stays hand-written on std
@@ -20,14 +20,14 @@ rustls = { version = "0.23.42", default-features = false, features = ["std", "tl
 rustls-graviola = "0.4.0"
 # Kept a separate plugin so the TLS dependency never leaks into the framework
 # crates.
-streamcraft-core = { path = "../core" }
+profluens-core = { path = "../core" }
 
 [dev-dependencies]
-streamcraft-elements = { path = "../elements" }
+profluens-elements = { path = "../elements" }
 
 [features]
 default = []
 # Test-only: run the download integration tests against the hand-rolled io_uring
 # reactor (elements' `io-uring`), exercising the streaming `Recv` op (offset -1) on a
 # real socket fd. The library itself has no io_uring code — the reactor is injected.
-io-uring = ["streamcraft-elements/io-uring"]
+io-uring = ["profluens-elements/io-uring"]

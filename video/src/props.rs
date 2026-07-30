@@ -6,9 +6,9 @@
 //! keep the constructor value, so the typed [`VideoFormat`](crate::format::VideoFormat)
 //! constructor and the parse path share one refinement path.
 
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::format::Value;
-use streamcraft_core::time::Rational;
+use profluens_core::ctx::Ctx;
+use profluens_core::format::Value;
+use profluens_core::time::Rational;
 
 use crate::format::{PixelFormat, VideoFormat};
 

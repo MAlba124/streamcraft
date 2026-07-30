@@ -1,21 +1,21 @@
 [package]
-name = "sc-ac3"
-description = "Pure-Rust AC-3 (ATSC A/52) + E-AC-3 (Dolby Digital Plus) audio decoder plugin for streamcraft"
+name = "pf-ac3"
+description = "Pure-Rust AC-3 (ATSC A/52) + E-AC-3 (Dolby Digital Plus) audio decoder plugin for profluens"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_ac3"
+name = "pf_ac3"
 
 [dependencies]
-# Core only. Unlike sc-mp3 / sc-aac (which adopt a vetted third-party pure-Rust
+# Core only. Unlike pf-mp3 / pf-aac (which adopt a vetted third-party pure-Rust
 # codec), this crate is **hand-written clean-room from ATSC A/52** — no
 # oxideav-*, no libav. The decode core (frame.rs / imdct.rs / parse.rs) depends
 # on nothing but `std` + `core`; the two element wrappers depend on
-# streamcraft-core for the `Element` trait and the `audio/raw` vocabulary.
-streamcraft-core = { path = "../core" }
+# profluens-core for the `Element` trait and the `audio/raw` vocabulary.
+profluens-core = { path = "../core" }
 
 [dev-dependencies]
-streamcraft-elements = { path = "../elements" }
+profluens-elements = { path = "../elements" }

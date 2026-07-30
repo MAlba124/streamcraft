@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use oxideav_core::{Error as OxError, NullCodecResolver};
 
-use sc_mp4::Mp4Reader;
+use pf_mp4::Mp4Reader;
 
 /// Path to a committed fixture.
 fn fixture(name: &str) -> PathBuf {

@@ -1,11 +1,11 @@
 //! `udpsrc` — receives UDP datagrams into pooled buffers, one datagram per
-//! buffer (spec: IO; the sc-http source is the pattern).
+//! buffer (spec: IO; the pf-http source is the pattern).
 //!
 //! `start()` binds (and optionally connects) a [`std::net::UdpSocket`]
 //! synchronously, then hands the fd to the reactor exactly like `httpsrc`
 //! hands its TCP socket: `into_raw_fd` → `File::from_raw_fd` →
 //! `ctx.io().register`. `process()` drains completed
-//! [`OpKind::Recv`](streamcraft_core::io::OpKind::Recv) ops — **`read(2)` on a
+//! [`OpKind::Recv`](profluens_core::io::OpKind::Recv) ops — **`read(2)` on a
 //! UDP socket returns exactly one datagram per call** (truncating an oversized
 //! one, which pool slots ≫ MTU make moot), so each completion is pushed
 //! downstream as-is, boundaries intact. The ride is single-op like httpsrc's:
@@ -27,17 +27,17 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::io::{FileHandle, IoResult};
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::io::{FileHandle, IoResult};
+use profluens_core::time::Timestamp;
 
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("datagram")];
 

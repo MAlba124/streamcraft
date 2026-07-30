@@ -1,5 +1,5 @@
 //! Rough FLAC encoder throughput + compression benchmark. Run in release:
-//!   cargo run --release --example bench -p sc-flac
+//!   cargo run --release --example bench -p pf-flac
 //!
 //! Encodes a few synthetic signals and reports encode MB/s (of input PCM) and the
 //! compression ratio (encoded / raw). This is the "prove it at the highest level"
@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use sc_flac::{FlacDecoder, FlacEncoder, SampleFormat};
+use pf_flac::{FlacDecoder, FlacEncoder, SampleFormat};
 
 /// Synthesise `n` interchannel S16 samples into interleaved LE bytes.
 fn synth(kind: &str, n: usize, channels: u32) -> Vec<u8> {
@@ -60,7 +60,7 @@ fn bench(kind: &str, channels: u32, seconds: u32) {
         let mut frames = Vec::new();
         enc.encode_interleaved(&pcm, &mut frames).unwrap();
         let body = enc.finish();
-        encoded[sc_flac::streaminfo_offset()..sc_flac::streaminfo_offset() + body.len()]
+        encoded[pf_flac::streaminfo_offset()..pf_flac::streaminfo_offset() + body.len()]
             .copy_from_slice(&body);
         encoded.extend_from_slice(&frames);
     }

@@ -4,26 +4,26 @@
 //! framing (ISO/IEC 14496-3 §1.A.2.2) into the raw `raw_data_block()` AUs our
 //! demuxers deliver, synthesizes the matching 2-byte AudioSpecificConfig
 //! (§1.6.2.1) as the in-band head, and scores the decode against ffmpeg's own
-//! decode of the same stream by best-shift SNR (the `sc-mp3` conformance bar:
+//! decode of the same stream by best-shift SNR (the `pf-mp3` conformance bar:
 //! decoders differ by output delay, so alignment is searched, fidelity is
 //! scored).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use sc_aac::AacDec;
+use pf_aac::AacDec;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 // ---------- fixtures ----------
 
@@ -79,7 +79,7 @@ fn adts_to_aus(data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
     (asc, aus)
 }
 
-// ---------- test elements (the sc-mp3 harness shapes) ----------
+// ---------- test elements (the pf-mp3 harness shapes) ----------
 
 static BYTES_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 static SRC_PADS: [PadDesc; 1] = [PadDesc {

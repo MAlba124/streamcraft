@@ -544,7 +544,7 @@ pub struct Pipeline {
     counters: Vec<Arc<ElementCounters>>,
     last_report: Option<RunReport>,
     /// Programmatic log level (spec: Debuggability). `None` leaves the gate to
-    /// `STREAMCRAFT_DEBUG` alone; when neither is set, `run()` wires no logging at all
+    /// `PROFLUENS_DEBUG` alone; when neither is set, `run()` wires no logging at all
     /// (no channels, no drain thread) — the zero-overhead default that keeps the hot
     /// path clean when nobody is looking.
     log_level: Option<Level>,
@@ -574,7 +574,7 @@ pub struct Pipeline {
     clock_shared: Arc<Mutex<Arc<dyn Clock>>>,
     /// Verbosity rank for build-phase pipeline diagnostics (add/link/negotiation/
     /// clock/groups — spec: Debuggability, "framework internals log too"), from
-    /// `STREAMCRAFT_DEBUG` under the pseudo-target `pipeline` (or the bare global
+    /// `PROFLUENS_DEBUG` under the pseudo-target `pipeline` (or the bare global
     /// level). These happen before the per-element log channels are wired at
     /// `run()`, and are one-shot build operations — they write straight to stderr.
     build_log_rank: u8,
@@ -587,7 +587,7 @@ pub struct Pipeline {
     /// Latency tracing gate (spec: Debuggability): while set, the scheduler times
     /// `process()` calls, stamps ring pushes for residency measurement, and sinks
     /// record wait overshoot — into the per-element histograms a [`TapHandle`]
-    /// reads. Off (the default, unless `STREAMCRAFT_TRACE=1`) the streaming path
+    /// reads. Off (the default, unless `PROFLUENS_TRACE=1`) the streaming path
     /// pays one relaxed load per call. Toggle via [`set_tracing`](Self::set_tracing),
     /// live — it is read per pass.
     tracing: Arc<AtomicBool>,
@@ -609,7 +609,7 @@ pub struct Pipeline {
     dyn_pads: Vec<Vec<DynPad>>,
     /// The introspection server, if serving (spec: Introspection protocol). `None`
     /// until [`serve_introspection`](Self::serve_introspection) or the
-    /// `STREAMCRAFT_INTROSPECT` env attach in `run()`; dropping it shuts down.
+    /// `PROFLUENS_INTROSPECT` env attach in `run()`; dropping it shuts down.
     #[cfg(feature = "introspect")]
     introspect: Option<crate::introspect::IntrospectServer>,
 }
@@ -626,7 +626,7 @@ impl Pipeline {
         let base_shared = Arc::new(AtomicI64::new(crate::time::BASE_UNSET));
         let default_clock: Arc<dyn Clock> = Arc::new(InstantClock::new());
         let build_log_rank = {
-            let spec = std::env::var("STREAMCRAFT_DEBUG")
+            let spec = std::env::var("PROFLUENS_DEBUG")
                 .ok()
                 .map(|s| crate::log::DebugSpec::parse(&s))
                 .unwrap_or_default();
@@ -669,7 +669,7 @@ impl Pipeline {
             pause: PauseShared::new(base_shared, stop),
             initial_paused: false,
             tracing: Arc::new(AtomicBool::new(
-                std::env::var_os("STREAMCRAFT_TRACE").is_some_and(|v| v != "0"),
+                std::env::var_os("PROFLUENS_TRACE").is_some_and(|v| v != "0"),
             )),
             dyn_pads: Vec::new(),
             pool_overrides: Vec::new(),
@@ -683,7 +683,7 @@ impl Pipeline {
     /// Enable/disable latency tracing (spec: Debuggability): per-element histograms of
     /// `process()` time, ring residency, and sink wait overshoot, read via
     /// [`TapHandle::latency`](crate::counters::TapHandle::latency). Also enabled by
-    /// `STREAMCRAFT_TRACE=1`. Live — takes effect on the next scheduler pass; the cost
+    /// `PROFLUENS_TRACE=1`. Live — takes effect on the next scheduler pass; the cost
     /// while on is two monotonic clock reads per batch.
     pub fn set_tracing(&mut self, on: bool) {
         self.tracing.store(on, Ordering::Release);
@@ -755,8 +755,8 @@ impl Pipeline {
 
     /// Programmatically enable logging up to `level`, formatting records to stderr on a
     /// dedicated drain thread during [`run`](Self::run) (spec: Debuggability — the "one
-    /// line in `main`" dev path, without needing `STREAMCRAFT_DEBUG` in the
-    /// environment). `STREAMCRAFT_DEBUG`, if set, still applies on top at `run()` time
+    /// line in `main`" dev path, without needing `PROFLUENS_DEBUG` in the
+    /// environment). `PROFLUENS_DEBUG`, if set, still applies on top at `run()` time
     /// and takes the more verbose of the two globals.
     pub fn log_to_stderr(&mut self, level: Level) {
         self.log_level = Some(level);
@@ -771,7 +771,7 @@ impl Pipeline {
     // --- Build-phase diagnostics (spec: Debuggability — framework internals log) ---
 
     /// Emit one build-phase pipeline line to stderr, gated like the log system
-    /// (`STREAMCRAFT_DEBUG=pipeline:debug`, or a bare global level, or the
+    /// (`PROFLUENS_DEBUG=pipeline:debug`, or a bare global level, or the
     /// programmatic [`set_log_level`](Self::set_log_level)). Build operations are
     /// one-shot, never hot paths, so a formatted stderr line is the honest tool —
     /// per-element ring channels do not exist until `run()` wires them.
@@ -1211,10 +1211,10 @@ impl Pipeline {
     pub fn run(&mut self) -> Result<(), Error> {
         self.stop.store(false, Ordering::Release);
         // Zero-code attach mode (spec: server architecture): if no server is active and
-        // `STREAMCRAFT_INTROSPECT=<path>` is set, serve on that path for this run.
+        // `PROFLUENS_INTROSPECT=<path>` is set, serve on that path for this run.
         #[cfg(feature = "introspect")]
         if self.introspect.is_none() {
-            if let Some(path) = std::env::var_os("STREAMCRAFT_INTROSPECT") {
+            if let Some(path) = std::env::var_os("PROFLUENS_INTROSPECT") {
                 let _ = self.serve_introspection(std::path::PathBuf::from(path));
             }
         }
@@ -1374,7 +1374,7 @@ impl Pipeline {
         });
 
         // Logging (spec: Debuggability — Logging cont'd). Build the level filter once
-        // from the programmatic level and `STREAMCRAFT_DEBUG`, then, *only if some level
+        // from the programmatic level and `PROFLUENS_DEBUG`, then, *only if some level
         // is actually enabled*, wire one log channel per element and one low-priority
         // drain thread. When logging is off nothing here allocates or spawns — the
         // disabled path stays at zero cost, which is the point (performance is #1).
@@ -1491,7 +1491,7 @@ impl Pipeline {
             // Named so a profiler attributes cycles to the group (spec:
             // Debuggability); ≤ 15 bytes, the Linux thread-name cap.
             let handle = std::thread::Builder::new()
-                .name(format!("sc-group-{gi}"))
+                .name(format!("pf-group-{gi}"))
                 .spawn(move || {
                     let stop_flag = Arc::clone(&stop);
                     let pause_wake = Arc::clone(&pause);
@@ -1586,7 +1586,7 @@ impl Pipeline {
     /// the single low-priority thread that formats all records to stderr.
     ///
     /// The gate is decided once, here: the global level is `max(programmatic, env)` and
-    /// per-target `name:level` rules from `STREAMCRAFT_DEBUG` raise matching elements
+    /// per-target `name:level` rules from `PROFLUENS_DEBUG` raise matching elements
     /// above it. If nothing is enabled, this wires *nothing* — no channels, no thread —
     /// so a run with logging off pays only this one comparison.
     // Logging wiring (once per run at setup), not the per-buffer path.
@@ -1932,7 +1932,7 @@ impl Pipeline {
     }
 
     /// Serve the introspection protocol on a Unix socket at `path` (spec: Introspection
-    /// protocol and scraft-scope). Costs nothing until a client connects. Call after the
+    /// protocol and pf-scope). Costs nothing until a client connects. Call after the
     /// topology is built (same convention as [`tap_handle`](Self::tap_handle)); a second
     /// call replaces the server. `run()` republishes the topology + handles after
     /// preroll so dynamic pads and the live log filters become visible.
@@ -2002,7 +2002,7 @@ impl Pipeline {
     // Graphviz dump (diagnostic, called before run), not the per-buffer path.
     #[allow(clippy::disallowed_methods)]
     pub fn dump_dot(&self) -> String {
-        let mut s = String::from("digraph streamcraft {\n  rankdir=LR;\n  node [shape=box];\n");
+        let mut s = String::from("digraph profluens {\n  rankdir=LR;\n  node [shape=box];\n");
         for (i, e) in self.elements.iter().enumerate() {
             let name = e.as_ref().map_or("?", |el| el.desc().name);
             s.push_str(&format!("  e{i} [label=\"{name}\"];\n"));
@@ -2378,7 +2378,7 @@ impl LogDrainThread {
         tap: Option<Arc<crate::introspect::tap::LogTapRegistry>>,
     ) -> Self {
         let handle = std::thread::Builder::new()
-            .name("sc-log-drain".into())
+            .name("pf-log-drain".into())
             .spawn(move || Self::run(drains, tap))
             .expect("spawn log drain");
         Self { handle }
@@ -2387,7 +2387,7 @@ impl LogDrainThread {
     #[cfg(not(feature = "introspect"))]
     fn spawn(drains: Vec<LogDrain>) -> Self {
         let handle = std::thread::Builder::new()
-            .name("sc-log-drain".into())
+            .name("pf-log-drain".into())
             .spawn(move || Self::run(drains))
             .expect("spawn log drain");
         Self { handle }

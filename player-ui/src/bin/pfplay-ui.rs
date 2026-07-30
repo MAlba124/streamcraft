@@ -1,10 +1,10 @@
-//! `scplay-ui` — the SDL3 GUI media player binary (spec: streamcraft.md Milestone
+//! `pfplay-ui` — the SDL3 GUI media player binary (spec: profluens.md Milestone
 //! applications §5 + the UI `<update>` §1209). Hand it a file; it opens a window, plays
 //! the video letterboxed with audio-synced pacing, burns in subtitles (the pipeline does
 //! that), and gives a transport bar, track menus, and a stats overlay.
 //!
 //! ```text
-//! scplay-ui [--headless-frames N] FILE
+//! pfplay-ui [--headless-frames N] FILE
 //! ```
 //!
 //! Keys: Space = pause/resume, ←/→ = seek ∓10 s, Home = seek 0, F = fullscreen,
@@ -17,7 +17,7 @@
 //! letterbox + DrawList compositing path and reporting fps / paced-drop numbers.
 
 // The adopted h264/hevc decoders churn malloc internally (see sdl3/examples/play_file.rs);
-// mimalloc buys playback headroom, exactly like scplay. Binary-only — the library stays
+// mimalloc buys playback headroom, exactly like pfplay. Binary-only — the library stays
 // allocator-agnostic. Gated behind the default `mimalloc` feature: `--no-default-features`
 // falls back to the system allocator so heaptrack/valgrind can observe allocations.
 #[cfg(feature = "mimalloc")]
@@ -26,10 +26,10 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::process::ExitCode;
 
-use scplay_ui::app::{run, Config};
+use pfplay_ui::app::{run, Config};
 
 fn usage() -> String {
-    "usage: scplay-ui [--headless-frames N] FILE".to_string()
+    "usage: pfplay-ui [--headless-frames N] FILE".to_string()
 }
 
 fn parse_args(args: &[String]) -> Result<Config, String> {

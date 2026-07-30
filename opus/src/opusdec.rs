@@ -165,11 +165,20 @@ impl OpusDec {
         Ok(true)
     }
 
-    /// Decode one audio packet into `pending` (gain-applied, pre-skip-trimmed). The RFC 7845
-    /// header/comment packets are handled by the caller.
+    /// Decode one audio packet into the reused `pending` buffer (gain-applied, pre-skip-trimmed).
+    /// Uses `decode_packet_into` so a steady decode does **no per-packet heap allocation** — the
+    /// `pending` buffer's capacity is retained across packets (the profluens no-alloc patch, like
+    /// `flacdec::pull_into` and `aacdec`'s reused `pending_pcm`). The RFC 7845 header/comment
+    /// packets are handled by the caller.
     fn decode_audio(&mut self, ctx: &mut Ctx, packet: &[u8]) -> Result<(), Error> {
-        let audio = match self.dec.decode_packet(packet) {
-            Ok(a) => a,
+        // `self.dec` and `self.pending` are disjoint fields — decode straight into the reused buf.
+        // The vendored oxideav-opus decode is allocation-free in steady state: a per-packet
+        // `DecodeBump` arena backs every transient (type-checked so it can never hold persistent
+        // state) plus a reused thread-local scratch for the hot PVQ leaf — see
+        // vendor/oxideav-opus/PROFLUENS-PATCHES.md. So this element drives zero per-packet heap
+        // traffic through the whole SILK/CELT decode graph.
+        let channels = match self.dec.decode_packet_into(packet, &mut self.pending) {
+            Ok(ch) => (ch as usize).max(1),
             // Per-packet error scope (spec: error handling): warn-drop a corrupt packet rather
             // than tearing down the stream; a following clean packet resumes decode.
             Err(e) => {
@@ -181,24 +190,24 @@ impl OpusDec {
                         message: format!("opusdec: dropping undecodable packet: {e:?}"),
                     },
                 });
+                self.pending.clear();
+                self.pending_pos = 0;
                 return Ok(());
             }
         };
-        let ch = (audio.channels as usize).max(1);
-        self.announce(ctx, ch);
-        let mut pcm = audio.pcm;
+        self.pending_pos = 0;
+        self.announce(ctx, channels);
         if self.output_gain_q7_8 != 0 {
-            apply_output_gain(&mut pcm, self.output_gain_q7_8);
+            apply_output_gain(&mut self.pending, self.output_gain_q7_8);
         }
-        // Trim the RFC 7845 §4.2 pre-skip (per-channel samples) off the output front.
+        // Trim the RFC 7845 §4.2 pre-skip (per-channel samples) off the output front (only at
+        // stream start, so the front drain is not a steady-state cost).
         if self.preskip_remaining > 0 {
-            let spc = pcm.len() / ch; // per-channel samples in this packet
+            let spc = self.pending.len() / channels; // per-channel samples in this packet
             let drop_spc = self.preskip_remaining.min(spc as u32) as usize;
-            pcm.drain(0..drop_spc * ch);
+            self.pending.drain(0..drop_spc * channels);
             self.preskip_remaining -= drop_spc as u32;
         }
-        self.pending = pcm;
-        self.pending_pos = 0;
         Ok(())
     }
 }

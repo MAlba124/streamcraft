@@ -225,7 +225,7 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
     // Only the (rare) pulse path mutates the quantised spectrum, so only it needs an owned
     // copy — the common no-pulse path borrows `ch.spectral` directly. The clone lands in the
     // same `scratch` arena as the rest of the frame's transients (Vec<T, A>::clone clones in
-    // `A`), so even the rare pulse copy is off the heap (streamcraft patch).
+    // `A`), so even the rare pulse copy is off the heap (profluens patch).
     let patched;
     let x_quant: &SpectralData<A> = if let Some(pd) = &ch.body.pulse_data {
         let mut p = ch.spectral.clone();
@@ -239,7 +239,7 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
 
     // 3a. §4.6.2.3.2 scalefactor accumulation. The accumulated absolute records are transient
     //     side info consumed by the dequant / joint-stereo / noise passes within this frame, so
-    //     they come from the caller's `scratch` arena rather than the heap (streamcraft patch).
+    //     they come from the caller's `scratch` arena rather than the heap (profluens patch).
     let abs = accumulate_in(
         &ch.body.scale_factor_data,
         &ch.body.section_data.sfb_cb,
@@ -251,7 +251,7 @@ fn reconstruct_pre_pair<A: std::alloc::Allocator + Copy>(
     //     is pure scratch — consumed by `quant_to_spec` on the next line and dropped — so it
     //     comes from the caller's `scratch` allocator (the pipeline's per-`process()` arena,
     //     reset by the scheduler) rather than the heap: no malloc/free of the outer + per-group
-    //     inner vectors every channel (streamcraft patch). `spec` escapes into the
+    //     inner vectors every channel (profluens patch). `spec` escapes into the
     //     PNS/TNS/filterbank tail, so it stays a heap `Vec`.
     let rescaled = rescale_spectrum_in(
         scratch,
@@ -459,7 +459,7 @@ impl ElementDecoder {
     /// [`decode_sce`](Self::decode_sce) with an explicit `scratch` allocator for the per-channel
     /// transient buffers *and* the returned PCM (the pipeline passes its per-`process()` arena;
     /// tests use `Global`). The whole single-channel decode — including the §4.6.11 filterbank
-    /// output — is off the heap when `scratch` is an arena (streamcraft patch).
+    /// output — is off the heap when `scratch` is an arena (profluens patch).
     pub fn decode_sce_in<A: std::alloc::Allocator + Copy>(
         &mut self,
         ch: &ChannelInput<'_, A>,
@@ -530,7 +530,7 @@ impl ElementDecoder {
 
     /// [`decode_cpe`](Self::decode_cpe) with an explicit `scratch` allocator for the two
     /// channels' transient buffers *and* the returned PCM pair (the pipeline passes its
-    /// per-`process()` arena). The filterbank outputs come from `scratch` too (streamcraft patch).
+    /// per-`process()` arena). The filterbank outputs come from `scratch` too (profluens patch).
     pub fn decode_cpe_in<A: std::alloc::Allocator + Copy>(
         &mut self,
         left: &ChannelInput<'_, A>,

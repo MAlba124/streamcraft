@@ -1,4 +1,4 @@
-# Streamcraft
+# Profluens
 
 An ultra light weight general purpose data/multimedia streaming/processing graph based
 framework. Inspired by GStreamer.
@@ -123,19 +123,19 @@ what is POD, not final signatures.
 
 ### Crate layout
 
-- `streamcraft-core` — buffer, formats, element trait, topology, scheduler, clock,
+- `profluens-core` — buffer, formats, element trait, topology, scheduler, clock,
   events, bus. Zero external dependencies, `#![forbid(unsafe_code)]` except one small
   audited module (buffer pool / ring buffer) with loom+miri coverage.
-- `streamcraft-elements` — built-in pure-Rust elements (filesrc, queue, tee, testsrc,
+- `profluens-elements` — built-in pure-Rust elements (filesrc, queue, tee, testsrc,
   assertion sinks), per-element feature flags.
-- `streamcraft-video`, `streamcraft-audio` — POD format descriptions and typed *views*
+- `profluens-video`, `profluens-audio` — POD format descriptions and typed *views*
   over the opaque buffer (`VideoFrameRef`, strides, channel layouts). No new buffer
   types, no traits — free functions and plain structs.
-- `streamcraft-scope` — the Slint inspector GUI + MCP server (§debuggability),
+- `profluens-scope` — the Slint inspector GUI + MCP server (§debuggability),
   riding on core's introspection protocol. Fully optional; apps that don't attach
   it pay nothing.
-- First-party codec and container crates (`sc-flac`, `sc-opus`, `sc-vp8`, `sc-vp9`,
-  `sc-av1`, `sc-mkv`, `sc-ogg`, …) — hand-written, specs checked into the tree
+- First-party codec and container crates (`pf-flac`, `pf-opus`, `pf-vp8`, `pf-vp9`,
+  `pf-av1`, `pf-mkv`, `pf-ogg`, …) — hand-written, specs checked into the tree
   (§first-party codecs). There is deliberately **no libav/FFmpeg binding** — an FFI
   wrapper is too heavyweight for this framework.
 
@@ -455,7 +455,7 @@ impl<'a> Inputs<'a> {
 GStreamer's bin bundles three unrelated jobs into one object, and all three cause pain:
 containment (ghost pads proxying every boundary pad), state aggregation (the arcane
 child-state rules), and autoplugging (decodebin: a bin that rewires itself from
-inside). Streamcraft has no bin object; the topology stays flat. The three jobs get
+inside). Profluens has no bin object; the topology stays flat. The three jobs get
 three separate, simpler tools:
 
 - **Templates** for reuse: a subgraph template is a function that expands into plain
@@ -476,7 +476,7 @@ three separate, simpler tools:
 ### Batching: the unit of work is a span, not a buffer
 
 GStreamer's unit of flow is one `GstBuffer` per pad-push — per-buffer locking,
-per-buffer dispatch, per-buffer everything. Streamcraft's unit is a **batch**:
+per-buffer dispatch, per-buffer everything. Profluens's unit is a **batch**:
 
 - `process()` receives and pushes *spans* of buffers. A batch of one is legal and
   normal (a 4K video frame is plenty of work); a batch of 512 audio chunks or network
@@ -540,12 +540,12 @@ one blocking call per buffer). Completion-based sources/sinks must be the *easy*
   `Buffer` with zero copies and zero per-IO bookkeeping. Multi-shot receive fills a
   batch per wakeup.
 - Core stays dependency-free: core defines the waitable-handle and registration
-  contracts; the actual io_uring source/sink lives in `streamcraft-elements` (Linux)
+  contracts; the actual io_uring source/sink lives in `profluens-elements` (Linux)
   behind a feature, with an epoll/blocking fallback element sharing the same element
   code above the submission layer.
 - Same contracts cover the neighbors: V4L2 (queued/dequeued buffers are
   completion-shaped), ALSA, sockets with `MSG_ZEROCOPY`, RDMA later. If a source/sink
-  API hands you completed buffers asynchronously, streamcraft should feel native.
+  API hands you completed buffers asynchronously, profluens should feel native.
 
 How IO elements *share* rings — never one ring per element (kernel resources, per-ring
 registered-buffer tables, one parked thread each):
@@ -717,7 +717,7 @@ Where "as good as or better than GStreamer" is won or lost:
 ### Latency (first-class, not a footnote)
 
 Latency in GStreamer is where debugging goes to die — queries, min/max ranges, live-ness
-flags, and `latency` messages that few people fully understand. Streamcraft treats
+flags, and `latency` messages that few people fully understand. Profluens treats
 latency as a budget that is *computed, enforced, and observable*:
 
 - **Declared, per element**: every element states its processing latency as POD
@@ -752,7 +752,7 @@ latency as a budget that is *computed, enforced, and observable*:
 
 GStreamer has four overlapping mechanisms — serialized and non-serialized events,
 queries, bus messages, and GObject signals — each with different threading and
-blocking semantics, and its deadlocks live in their intersections. Streamcraft has
+blocking semantics, and its deadlocks live in their intersections. Profluens has
 exactly **two channels, and no query system at all**:
 
 - **In-band events** travel *with* buffers through the same queues, ordered relative
@@ -857,7 +857,7 @@ Global invariants every element and the scheduler can rely on:
   until then.
 - **Drain and abort are distinct shutdowns**: *drain* pushes EOS from sources and
   waits (bounded) for sinks and muxers to finalize — trailers written, files valid,
-  always. *Abort* flushes, cancels kernel ops, tears down now. `scraft-launch` maps
+  always. *Abort* flushes, cancels kernel ops, tears down now. `pf-launch` maps
   Ctrl-C to drain, second Ctrl-C to abort — the recording-app correctness pattern,
   owned by the framework.
 - **Pool swap protocol**: when a mid-stream `FormatChange` alters buffer sizes, the
@@ -1014,7 +1014,7 @@ impl Pipeline {
   snapshot is a few contiguous reads. Plain atomics, updated once per batch,
   near-zero cost when unread.
 - **Own logging in core** (no `log`/`tracing` dep): per-element targets,
-  runtime-adjustable levels, `STREAMCRAFT_DEBUG=element:level` env syntax like
+  runtime-adjustable levels, `PROFLUENS_DEBUG=element:level` env syntax like
   `GST_DEBUG`. A helper crate can bridge to `tracing`/perfetto spans per buffer per
   element for those who want it.
 - **Deterministic replay**: record source output, replay it through the pipeline in
@@ -1070,12 +1070,12 @@ global view. No global lock, no shared buffer on the hot path.
 
 **The drain reuses the Reactor and the introspection protocol — this is where "same IO as
 elements" is honored.** Drained records are just another frame type on the introspection
-channel scraft-scope already consumes (its Events-and-logs panel and the MCP `tail_logs`
+channel pf-scope already consumes (its Events-and-logs panel and the MCP `tail_logs`
 tool). A file drain writes through the same io_uring/sync `Reactor` elements use — but it is
 a framework-owned drain task, *not* a graph node. Reuse the IO machinery, not the graph.
 
 **Levels and targets** match the Debuggability bullet above: per-element runtime-adjustable
-levels behind a relaxed atomic, `STREAMCRAFT_DEBUG=element:level` env syntax, plus
+levels behind a relaxed atomic, `PROFLUENS_DEBUG=element:level` env syntax, plus
 compile-time category gating to drop whole classes from the binary. A default **stderr
 drain** (one line in `main`) formats records for humans in dev; production swaps in the
 file/socket/null drain — same records, different sink. An optional `tracing`/perfetto bridge
@@ -1191,7 +1191,7 @@ reads directly) are faster but per-type. Leaning toward the seqlock for uniformi
 typed atomic only where a bench shows the per-batch read matters.
 </experimental>
 
-### Introspection protocol and scraft-scope (the inspector)
+### Introspection protocol and pf-scope (the inspector)
 
 Everything the debuggability sections describe — dumps, counters, latency reports,
 bus traffic, logs — is exposed through one **introspection protocol**: a compact
@@ -1203,7 +1203,7 @@ locks on streaming paths.
 
 Must be super super super fast and low overhead.
 
-**scraft-scope** is the flagship client: a GUI written in Slint (Rust-native,
+**pf-scope** is the flagship client: a GUI written in Slint (Rust-native,
 lightweight — fits the ethos; no GTK/Electron) that can run two ways:
 
 <update> We should use SDL3 with a custom UI library on top. We should also swap our custom wayland
@@ -1211,7 +1211,7 @@ and vulkan stuff to use sdl3 instead. Graphics sucks and we shouldn't waste time
 light weight enough for us. Also, the UI must be the same philosophy as the rest of SC, (i.e. very
 performant, per frame arenas).  </update>
 
-- **Attach**: a standalone binary connecting to any running streamcraft app by
+- **Attach**: a standalone binary connecting to any running profluens app by
   socket — zero code in the target beyond the feature flag.
 - **Embed**: `Scope::spawn(&pipeline)` runs the same UI in-process on its own
   thread for dev builds — one line in `main`, same protocol underneath, so the two
@@ -1236,7 +1236,7 @@ What it shows, all live:
   `get_topology`, `get_latency_report`, `get_counters`, `tail_bus`, `tail_logs`,
   `set_property`, `pause`/`step`, `dump_dot` — so an agent can attach to a live
   pipeline, diagnose "why is this path late", and propose the fix from real data.
-  Debugging a streamcraft app with an agent should be *better* than with printf,
+  Debugging a profluens app with an agent should be *better* than with printf,
   because the agent gets structured truth instead of log soup.
 
 The protocol is versioned and documented from day one — it is also how CI's stress
@@ -1301,13 +1301,13 @@ being written.
 ### Plugins
 
 - **A plugin is just a crate.** The primary consumption path is `use` plus typed
-  construction: `use scraft_http::HttpSrc;` → `pipeline.add(HttpSrc::new(url))`.
+  construction: `use pf_http::HttpSrc;` → `pipeline.add(HttpSrc::new(url))`.
   No registration, no factories, no strings — rustc is the registry, with dead-code
   elimination and compile-checked config for free.
 - **`Registry` is the opt-in second layer**, existing only where "element by name" is
   genuinely the point: a plugin crate may additionally expose
   `fn register(&mut Registry)` with its descriptors and `make_default` factories,
-  powering `parse()` (scraft-launch, quick tests, bug-report one-liners) and, later,
+  powering `parse()` (pf-launch, quick tests, bug-report one-liners) and, later,
   dynamically loaded plugins. Applications that don't use string construction never
   touch it.
 
@@ -1319,7 +1319,7 @@ being written.
   }
   ```
 - **Dynamic loading later, feature-gated**: Rust has no stable ABI, so `dlopen` plugins
-  need a small versioned C-ABI shim (`extern "C" fn streamcraft_plugin_register`).
+  need a small versioned C-ABI shim (`extern "C" fn profluens_plugin_register`).
   Build it only when a real out-of-tree consumer exists — it's a maintenance tax.
 - Registry enables **string pipeline construction**
   (`parse("filesrc path=x ! decode ! sink")`) — a gst-launch equivalent is cheap once
@@ -1385,9 +1385,9 @@ adapted to it.
 
 Conventions, mandatory for every codec/container crate:
 
-- **The spec lives in the tree**: `sc-flac/spec/rfc9639.txt`, `sc-opus/spec/rfc6716.txt`,
-  `sc-vp8/spec/rfc6386.txt`, `sc-mkv/spec/rfc9559.txt` + `rfc8794.txt` (EBML),
-  `sc-ogg/spec/rfc3533.txt`, and the AV1/VP9 bitstream PDFs. Code cross-references
+- **The spec lives in the tree**: `pf-flac/spec/rfc9639.txt`, `pf-opus/spec/rfc6716.txt`,
+  `pf-vp8/spec/rfc6386.txt`, `pf-mkv/spec/rfc9559.txt` + `rfc8794.txt` (EBML),
+  `pf-ogg/spec/rfc3533.txt`, and the AV1/VP9 bitstream PDFs. Code cross-references
   spec sections in comments (`// §4.5.2: residual coding, method 1`), so review
   means reading the implementation *against* the normative text, not against
   someone's blog post. Spec errata and interpretation decisions get documented in
@@ -1438,7 +1438,7 @@ integration test and benchmark the day it works.
 3. **Convert wav to flac** — `filesrc ! wavparse ! flacenc ! filesink`.
    Forces: format negotiation (solver picks sample format/rate across the chain),
    the `-audio` helper crate, non-live throughput mode (no clock waits, maximal
-   batches), and the first hand-written codec: the `sc-flac` encoder
+   batches), and the first hand-written codec: the `pf-flac` encoder
    (§first-party codecs), tags preserved via the `Tag` event.
    Pass: output validates with `flac -t`; faster than `ffmpeg` doing the same
    conversion, single-threaded, and the win must come from batching + zero-copy
@@ -1453,7 +1453,7 @@ integration test and benchmark the day it works.
 5. **Play a video file (no audio)** — `filesrc ! mkvdemux ! vp8dec ! videosink`
    (raw-video bring-up first: `filesrc ! rawvideoparse ! videosink`, which needs no
    decoder and isolates the sink/clock path).
-   Forces: the first hand-written video decoder (`sc-vp8`) producing frames straight
+   Forces: the first hand-written video decoder (`pf-vp8`) producing frames straight
    into pool memory, dynamic pads from the demuxer, video sink rendering on clock
    deadlines, QoS (late-frame dropping visible as bus observations).
    Pass: smooth playback at native rate; artificial CPU starvation degrades via
@@ -1472,7 +1472,7 @@ integration test and benchmark the day it works.
    alignment at splice, latency recompute, kernel cancel, rollback on join failure.
    Pass: the switch is glitch-free on the audio path (no gap, no click), and a
    stress loop switching every few hundred ms survives sanitizers overnight.
-8. **`scraft-launch`** — the gst-launch equivalent over `Registry::parse`, with
+8. **`pf-launch`** — the gst-launch equivalent over `Registry::parse`, with
    `--dump-dot`, `--latency-report`, `--counters` flags.
    Forces: registry, parse syntax, and the observability APIs — and from then on,
    every bug report and benchmark in the project is a one-liner.
@@ -1486,7 +1486,7 @@ integration test and benchmark the day it works.
     Forces: network clock, clock slaving at both sinks, drift correction.
     Pass: measured inter-room skew < 1 ms over hours (loopback capture) while both
     device clocks drift freely.
-11. **scraft-scope attached to milestone 6** — live graph, latency panel, log/event
+11. **pf-scope attached to milestone 6** — live graph, latency panel, log/event
     feeds, property editing, and an MCP agent diagnosing an injected latency bug.
     Forces: the introspection protocol end-to-end, the Slint UI, the MCP server.
     Pass: attaching under full load changes the pinned benchmarks by < 1%.

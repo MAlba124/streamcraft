@@ -1,7 +1,7 @@
-//! sc-mpeg4p2 — the MPEG-4 Part 2 (Visual) Advanced Simple Profile codec plugin,
+//! pf-mpeg4p2 — the MPEG-4 Part 2 (Visual) Advanced Simple Profile codec plugin,
 //! the "XviD / DivX" video codec (ISO/IEC 14496-2).
 //!
-//! Unlike sc-vp8 / sc-h264 (which adopt the pure-Rust OxideAV decoders) this
+//! Unlike pf-vp8 / pf-h264 (which adopt the pure-Rust OxideAV decoders) this
 //! crate is **hand-written, clean-room from ISO/IEC 14496-2** — no libav, no FFI,
 //! no backing library. Every non-trivial step cites the standard clause at its
 //! point of use (the repo's algorithm-citation rule): the VOS/VO/VOL/VOP header
@@ -60,12 +60,12 @@ pub mod vlc;
 
 pub use mpeg4p2dec::Mpeg4p2Dec;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! mpeg4p2dec ! …")`). Typed `use` + constructor stays primary; this
-/// powers `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken
+/// powers `pf-launch` and one-liner tests. The descriptor is `&'static`, taken
 /// from a throwaway default instance; [`Mpeg4p2Dec`] is config-free (dimensions
 /// come from the VOL header, announced at runtime).
 pub fn register(registry: &mut Registry) {

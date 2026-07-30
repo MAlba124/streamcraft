@@ -14,15 +14,15 @@
 //! src, so link-time negotiation fixes those fields on the converter's sink and `new(target)`
 //! reads them through the shared vocabulary with no out-of-band hint.
 
-use streamcraft_audio::{
+use profluens_audio::{
     convert_interleaved_vec, AudioConvert, AudioFormat, SampleFormat,
 };
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_audioconvert_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_audioconvert_{}_{}.bin", tag, std::process::id()));
     p
 }
 
@@ -166,17 +166,17 @@ fn s32_to_s16_narrows_with_rounding_matches_library() {
 /// its input format from the negotiated caps — the piece `filesrc` (a `bytes` pad) can't
 /// provide. It emits a fixed `S16` stereo @ 44100 PCM payload then EOS.
 mod raw_src {
-    use streamcraft_audio::{FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
-    use streamcraft_core::batch::Inputs;
-    use streamcraft_core::ctx::Ctx;
-    use streamcraft_core::element::{
+    use profluens_audio::{FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
+    use profluens_core::batch::Inputs;
+    use profluens_core::ctx::Ctx;
+    use profluens_core::element::{
         Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
     };
-    use streamcraft_core::error::Error;
-    use streamcraft_core::event::Event;
-    use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-    use streamcraft_core::id::PadId;
-    use streamcraft_core::time::Timestamp;
+    use profluens_core::error::Error;
+    use profluens_core::event::Event;
+    use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+    use profluens_core::id::PadId;
+    use profluens_core::time::Timestamp;
 
     // Fixed `audio/raw`: S16 stereo @ 44100. `Eq` on every field so the intersection with a
     // broad `audio/raw` sink fixes all three (rate/channels as Int, sample as the interned

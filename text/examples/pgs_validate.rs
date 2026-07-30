@@ -1,9 +1,9 @@
 //! Offline validation: decode the real Coneheads PGS stream (`/tmp/con.sup`, extracted with
-//! `ffmpeg -map 0:s:0 -c copy`) with `sc_text::pgs` and report the decode.
+//! `ffmpeg -map 0:s:0 -c copy`) with `pf_text::pgs` and report the decode.
 //!
-//! Run: `nix develop --command cargo run --release -p sc-text --example pgs_validate`
+//! Run: `nix develop --command cargo run --release -p pf-text --example pgs_validate`
 
-use sc_text::pgs;
+use pf_text::pgs;
 
 const SUP: &str = "/tmp/con.sup";
 

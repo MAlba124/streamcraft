@@ -1,4 +1,4 @@
-//! The pure-streamcraft RTP loop: a **sender pipeline**
+//! The pure-profluens RTP loop: a **sender pipeline**
 //! (`ausrc ! rtph264pay ! udpsink`, clock-paced) streaming to a **receiver
 //! pipeline** (`udpsrc ! rtpsession ! rtph264depay`) over a real localhost
 //! socket — both ends this crate, no external tools. Byte-exact access units
@@ -8,18 +8,18 @@ use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sc_rtp::elements::{RtpH264Depay, RtpH264Pay, RtpSession, RtpStreamDesc, UdpSink, UdpSrc};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_rtp::elements::{RtpH264Depay, RtpH264Pay, RtpSession, RtpStreamDesc, UdpSink, UdpSrc};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 static AU_OFFERS: [OfferDesc; 1] = [OfferDesc::any("h264/annexb")];
 

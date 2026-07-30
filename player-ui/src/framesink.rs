@@ -1,5 +1,5 @@
 //! [`FrameSlotSink`] — the clock-paced, GUI-bridging video sink (spec:
-//! streamcraft.md's UI `<update>` §1209 — "use SDL3 with a custom UI library on
+//! profluens.md's UI `<update>` §1209 — "use SDL3 with a custom UI library on
 //! top … the UI must be the same philosophy as the rest of SC (very performant,
 //! per-frame arenas)"). A media player cannot have two SDL windows fighting, so
 //! this sink touches **no** SDL: the GUI thread owns the one window, and video
@@ -8,7 +8,7 @@
 //!
 //! # Why this exists, and how it preserves A/V sync
 //!
-//! [`Sdl3VideoSink`](sc_sdl3) is an *active* sink that paces each frame on the
+//! [`Sdl3VideoSink`](pf_sdl3) is an *active* sink that paces each frame on the
 //! pipeline clock (`base + pts + path_latency` via `ctx.wait_until`) and then
 //! GPU-presents. Here we replicate the **pacing** verbatim — the same QoS drop,
 //! the same `ctx.wait_until`, the same seek-gen bail — but instead of presenting we
@@ -34,27 +34,27 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::clock::WaitOutcome;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::clock::WaitOutcome;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{
     ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc,
 };
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
-use sc_vaapi::gpuframe::{self, GpuFrame, GpuFrameChannel, GpuFrameHeader};
+use pf_vaapi::gpuframe::{self, GpuFrame, GpuFrameChannel, GpuFrameHeader};
 
 const SINK: PadId = PadId(0);
 
 // `video/raw` vocabulary — literals, exactly as `Sdl3VideoSink` declares them, so the
-// crate does not pin field-name identity to streamcraft-video (the pipeline interns by
+// crate does not pin field-name identity to profluens-video (the pipeline interns by
 // string, so ids line up with any video peer regardless of who declared the field).
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";
@@ -105,7 +105,7 @@ static DESC: ElementDesc = ElementDesc {
     make_default: None, // built explicitly with a shared FrameSlot, not by parse-launch
 };
 
-/// The pixel format the slot carries. Mirrors [`streamcraft_video::PixelFormat`] but is
+/// The pixel format the slot carries. Mirrors [`profluens_video::PixelFormat`] but is
 /// kept local so a consumer (the SDL video layer) does not have to depend on the video
 /// crate just to read the enum — it is a tiny POD tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -487,7 +487,7 @@ impl FrameSlotSink {
     /// Build the **zero-copy** sink: incoming `video/gpu` buffers are paced on the clock, then
     /// the paired [`GpuFrame`] is popped from `channel` and published to the slot for the GUI
     /// to import via EGL. Pair with a [`FrameSlot::new_zerocopy`] slot (same channel) and a
-    /// zero-copy decoder (`sc_vaapi::video_decoder_zerocopy_for`, the channel's push side).
+    /// zero-copy decoder (`pf_vaapi::video_decoder_zerocopy_for`, the channel's push side).
     pub fn new_zerocopy(slot: Arc<FrameSlot>, channel: Arc<GpuFrameChannel>) -> Self {
         Self { slot, format: None, preroll_next: false, channel: Some(channel) }
     }

@@ -107,7 +107,7 @@ pub fn quant_to_spec<S: std::alloc::Allocator>(
 /// [`quant_to_spec`] with the window-major `spec` drawn from a caller `scratch` allocator (the
 /// pipeline's per-`process()` arena) instead of the heap. `spec` is a per-channel transient
 /// consumed by the PNS/TNS/filterbank tail *within the same decode call* — it never escapes
-/// `process()` — so arena-backing it removes a per-channel heap allocation (streamcraft patch).
+/// `process()` — so arena-backing it removes a per-channel heap allocation (profluens patch).
 /// `S` is the (arena-backed) input-group allocator; `A` the output allocator (tests infer both
 /// `Global`).
 pub fn quant_to_spec_in<A: std::alloc::Allocator + Copy, S: std::alloc::Allocator>(

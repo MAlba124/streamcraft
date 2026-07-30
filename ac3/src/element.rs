@@ -30,17 +30,17 @@
 //! precise breakdown of what reconstructs correctly vs. the open bit-allocation
 //! issue. The output geometry and timeline are correct; the sample values are not.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 use crate::frame::Frame;
 use crate::parse::{next_frame, overflow_drop, Framed};

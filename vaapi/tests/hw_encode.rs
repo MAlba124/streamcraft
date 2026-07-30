@@ -10,8 +10,8 @@
 //! then fails exactly here (the decode-path lesson). The full encode round trips
 //! live in `hw_encode_roundtrip.rs`.
 
-use sc_vaapi::ffi;
-use sc_vaapi::va::{Config, Context, Display, Surfaces};
+use pf_vaapi::ffi;
+use pf_vaapi::va::{Config, Context, Display, Surfaces};
 
 /// The H.264 encode profiles worth trying, most capable first.
 const H264_PROFILES: [ffi::VAProfile; 3] = [
@@ -22,7 +22,7 @@ const H264_PROFILES: [ffi::VAProfile; 3] = [
 
 #[test]
 fn probe_reports_encode_entrypoints() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip probe_reports_encode_entrypoints: no VA-API device");
         return;
     };
@@ -50,7 +50,7 @@ fn probe_reports_encode_entrypoints() {
 /// alone does not give.
 #[test]
 fn h264_encode_context_allocates() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip h264_encode_context_allocates: no VA-API device");
         return;
     };

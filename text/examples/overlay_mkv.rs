@@ -15,29 +15,29 @@
 //! caption region's luma **changes while a cue is active** (frames at ~1.5 s and ~4.5 s) versus
 //! a frame with no active cue (~2.5 s / ~5.75 s). Headless — no display.
 //!
-//! Run: `nix develop --command cargo run --release -p sc-text --example overlay_mkv`
+//! Run: `nix develop --command cargo run --release -p pf-text --example overlay_mkv`
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use sc_h264::H264Dec;
-use sc_mkv::ebml::id;
-use sc_mkv::{MatroskaReader, MkvDemux};
-use sc_text::{SubParse, SubtitleOverlay};
+use pf_h264::H264Dec;
+use pf_mkv::ebml::id;
+use pf_mkv::{MatroskaReader, MkvDemux};
+use pf_text::{SubParse, SubtitleOverlay};
 
-use streamcraft_elements::flow::Queue;
+use profluens_elements::flow::Queue;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 const MKV_PATH: &str = "/tmp/subbed.mkv";
 const SRT_PATH: &str = "/tmp/subs.srt";
@@ -161,7 +161,7 @@ fn run_overlay(stream: Vec<u8>) -> Arc<Mutex<Recorded>> {
             .tracks()
             .iter()
             .find(|t| t.track_number == n)
-            .map(|t| sc_mkv::codec::family_for(&t.codec_id))
+            .map(|t| pf_mkv::codec::family_for(&t.codec_id))
             .unwrap_or("bytes")
     };
 
@@ -172,8 +172,8 @@ fn run_overlay(stream: Vec<u8>) -> Arc<Mutex<Recorded>> {
 
     let added = p.preroll().expect("preroll");
     // Match each discovered pad to its role by its track's family.
-    let mut video_pad: Option<streamcraft_core::pipeline::AddedPadInfo> = None;
-    let mut subtitle_pad: Option<streamcraft_core::pipeline::AddedPadInfo> = None;
+    let mut video_pad: Option<profluens_core::pipeline::AddedPadInfo> = None;
+    let mut subtitle_pad: Option<profluens_core::pipeline::AddedPadInfo> = None;
     for ap in &added {
         let n: u64 = ap.name.trim_start_matches("src_track").parse().unwrap_or(0);
         let family = family_of(n);

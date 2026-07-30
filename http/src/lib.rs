@@ -1,4 +1,4 @@
-//! sc-http — a hand-written HTTP source plugin for streamcraft.
+//! pf-http — a hand-written HTTP source plugin for profluens.
 //!
 //! Milestone 2: [`HttpSrc`] downloads a file over HTTP(S) so `HttpSrc ! FileSink`
 //! writes it to disk (spec: Milestone applications §2). The HTTP layer is custom

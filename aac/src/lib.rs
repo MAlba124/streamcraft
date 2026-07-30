@@ -1,8 +1,8 @@
-//! `sc-aac` — AAC decode for streamcraft, backed by **oxideav-aac** (pure Rust).
+//! `pf-aac` — AAC decode for profluens, backed by **oxideav-aac** (pure Rust).
 //!
-//! ## Adoption verdict (rubric: `sc-vp8`'s lib.rs; judged by source, not blurbs)
+//! ## Adoption verdict (rubric: `pf-vp8`'s lib.rs; judged by source, not blurbs)
 //! `oxideav-aac 0.1.6` (crates.io, 2026-07): **zero `unsafe`**, no build.rs, one
-//! dependency (`oxideav-core`, already in-tree via `sc-h264`), ISO/IEC 14496-3
+//! dependency (`oxideav-core`, already in-tree via `pf-h264`), ISO/IEC 14496-3
 //! citations at point of use throughout. The published decoder covers AAC-LC and
 //! HE-AAC (SBR) with M/S, intensity, TNS, PNS, LTP; git HEAD adds LATM/PS/ER —
 //! re-evaluate on the next release. The `oxideav-core` `Decoder` trait impl only
@@ -20,8 +20,8 @@ pub mod adtsparse;
 pub use aacdec::AacDec;
 pub use adtsparse::AdtsParse;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins).
 pub fn register(registry: &mut Registry) {

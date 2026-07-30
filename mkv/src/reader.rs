@@ -29,7 +29,7 @@
 //! ## Untrusted input (spec: a crash on bad input is a P0)
 //! Every field is bounds-checked and every arithmetic step is guarded; a truncated,
 //! over-long, or structurally impossible element yields a [`ReadError`] the demuxer element
-//! maps to a `streamcraft` error — the reader never panics or slices out of range.
+//! maps to a `profluens` error — the reader never panics or slices out of range.
 
 use std::collections::VecDeque;
 
@@ -146,7 +146,7 @@ pub struct MatroskaReader {
     /// Decoded frames waiting to be drained by [`next_frame`](Self::next_frame), in stream
     /// order (a laced block pushes several at once).
     pending: VecDeque<Frame>,
-    /// Recycled frame-payload buffers (streamcraft patch). [`push_frame`] draws a `Vec<u8>`
+    /// Recycled frame-payload buffers (profluens patch). [`push_frame`] draws a `Vec<u8>`
     /// from here instead of allocating; a consumer hands each drained frame's buffer back via
     /// [`recycle`](Self::recycle) once done with it, so steady-state framing allocates nothing.
     /// Bounded, so a stalled consumer cannot grow it without limit. Empty for consumers that
@@ -186,7 +186,7 @@ impl MatroskaReader {
     }
 
     /// Hand a drained frame's payload buffer back for reuse by a later [`push_frame`], so
-    /// steady-state framing allocates nothing (streamcraft patch). Bounded — buffers past the
+    /// steady-state framing allocates nothing (profluens patch). Bounded — buffers past the
     /// cap are dropped. Recycling is optional: a consumer that never calls this just keeps
     /// allocating fresh buffers, with identical output.
     pub fn recycle(&mut self, buf: Vec<u8>) {

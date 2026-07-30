@@ -1,17 +1,17 @@
 //! Download a file over HTTP(S): `HttpSrc ! FileSink`.
 //!
-//! Usage: `cargo run -p sc-http --example download -- <url> [out-path]`
+//! Usage: `cargo run -p pf-http --example download -- <url> [out-path]`
 //! (`http://` or `https://` — TLS is rustls on graviola, roots from the system
 //! CA bundle.)
 
-use sc_http::HttpSrc;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::FileSink;
+use pf_http::HttpSrc;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::FileSink;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let url = args.next().unwrap_or_else(|| "http://example.com/".to_string());
-    let out = args.next().unwrap_or_else(|| "/tmp/sc_download.out".to_string());
+    let out = args.next().unwrap_or_else(|| "/tmp/pf_download.out".to_string());
 
     let mut p = Pipeline::new();
     let src = p.add(HttpSrc::new(&url));

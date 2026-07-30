@@ -1,17 +1,17 @@
-//! `MkvMux` — the streamcraft **element** wrapping the tested [`MatroskaWriter`]
+//! `MkvMux` — the profluens **element** wrapping the tested [`MatroskaWriter`]
 //! (crate::MatroskaWriter) (spec: `spec/MATROSKA.md`; Writing elements). This is the
 //! **single-track** version: one sink pad, one src pad, fitting today's static pad model
 //! (spec: Elements and pads). The general multiplexer — one sink pad per input stream
 //! plus fan-in — is [`MkvMuxN`](crate::MkvMuxN) (`mux_multi`). Everything here is a
 //! **passive transform**: encoded frames in, MKV bytes out, inlining into the upstream
-//! group like `sc-ogg`'s `OggMux`.
+//! group like `pf-ogg`'s `OggMux`.
 //!
 //! The **sink pad offers every family it can mux** (plus a `bytes` fallback for the
 //! constructed path) with the field/value names those announcements carry — a consumer
 //! that *reads* announced fields must declare them, since a pad's offers are what interns
 //! the names the upstream's announcement resolves against (spec: Formats — dynamic caps;
 //! a wildcard pad would admit everything but intern nothing). The src pad stays raw
-//! [`bytes`](streamcraft_core::format::OfferDesc::any) — a Matroska byte stream.
+//! [`bytes`](profluens_core::format::OfferDesc::any) — a Matroska byte stream.
 //!
 //! ## Track config: negotiated (remux) or constructed
 //! Two ways to know the track:
@@ -51,21 +51,21 @@
 //! (belt-and-braces, idempotent) for symmetry with `OggMux` and so a future trailing
 //! element (Cues) has a hook. Any bytes `finalize` were to produce are pushed downstream.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::{Buffer, BufferFlags};
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::buffer::{Buffer, BufferFlags};
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::{FormatId, PadId};
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::memory::Memory;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::id::{FormatId, PadId};
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::memory::Memory;
+use profluens_core::time::Timestamp;
 
 use crate::codec::{self, Reframer};
 use crate::reader::{MatroskaReader, Track};
@@ -104,7 +104,7 @@ static MUX_AUDIO_FIELDS: [FieldDesc; 3] = [
 /// The colorimetry value names an upstream (demuxer) announcement may carry — `Set`,
 /// not `Any`, for the same reason as [`MUX_SAMPLE_VALUES`]: declaring the *values* is
 /// what interns them, and `build_fixed` drops an announcement whose names never
-/// interned. The names mirror `streamcraft-video`'s color vocabulary (pinned by that
+/// interned. The names mirror `profluens-video`'s color vocabulary (pinned by that
 /// crate's tests); the muxer maps them back to H.273 code points in `color_map`.
 static MUX_MATRIX_VALUES: [ValueDesc; 4] = [
     ValueDesc::Id("bt709"),
@@ -146,7 +146,7 @@ static MUX_SINK_OFFERS: [OfferDesc; 6] = [
     OfferDesc { family: "flac", fields: &MUX_AUDIO_FIELDS },
     OfferDesc { family: "vp8", fields: &MUX_VIDEO_FIELDS },
     OfferDesc { family: "vp9", fields: &MUX_VIDEO_FIELDS },
-    // The passthrough NAL framings (`sc-mp4`'s remux mode): length-prefixed samples led
+    // The passthrough NAL framings (`pf-mp4`'s remux mode): length-prefixed samples led
     // by the raw config record in-band — Matroska's native shape (RFC 9559 §12).
     OfferDesc { family: "h264/avcc", fields: &MUX_VIDEO_FIELDS },
     OfferDesc { family: "h265/hvcc", fields: &MUX_VIDEO_FIELDS },
@@ -1149,7 +1149,7 @@ impl MkvDemux {
                     off,
                 });
             }
-            // Return the frame's payload buffer to the reader for reuse (streamcraft patch): the
+            // Return the frame's payload buffer to the reader for reuse (profluens patch): the
             // Matroska framing then allocates nothing in steady state. `out_bytes` is fully
             // consumed above, so `frame.data` is no longer borrowed. `next_frame` returned an
             // owned `Frame`, so `self.reader` is free to borrow here.

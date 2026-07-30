@@ -1,5 +1,5 @@
 //! Introspection protocol + server tests (spec: Introspection protocol and
-//! scraft-scope). Table-driven where it pays; "tests are data". The whole file runs in
+//! pf-scope). Table-driven where it pays; "tests are data". The whole file runs in
 //! well under a second (the server's poll granularity is 5 ms, so a round trip is a few
 //! polls). Empty when the `introspect` feature is off, so the feature-off suite links.
 
@@ -9,20 +9,20 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{Constraint, OfferDesc, Value};
-use streamcraft_core::id::{ElementId, PadId};
-use streamcraft_core::introspect::strtab::StrTab;
-use streamcraft_core::introspect::tap::{BusTapRow, LogTapRegistry};
-use streamcraft_core::introspect::wire::{self, errcode, kind};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{Constraint, OfferDesc, Value};
+use profluens_core::id::{ElementId, PadId};
+use profluens_core::introspect::strtab::StrTab;
+use profluens_core::introspect::tap::{BusTapRow, LogTapRegistry};
+use profluens_core::introspect::wire::{self, errcode, kind};
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 // ===========================================================================
 // 1. Golden wire pinning — row sizes and field offsets are a contract.
@@ -333,10 +333,10 @@ fn strtab_interns_by_pointer_and_content() {
 
 #[test]
 fn bus_tap_row_kind_and_mapping_table() {
-    use streamcraft_core::bus::{BusMessage, State};
-    use streamcraft_core::id::{ElementId, GroupId, LinkId, PadId};
-    use streamcraft_core::format::FixedFormat;
-    use streamcraft_core::id::FormatId;
+    use profluens_core::bus::{BusMessage, State};
+    use profluens_core::id::{ElementId, GroupId, LinkId, PadId};
+    use profluens_core::format::FixedFormat;
+    use profluens_core::id::FormatId;
 
     // (message, expected kind, expected class, a, b, c, d)
     let cases: Vec<(BusMessage, u8, u8, u32, u32, u64, u64)> = vec![
@@ -392,8 +392,8 @@ fn bus_tap_row_kind_and_mapping_table() {
 
 #[test]
 fn bus_tap_row_truncates_error_text_at_char_boundary() {
-    use streamcraft_core::bus::BusMessage;
-    use streamcraft_core::id::ElementId;
+    use profluens_core::bus::BusMessage;
+    use profluens_core::id::ElementId;
     // A message longer than 64 bytes with a multibyte char straddling the cut.
     let long = "x".repeat(63) + "é"; // 'é' is 2 bytes; byte 63 is 'x', 64/65 are 'é'
     let msg = BusMessage::Error {
@@ -413,7 +413,7 @@ fn bus_tap_row_truncates_error_text_at_char_boundary() {
 
 #[test]
 fn log_tap_registry_drops_exact_on_full_ring() {
-    use streamcraft_core::log::{FieldValue, Level, LogRecord};
+    use profluens_core::log::{FieldValue, Level, LogRecord};
 
     let reg = LogTapRegistry::new();
     let (id, _rx) = reg.attach(4); // rounds up to a power of two → 4
@@ -424,7 +424,7 @@ fn log_tap_registry_drops_exact_on_full_ring() {
         level: Level::Info,
         event: "tick",
         nfields: 0,
-        fields: [streamcraft_core::log::Field::new("", FieldValue::Uint(0)); 4],
+        fields: [profluens_core::log::Field::new("", FieldValue::Uint(0)); 4],
     };
     // Publish 10 into a 4-slot ring that is never drained → 6 dropped.
     for _ in 0..10 {
@@ -436,7 +436,7 @@ fn log_tap_registry_drops_exact_on_full_ring() {
 
 #[test]
 fn log_tap_fast_path_is_a_noop_without_subscribers() {
-    use streamcraft_core::log::{FieldValue, Level, LogRecord};
+    use profluens_core::log::{FieldValue, Level, LogRecord};
     let reg = LogTapRegistry::new();
     let rec = LogRecord {
         ts: Timestamp::ZERO,
@@ -445,7 +445,7 @@ fn log_tap_fast_path_is_a_noop_without_subscribers() {
         level: Level::Info,
         event: "tick",
         nfields: 0,
-        fields: [streamcraft_core::log::Field::new("", FieldValue::Uint(0)); 4],
+        fields: [profluens_core::log::Field::new("", FieldValue::Uint(0)); 4],
     };
     // No subscriber: publish must not panic and must be a no-op.
     for _ in 0..100 {
@@ -625,7 +625,7 @@ fn temp_socket() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("sc-introspect-{}-{}.sock", std::process::id(), n))
+    std::env::temp_dir().join(format!("pf-introspect-{}-{}.sock", std::process::id(), n))
 }
 
 // ===========================================================================
@@ -805,7 +805,7 @@ fn wrong_major_client_hello_is_rejected_and_closed() {
 
 #[test]
 fn subscribe_bus_delivers_a_tap_without_stealing_from_the_bus() {
-    use streamcraft_core::bus::BusMessage;
+    use profluens_core::bus::BusMessage;
 
     // A run posts `BusMessage::Eos` through the pipeline's own sender (the one the tap
     // watches) at end of stream — a real, deterministic trigger, no test-only API. The
@@ -856,7 +856,7 @@ fn subscribe_bus_delivers_a_tap_without_stealing_from_the_bus() {
 
 #[test]
 fn short_run_with_logging_and_log_subscribe_decodes_records() {
-    use streamcraft_core::log::Level;
+    use profluens_core::log::Level;
 
     let (mut p, _src, sink) = build_pipeline(4);
     p.set_log_level(Some(Level::Trace)); // wire log channels this run
@@ -943,7 +943,7 @@ fn dropping_server_unlinks_socket_and_ends_connection() {
 
 #[test]
 fn seek_maps_time_through_the_index_or_errors_unsupported() {
-    use streamcraft_core::pipeline::SeekIndex;
+    use profluens_core::pipeline::SeekIndex;
 
     // Without an index: Seek → Error(UNSUPPORTED).
     let (mut p, _src, _sink) = build_pipeline(4);

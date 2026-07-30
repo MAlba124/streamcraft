@@ -11,9 +11,9 @@
 //! tool and no fixture file. The decoded PCM is cross-checked against the standalone
 //! [`FlacDecoder`], so the harness path is validated against the codec's own oracle.
 
-use sc_flac::{FlacDecoder, FlacEncoder, SampleFormat};
-use streamcraft_core::format::Value;
-use streamcraft_core::harness::Harness;
+use pf_flac::{FlacDecoder, FlacEncoder, SampleFormat};
+use profluens_core::format::Value;
+use profluens_core::harness::Harness;
 
 const RATE: u32 = 22_050;
 const CHANNELS: u32 = 2;
@@ -59,7 +59,7 @@ fn flacdec_announces_format_and_decodes_pcm() {
     let (pcm, expected) = gen_s16(frames);
     let flac = encode_stream(&pcm);
 
-    let mut h = Harness::new(sc_flac::FlacDec::new());
+    let mut h = Harness::new(pf_flac::FlacDec::new());
 
     // Feed the FLAC byte stream in small chunks — the incremental, arrives-a-bit-at-a-time
     // shape a real byte source produces — running `process()` after each, collecting every

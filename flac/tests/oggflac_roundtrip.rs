@@ -6,24 +6,24 @@
 //! block per packet + one FLAC frame per packet, muxed into pages by the library
 //! [`OggMux`]), then run `oggdemux ! oggflacdeframe ! flacdec` in a pipeline and assert the
 //! decoded PCM equals the input sample-for-sample. `oggflacdeframe` is the element under
-//! test; the mux side is the tested `sc-ogg` writer, so this exercises exactly the
+//! test; the mux side is the tested `pf-ogg` writer, so this exercises exactly the
 //! milestone pipeline minus the sink: `filesrc ! oggdemux ! oggflacdeframe ! flacdec`.
 
 use std::sync::{Arc, Mutex};
 
-use sc_flac::{FlacDec, FlacDecoder, FlacEncoder, OggFlacDeframe, SampleFormat};
-use sc_ogg::{OggDemux, OggMux};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_flac::{FlacDec, FlacDecoder, FlacEncoder, OggFlacDeframe, SampleFormat};
+use pf_ogg::{OggDemux, OggMux};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 // =====================================================================================
 // Building an Ogg-FLAC stream from raw PCM
@@ -81,7 +81,7 @@ fn encode_ogg_flac_packets(samples: &[i16], channels: u32, rate: u32) -> Vec<Vec
     }
     let body = enc.finish();
     // Patch the finalised STREAMINFO body over the placeholder in the native header.
-    header[sc_flac::streaminfo_offset()..sc_flac::streaminfo_offset() + body.len()]
+    header[pf_flac::streaminfo_offset()..pf_flac::streaminfo_offset() + body.len()]
         .copy_from_slice(&body);
 
     // Split the native header into its metadata blocks: `fLaC` (4) + a chain of

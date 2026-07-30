@@ -10,7 +10,7 @@
 //! `ctx.io()`, exactly like `filesrc` registers its file.
 //!
 //! `process()` then drains completed body reads — submitted as streaming
-//! [`OpKind::Recv`](streamcraft_core::io::OpKind::Recv) ops — decodes them into pooled
+//! [`OpKind::Recv`](profluens_core::io::OpKind::Recv) ops — decodes them into pooled
 //! buffers and pushes them downstream, ending with [`Flow::Eos`] once the body is
 //! complete. The socket ride is **single-op**: unlike `filesrc`'s positioned reads
 //! (order-independent, pipelined `credits` deep), a streaming socket read consumes the
@@ -55,17 +55,17 @@ use std::net::TcpStream;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 
 use crate::tls;
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::io::{FileHandle, IoResult};
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::io::{FileHandle, IoResult};
+use profluens_core::time::Timestamp;
 
 /// Cap on the response header block, so a server that never sends `\r\n\r\n` can't
 /// make us buffer unboundedly.
@@ -885,7 +885,7 @@ impl Element for HttpSrc {
             format!("{}:{}", url.host, url.port)
         };
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: streamcraft\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: profluens\r\n\r\n",
             url.path, host_header
         );
 

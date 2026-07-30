@@ -1,4 +1,4 @@
-//! Canonical-prefix-code decode tables (streamcraft patch — see `STREAMCRAFT-PATCHES.md`).
+//! Canonical-prefix-code decode tables (profluens patch — see `PROFLUENS-PATCHES.md`).
 //!
 //! The §4.A spectrum Huffman codebooks (`hcod1..hcod11`) and the §4.A.1 scalefactor codebook
 //! (`hcod_sf`) were decoded by a **linear scan**: for each of up to `max_len` bit-reads, walk

@@ -1,13 +1,13 @@
 //! `WavParse` in a pipeline: `filesrc ! wavparse ! filesink` strips the RIFF header and
 //! streams the PCM payload byte-identically (spec: Milestone applications §3).
 
-use streamcraft_audio::{parse_wav_header, write_pcm_wav, AudioFormat, SampleFormat, WavParse};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use profluens_audio::{parse_wav_header, write_pcm_wav, AudioFormat, SampleFormat, WavParse};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_wav_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_wav_{}_{}.bin", tag, std::process::id()));
     p
 }
 

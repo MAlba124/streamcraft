@@ -1,4 +1,4 @@
-//! The autoplug controller (spec: streamcraft.md §no-bins — "decodebin's actual job …
+//! The autoplug controller (spec: profluens.md §no-bins — "decodebin's actual job …
 //! is bus-listening logic issuing first-class relink operations. Ship an autoplug
 //! controller as a **library, not as a magic self-modifying graph node**"; roadmap item 8
 //! lists the "autoplug controller"). Given a prerolled pipeline and its discovered demux
@@ -14,7 +14,7 @@
 //! spare element in the graph — harmless).
 //!
 //! The sharp edge: every demux src pad offers `[<codec-family>, bytes]` (the `bytes` escape
-//! lets a generic byte sink tap any track — see `sc-mkv`'s `codec::offers_for`), and the
+//! lets a generic byte sink tap any track — see `pf-mkv`'s `codec::offers_for`), and the
 //! audio decoders accept `bytes` on their sink (`flacdec`/`mp3dec`/`aacdec` all bridge raw
 //! bytes so a `filesrc`-of-a-`.flac` links). So *any* audio decoder byte-bridge-links to
 //! *any* audio pad — pure negotiation cannot tell FLAC from AAC. We resolve this with the
@@ -35,16 +35,16 @@
 //! The numbers below encode measured deadlock/stutter post-mortems, not guesses — see the
 //! inline comments at each `set_element_pool`/`set_queue_capacity`.
 
-use streamcraft_core::element::{Element, SchedHint};
-use streamcraft_core::error::Error;
-use streamcraft_core::id::ElementId;
-use streamcraft_core::pipeline::Pipeline;
+use profluens_core::element::{Element, SchedHint};
+use profluens_core::error::Error;
+use profluens_core::id::ElementId;
+use profluens_core::pipeline::Pipeline;
 
-use streamcraft_audio::{AudioConvert, AudioDownmix, AudioResample, SampleFormat};
-use streamcraft_elements::flow::Queue;
-use streamcraft_elements::testing::TestSink;
+use profluens_audio::{AudioConvert, AudioDownmix, AudioResample, SampleFormat};
+use profluens_elements::flow::Queue;
+use profluens_elements::testing::TestSink;
 
-use sc_text::{PgsDec, SubParse, SubtitleOverlay};
+use pf_text::{PgsDec, SubParse, SubtitleOverlay};
 
 /// Where a decoder's output goes: a real device sink, or a drop sink (headless / no
 /// device). The controller stays agnostic to which — the CLI picks per `--no-window` /
@@ -62,7 +62,7 @@ pub enum SinkChoice {
     /// the clock, so this is a *video* choice paired with `audio: Device`.
     External,
     /// Like [`External`](Self::External), but **zero-copy**: try to build a VA-API decoder in
-    /// DMA-BUF-export mode (`sc_vaapi::video_decoder_zerocopy_for`) so the decoded surface
+    /// DMA-BUF-export mode (`pf_vaapi::video_decoder_zerocopy_for`) so the decoded surface
     /// reaches the GUI without a CPU round-trip. The subtitle overlay cannot touch a GPU-only
     /// frame, so this path taps `decoder.src` **directly** (no suboverlay — subtitles are a
     /// documented follow-up here). Falls back to the plain `External` path (software/readback
@@ -105,10 +105,10 @@ pub struct Wiring {
     /// the presenter must be the EGL frame-slot sink. `false` for the CPU/software path
     /// (including a [`SinkChoice::ExternalZeroCopy`] that fell back to readback).
     pub video_zerocopy: bool,
-    /// The window↔app control channel of the raw-wire presenter (`SC_PRESENT`): the app reads
+    /// The window↔app control channel of the raw-wire presenter (`PF_PRESENT`): the app reads
     /// it to drive pause/seek from window clicks + publish duration/pause to the HUD. `None`
     /// unless the waylandvideosink is in use.
-    pub player_control: Option<std::sync::Arc<sc_present::PlayerControl>>,
+    pub player_control: Option<std::sync::Arc<pf_present::PlayerControl>>,
 }
 
 impl Wiring {
@@ -120,20 +120,20 @@ impl Wiring {
 }
 
 /// The video decoder candidate order (software), by the demux family they decode. Hardware
-/// (`sc_vaapi::video_decoder_for`) is tried first, ahead of these, and is capability-gated
-/// (no device or `SC_NO_VAAPI` set → skipped). Each family string is exactly what the
-/// demuxers announce (`sc-mkv`/`sc-mp4` `codec::family_for` / decode-mode families).
+/// (`pf_vaapi::video_decoder_for`) is tried first, ahead of these, and is capability-gated
+/// (no device or `PF_NO_VAAPI` set → skipped). Each family string is exactly what the
+/// demuxers announce (`pf-mkv`/`pf-mp4` `codec::family_for` / decode-mode families).
 fn make_video_decoder(family: &str) -> Option<Box<dyn Element>> {
     Some(match family {
         // MP4 decode-mode and MKV both emit Annex B for AVC/HEVC (Mp4Demux::new, not
         // passthrough), so both software decoders take `h264/annexb` / `h265/annexb`.
-        "h264/annexb" => Box::new(sc_h264::H264Dec::new()),
-        "h265/annexb" => Box::new(sc_h265::H265Dec::new()),
-        "vp8" => Box::new(sc_vp8::Vp8Dec::new()),
-        "vp9" => Box::new(sc_vp9::Vp9Dec::new()),
-        "av1" => Box::new(sc_av1::Av1Dec::new()),
+        "h264/annexb" => Box::new(pf_h264::H264Dec::new()),
+        "h265/annexb" => Box::new(pf_h265::H265Dec::new()),
+        "vp8" => Box::new(pf_vp8::Vp8Dec::new()),
+        "vp9" => Box::new(pf_vp9::Vp9Dec::new()),
+        "av1" => Box::new(pf_av1::Av1Dec::new()),
         // MPEG-4 Part 2 ASP (XviD/DivX) — the video of classic `.avi` rips.
-        "mpeg4/asp" => Box::new(sc_mpeg4p2::Mpeg4p2Dec::new()),
+        "mpeg4/asp" => Box::new(pf_mpeg4p2::Mpeg4p2Dec::new()),
         _ => return None,
     })
 }
@@ -144,15 +144,18 @@ fn make_video_decoder(family: &str) -> Option<Box<dyn Element>> {
 /// because both accept `bytes`.
 fn make_audio_decoder(family: &str) -> Option<Box<dyn Element>> {
     Some(match family {
-        "aac" => Box::new(sc_aac::AacDec::new()),
-        "flac" => Box::new(sc_flac::FlacDec::new()),
+        "aac" => Box::new(pf_aac::AacDec::new()),
+        "flac" => Box::new(pf_flac::FlacDec::new()),
+        // Opus (RFC 6716) — the `A_OPUS`/`Opus` tracks in mkv/webm/mp4 and Ogg-Opus. Decodes to
+        // interleaved 48 kHz s16; a downstream `audioresample` handles any device-rate mismatch.
+        "opus" => Box::new(pf_opus::OpusDec::new()),
         // `mp3` appears as a demux family via the elementary path and mkv/avi `A_MPEG/L3`.
-        "mp3" => Box::new(sc_mp3::Mp3Dec::new()),
+        "mp3" => Box::new(pf_mp3::Mp3Dec::new()),
         // Dolby: AC-3 (ATSC A/52) and E-AC-3 (Annex E) — the 5.1 tracks in BluRay/WEB-DL/AVI
         // rips. Decode to interleaved S16 in canonical L,R,C,LFE,Ls,Rs order; a `>2ch` sink
         // path inserts the BS.775 downmix (see `wire_audio_chain`).
-        "ac3" => Box::new(sc_ac3::Ac3Dec::new()),
-        "eac3" => Box::new(sc_ac3::Eac3Dec::new()),
+        "ac3" => Box::new(pf_ac3::Ac3Dec::new()),
+        "eac3" => Box::new(pf_ac3::Eac3Dec::new()),
         _ => return None,
     })
 }
@@ -170,9 +173,9 @@ const AUDIO_SLOTS: u32 = 64;
 const AUDIO_QUEUE: usize = 64;
 
 /// How autoplug learns a discovered pad's real codec family. Some demuxers publish a
-/// *per-track* offer menu whose first family is the codec ([`sc_mkv::MkvDemux`] via
+/// *per-track* offer menu whose first family is the codec ([`pf_mkv::MkvDemux`] via
 /// `codec::offers_for`) — [`Pipeline::pad_families`] reads it directly. Others share one
-/// all-families menu across every dynamic pad ([`sc_mp4::Mp4Demux`], whose menu leads with
+/// all-families menu across every dynamic pad ([`pf_mp4::Mp4Demux`], whose menu leads with
 /// `bytes`) and expose the per-track family only through their reader — the controller then
 /// supplies an explicit `pad → family` map. This closure is that override, consulted before
 /// the pad's declared menu.
@@ -197,12 +200,12 @@ pub type AudioChannels<'a> = dyn Fn(&str) -> Option<u16> + 'a;
 pub fn autoplug_container(
     p: &mut Pipeline,
     demux: ElementId,
-    pads: &[streamcraft_core::pipeline::AddedPadInfo],
+    pads: &[profluens_core::pipeline::AddedPadInfo],
     family_of: Option<&FamilyResolver<'_>>,
     audio_channels: Option<&AudioChannels<'_>>,
     video_sink: SinkChoice,
     audio_sink: SinkChoice,
-    zc_channel: Option<&std::sync::Arc<sc_vaapi::gpuframe::GpuFrameChannel>>,
+    zc_channel: Option<&std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
 ) -> Wiring {
     let mut w = Wiring::default();
 
@@ -255,22 +258,22 @@ pub fn autoplug_container(
             // DMA-BUF-export mode taps `decoder.src` DIRECTLY (no suboverlay — a CPU overlay
             // cannot touch a GPU-only frame; subtitles are the documented follow-up). Its src
             // is `video/gpu`, so it can only link a `video/gpu` presenter.
-            // Internal raw-wire Wayland presenter (opt-in via `SC_PRESENT`): a zero-copy HW
+            // Internal raw-wire Wayland presenter (opt-in via `PF_PRESENT`): a zero-copy HW
             // decoder feeding `waylandvideosink` over a channel created here, so both the
             // decoder and the sink hold `Arc` clones and it lives with the pipeline. No
             // libwayland, no readback, no SDL. Falls through to the normal path if the HW
             // decoder can't be built/linked for this family.
-            if std::env::var_os("SC_PRESENT").is_some() {
-                let ch = sc_vaapi::gpuframe::GpuFrameChannel::new();
+            if std::env::var_os("PF_PRESENT").is_some() {
+                let ch = pf_vaapi::gpuframe::GpuFrameChannel::new();
                 if let Some((dec_id, name)) =
                     try_link_video_zerocopy(p, (ap.element, &ap.name), family, &ch)
                 {
                     p.set_element_pool(dec_id, VIDEO_SLOT, VIDEO_SLOTS);
                     p.set_queue_capacity(dec_id, VIDEO_QUEUE);
                     // The window↔app control channel: clicks → pause/seek, duration/pause → HUD.
-                    let ctrl = sc_present::PlayerControl::new();
+                    let ctrl = pf_present::PlayerControl::new();
                     let sink = p.add_boxed(Box::new(
-                        sc_present::WaylandVideoSink::new()
+                        pf_present::WaylandVideoSink::new()
                             .with_channel(ch)
                             .with_control(std::sync::Arc::clone(&ctrl)),
                     ));
@@ -357,14 +360,14 @@ pub fn autoplug_container(
             }
         }
 
-        // SC_PRESENT: the raw-wire sink shows the first PGS subtitle in its OWN subsurface
+        // PF_PRESENT: the raw-wire sink shows the first PGS subtitle in its OWN subsurface
         // (no overlay — a CPU overlay can't touch the GPU frame). Route `queue → pgsdec →
         // waylandvideosink.subtitle`; the sink renders the RGBA bitmap over the video. (Text
         // subtitles still need the overlay's rasterizer — a follow-up.)
         if Some(i) == sub_idx
             && family == "subtitle/pgs"
             && w.video_zerocopy
-            && std::env::var_os("SC_PRESENT").is_some()
+            && std::env::var_os("PF_PRESENT").is_some()
         {
             if let Some(sink) = w.video_sink {
                 let q = p.add(Queue::new());
@@ -491,7 +494,7 @@ fn drop_reason(family: &str) -> String {
 }
 
 /// Whether a family could be hardware-decoded (so an unlinked one is an "extra track", not
-/// "unsupported"). h264 + h265 today (matching `sc_vaapi::video_decoder_for`); both also have
+/// "unsupported"). h264 + h265 today (matching `pf_vaapi::video_decoder_for`); both also have
 /// software decoders, so this only refines the drop message for a *second* such track.
 fn is_hw_video_family(family: &str) -> bool {
     matches!(family, "h264/annexb" | "h265/annexb")
@@ -507,10 +510,10 @@ fn try_link_video(
     pad: (ElementId, &str),
     family: &str,
 ) -> Option<(ElementId, &'static str)> {
-    // Hardware-first (spec: play_file — the probe gates construction; `SC_NO_VAAPI` or no
+    // Hardware-first (spec: play_file — the probe gates construction; `PF_NO_VAAPI` or no
     // device → `None`). A hardware decoder that constructs but fails to link (unsupported
     // profile) falls through to software.
-    if let Some(hw) = sc_vaapi::video_decoder_for(family) {
+    if let Some(hw) = pf_vaapi::video_decoder_for(family) {
         let id = p.add_boxed(hw);
         let hw_name = match family {
             "h265/annexb" => "vaapih265dec",
@@ -539,9 +542,9 @@ fn try_link_video_zerocopy(
     p: &mut Pipeline,
     pad: (ElementId, &str),
     family: &str,
-    channel: &std::sync::Arc<sc_vaapi::gpuframe::GpuFrameChannel>,
+    channel: &std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>,
 ) -> Option<(ElementId, &'static str)> {
-    let hw = sc_vaapi::video_decoder_zerocopy_for(family, std::sync::Arc::clone(channel))?;
+    let hw = pf_vaapi::video_decoder_zerocopy_for(family, std::sync::Arc::clone(channel))?;
     let hw_name = match family {
         "h265/annexb" => "vaapih265dec",
         _ => "vaapih264dec",
@@ -617,9 +620,9 @@ fn wire_video(
             // emits `video/raw` (i420/gray8/nv12, subtitles already burned in by the overlay); the
             // sink CPU-converts to ARGB and presents via `wl_shm`. Its own control channel feeds
             // the same clicks→pause/seek + HUD as the zero-copy sink.
-            let ctrl = sc_present::PlayerControl::new();
+            let ctrl = pf_present::PlayerControl::new();
             let s = p.add_boxed(Box::new(
-                sc_present::WaylandRawSink::new().with_control(std::sync::Arc::clone(&ctrl)),
+                pf_present::WaylandRawSink::new().with_control(std::sync::Arc::clone(&ctrl)),
             ));
             p.link((out_el, out_pad), (s, "sink")).expect("video ! waylandrawsink");
             w.video_sink = Some(s);
@@ -629,7 +632,7 @@ fn wire_video(
             // A decoded frame is `video/raw`, which `TestSink` (bytes only) cannot take —
             // `VideoCkSink` accepts `video/raw` and just checksums/counts frames, the honest
             // headless drop for `--no-window`.
-            let id = p.add(streamcraft_video::VideoCkSink::new_element());
+            let id = p.add(profluens_video::VideoCkSink::new_element());
             p.link((out_el, out_pad), (id, "sink")).expect("video ! videocksink (headless drop)");
             w.video_sink = Some(id);
         }
@@ -688,7 +691,7 @@ fn link_audio(
         // uses the device sink (it provides the pipeline clock). The GUI pairs an External video
         // choice with `audio: Device`; a stray `audio: External*` grabs the device.
         SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy => {
-            let s = p.add(sc_pipewire::PipeWireAudioSink::new());
+            let s = p.add(pf_pipewire::PipeWireAudioSink::new());
             wire_audio_chain(p, dec_id, s, "pipewireaudiosink")?;
             w.audio_sink = Some(s);
         }
@@ -821,7 +824,7 @@ pub fn wire_elementary_audio(
     match audio_sink {
         // Device/External* all use the audio device (see the note in `link_audio`).
         SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy => {
-            let s = p.add(sc_pipewire::PipeWireAudioSink::new());
+            let s = p.add(pf_pipewire::PipeWireAudioSink::new());
             match wire_audio_chain(p, dec_id, s, "pipewireaudiosink") {
                 Ok(()) => {
                     w.audio_sink = Some(s);

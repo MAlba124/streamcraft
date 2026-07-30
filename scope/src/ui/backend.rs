@@ -1,6 +1,6 @@
 //! The SDL3 backend — the crate's only `unsafe` module.
 //!
-//! Mirrors the pattern established by `sc-sdl3`'s `video.rs`: a thin safe wrapper
+//! Mirrors the pattern established by `pf-sdl3`'s `video.rs`: a thin safe wrapper
 //! over `sdl3-sys` with a SAFETY note per `unsafe` block, refcounted subsystem
 //! init (an app may already use SDL for its video sink — the scope embeds into that
 //! process), one window + renderer, and one static font-atlas texture.
@@ -62,7 +62,7 @@ pub struct Backend {
 
 // SAFETY: the raw SDL handles are used only from the thread that owns the Backend;
 // SDL video on the Linux drivers this targets is a single-threaded in-process
-// protocol client (same posture as sc-sdl3::video). Backend is moved whole, never
+// protocol client (same posture as pf-sdl3::video). Backend is moved whole, never
 // shared, so Send but not Sync.
 unsafe impl Send for Backend {}
 

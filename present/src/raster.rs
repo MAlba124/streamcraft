@@ -420,7 +420,7 @@ impl<'a> Canvas<'a> {
     /// samples with row pitch `mstride` bytes; each sample scales the color's alpha
     /// (`px_alpha = mask · colorA / 255`) and the tinted, faded color is source-over blended.
     ///
-    /// This is the text path: `sc-text` rasterizes glyph coverage into an A8 buffer, and we land
+    /// This is the text path: `pf-text` rasterizes glyph coverage into an A8 buffer, and we land
     /// it as a colored, anti-aliased run here. The mask, its stride and the destination are all
     /// clipped independently, so a glyph partly off the canvas paints only its visible part and a
     /// truncated `mask` slice is never over-read.

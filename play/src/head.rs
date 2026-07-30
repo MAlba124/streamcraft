@@ -17,7 +17,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use sc_mkv::ebml::id;
+use pf_mkv::ebml::id;
 
 /// Read the first [`probe::PREFIX_LEN`](crate::probe::PREFIX_LEN)-plus bytes for typefind.
 /// A single small read; the caller classifies, then chooses the head strategy below.
@@ -112,7 +112,7 @@ pub fn mp4_head(path: &str) -> std::io::Result<Vec<u8>> {
 
 /// The AVI stream head: the leading `RIFF('AVI ' …)` up to and including the `movi` LIST
 /// four-CC — everything `AviDemux::new` needs to discover streams at preroll. The `hdrl`
-/// list (per-stream `strh`/`strf` headers) precedes `movi`, and `sc-avi`'s `probe_header`
+/// list (per-stream `strh`/`strf` headers) precedes `movi`, and `pf-avi`'s `probe_header`
 /// resolves the tracks + the `movi` data start from these bytes; the whole file is fed on
 /// the sink pad at run time regardless (like MKV/MP4).
 ///
@@ -158,7 +158,7 @@ mod tests {
 
     #[allow(clippy::disallowed_methods)] // test fixture write; clippy.toml sanctions test setup
     fn write_tmp(name: &str, bytes: &[u8]) -> String {
-        let path = std::env::temp_dir().join(format!("scplay-head-test-{name}-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pfplay-head-test-{name}-{}", std::process::id()));
         let mut f = std::fs::File::create(&path).expect("create tmp");
         f.write_all(bytes).expect("write tmp");
         path.to_string_lossy().into_owned()

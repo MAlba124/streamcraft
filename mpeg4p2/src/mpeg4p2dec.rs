@@ -21,20 +21,20 @@ use crate::decoder::{DecodeResult, Decoder};
 use crate::headers::{self, startcode, VolHeader};
 use crate::packed;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
-use streamcraft_video::color;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
+use profluens_video::color;
 
-// `video/raw` family/field/value names (kept as literals, like sc-vp8/sc-h264).
+// `video/raw` family/field/value names (kept as literals, like pf-vp8/pf-h264).
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";
 const F_HEIGHT: &str = "height";
@@ -381,7 +381,7 @@ fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDe
     ];
     for (field, statify) in table {
         let Some(fid) = ctx.field_id(field) else { continue };
-        let Some(streamcraft_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
+        let Some(profluens_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
         let Some(stat) = ctx.value_name(vid).and_then(statify) else { continue };
         out.push((field, ValueDesc::Id(stat)));
     }

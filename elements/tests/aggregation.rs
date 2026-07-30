@@ -7,17 +7,17 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::Buffer;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::buffer::Buffer;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 
@@ -90,7 +90,7 @@ static MUX_DESC: ElementDesc = ElementDesc {
     pads: &MUX_PADS,
     props: &[],
     sched: SchedHint::Active,
-    inputs: InputPolicy::All { by: streamcraft_core::element::AlignBy::RunningTime },
+    inputs: InputPolicy::All { by: profluens_core::element::AlignBy::RunningTime },
     latency: LatencyDesc { min: Timestamp::ZERO, max: Timestamp::ZERO, is_live: false, jitter: Timestamp::ZERO },
     make_default: None,
 };
@@ -212,7 +212,7 @@ impl Element for RecordingSink {
 
 #[test]
 fn muxer_merges_two_streams_in_pts_order() {
-    use streamcraft_core::pipeline::Pipeline;
+    use profluens_core::pipeline::Pipeline;
 
     // Stream A: PTS 0,20,40,60,80 (marker 0). Stream B: 10,30,50,70,90 (marker 1).
     let n = 5;

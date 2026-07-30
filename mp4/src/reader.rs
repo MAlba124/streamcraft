@@ -24,20 +24,20 @@
 //!
 //! ## Untrusted input (spec: "a crash on bad input is a P0")
 //! Resolution is fully bounds-checked (via [`crate::boxes`]); a truncated/over-long/
-//! self-referential table yields an [`Mp4Error`] the element maps to a `streamcraft`
+//! self-referential table yields an [`Mp4Error`] the element maps to a `profluens`
 //! error. Streaming never reads past the buffered window. Fragmented (`moof`) files are
 //! detected in resolution and errored loudly — their samples are not in `stbl`.
 
 use std::collections::VecDeque;
 
-use streamcraft_core::memory::Memory;
+use profluens_core::memory::Memory;
 
 use crate::boxes::{self, BoxError, BoxHeader};
 use crate::codec::{self, Reframer, SampleEntry};
 
 /// A resolution- or streaming-time failure. `Box`/table errors are wrapped from
 /// [`BoxError`]; the MP4-specific structural rejections (fragmented file, self-referential
-/// chunk map) get their own variants so the element can word the `streamcraft` error.
+/// chunk map) get their own variants so the element can word the `profluens` error.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mp4Error {
     /// A box or table field was truncated / structurally impossible (from [`crate::boxes`]).

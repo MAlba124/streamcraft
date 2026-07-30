@@ -8,8 +8,8 @@
 //! the block-level cases so the reader is actually *in* the streaming state when it hits the
 //! corruption, rather than rejecting it at the top level.
 
-use sc_mkv::ebml::{self, id};
-use sc_mkv::MatroskaReader;
+use pf_mkv::ebml::{self, id};
+use pf_mkv::MatroskaReader;
 
 /// A valid stream head (EBML Header + Segment + Info + Tracks + open Cluster) so appended bad
 /// block bytes are parsed in the streaming phase. Mirrors `lacing.rs`'s builder.

@@ -41,7 +41,7 @@ ffmpeg -i fx_stereo.wav -c:a libmp3lame -b:a 128k -joint_stereo 1 -id3v2_version
 
 # ID3v2-prefixed variant of the mono content.
 ffmpeg -i fx_mono.wav -c:a libmp3lame -b:a 128k -write_id3v2 1 \
-  -metadata title="streamcraft mp3dec fixture" -metadata artist="oxideav-mp3 gate" mono_128_id3.mp3
+  -metadata title="profluens mp3dec fixture" -metadata artist="oxideav-mp3 gate" mono_128_id3.mp3
 
 # Oracle decodes (interleaved s16le).
 ffmpeg -i mono_128.mp3 -f s16le -c:a pcm_s16le -ac 1 mono_128.ref.s16le

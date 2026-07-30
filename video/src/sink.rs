@@ -15,16 +15,16 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::clock::WaitOutcome;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::clock::WaitOutcome;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 use crate::format::RAW_ANY_OFFER;
 
@@ -32,7 +32,7 @@ const SINK: PadId = PadId(0);
 
 // Accept a `video/raw` stream, or a raw `bytes` transport (so it can sit directly after
 // a `rawvideoparse`, which announces `video/raw`, or a byte producer in a smoke test).
-use streamcraft_core::format::OfferDesc;
+use profluens_core::format::OfferDesc;
 static OFFERS: [OfferDesc; 2] = [RAW_ANY_OFFER[0], OfferDesc::any("bytes")];
 
 static PADS: [PadDesc; 1] = [PadDesc {

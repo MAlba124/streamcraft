@@ -2,8 +2,8 @@
 //! `filesrc ! mkvdemux ! vp8dec ! sdl3videosink`, clock-paced to a real window.
 //!
 //! ```text
-//! cargo run --release -p sc-mkv --example make_vp8_sample -- /tmp/sample.mkv 5
-//! cargo run --release -p sc-sdl3 --example play_mkv -- /tmp/sample.mkv
+//! cargo run --release -p pf-mkv --example make_vp8_sample -- /tmp/sample.mkv 5
+//! cargo run --release -p pf-sdl3 --example play_mkv -- /tmp/sample.mkv
 //! ```
 //!
 //! `MkvDemux` discovers its tracks during preroll from constructor-supplied header
@@ -11,12 +11,12 @@
 //! example reads the stream head up to the first Cluster and hands it over; the whole
 //! file then streams through `FileSrc` as usual.
 
-use sc_mkv::ebml::id;
-use sc_mkv::MkvDemux;
-use sc_vp8::Vp8Dec;
-use sc_sdl3::Sdl3VideoSink;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::FileSrc;
+use pf_mkv::ebml::id;
+use pf_mkv::MkvDemux;
+use pf_vp8::Vp8Dec;
+use pf_sdl3::Sdl3VideoSink;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::FileSrc;
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {

@@ -7,8 +7,8 @@
 //! several frames sharing the block timestamp (RFC 9559 §10.3.5), and each mode's size coding
 //! is verified frame-for-frame.
 
-use sc_mkv::ebml::{self, id};
-use sc_mkv::MatroskaReader;
+use pf_mkv::ebml::{self, id};
+use pf_mkv::MatroskaReader;
 
 /// Build a minimal but valid MKV stream: EBML Header + open Segment + Info(TimestampScale) +
 /// Tracks(one A_FLAC entry) + one open Cluster(Timestamp=0) + the given raw `block_bytes`

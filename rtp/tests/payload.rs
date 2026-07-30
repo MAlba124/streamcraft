@@ -66,11 +66,11 @@
 // element (clippy.toml: disallowed-methods).
 #![allow(clippy::disallowed_methods)]
 
-use sc_rtp::depay::h264::{H264Depay, H264DepayError};
-use sc_rtp::depay::opus::depay as opus_depay;
-use sc_rtp::packet::RtpPacket;
-use sc_rtp::pay::h264::pay as h264_pay;
-use sc_rtp::pay::opus::pay as opus_pay;
+use pf_rtp::depay::h264::{H264Depay, H264DepayError};
+use pf_rtp::depay::opus::depay as opus_depay;
+use pf_rtp::packet::RtpPacket;
+use pf_rtp::pay::h264::pay as h264_pay;
+use pf_rtp::pay::opus::pay as opus_pay;
 
 // ---------------------------------------------------------------- helpers
 

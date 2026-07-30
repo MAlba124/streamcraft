@@ -12,19 +12,19 @@
 
 use std::sync::{Arc, Mutex};
 
-use sc_mkv::MatroskaReader;
-use sc_mp4::{Mp4Demux, Mp4Reader};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_mkv::MatroskaReader;
+use pf_mp4::{Mp4Demux, Mp4Reader};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 static SRC_PADS: [PadDesc; 1] = [PadDesc {
@@ -149,7 +149,7 @@ fn head_through_moov(file: &[u8]) -> Vec<u8> {
 
 /// Round `ns` to the muxer's millisecond TimestampScale (round-to-nearest, back to ns).
 fn quantize_ms(ns: u64) -> u64 {
-    let scale = sc_mkv::DEFAULT_TIMESTAMP_SCALE;
+    let scale = pf_mkv::DEFAULT_TIMESTAMP_SCALE;
     ((ns + scale / 2) / scale) * scale
 }
 
@@ -184,7 +184,7 @@ fn h264_mp4_remuxes_to_conformant_mkv() {
     p.link((src, "src"), (demux, "sink")).expect("src -> demux");
     let added = p.preroll().expect("preroll");
     assert_eq!(added.len(), 1, "fixture is single-track");
-    let mux = p.add(sc_mkv::MkvMux::from_caps());
+    let mux = p.add(pf_mkv::MkvMux::from_caps());
     let sink = p.add(ByteCollect { got: Arc::clone(&got) });
     p.link((added[0].element, &added[0].name), (mux, "sink")).expect("demux -> mux");
     p.link((mux, "src"), (sink, "sink")).expect("mux -> sink");
@@ -202,7 +202,7 @@ fn h264_mp4_remuxes_to_conformant_mkv() {
     let want_dur = duration;
     let got_dur = r.duration_ns().expect("remux declares Info\\Duration — not a live stream");
     assert!(
-        got_dur.abs_diff(want_dur) <= sc_mkv::DEFAULT_TIMESTAMP_SCALE,
+        got_dur.abs_diff(want_dur) <= pf_mkv::DEFAULT_TIMESTAMP_SCALE,
         "duration {got_dur} ns ≈ mdhd duration {want_dur} ns (within one ms tick)"
     );
 
@@ -272,7 +272,7 @@ fn av_mp4_remuxes_to_two_track_mkv() {
     p.link((src, "src"), (demux, "sink")).expect("src -> demux");
     let added = p.preroll().expect("preroll");
     assert_eq!(added.len(), 2, "one dynamic pad per track");
-    let mux = p.add(sc_mkv::MkvMux::multi(2));
+    let mux = p.add(pf_mkv::MkvMux::multi(2));
     let sink = p.add(ByteCollect { got: Arc::clone(&got) });
     for (i, &tidx) in [vidx, aidx].iter().enumerate() {
         let ap = added
@@ -303,7 +303,7 @@ fn av_mp4_remuxes_to_two_track_mkv() {
 
     let got_dur = r.duration_ns().expect("Info\\Duration declared");
     assert!(
-        got_dur.abs_diff(want_dur) <= sc_mkv::DEFAULT_TIMESTAMP_SCALE,
+        got_dur.abs_diff(want_dur) <= pf_mkv::DEFAULT_TIMESTAMP_SCALE,
         "duration {got_dur} ns ≈ max mdhd duration {want_dur} ns (within one ms tick)"
     );
 

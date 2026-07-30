@@ -232,7 +232,7 @@ fn tns_frame_filter(
             // `clamp_tns_order` bounds `tns_order` by Table 4.102's
             // `TNS_MAX_ORDER` (≤ 20, AAC Main / other AOTs > 32 kHz), so
             // the widened `coef` lives in a fixed-size stack buffer — no
-            // per-filter heap alloc on the TNS decode path (streamcraft
+            // per-filter heap alloc on the TNS decode path (profluens
             // patch). The `<= TNS_ORDER_STACK_CAP` guard is a defensive
             // belt-and-braces against a future table growth; the clamp
             // makes it unreachable today.
@@ -248,7 +248,7 @@ fn tns_frame_filter(
             // Decode the widened `coef` straight into a stack LPC buffer:
             // `tns_order ≤ TNS_ORDER_STACK_CAP` so the `order + 1` LPC
             // coefficients fit `TNS_ORDER_STACK_CAP + 1` slots — no
-            // per-filter Vec on the decode path (streamcraft patch).
+            // per-filter Vec on the decode path (profluens patch).
             let mut lpc_buf = [0.0_f64; TNS_ORDER_STACK_CAP + 1];
             let lpc_len = tns_decode_coef_to_lpc_into(
                 coef_res_bits,

@@ -10,18 +10,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use sc_flac::{FlacDec, FlacDecoder, FlacEncoder, SampleFormat, StreamDecoder};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_flac::{FlacDec, FlacDecoder, FlacEncoder, SampleFormat, StreamDecoder};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{FixedFormat, OfferDesc, Value};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::io::FileSrc;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{FixedFormat, OfferDesc, Value};
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::io::FileSrc;
 
 /// Encode interleaved S16 samples into a complete FLAC stream (mirrors `roundtrip.rs`:
 /// encode frames, then patch the header with the finalised STREAMINFO body).
@@ -34,7 +34,7 @@ fn encode_s16(samples: &[i16], channels: u32, rate: u32) -> Vec<u8> {
     let mut frames = Vec::new();
     enc.encode_interleaved(&pcm, &mut frames).expect("encode");
     let body = enc.finish();
-    header[sc_flac::streaminfo_offset()..sc_flac::streaminfo_offset() + body.len()]
+    header[pf_flac::streaminfo_offset()..pf_flac::streaminfo_offset() + body.len()]
         .copy_from_slice(&body);
     let mut stream = header;
     stream.extend_from_slice(&frames);
@@ -150,7 +150,7 @@ impl Element for FormatProbe {
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_flacdec_{}_{}.flac", tag, std::process::id()));
+    p.push(format!("pf_flacdec_{}_{}.flac", tag, std::process::id()));
     p
 }
 

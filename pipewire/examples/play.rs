@@ -1,7 +1,7 @@
 //! Play an audio file: `filesrc ! flacdec ! pipewireaudiosink` (spec: Milestone
 //! applications — play an audio file), with a live progress line, pause, and seeking.
 //!
-//! Usage: `cargo run --release -p sc-pipewire --example play -- <file.flac>`
+//! Usage: `cargo run --release -p pf-pipewire --example play -- <file.flac>`
 //! Controls: `space`/`p` pause·resume · `←`/`→` seek ∓/±5 s · `↑`/`↓` seek ±30 s · `q` quit.
 //!
 //! Requires a running PipeWire session — it plays to the default output. `flacdec` announces
@@ -21,11 +21,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sc_flac::{FlacDec, StreamDecoder};
-use sc_pipewire::PipeWireAudioSink;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::io::FileSrc;
+use pf_flac::{FlacDec, StreamDecoder};
+use pf_pipewire::PipeWireAudioSink;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::io::FileSrc;
 
 /// What the app needs to map a wall-clock seek target to a byte offset and a play position.
 #[derive(Clone, Copy)]

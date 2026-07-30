@@ -1,8 +1,8 @@
 //! Hand-written AVI/RIFF primitives: the header probe that discovers streams, the
 //! streaming chunk walker that turns the `movi` list into per-stream chunks, and the
 //! `idx1` index parser. Everything here is **core-independent** (plain byte slices in,
-//! plain structs out) so it is unit-tested in isolation, exactly like `sc-mkv`'s `ebml`
-//! and `sc-ogg`'s `page`.
+//! plain structs out) so it is unit-tested in isolation, exactly like `pf-mkv`'s `ebml`
+//! and `pf-ogg`'s `page`.
 //!
 //! ## The AVI file format (spec at point of use)
 //! AVI is a RIFF document (Microsoft *AVI RIFF File Reference*,
@@ -156,7 +156,7 @@ impl AviHeader {
 
 /// A bounds-checked forward cursor over a byte slice. Every read is fallible — a truncated
 /// header errors rather than panicking (this brief's untrusted-input P0). Mirrors
-/// `sc-mkv`'s `codec::Cursor`.
+/// `pf-mkv`'s `codec::Cursor`.
 struct Cursor<'a> {
     data: &'a [u8],
     at: usize,
@@ -547,7 +547,7 @@ impl Idx1 {
         as_rel < self.file_len
     }
 
-    /// Build a time→byte [`streamcraft_core::pipeline::SeekIndex`] from the video stream's
+    /// Build a time→byte [`profluens_core::pipeline::SeekIndex`] from the video stream's
     /// keyframe entries: for each keyframe chunk of `video_stream_index`, its presentation
     /// time (`frame_number × sample_duration_ns`) mapped to the **absolute byte offset of the
     /// enclosing structure to resume reads from**. The demuxer re-syncs by scanning for the
@@ -561,7 +561,7 @@ impl Idx1 {
         &self,
         video_stream_index: usize,
         video_sample_dur_ns: u64,
-    ) -> streamcraft_core::pipeline::SeekIndex {
+    ) -> profluens_core::pipeline::SeekIndex {
         let mut entries = Vec::new();
         let mut frame: u64 = 0;
         for e in &self.entries {
@@ -575,7 +575,7 @@ impl Idx1 {
             frame += 1;
         }
         // Entries are already ascending in `frame` and thus in time.
-        streamcraft_core::pipeline::SeekIndex {
+        profluens_core::pipeline::SeekIndex {
             entries,
             file_len: Some(self.file_len),
         }

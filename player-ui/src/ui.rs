@@ -1,5 +1,5 @@
 //! The player's immediate-mode UI — transport bar, track menus, and stats overlay,
-//! built each frame from live state onto scope's [`Ui`] toolkit (spec: streamcraft.md UI
+//! built each frame from live state onto scope's [`Ui`] toolkit (spec: profluens.md UI
 //! `<update>` §1209 — "the same philosophy as the rest of SC (very performant, per-frame
 //! arenas)"). Nothing here is retained across frames except the small [`PlayerUiState`]
 //! the caller owns; the widgets rebuild the picture from the data every frame, the
@@ -9,10 +9,10 @@
 //! so the video is unobstructed during playback. The stats overlay is a scope-style panel
 //! reading the tap counters — zero cost when hidden (it draws nothing).
 
-use streamcraft_core::pipeline::SeekIndex;
-use streamcraft_core::time::Timestamp;
-use streamcraft_scope::ui::draw::{Color, Rect};
-use streamcraft_scope::ui::{MouseButton, Ui};
+use profluens_core::pipeline::SeekIndex;
+use profluens_core::time::Timestamp;
+use profluens_scope::ui::draw::{Color, Rect};
+use profluens_scope::ui::{MouseButton, Ui};
 
 /// How long the transport bar lingers after the last mouse motion before fading out.
 const IDLE_HIDE_SECS: f32 = 2.5;
@@ -139,7 +139,7 @@ pub struct StatRow {
 }
 
 /// A UI action the caller must carry out against the player (the UI itself holds no
-/// handles — it returns intent, the binary drives `sc-play`). Immediate-mode all the way
+/// handles — it returns intent, the binary drives `pf-play`). Immediate-mode all the way
 /// down: one action per frame at most.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UiActions {
@@ -260,7 +260,7 @@ fn draw_transport(
 
 /// The timeline: a fill bar showing progress, clickable/draggable to seek. Returns the
 /// requested seek time when the user clicks or drags. Resolving the target time→byte is
-/// the caller's job (via `SeekIndex::resolve`, like scplay's digit-seek) — here we just
+/// the caller's job (via `SeekIndex::resolve`, like pfplay's digit-seek) — here we just
 /// produce the target *time* from the click x, and confirm the index CAN resolve it.
 fn draw_timeline(
     state: &mut PlayerUiState,

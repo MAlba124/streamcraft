@@ -1,6 +1,6 @@
 //! Milestone 3: encode a WAV file to FLAC — `filesrc ! wavparse ! flacenc ! filesink`.
 //!
-//! Run: `cargo run --release -p streamcraft-audio --example wav_to_flac -- [in.wav] [out.flac]`
+//! Run: `cargo run --release -p profluens-audio --example wav_to_flac -- [in.wav] [out.flac]`
 //! With no args it synthesises a 1-second stereo sine WAV in the temp dir.
 //!
 //! Because format negotiation is still link-time only, the encoder's parameters
@@ -8,10 +8,10 @@
 //! `FlacEnc::new` — the runtime-caps path that would let `wavparse` dictate them
 //! downstream is a follow-up.
 
-use sc_flac::{FlacDecoder, FlacEnc, SampleFormat as FlacFmt};
-use streamcraft_audio::{parse_wav_header, write_pcm_wav, AudioFormat, SampleFormat, WavParse};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use pf_flac::{FlacDecoder, FlacEnc, SampleFormat as FlacFmt};
+use profluens_audio::{parse_wav_header, write_pcm_wav, AudioFormat, SampleFormat, WavParse};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn map_format(f: SampleFormat) -> Option<FlacFmt> {
     Some(match f {
@@ -39,14 +39,14 @@ fn synth_wav(path: &std::path::Path) {
 fn main() {
     let mut args = std::env::args().skip(1);
     let inp = args.next().map(std::path::PathBuf::from).unwrap_or_else(|| {
-        let p = std::env::temp_dir().join("sc_wav_to_flac_in.wav");
+        let p = std::env::temp_dir().join("pf_wav_to_flac_in.wav");
         synth_wav(&p);
         p
     });
     let outp = args
         .next()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("sc_wav_to_flac_out.flac"));
+        .unwrap_or_else(|| std::env::temp_dir().join("pf_wav_to_flac_out.flac"));
 
     // Parse the header (the first few KiB is plenty) to configure the encoder.
     let head = {

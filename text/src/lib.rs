@@ -1,4 +1,4 @@
-//! streamcraft-text (`sc-text`) — **subtitle support**: cue parsing + a non-blocking overlay
+//! profluens-text (`pf-text`) — **subtitle support**: cue parsing + a non-blocking overlay
 //! compositor (spec: subtitle support; RFC 9559 §12.7 the Matroska S_TEXT/* codec mappings the
 //! demuxer announces).
 //!
@@ -91,12 +91,12 @@ pub use subparse::{SubParse, EVENTS_FAMILY};
 /// rides the payload, exactly as `subtitle/events` carries its text inline.
 pub const BITMAP_FAMILY: &str = "subtitle/bitmap";
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("... ! subparse ! suboverlay ! ...")`). Typed `use` + constructor stays primary;
-/// this powers `scraft-launch` and one-liner tests. Descriptors are `&'static`, taken from
+/// this powers `pf-launch` and one-liner tests. Descriptors are `&'static`, taken from
 /// throwaway default instances (both elements default-construct with no props — `subparse`
 /// learns its dialect from caps, `suboverlay` learns its geometry from the negotiated video
 /// format).

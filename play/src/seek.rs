@@ -19,7 +19,7 @@
 //! This is controller code running before the pipeline; the two file reads it needs
 //! (Cues pread, whole-head reparse) carry the documented `#[allow]` per `clippy.toml`.
 
-use streamcraft_core::pipeline::SeekIndex;
+use profluens_core::pipeline::SeekIndex;
 
 /// A built index plus the declared stream duration in ns (for the CLI's digit-seek and the
 /// summary). `duration` is `None` when the container did not declare one.
@@ -49,12 +49,12 @@ impl SeekInfo {
 /// `build_seek_index`, with the pread bounded to 4 MiB (the Cues master is small).
 pub fn mkv_seek_index(path: &str, header: &[u8], file_len: u64) -> SeekInfo {
     // Duration from the header's Segment Info — a throwaway reader parses the same prefix.
-    let mut probe = sc_mkv::MatroskaReader::new();
+    let mut probe = pf_mkv::MatroskaReader::new();
     let _ = probe.push(header);
     let duration_ns = probe.duration_ns();
 
     let mut index = SeekIndex { entries: Vec::new(), file_len: Some(file_len) };
-    let Some(info) = sc_mkv::parse_seek_head(header) else {
+    let Some(info) = pf_mkv::parse_seek_head(header) else {
         return SeekInfo { index, duration_ns };
     };
     if let Some(cues_pos) = info.cues_pos {
@@ -65,7 +65,7 @@ pub fn mkv_seek_index(path: &str, header: &[u8], file_len: u64) -> SeekInfo {
             // ignores the tail, so an over-read is harmless.
             let want = ((file_len - abs) as usize).min(4 * 1024 * 1024);
             if let Some(buf) = pread(path, abs, want) {
-                index.entries = sc_mkv::parse_cues(&buf, info.segment_data_start, info.timestamp_scale);
+                index.entries = pf_mkv::parse_cues(&buf, info.segment_data_start, info.timestamp_scale);
             }
         }
     }
@@ -80,7 +80,7 @@ pub fn mkv_seek_index(path: &str, header: &[u8], file_len: u64) -> SeekInfo {
 /// Falls back to the proportional index when there is no video track (audio-only MP4: an
 /// audio sample is a random-access point anyway, so proportional-by-bytes is adequate and
 /// the demuxer re-walks its sample list). The declared duration is the max track duration.
-pub fn mp4_seek_index(reader: &sc_mp4::Mp4Reader, file_len: u64) -> SeekInfo {
+pub fn mp4_seek_index(reader: &pf_mp4::Mp4Reader, file_len: u64) -> SeekInfo {
     // Duration: the longest track (mdhd duration/timescale, already in ns on the Track).
     let duration_ns = reader.tracks().iter().map(|t| t.duration_ns).max().filter(|&d| d > 0);
 
@@ -119,17 +119,17 @@ pub fn mp4_seek_index(reader: &sc_mp4::Mp4Reader, file_len: u64) -> SeekInfo {
 
 /// Build the AVI seek info (spec: flush/seek). v1 is the **proportional** fallback: the
 /// declared duration comes from the AVI header (the video stream's frame count × its
-/// `dwScale/dwRate` sample duration, via `sc-avi`'s [`AviHeader::duration_ns`]), and
+/// `dwScale/dwRate` sample duration, via `pf-avi`'s [`AviHeader::duration_ns`]), and
 /// [`SeekIndex::resolve`] estimates a byte offset from `file_len`; the demuxer re-syncs to
 /// the next chunk id after a `FlushStart`, so an approximate landing is safe.
 ///
-/// Keyframe-exact AVI seeking (the trailing `idx1` → `sc_avi::build_seek_index`) is a
+/// Keyframe-exact AVI seeking (the trailing `idx1` → `pf_avi::build_seek_index`) is a
 /// documented follow-up: it needs an app-side pread of the `idx1` range at the file tail
 /// (like the MKV Cues pread), orthogonal to getting AVI *playback* working.
 ///
-/// [`AviHeader::duration_ns`]: sc_avi::AviHeader::duration_ns
+/// [`AviHeader::duration_ns`]: pf_avi::AviHeader::duration_ns
 pub fn avi_seek_index(header: &[u8], file_len: u64) -> SeekInfo {
-    let duration_ns = sc_avi::probe_header(header).ok().and_then(|(h, _movi)| h.duration_ns());
+    let duration_ns = pf_avi::probe_header(header).ok().and_then(|(h, _movi)| h.duration_ns());
     SeekInfo::proportional(file_len, duration_ns)
 }
 
@@ -156,7 +156,7 @@ fn pread(path: &str, off: u64, len: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use streamcraft_core::time::Timestamp;
+    use profluens_core::time::Timestamp;
 
     #[test]
     fn proportional_resolves_by_bytes_when_duration_known() {

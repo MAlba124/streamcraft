@@ -1,5 +1,5 @@
 //! Server tests driven by the crate's own client over real loopback TCP:
-//! [`sc_rtsp::client::RtspClient`] speaks to [`sc_rtsp::server::RtspServer`]
+//! [`pf_rtsp::client::RtspClient`] speaks to [`pf_rtsp::server::RtspServer`]
 //! on 127.0.0.1 — the full RFC 2326 happy path (OPTIONS → DESCRIBE → SETUP
 //! → PLAY → keepalive → PAUSE → TEARDOWN with [`ServerEvent`]s observed),
 //! the error catalogue (461/455/454/501/400, §11), session timeout
@@ -10,9 +10,9 @@ use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
-use sc_rtsp::client::{resolve_control, RtspClient, RtspError};
-use sc_rtsp::sdp::MediaKind;
-use sc_rtsp::server::{RtspServer, ServerConfig, ServerEvent};
+use pf_rtsp::client::{resolve_control, RtspClient, RtspError};
+use pf_rtsp::sdp::MediaKind;
+use pf_rtsp::server::{RtspServer, ServerConfig, ServerEvent};
 
 /// The presentation DESCRIBE serves: one H.264 video track whose
 /// `a=control` matches the server's configured control name.

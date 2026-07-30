@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use streamcraft_core::time::Timestamp;
+use profluens_core::time::Timestamp;
 
-use sc_text::{font, pgs};
+use pf_text::{font, pgs};
 
 use crate::control::{PlayerControl, UiCommand};
 use crate::raster::Canvas;
@@ -204,7 +204,7 @@ struct Hud {
 /// over the video, no GPU): a play/pause glyph, the elapsed time, and a live timeline with a
 /// progress fill + seek knob.
 fn draw_controls(c: &mut Canvas, h: &Hud) {
-    const ACCENT: u32 = 0xff30_ffa0; // streamcraft green
+    const ACCENT: u32 = 0xff30_ffa0; // profluens green
     const INK: u32 = 0xffe6_edf5;
     let width = h.width;
     c.clear(0); // fully transparent — video shows through everywhere we don't draw

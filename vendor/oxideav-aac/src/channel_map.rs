@@ -134,7 +134,7 @@ pub fn reorder_permutation(channel_configuration: u8) -> Option<Vec<usize>> {
 /// This is the entry point the decode driver calls once a frame's
 /// element-order channels are assembled. Generic over the allocator `A`
 /// of the outer channel list so the hot decode path can reorder in place
-/// in its per-`process()` arena rather than the heap (streamcraft patch);
+/// in its per-`process()` arena rather than the heap (profluens patch);
 /// the temporary `slots` scratch is drawn from that same allocator.
 #[must_use]
 pub fn reorder_channels<T, A: std::alloc::Allocator + Copy>(

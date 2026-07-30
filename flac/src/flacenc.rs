@@ -1,4 +1,4 @@
-//! `flacenc` — the streamcraft element wrapping [`FlacEncoder`] (spec: Milestone
+//! `flacenc` — the profluens element wrapping [`FlacEncoder`] (spec: Milestone
 //! applications §3; Writing elements). A passive transform: raw **interleaved** PCM
 //! buffers arrive on the sink pad, encoded FLAC bytes leave on the src pad. It inlines
 //! into the upstream active element's group like [`passthrough`], so it never blocks.
@@ -19,18 +19,18 @@
 //! required because a sequential sink (`filesink`) cannot be back-patched. The output
 //! is a fully valid, streamable FLAC file.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{
     Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc,
 };
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 use crate::encoder::{FlacEncoder, SampleFormat};
 

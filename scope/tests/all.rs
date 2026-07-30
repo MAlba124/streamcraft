@@ -4,11 +4,11 @@
 //! state / interaction outcomes without SDL. The backend's FFI is exercised only by
 //! the headless `ui_demo --frames` run in CI, not here.
 
-use streamcraft_scope::ui::arena::Arena;
-use streamcraft_scope::ui::draw::{Color, DrawList, Rect, TexId};
-use streamcraft_scope::ui::font::{Font, ATLAS_H, ATLAS_W};
-use streamcraft_scope::ui::widgets::{LogView, UiState};
-use streamcraft_scope::ui::{Id, Input, Key, Mods, MouseButton, Ui};
+use profluens_scope::ui::arena::Arena;
+use profluens_scope::ui::draw::{Color, DrawList, Rect, TexId};
+use profluens_scope::ui::font::{Font, ATLAS_H, ATLAS_W};
+use profluens_scope::ui::widgets::{LogView, UiState};
+use profluens_scope::ui::{Id, Input, Key, Mods, MouseButton, Ui};
 
 // ---------------------------------------------------------------------------
 // Arena
@@ -606,7 +606,7 @@ fn input_key_pressed_lookup() {
 // App: pure camera / hit-test / formatting helpers
 // ---------------------------------------------------------------------------
 
-use streamcraft_scope::app::{dist_point_segment, fit_camera, fmt_time, zoom_at};
+use profluens_scope::app::{dist_point_segment, fit_camera, fmt_time, zoom_at};
 
 #[test]
 fn point_segment_distance() {
@@ -702,7 +702,7 @@ fn draw_build_rotated_quad_vertices() {
 // Dock tree (model: simprof's dockspace — splits with tabbed leaves)
 // ---------------------------------------------------------------------------
 
-use streamcraft_scope::ui::dock::{drop_zone_at, DockTree, DropZone, DIVIDER, TAB_H};
+use profluens_scope::ui::dock::{drop_zone_at, DockTree, DropZone, DIVIDER, TAB_H};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum P {
@@ -715,7 +715,7 @@ fn tree() -> DockTree<P> {
     DockTree::two_over_one(P::Graph, P::Elements, P::Log, 0.6, 0.7)
 }
 
-fn lay(t: &DockTree<P>) -> streamcraft_scope::ui::dock::DockLayout<P> {
+fn lay(t: &DockTree<P>) -> profluens_scope::ui::dock::DockLayout<P> {
     t.layout(Rect::new(0.0, 0.0, 1000.0, 800.0), &|p| format!("{p:?}"), &|s| {
         s.len() as f32 * 8.0 + 20.0
     })

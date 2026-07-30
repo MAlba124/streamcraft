@@ -2,7 +2,7 @@
 //! whole `movi` list (chunk counts + bytes per stream) and, when present, the `idx1` index.
 //!
 //! ```text
-//! cargo run --release -p sc-avi --example probe -- FILE.avi
+//! cargo run --release -p pf-avi --example probe -- FILE.avi
 //! ```
 //!
 //! This is **app/tooling code**, so the file IO here is the sanctioned exception to the
@@ -11,7 +11,7 @@
 //! `#[allow(clippy::disallowed_methods)]` per read. It mirrors how `sdl3/examples/play_file.rs`
 //! preads the MKV Cues range app-side to build a `SeekIndex`.
 
-use sc_avi::riff::{self, MoviWalker, StreamKind};
+use pf_avi::riff::{self, MoviWalker, StreamKind};
 use std::io::Read;
 
 /// The stream head: enough of the file to cover the `RIFF/AVI` header + `LIST 'hdrl'` + the
@@ -95,7 +95,7 @@ fn main() {
     );
     println!("{} stream(s):", avi.streams.len());
     for s in &avi.streams {
-        let family = sc_avi::codec::family_for(s);
+        let family = pf_avi::codec::family_for(s);
         match s.kind {
             StreamKind::Video => {
                 let fps = if s.scale != 0 { s.rate as f64 / s.scale as f64 } else { 0.0 };
@@ -142,7 +142,7 @@ fn main() {
     //    a top-level chunk after movi, so scan the last stretch of the file for its id.
     if let Some((idx1_off, idx1_size)) = find_idx1(&path, file_len) {
         let payload = read_at(&path, idx1_off + 8, idx1_size as usize).expect("read idx1");
-        if let Some(si) = sc_avi::build_seek_index(&header, &payload, file_len) {
+        if let Some(si) = pf_avi::build_seek_index(&header, &payload, file_len) {
             println!(
                 "\nidx1 at byte {idx1_off} ({idx1_size} bytes) → SeekIndex with {} video keyframe entries",
                 si.entries.len()

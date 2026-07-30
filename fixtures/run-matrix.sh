@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# run-matrix.sh — drive every fixture through scplay and tabulate PASS/FAIL.
+# run-matrix.sh — drive every fixture through pfplay and tabulate PASS/FAIL.
 #
-# Player CLI contract (frozen — scplay is being built to this spec):
-#   scplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
+# Player CLI contract (frozen — pfplay is being built to this spec):
+#   pfplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
 #     * prints "track <padname>: ..." lines to stdout
 #     * exit 0 on clean EOS or a --max-secs stop
 #     * nonzero, with ONE stderr line, when the container is unknown or no
@@ -15,8 +15,8 @@
 # wrapped in `timeout` so a hang surfaces as FAIL instead of wedging the matrix.
 #
 # Usage:
-#   ./run-matrix.sh /path/to/scplay          # hardware path (as built)
-#   ./run-matrix.sh --sw /path/to/scplay     # software path (SC_NO_VAAPI=1)
+#   ./run-matrix.sh /path/to/pfplay          # hardware path (as built)
+#   ./run-matrix.sh --sw /path/to/pfplay     # software path (PF_NO_VAAPI=1)
 #
 # Exit status: 0 iff every row passed.
 
@@ -33,13 +33,13 @@ fi
 
 SCPLAY="${1:-}"
 if [ -z "$SCPLAY" ]; then
-    echo "usage: $0 [--sw] <path-to-scplay-binary>" >&2
+    echo "usage: $0 [--sw] <path-to-pfplay-binary>" >&2
     exit 2
 fi
 if [ ! -x "$SCPLAY" ]; then
     # Allow a bare name resolved via PATH, but insist it exists.
     if ! command -v "$SCPLAY" >/dev/null 2>&1; then
-        echo "error: scplay binary not found or not executable: $SCPLAY" >&2
+        echo "error: pfplay binary not found or not executable: $SCPLAY" >&2
         exit 2
     fi
 fi
@@ -71,11 +71,11 @@ MATRIX=(
 )
 
 if [ "$SW" -eq 1 ]; then
-    echo "== scplay matrix (software path: SC_NO_VAAPI=1) =="
+    echo "== pfplay matrix (software path: PF_NO_VAAPI=1) =="
 else
-    echo "== scplay matrix (default path) =="
+    echo "== pfplay matrix (default path) =="
 fi
-echo "   scplay: $SCPLAY"
+echo "   pfplay: $SCPLAY"
 echo
 
 hdr_fmt='%-26s %-6s %-5s %-6s  %s\n'
@@ -90,7 +90,7 @@ run_one() {
     local out err rc
     out="$(mktemp)"; err="$(mktemp)"
     local -a env=()
-    [ "$SW" -eq 1 ] && env=(env SC_NO_VAAPI=1)
+    [ "$SW" -eq 1 ] && env=(env PF_NO_VAAPI=1)
 
     # `timeout` returns 124 on TERM-kill (hang). Bound every run.
     "${env[@]}" timeout "$HARD_TIMEOUT" \

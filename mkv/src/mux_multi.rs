@@ -58,21 +58,21 @@
 
 use std::collections::VecDeque;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::{Buffer, BufferFlags};
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::buffer::{Buffer, BufferFlags};
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     AlignBy, Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{
     ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc,
 };
-use streamcraft_core::id::{FormatId, PadId};
-use streamcraft_core::memory::Memory;
-use streamcraft_core::time::Timestamp;
+use profluens_core::id::{FormatId, PadId};
+use profluens_core::memory::Memory;
+use profluens_core::time::Timestamp;
 
 use crate::element::MkvMux;
 use crate::writer::{MatroskaWriter, MuxOut, MuxPiece, TrackConfig};
@@ -130,7 +130,7 @@ static MUXN_AAC_FIELDS: [FieldDesc; 3] = [
     FieldDesc { field: "duration", allowed: ConstraintDesc::Any, preferred: None },
 ];
 /// Colorimetry value names an announcement may carry — `Set` interns the *values*
-/// (same rationale as [`MUXN_SAMPLE_VALUES`]); names mirror `streamcraft-video`'s
+/// (same rationale as [`MUXN_SAMPLE_VALUES`]); names mirror `profluens-video`'s
 /// color vocabulary, mapped back to H.273 code points in `color_map`.
 static MUXN_MATRIX_VALUES: [ValueDesc; 4] = [
     ValueDesc::Id("bt709"),

@@ -7,15 +7,15 @@
 //!   logging on changes nothing but what is emitted.
 //!
 //! The record-reaches-drain and gate-suppression proofs live in
-//! `streamcraft-core`'s `ctx` unit tests, which read a `LogDrain` directly (the
+//! `profluens-core`'s `ctx` unit tests, which read a `LogDrain` directly (the
 //! `Ctx`→`Log` install is crate-internal, so it can't be reached from here). Here we
 //! confirm the pipeline actually wires those pieces under a real run and joins the
 //! drain thread cleanly on shutdown. Records are formatted to stderr; the test asserts
 //! on the transported data, not on that text.
 
-use streamcraft_core::log::Level;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
+use profluens_core::log::Level;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
 
 fn expected_hash(n: u64) -> u64 {
     let mut h = FNV_OFFSET;

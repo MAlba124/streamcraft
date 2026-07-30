@@ -976,7 +976,7 @@ impl Window {
 
 }
 
-/// One dmabuf plane's geometry (mirrors `sc_vaapi::va::ExportedPlane`, kept local so the
+/// One dmabuf plane's geometry (mirrors `pf_vaapi::va::ExportedPlane`, kept local so the
 /// presenter core does not depend on the VA-API crate — the sink maps `GpuFrame` into these).
 #[derive(Clone, Copy)]
 pub struct Plane {
@@ -1065,7 +1065,7 @@ fn display_error(c: &Connection) -> io::Error {
 /// A `memfd`-backed shared region of `size` bytes, mmap'd writable.
 pub(crate) fn shm_alloc(size: usize) -> io::Result<(RawFd, *mut libc::c_void)> {
     // SAFETY: memfd_create with a static name; fd is checked before use.
-    let fd = unsafe { libc::memfd_create(c"sc-present".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"pf-present".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

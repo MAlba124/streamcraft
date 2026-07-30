@@ -2,7 +2,7 @@
 //! Annex-B framing, Exp-Golomb codecs, SPS/PPS parsing, and POC math independent of
 //! any VA-API device (ITU-T H.264 clause references in `src/h264parse.rs`).
 
-use sc_vaapi::h264parse::{
+use pf_vaapi::h264parse::{
     self, parse_pps, parse_sps, split_nals, BitReader, PocState, SliceType,
 };
 

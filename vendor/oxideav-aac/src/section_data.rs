@@ -259,7 +259,7 @@ impl Section {
 /// per-frame scratch — built here and consumed once within a single
 /// `decode_raw_data_block_planar` call — so they come from the
 /// caller's per-`process()` bump arena rather than the heap
-/// (streamcraft patch). `sfb_cb`'s per-band rows are the last per-frame
+/// (profluens patch). `sfb_cb`'s per-band rows are the last per-frame
 /// heap allocation in the parse path (~2.6K `vec![0u8; max_sfb]` allocs
 /// per run in a live capture); they are read as `&[Vec<u8, A>]` by ~19
 /// downstream tools (pns, cce, dequant, ms/intensity stereo,
@@ -282,7 +282,7 @@ pub struct SectionData<A: std::alloc::Allocator = std::alloc::Global> {
 // Hand-written PartialEq / Eq (as for `SpectralData` / `AbsoluteScaleFactors`): a derive would
 // bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
 // PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
-// allocators — including `sfb_cb`, whose rows are now allocator-parametric (streamcraft patch).
+// allocators — including `sfb_cb`, whose rows are now allocator-parametric (profluens patch).
 impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<SectionData<A2>>
     for SectionData<A1>
 {
@@ -353,7 +353,7 @@ impl SectionData {
 impl<A: std::alloc::Allocator + Copy> SectionData<A> {
     /// [`parse`](SectionData::parse) with an explicit `scratch` allocator for the per-group
     /// `sections` lists (the pipeline passes its per-`process()` arena; tests infer `A = Global`).
-    /// `sfb_cb` stays on the heap regardless of `A` — see the struct docs (streamcraft patch).
+    /// `sfb_cb` stays on the heap regardless of `A` — see the struct docs (profluens patch).
     pub fn parse_in(
         reader: &mut BitReader<'_>,
         window_sequence: WindowSequence,

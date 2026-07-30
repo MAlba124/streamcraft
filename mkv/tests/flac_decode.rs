@@ -3,25 +3,25 @@
 //! `filesrc ! mkvdemux ! flacdec ! …` milestone on a byte stream: MKV bytes in, PCM out,
 //! sample-for-sample equal to decoding the original native FLAC stream.
 //!
-//! Dev-dependency on `sc-flac` (no cycle — the container is codec-agnostic and `sc-flac` does
-//! not depend on `sc-mkv`), used to make real A_FLAC frames + STREAMINFO and to decode.
+//! Dev-dependency on `pf-flac` (no cycle — the container is codec-agnostic and `pf-flac` does
+//! not depend on `pf-mkv`), used to make real A_FLAC frames + STREAMINFO and to decode.
 
 use std::sync::{Arc, Mutex};
 
-use sc_flac::{FlacDec, FlacDecoder, FlacEncoder, SampleFormat};
-use sc_mkv::ebml::id;
-use sc_mkv::{MatroskaWriter, MkvDemux, TrackConfig};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_flac::{FlacDec, FlacDecoder, FlacEncoder, SampleFormat};
+use pf_mkv::ebml::id;
+use pf_mkv::{MatroskaWriter, MkvDemux, TrackConfig};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 // --- a source that streams a byte blob in fixed chunks, then EOS ---------------------
 
@@ -160,7 +160,7 @@ fn encode(samples: &[i16], channels: u32, rate: u32) -> (Vec<u8>, Vec<u8>, Vec<V
         i = end;
     }
     let body = enc.finish();
-    let off = sc_flac::streaminfo_offset();
+    let off = pf_flac::streaminfo_offset();
     header[off..off + body.len()].copy_from_slice(&body);
     let codec_private = header.clone();
     // The native reference stream is head + every frame concatenated.

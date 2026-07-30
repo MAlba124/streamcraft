@@ -22,7 +22,7 @@
 //! advisory").
 //!
 //! ## Format
-//! Both pads carry raw [`bytes`](streamcraft_core::format::OfferDesc::any) — an Ogg-FLAC
+//! Both pads carry raw [`bytes`](profluens_core::format::OfferDesc::any) — an Ogg-FLAC
 //! packet stream in, a native FLAC byte stream out — matching the `oggdemux` src pad and the
 //! `flacdec` sink pad, so it links to both at link time with no typed vocabulary. This
 //! element is a **passive byte→byte transform** (bytes in, bytes out, inlining into the
@@ -36,16 +36,16 @@
 //! prefix, or that lacks the `0x7F "FLAC"` signature, is reported as an [`Error`] rather
 //! than mis-de-framed or panicking (spec: a crash on bad input is a P0).
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 // The src pad's local index (== position in the element's `pads` array). The sink pad
 // (index 0) needs no id: input is drained via `Inputs::pop`, which is pad-agnostic — same

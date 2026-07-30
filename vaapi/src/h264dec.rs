@@ -20,19 +20,19 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
 use std::sync::Arc;
 
@@ -1112,7 +1112,7 @@ impl VaapiH264Dec {
                     ),
                 );
                 eprintln!(
-                    "scplay-ui: zero-copy VA-API export unavailable ({e}) — falling back to CPU \
+                    "pfplay-ui: zero-copy VA-API export unavailable ({e}) — falling back to CPU \
                      readback (video path = SDL texture upload)"
                 );
                 self.pending = Some(out); // retry via readback next call
@@ -1141,7 +1141,7 @@ impl VaapiH264Dec {
                 ],
             );
             self.announced = true;
-            eprintln!("scplay-ui: video path = zero-copy VA-API/EGL (vaapih264dec DMA-BUF export)");
+            eprintln!("pfplay-ui: video path = zero-copy VA-API/EGL (vaapih264dec DMA-BUF export)");
         }
 
         let Some(mut buf) = ctx.try_alloc(SRC_PAD) else {

@@ -1,4 +1,4 @@
-//! streamcraft-video — POD video format descriptions and typed *views* over the
+//! profluens-video — POD video format descriptions and typed *views* over the
 //! opaque buffer: pixel formats, planes, strides, colorimetry (spec: Crate layout).
 //! [`VideoFrameRef::new`] validates once, then exposes planes/strides; no new buffer
 //! types, no traits, zero cost over raw offset math — the `-video` mirror of the
@@ -34,12 +34,12 @@ pub use parse::RawVideoParse;
 pub use sink::{VideoCkSink, VideoCkSinkStats, VideoRender};
 pub use testsrc::{frame_pattern_byte, VideoTestSrc};
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("videotestsrc frames=90 ! videocksink")`). Typed `use` + constructor stays
-/// primary; this powers `scraft-launch` and one-liner tests. Descriptors are `&'static`,
+/// primary; this powers `pf-launch` and one-liner tests. Descriptors are `&'static`,
 /// taken from throwaway default instances: `videotestsrc` / `rawvideoparse` read their
 /// `width`/`height`/`pixfmt`/`fps` (and `videotestsrc`'s `frames`/`seed`) props in
 /// `start()`; `videocksink` is config-free (its typed stats handle is unreachable through

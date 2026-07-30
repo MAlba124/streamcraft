@@ -1,23 +1,23 @@
 //! `vaapi-probe` — print the VA-API decode capability table on this machine.
 //!
 //! ```text
-//! cargo run -p sc-vaapi --example vaapi-probe
-//! SC_NO_VAAPI=1 cargo run -p sc-vaapi --example vaapi-probe   # forces "no device"
-//! SC_VAAPI_DEVICE=/dev/dri/renderD129 cargo run … --example vaapi-probe
+//! cargo run -p pf-vaapi --example vaapi-probe
+//! PF_NO_VAAPI=1 cargo run -p pf-vaapi --example vaapi-probe   # forces "no device"
+//! PF_VAAPI_DEVICE=/dev/dri/renderD129 cargo run … --example vaapi-probe
 //! ```
 //!
 //! Exits 0 either way: a machine with no usable device prints a clear message
 //! rather than failing, so the example is a safe smoke test in CI.
 
-use streamcraft_core::registry::Registry;
+use profluens_core::registry::Registry;
 
 fn main() {
-    println!("== sc-vaapi capability probe ==");
+    println!("== pf-vaapi capability probe ==");
 
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         println!("no VA-API device (probe returned None)");
-        if std::env::var("SC_NO_VAAPI").as_deref() == Ok("1") {
-            println!("  (SC_NO_VAAPI=1 is set — probing is disabled)");
+        if std::env::var("PF_NO_VAAPI").as_deref() == Ok("1") {
+            println!("  (PF_NO_VAAPI=1 is set — probing is disabled)");
         }
         return;
     };
@@ -38,7 +38,7 @@ fn main() {
         );
     }
 
-    println!("\nstreamcraft decode families:");
+    println!("\nprofluens decode families:");
     if caps.decode_families.is_empty() {
         println!("  (none)");
     } else {
@@ -47,7 +47,7 @@ fn main() {
         }
     }
 
-    println!("\nstreamcraft encode families:");
+    println!("\nprofluens encode families:");
     if caps.encode_families.is_empty() {
         println!("  (none)");
     } else {
@@ -58,7 +58,7 @@ fn main() {
 
     // Build a registry and register the gated element(s); list what registered.
     let mut registry = Registry::new();
-    sc_vaapi::register(&mut registry);
+    pf_vaapi::register(&mut registry);
     println!("\nregistered elements:");
     let names = registry.names();
     if names.is_empty() {

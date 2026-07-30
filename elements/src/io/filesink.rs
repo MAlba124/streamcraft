@@ -6,16 +6,16 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{Constraint, OfferDesc};
-use streamcraft_core::io::{FileHandle, IoResult};
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{Constraint, OfferDesc};
+use profluens_core::io::{FileHandle, IoResult};
+use profluens_core::time::Timestamp;
 
 /// Writes an untyped byte stream — offer the open `bytes` family, no fields.
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
@@ -83,7 +83,7 @@ impl Element for FileSink {
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         // A parsed `path=` overrides the constructor value (spec: Plugins — the string
         // rides `Value::Id`, resolved by name off the value vocabulary).
-        if let Some(streamcraft_core::format::Value::Id(id)) = ctx.prop("path") {
+        if let Some(profluens_core::format::Value::Id(id)) = ctx.prop("path") {
             if let Some(s) = ctx.value_name(id) {
                 self.path = PathBuf::from(s);
             }
@@ -154,13 +154,13 @@ impl Element for FileSink {
             if !self.started {
                 return Err(Error::Todo("filesink not started"));
             }
-            let buf = streamcraft_core::buffer::Buffer {
+            let buf = profluens_core::buffer::Buffer {
                 memory: data.clone(),
                 pts: Timestamp::NONE,
                 dts: Timestamp::NONE,
                 duration: Timestamp::NONE,
-                flags: streamcraft_core::buffer::BufferFlags::empty(),
-                format: streamcraft_core::id::FormatId(0),
+                flags: profluens_core::buffer::BufferFlags::empty(),
+                format: profluens_core::id::FormatId(0),
                 sync: None,
             };
             ctx.io().submit_write(self.file, *offset, buf, 0);

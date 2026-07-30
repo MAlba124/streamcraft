@@ -137,7 +137,7 @@ pub const AOT_AAC_SSR: u8 = 3;
 /// [`Self::section_data`]'s per-group `sections` and
 /// [`Self::scale_factor_data`]'s per-group `entries` — which come from
 /// the caller's per-`process()` bump arena rather than the heap
-/// (streamcraft patch). Every other field (`ics_info` and the tool
+/// (profluens patch). Every other field (`ics_info` and the tool
 /// records) stays [`std::alloc::Global`]: they do not allocate on the
 /// hot ≤32B path, and a generic struct freely mixes `A`-backed and
 /// `Global` fields.
@@ -206,7 +206,7 @@ pub struct IcsBody<A: std::alloc::Allocator = std::alloc::Global> {
 // Hand-written PartialEq / Eq (as for `SectionData` / `ScaleFactorData` / `SpectralData`): a
 // derive would bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. The
 // two `A`-backed fields (`section_data`, `scale_factor_data`) compare cross-allocator via their
-// own hand-written `PartialEq`; the rest are plain `Global`/`Copy` fields (streamcraft patch).
+// own hand-written `PartialEq`; the rest are plain `Global`/`Copy` fields (profluens patch).
 impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<IcsBody<A2>> for IcsBody<A1> {
     fn eq(&self, other: &IcsBody<A2>) -> bool {
         self.global_gain == other.global_gain
@@ -296,7 +296,7 @@ impl<A: std::alloc::Allocator + Copy> IcsBody<A> {
     /// [`parse`](IcsBody::parse) with an explicit `scratch` allocator. On the hot decode path the
     /// `section_data()` per-group `sections` and the `scale_factor_data()` per-group `entries`
     /// come from the caller's per-`process()` arena rather than the heap; every other field stays
-    /// [`std::alloc::Global`] (streamcraft patch). Tests call [`parse`](IcsBody::parse), inferring
+    /// [`std::alloc::Global`] (profluens patch). Tests call [`parse`](IcsBody::parse), inferring
     /// `A = Global`.
     pub fn parse_in(
         reader: &mut BitReader<'_>,

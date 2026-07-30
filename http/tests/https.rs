@@ -1,4 +1,4 @@
-//! HTTPS: `httpsrc` over TLS — rustls on the graviola provider (see `sc_http::tls`).
+//! HTTPS: `httpsrc` over TLS — rustls on the graviola provider (see `pf_http::tls`).
 //!
 //! Hermetic — no real internet, no real CAs. Each test stands up a **rustls server**
 //! on `127.0.0.1:0` using the self-signed fixtures in `tests/tls/` (identity A
@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConnection, StreamOwned};
-use sc_http::HttpSrc;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::FileSink;
+use pf_http::HttpSrc;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::FileSink;
 
 /// Identity A: what `httpsrc` is told to trust (as a one-cert PEM "CA bundle").
 const CERT_A_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tls/cert_a.pem");
@@ -34,7 +34,7 @@ const KEY_B_DER: &[u8] = include_bytes!("tls/key_b.der");
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_https_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_https_{}_{}.bin", tag, std::process::id()));
     p
 }
 
@@ -183,7 +183,7 @@ fn chunked_encode(body: &[u8], sizes: &[usize]) -> Vec<u8> {
 
 /// Run `httpsrc ! filesink` against `https://127.0.0.1:<port>/file`, returning the
 /// downloaded bytes (or the run error).
-fn download(port: u16, tag: &str) -> Result<Vec<u8>, streamcraft_core::error::Error> {
+fn download(port: u16, tag: &str) -> Result<Vec<u8>, profluens_core::error::Error> {
     let outp = temp_path(tag);
     let mut p = Pipeline::new();
     let src = p.add(HttpSrc::new(format!("https://127.0.0.1:{port}/file")));

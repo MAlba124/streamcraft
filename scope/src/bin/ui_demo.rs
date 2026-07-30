@@ -9,15 +9,15 @@
 //!
 //! Headless / CI:
 //! ```text
-//! SDL_VIDEODRIVER=dummy cargo run -p streamcraft-scope --bin ui_demo -- --frames 60
+//! SDL_VIDEODRIVER=dummy cargo run -p profluens-scope --bin ui_demo -- --frames 60
 //! ```
 //! renders 60 frames and exits 0. Without `--frames`, it runs until the window is
 //! closed.
 
-use streamcraft_scope::ui::backend::Backend;
-use streamcraft_scope::ui::draw::Color;
-use streamcraft_scope::ui::widgets::{LogView, UiState};
-use streamcraft_scope::ui::{Font, Rect, Ui};
+use profluens_scope::ui::backend::Backend;
+use profluens_scope::ui::draw::Color;
+use profluens_scope::ui::widgets::{LogView, UiState};
+use profluens_scope::ui::{Font, Rect, Ui};
 
 /// Fake per-element live state we animate to look like a running pipeline.
 struct FakeElement {
@@ -46,7 +46,7 @@ fn main() {
     }
 
     let font = Font::new();
-    let mut backend = match Backend::open("scraft-scope (demo)", 900, 620, &font) {
+    let mut backend = match Backend::open("pf-scope (demo)", 900, 620, &font) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("ui_demo: could not open window: {e}");

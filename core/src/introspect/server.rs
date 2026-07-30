@@ -133,7 +133,7 @@ impl IntrospectServer {
         listener.set_nonblocking(false)?;
         let shared_l = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
-            .name("sc-introspect-accept".into())
+            .name("pf-introspect-accept".into())
             .spawn(move || accept_loop(listener, shared_l))
             .expect("spawn introspect accept thread");
         Ok(IntrospectServer { shared, path, listener: Some(handle) })
@@ -176,7 +176,7 @@ fn accept_loop(listener: UnixListener, shared: Arc<IntrospectShared>) {
                 }
                 let shared_c = Arc::clone(&shared);
                 let h = std::thread::Builder::new()
-                    .name("sc-introspect-client".into())
+                    .name("pf-introspect-client".into())
                     .spawn(move || {
                         let _ = client_loop(stream, shared_c);
                     })

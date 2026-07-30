@@ -7,7 +7,7 @@
 //! `scope/src/ui/font_atlas.a8` — the scope UI's baked JetBrains Mono atlas (SIL Open Font
 //! License 1.1; the licence is copied to `text/src/FONT_LICENSE.txt`, and the origin +
 //! `bake_font.py` tool live in the `scope` crate). We copy rather than depend on
-//! `streamcraft-scope` because that crate pulls SDL3/GPU — far too heavy for a pure-CPU
+//! `profluens-scope` because that crate pulls SDL3/GPU — far too heavy for a pure-CPU
 //! overlay element. A single self-contained bitmap font in this crate is the right call.
 //!
 //! # Model — what this file adds over the copy

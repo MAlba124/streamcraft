@@ -72,7 +72,7 @@ type Result<T> = core::result::Result<T, Error>;
 ///
 /// This direct `O(N²)` sum is the *executable reference* — the literal spec
 /// formula. Production synthesis runs the `O(N log N)` [`ImdctPlan`] below;
-/// the test suite pins the two against each other (streamcraft patch).
+/// the test suite pins the two against each other (profluens patch).
 #[cfg_attr(not(test), allow(dead_code))]
 fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
     let half = n_transform / 2;
@@ -86,8 +86,8 @@ fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
         // cos((k+1)θ+φ) = 2cosθ·cos(kθ+φ) − cos((k−1)θ+φ): one multiply-add
         // per coefficient instead of a libm cosine. The per-term cos() made
         // this O(N²) transform ~40% of an entire playback process's CPU
-        // (2·10⁶ cos calls per long frame per channel) — streamcraft patch,
-        // see STREAMCRAFT-PATCHES.md. f64 recurrence error over N/2 ≤ 1024
+        // (2·10⁶ cos calls per long frame per channel) — profluens patch,
+        // see PROFLUENS-PATCHES.md. f64 recurrence error over N/2 ≤ 1024
         // steps is ~1e−13 relative — far inside the conformance tolerances
         // (the crate's own reference tests gate this).
         let theta = phase_step * (n as f64 + n0);
@@ -134,7 +134,7 @@ fn cis(theta: f64) -> C64 {
 }
 
 /// An `O(N log N)` plan for the §4.6.11.3.1 IMDCT of one transform length
-/// (streamcraft patch — see STREAMCRAFT-PATCHES.md; the naive [`imdct`] above is
+/// (profluens patch — see PROFLUENS-PATCHES.md; the naive [`imdct`] above is
 /// kept as the executable reference the tests compare against).
 ///
 /// Derivation (clean-room, from the spec formula):
@@ -218,7 +218,7 @@ impl ImdctPlan {
     /// allocations (one of them a zeroed one) with no change to the result. The `N`-length
     /// output is drawn from the caller's `scratch` allocator (the pipeline's per-`process()`
     /// arena, reset by the scheduler) rather than the heap — it is a per-frame transient the
-    /// windowing step below consumes in place (streamcraft patch). The reused plan scratch
+    /// windowing step below consumes in place (profluens patch). The reused plan scratch
     /// (`scratch_z` / `scratch_c4`) stays Global — it persists across frames.
     fn imdct<A: std::alloc::Allocator + Copy>(&mut self, spec: &[f64], scratch: A) -> Vec<f64, A> {
         // Destructure so the reused scratch (`&mut`) and the constant twiddle/permutation
@@ -314,7 +314,7 @@ pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
     let step = 2.0 * core::f64::consts::PI / n_transform as f64;
     // Same Chebyshev recurrence as `imdct` (see there): for fixed k the angle
     // walks n in steps of θ_k = step·(k + 1/2) from φ = θ_k·n0 — one
-    // multiply-add per sample instead of a libm cosine (streamcraft patch).
+    // multiply-add per sample instead of a libm cosine (profluens patch).
     (0..half)
         .map(|k| {
             let theta = step * (k as f64 + 0.5);
@@ -453,8 +453,8 @@ fn compute_half_window(n_transform: usize, shape: WindowShape) -> Vec<f64> {
 /// The result is a **constant** keyed only by `(n_transform, shape)` — there are only four
 /// (long/short × sine/KBD) — so it is computed once and cached. Recomputing the KBD window
 /// per frame (a Bessel-I0 power series per sample) was ~3% of playback CPU in profiling; the
-/// window never changes, so a `OnceLock` per shape removes it (streamcraft patch — see
-/// `STREAMCRAFT-PATCHES.md`). Returning a `&'static` slice (rather than an owned clone) also
+/// window never changes, so a `OnceLock` per shape removes it (profluens patch — see
+/// `PROFLUENS-PATCHES.md`). Returning a `&'static` slice (rather than an owned clone) also
 /// drops the per-call 8 KiB copy that the earlier version paid.
 fn half_window(n_transform: usize, shape: WindowShape) -> &'static [f64] {
     use std::sync::OnceLock;
@@ -481,7 +481,7 @@ fn half_window(n_transform: usize, shape: WindowShape) -> &'static [f64] {
 /// left × 2 right = 8 constant results — so they are assembled once (the left-half references
 /// plus the one reversed right half) and thereafter returned by reference. This drops the two
 /// half-window copies and the reverse the naive path paid per call; the short-block synthesis
-/// hit this eight times per frame per channel (streamcraft patch).
+/// hit this eight times per frame per channel (profluens patch).
 fn window_halves(
     n_transform: usize,
     left_shape: WindowShape,
@@ -605,7 +605,7 @@ impl Filterbank {
     /// The returned PCM and every transform intermediate are drawn from the caller's `scratch`
     /// allocator (the pipeline's per-`process()` arena, reset by the scheduler) rather than the
     /// heap — the whole frame's filterbank stage imposes no steady-state heap traffic
-    /// (streamcraft patch). The persistent overlap tail (`self.overlap`) stays a Global `Vec`:
+    /// (profluens patch). The persistent overlap tail (`self.overlap`) stays a Global `Vec`:
     /// it is refilled by copy (`extend_from_slice` copies the arena tail into the Global buffer),
     /// so it never holds arena memory across the reset.
     ///
@@ -777,7 +777,7 @@ impl LongKind {
 /// per channel: a 2048-wide zeroed allocation, two `window_halves` calls (each cloning cached
 /// half-windows and reversing them), and the piecewise copy loops. Profiling a zero-copy-video
 /// playback showed this per-frame window reconstruction (alloc + memset + clones) as a chunk of
-/// the audio-decode allocation churn (streamcraft patch — see `STREAMCRAFT-PATCHES.md`). The
+/// the audio-decode allocation churn (profluens patch — see `PROFLUENS-PATCHES.md`). The
 /// window never changes, so it is computed once per combo and thereafter returned by reference;
 /// the values are identical to [`compute_long_window`], so decoded output is byte-for-byte
 /// unchanged.

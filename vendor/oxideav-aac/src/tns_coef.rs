@@ -149,7 +149,7 @@ const HALF_PI: f64 = PI / 2.0;
 /// 20; [`crate::tns_max::clamp_tns_order`] enforces it upstream). Every
 /// PARCOR / LPC / history scratch buffer in this module is bounded by
 /// this, so all of them live on the stack (fixed-size arrays) with no
-/// per-filter heap alloc on the TNS decode path (streamcraft patch).
+/// per-filter heap alloc on the TNS decode path (profluens patch).
 /// The `_into` entry points guard their `out` slices defensively so a
 /// caller that somehow supplies an over-order slice is rejected rather
 /// than overrunning the stack buffer.
@@ -405,7 +405,7 @@ pub fn tns_decode_coef_to_lpc(
 /// PARCOR array, then [`lpc_step_up_into`] over the caller's `out`
 /// slice, returning the `coef.len() + 1` LPC coefficient count. No heap
 /// alloc: the whole `coef → PARCOR → LPC` chain stays on the stack, so
-/// the per-filter TNS decode path allocates nothing (streamcraft
+/// the per-filter TNS decode path allocates nothing (profluens
 /// patch).
 ///
 /// `out.len()` must be at least `coef.len() + 1`. `coef.len()` must not
@@ -529,7 +529,7 @@ pub fn tns_ar_filter(
     // y(n-order). Index `0` is the most recent output; the ring is
     // shifted by one each iteration. Seeded with zeros per §4.6.9.3.
     // Stack-allocated to `TNS_MAX_ORDER` and sliced to `order` — no
-    // per-invocation heap alloc (streamcraft patch).
+    // per-invocation heap alloc (profluens patch).
     let mut history_buf = [0.0_f64; TNS_MAX_ORDER];
     let history = &mut history_buf[..order];
 
@@ -620,7 +620,7 @@ pub fn tns_ma_filter(
     // matching the all-pole filter's zero-initialised state so the two
     // are mutual inverses over the region. Stack-allocated to
     // `TNS_MAX_ORDER` and sliced to `order` — no per-invocation heap
-    // alloc (streamcraft patch).
+    // alloc (profluens patch).
     let mut history_buf = [0.0_f64; TNS_MAX_ORDER];
     let history = &mut history_buf[..order];
 

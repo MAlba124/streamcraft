@@ -2,7 +2,7 @@
 //! publisher, plus an offline parse of the captured DESCRIBE fixture.
 //!
 //! The live test *requires a running server* and skips cleanly (print +
-//! return, like sc-vaapi's hardware tests) when 127.0.0.1:8554 is
+//! return, like pf-vaapi's hardware tests) when 127.0.0.1:8554 is
 //! unreachable — or reachable but without a publisher on `/live` — so the
 //! suite stays green on machines without the setup. To run it for real:
 //!
@@ -10,7 +10,7 @@
 //! nix run nixpkgs#mediamtx &          # RTSP server on :8554
 //! ffmpeg -re -f lavfi -i testsrc2=duration=30:size=320x240:rate=25 \
 //!     -c:v libx264 -preset ultrafast -f rtsp rtsp://127.0.0.1:8554/live &
-//! cargo test -p sc-rtsp --test live_mediamtx
+//! cargo test -p pf-rtsp --test live_mediamtx
 //! ```
 //!
 //! When live, the DESCRIBE body is (re)captured into
@@ -21,8 +21,8 @@
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-use sc_rtsp::client::{resolve_control, RtspClient};
-use sc_rtsp::sdp::MediaKind;
+use pf_rtsp::client::{resolve_control, RtspClient};
+use pf_rtsp::sdp::MediaKind;
 
 const SERVER: &str = "127.0.0.1:8554";
 const URL: &str = "rtsp://127.0.0.1:8554/live";
@@ -152,7 +152,7 @@ fn fixture_mediamtx_describe_parses() {
         Ok(r) => r,
         Err(e) => panic!("fixture {FIXTURE} unreadable ({e}) — run the live test to capture it"),
     };
-    let sdp = sc_rtsp::sdp::parse(&raw).unwrap();
+    let sdp = pf_rtsp::sdp::parse(&raw).unwrap();
 
     let video = sdp
         .media
@@ -179,9 +179,9 @@ fn fixture_mediamtx_describe_parses() {
     if let Some(fmtp) = video.fmtp.get(&pt) {
         if let Some(sprop) = fmtp.params.get("sprop-parameter-sets") {
             let mut sets = sprop.split(',');
-            let sps = sc_rtsp::sdp::decode_base64(sets.next().unwrap()).unwrap();
+            let sps = pf_rtsp::sdp::decode_base64(sets.next().unwrap()).unwrap();
             assert_eq!(sps[0] & 0x1F, 7, "first parameter set is an SPS");
-            let pps = sc_rtsp::sdp::decode_base64(sets.next().unwrap()).unwrap();
+            let pps = pf_rtsp::sdp::decode_base64(sets.next().unwrap()).unwrap();
             assert_eq!(pps[0] & 0x1F, 8, "second parameter set is a PPS");
         }
     }

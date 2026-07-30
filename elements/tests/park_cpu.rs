@@ -10,9 +10,9 @@
 
 use std::time::Duration;
 
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::testing::{TimedTestSink, TimedTestSrc};
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::testing::{TimedTestSink, TimedTestSrc};
 
 /// Whole-process CPU time (utime + stime) from `/proc/self/stat`, in ms. CPU
 /// time — unlike wall time — is not inflated by scheduler delays on a loaded

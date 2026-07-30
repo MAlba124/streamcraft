@@ -1,4 +1,4 @@
-//! Immediate-mode UI for scraft-scope — the pipeline inspector's own tiny widget
+//! Immediate-mode UI for pf-scope — the pipeline inspector's own tiny widget
 //! toolkit, drawn through SDL3's `SDL_RenderGeometryRaw`.
 //!
 //! # Why immediate mode
@@ -6,7 +6,7 @@
 //! The inspector shows fast-changing live data (queue fill bars, counters, log
 //! tails, latency histograms). A retained widget tree would mean diffing that state
 //! into persistent nodes every frame; immediate mode instead *rebuilds the UI from
-//! the data every frame*, which is both simpler and a natural fit for streamcraft's
+//! the data every frame*, which is both simpler and a natural fit for profluens's
 //! per-frame-arena, no-steady-state-allocation ethos. The concept is Casey
 //! Muratori's "Immediate-Mode Graphical User Interfaces" (2005 talk / RAD Game
 //! Tools); this is a clean-room implementation of the idea, not a port of any

@@ -1,4 +1,4 @@
-//! sc-ogg — a hand-written, dependency-free Ogg container plugin for streamcraft.
+//! pf-ogg — a hand-written, dependency-free Ogg container plugin for profluens.
 //!
 //! Ogg (RFC 3533, "The Ogg Encapsulation Format Version 0") is the streaming container
 //! that carries FLAC / Opus / Vorbis packets. This crate implements the reader
@@ -7,7 +7,7 @@
 //! cross-referencing sections as `§6` etc. Review means reading the code against the
 //! normative text.
 //!
-//! Layout mirrors the `sc-flac` / `sc-http` plugins: a thin `lib.rs` re-exporting the
+//! Layout mirrors the `pf-flac` / `pf-http` plugins: a thin `lib.rs` re-exporting the
 //! public surface, submodules for the actual work, and the spec (plus interpretation
 //! `NOTES.md`) in `spec/`.
 //!
@@ -37,7 +37,7 @@
 //!   skip forward to the next `OggS` (§6). Truncated tails are held (streaming) or
 //!   reported as leftover ([`OggReader::finish`]).
 //!
-//! ## streamcraft elements
+//! ## profluens elements
 //! - [`OggDemux`] / [`OggMux`] — **single logical bitstream** container elements wrapping
 //!   the reader/writer above ([`element`]). `OggDemux` turns an Ogg byte stream into one
 //!   codec packet per output buffer (first bos serial only); `OggMux` wraps one input
@@ -48,9 +48,9 @@
 //! - **Multi-stream elements**: the demuxer emits only the *first* logical bitstream and
 //!   the muxer accepts only *one* input stream. The general case wants one dynamic src pad
 //!   *per discovered logical stream* (demux) and one dynamic sink pad per input (mux); the
-//!   milestone-1 [`Element`](streamcraft_core::element::Element) pad model is static
+//!   milestone-1 [`Element`](profluens_core::element::Element) pad model is static
 //!   (`PadDesc { dynamic: false, .. }`) and the scheduler has no per-stream pad add/remove
-//!   yet. Following how `sc-flac` shipped the codec core before element polish, the
+//!   yet. Following how `pf-flac` shipped the codec core before element polish, the
 //!   single-stream elements ship now; the multi-stream ones land once the core grows
 //!   dynamic pads. The reader/writer library already demuxes/muxes every serial, so the
 //!   dynamic-pad wrapper is the only missing piece.
@@ -66,8 +66,8 @@ pub mod writer;
 pub use crc::{crc32, Crc32};
 pub use element::{OggDemux, OggMux, DEFAULT_SERIAL};
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! oggdemux ! …")`). Typed `use` + constructor stays primary; both

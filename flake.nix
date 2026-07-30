@@ -1,5 +1,5 @@
 {
-  description = "StreamCraft — ultra light weight data/multimedia streaming/processing graph framework";
+  description = "Profluens — ultra light weight data/multimedia streaming/processing graph framework";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -42,8 +42,8 @@
           ];
 
           # PipeWire (libpipewire-0.3 + libspa), SDL3, and libva (+ libva-drm),
-          # found via pkg-config. Only sc-pipewire links libpipewire, only sc-sdl3
-          # links SDL3, and only sc-vaapi links libva (spec: a device backend is
+          # found via pkg-config. Only pf-pipewire links libpipewire, only pf-sdl3
+          # links SDL3, and only pf-vaapi links libva (spec: a device backend is
           # the one "buy, don't build"); the core stays dependency-free.
           buildInputs = [ pkgs.pipewire pkgs.sdl3 pkgs.libva ];
 
@@ -68,7 +68,7 @@
           LIBVA_DRIVERS_PATH = "${pkgs.intel-media-driver}/lib/dri:${pkgs.mesa}/lib/dri";
 
           shellHook = ''
-            echo "streamcraft devshell — $(rustc --version)"
+            echo "profluens devshell — $(rustc --version)"
           '';
         };
 

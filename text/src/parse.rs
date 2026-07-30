@@ -26,7 +26,7 @@
 // here builds owned cue text, the natural shape of a subtitle document; not steady-state heap.
 #![allow(clippy::disallowed_methods)]
 
-use streamcraft_core::time::Timestamp;
+use profluens_core::time::Timestamp;
 
 /// One parsed subtitle cue: plain UTF-8 text (markup already stripped, `\n` between lines)
 /// shown over `[start, end)`. `end == Timestamp::NONE` when a format left the span open

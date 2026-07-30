@@ -33,7 +33,7 @@
 
 use std::collections::VecDeque;
 
-use streamcraft_core::memory::Memory;
+use profluens_core::memory::Memory;
 
 use crate::ebml::{self, id};
 
@@ -43,7 +43,7 @@ use crate::ebml::{self, id};
 pub const DEFAULT_TIMESTAMP_SCALE: u64 = 1_000_000;
 
 /// The muxer's identity, written into `MuxingApp`/`WritingApp` (spec `§ID-tree`).
-pub const APP_NAME: &str = "sc-mkv";
+pub const APP_NAME: &str = "pf-mkv";
 
 /// TrackType for video (spec `§ID-tree`; RFC 9559 §5.1.4.1.3 Table 2: 1 video, 2 audio).
 const TRACK_TYPE_VIDEO: u64 = 1;
@@ -240,7 +240,7 @@ impl OpenCluster {
 /// Multi-track Matroska muxer. Configure with tracks, [`write_header`], then
 /// [`write_frame`] per encoded frame, then [`finalize`]. Everything appends into a
 /// caller-owned `Vec<u8>` so steady-state muxing does not reallocate (spec: performance
-/// first) — mirrors the `sc-ogg` writer's buffer-append contract.
+/// first) — mirrors the `pf-ogg` writer's buffer-append contract.
 pub struct MatroskaWriter {
     tracks: Vec<TrackConfig>,
     timestamp_scale: u64,
@@ -1151,7 +1151,7 @@ mod tests {
     /// stream must then parse with the patched duration and intact cues.
     #[test]
     fn reserved_duration_patches_in_scatter_stream() {
-        use streamcraft_core::memory::Pool;
+        use profluens_core::memory::Pool;
         let video = TrackConfig::video(1, "V_VP8", Vec::new(), 320, 240);
         let mut w = MatroskaWriter::new(vec![video]);
         w.enable_cues();

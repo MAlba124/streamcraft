@@ -1,4 +1,4 @@
-# sc-mp4 — spec provenance and design notes
+# pf-mp4 — spec provenance and design notes
 
 The ISO/IEC standards this crate is written against are **copyrighted and cannot be
 vendored** (unlike the FLAC RFC 9639, the Matroska RFC 9559, or the Ogg RFC 3533 checked
@@ -39,7 +39,7 @@ standard revisions.
   structured video in the ISO base media file format*. The `AVCDecoderConfigurationRecord`
   (§5.3.3.1) and `HEVCDecoderConfigurationRecord` (§8.3.3.1) carried in the `avcC` / `hvcC`
   child of an `avc1` / `hvc1` sample entry. **This crate does not re-parse these records**:
-  the identical record rides an MKV `CodecPrivate`, so `src/codec.rs` reuses `sc-mkv`'s
+  the identical record rides an MKV `CodecPrivate`, so `src/codec.rs` reuses `pf-mkv`'s
   already-tested `nal_head_from_config` (see "Reframer reuse" below). Edition: 2022.
 
 - **RFC 6381** — *The 'Codecs' and 'Profiles' Parameters for "Bucket" Media Types*. The
@@ -47,14 +47,14 @@ standard revisions.
   four-CCs RFC 6381 §3.3 registers (`avc1`/`avc3`, `hvc1`/`hev1`, `vp09`, `av01`, `Opus`,
   `mp4a`). Not vendored (RFC text is freely available at rfc-editor.org).
 
-## Reframer reuse (why sc-mp4 depends on sc-mkv)
+## Reframer reuse (why pf-mp4 depends on pf-mkv)
 
 `avc1`/`hvc1` sample entries store frames as **length-prefixed NAL units** and their
 parameter sets in an `avcC`/`hvcC` configuration record — byte-for-byte the same record
 Matroska carries in `CodecPrivate`, and the same length-prefixed → Annex B reframing MKV
-Blocks need. Rather than copy `sc-mkv`'s tested `parse_avcc`/`parse_hvcc` +
-`length_prefixed_to_annex_b`, sc-mp4 depends on sc-mkv and reuses
-`sc_mkv::nal_head_from_config` + `sc_mkv::Reframer`. One implementation, tested once. This
+Blocks need. Rather than copy `pf-mkv`'s tested `parse_avcc`/`parse_hvcc` +
+`length_prefixed_to_annex_b`, pf-mp4 depends on pf-mkv and reuses
+`pf_mkv::nal_head_from_config` + `pf_mkv::Reframer`. One implementation, tested once. This
 is **not** a container dependency: the MP4 box grammar, sample-table resolution, and
 streaming slicer are all hand-written in this crate; only the codec-record parser (a
 14496-15 concern, not a 14496-12 one) is shared.

@@ -1,8 +1,8 @@
-//! `scplay` — the general-purpose player CLI (spec: Milestone applications §5). Probe a
+//! `pfplay` — the general-purpose player CLI (spec: Milestone applications §5). Probe a
 //! file, autoplug the pipeline, play it:
 //!
 //! ```text
-//! scplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
+//! pfplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
 //! ```
 //!
 //! Contract (a separate validation harness runs against this):
@@ -28,9 +28,9 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use sc_play::{Player, SinkChoice, SinkPolicy};
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::time::Timestamp;
+use pf_play::{Player, SinkChoice, SinkPolicy};
+use profluens_core::bus::BusMessage;
+use profluens_core::time::Timestamp;
 
 /// Parsed CLI options. Switches come first; the single positional is the file.
 struct Options {
@@ -73,7 +73,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 }
 
 fn usage() -> String {
-    "usage: scplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE".to_string()
+    "usage: pfplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE".to_string()
 }
 
 fn main() -> ExitCode {
@@ -166,7 +166,7 @@ fn install_stats(player: &mut Player, on: bool) {
         return;
     }
     let tap = player.pipeline.tap_handle();
-    let watched: Vec<(String, streamcraft_core::id::ElementId)> =
+    let watched: Vec<(String, profluens_core::id::ElementId)> =
         player.watched().into_iter().map(|(n, id)| (n.to_string(), id)).collect();
     std::thread::spawn(move || {
         let mut prev: Vec<(u64, u64)> = vec![(0, 0); watched.len()];
@@ -194,7 +194,7 @@ fn install_stats(player: &mut Player, on: bool) {
 }
 
 /// `--max-secs N`: a cooperative stop after N wall seconds (exits 0). A watcher thread trips
-/// the [`StopHandle`](streamcraft_core::pipeline::Pipeline::stop_handle); `run()` then returns
+/// the [`StopHandle`](profluens_core::pipeline::Pipeline::stop_handle); `run()` then returns
 /// `Ok`.
 fn install_max_secs(player: &mut Player, max_secs: Option<u64>) {
     let Some(secs) = max_secs else { return };
@@ -269,7 +269,7 @@ fn install_stdin_controls(player: &mut Player) {
 
 /// Window transport: drain the raw-wire presenter's [`PlayerControl`] (clicks from the video
 /// window) into the same pause/seek/stop handles, and publish duration + pause state back for
-/// the HUD. No-op unless `SC_PRESENT`'s `waylandvideosink` is in use. Polls at ~33 Hz; the
+/// the HUD. No-op unless `PF_PRESENT`'s `waylandvideosink` is in use. Polls at ~33 Hz; the
 /// thread dies with the process (none is joined).
 fn install_window_controls(player: &mut Player) {
     let Some(control) = player.player_control() else {
@@ -287,15 +287,15 @@ fn install_window_controls(player: &mut Player) {
         let mut seek_to: Option<f32> = None;
         for cmd in control.drain() {
             match cmd {
-                sc_present::UiCommand::TogglePause => {
+                pf_present::UiCommand::TogglePause => {
                     let paused = pause.toggle();
                     control.set_paused(paused);
                 }
-                sc_present::UiCommand::Quit => {
+                pf_present::UiCommand::Quit => {
                     stop.stop();
                     return;
                 }
-                sc_present::UiCommand::SeekFraction(f) => seek_to = Some(f),
+                pf_present::UiCommand::SeekFraction(f) => seek_to = Some(f),
             }
         }
         if let (Some(f), Some(dur)) = (seek_to, duration.nanos()) {

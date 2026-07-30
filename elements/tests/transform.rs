@@ -3,13 +3,13 @@
 //! group runner drives a two-element inline chain, and the output must still be
 //! byte-identical.
 
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::flow::PassThrough;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::flow::PassThrough;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_tf_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_tf_{}_{}.bin", tag, std::process::id()));
     p
 }
 

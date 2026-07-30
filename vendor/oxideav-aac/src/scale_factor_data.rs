@@ -325,7 +325,7 @@ pub fn hcod_sf_encode(dpcm: i8) -> Result<(u8, u32)> {
 /// test that exhaustively walks all `2^19` 19-bit prefixes.
 pub fn hcod_sf_decode(reader: &mut BitReader<'_>) -> Result<i8> {
     // Peek-and-lookup over the §4.A.1 codebook (was an O(entries·max_len) linear scan per
-    // symbol — the hottest audio-decode op in profiling; streamcraft patch). The table is a
+    // symbol — the hottest audio-decode op in profiling; profluens patch). The table is a
     // pure function of `HCOD_SF`, so the decoded index — and thus every `(idx + SF_INDEX_OFFSET)`
     // DPCM delta — is identical.
     static TABLE: std::sync::OnceLock<PrefixTable> = std::sync::OnceLock::new();
@@ -377,7 +377,7 @@ pub enum ScaleFactorEntry {
 /// unchanged): on the hot decode path the per-group record lists —
 /// built here and consumed once by [`accumulate_in`] within the same
 /// frame — come from the caller's per-`process()` bump arena rather
-/// than the heap (streamcraft patch).
+/// than the heap (profluens patch).
 #[derive(Debug, Clone)]
 pub struct ScaleFactorData<A: std::alloc::Allocator = std::alloc::Global> {
     /// `entries[g]` — the per-band records of window group `g` in
@@ -389,7 +389,7 @@ pub struct ScaleFactorData<A: std::alloc::Allocator = std::alloc::Global> {
 // Hand-written PartialEq / Eq (as for `SpectralData` / `AbsoluteScaleFactors`): a derive would
 // bound `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
 // PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
-// allocators (streamcraft patch).
+// allocators (profluens patch).
 impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<ScaleFactorData<A2>>
     for ScaleFactorData<A1>
 {
@@ -423,7 +423,7 @@ impl<A: std::alloc::Allocator + Copy> ScaleFactorData<A> {
     /// [`parse`](ScaleFactorData::parse) with an explicit `scratch` allocator for the per-group
     /// `entries` lists (the pipeline passes its per-`process()` arena; tests infer `A = Global`).
     /// The returned records are transient side info consumed by [`accumulate_in`] within the same
-    /// frame, so on the hot path they cost no heap malloc/free per channel (streamcraft patch).
+    /// frame, so on the hot path they cost no heap malloc/free per channel (profluens patch).
     pub fn parse_in<SA: std::alloc::Allocator>(
         reader: &mut BitReader<'_>,
         sfb_cb: &[Vec<u8, SA>],
@@ -434,7 +434,7 @@ impl<A: std::alloc::Allocator + Copy> ScaleFactorData<A> {
             Vec::with_capacity_in(sfb_cb.len(), scratch);
         for group in sfb_cb {
             // At most one entry per band — pre-size so the per-band pushes don't realloc-grow
-            // (grow_one profiled as a chunk of the 16/32-byte allocations; streamcraft patch).
+            // (grow_one profiled as a chunk of the 16/32-byte allocations; profluens patch).
             let mut group_entries: Vec<ScaleFactorEntry, A> =
                 Vec::with_capacity_in(group.len(), scratch);
             for &cb in group {
@@ -654,7 +654,7 @@ pub struct AbsoluteScaleFactors<A: std::alloc::Allocator = std::alloc::Global> {
 // PartialEq / Eq are hand-written so they compare `entries` element-wise regardless of the
 // allocator type parameter: a derived impl would bound `A: PartialEq`, which `Global` (and the
 // arena allocators the hot path uses) does not satisfy. `Vec<T, A1>: PartialEq<Vec<T, A2>>`
-// compares contents only, so this stays a value comparison. (streamcraft patch)
+// compares contents only, so this stays a value comparison. (profluens patch)
 impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<AbsoluteScaleFactors<A2>>
     for AbsoluteScaleFactors<A1>
 {
@@ -694,7 +694,7 @@ pub fn accumulate(
 /// records: the hot decode path passes its per-`process()` bump arena so the
 /// `Vec<Vec<AbsoluteScaleFactorEntry, A>, A>` — transient side info consumed by the dequant /
 /// joint-stereo / noise passes within the same frame — comes from the arena rather than the heap
-/// (streamcraft patch). `A: Copy` because the outer and inner vecs share one allocator; `Global`
+/// (profluens patch). `A: Copy` because the outer and inner vecs share one allocator; `Global`
 /// and `&Bump` are both `Copy`.
 pub fn accumulate_in<A: std::alloc::Allocator + Copy, SA: std::alloc::Allocator>(
     sfd: &ScaleFactorData<A>,
@@ -713,7 +713,7 @@ pub fn accumulate_in<A: std::alloc::Allocator + Copy, SA: std::alloc::Allocator>
         Vec::with_capacity_in(sfb_cb.len(), scratch);
     for (group_entries, group_cb) in sfd.entries.iter().zip(sfb_cb.iter()) {
         let mut entry_iter = group_entries.iter();
-        // One output per non-zero band — pre-size to avoid realloc-growth (streamcraft patch).
+        // One output per non-zero band — pre-size to avoid realloc-growth (profluens patch).
         let mut group_out: Vec<AbsoluteScaleFactorEntry, A> =
             Vec::with_capacity_in(group_cb.len(), scratch);
         for &cb in group_cb {

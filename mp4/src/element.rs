@@ -4,7 +4,7 @@
 //! can start (avc1/hvc1: an Annex B parameter-set head from `avcC`/`hvcC`, then Annex B
 //! access units; vp09/av01/Opus/AAC: the raw samples verbatim).
 //!
-//! This is the **exact structural sibling** of [`sc_mkv::MkvDemux`]: constructor-supplied
+//! This is the **exact structural sibling** of [`pf_mkv::MkvDemux`]: constructor-supplied
 //! track discovery, one dynamic src pad per track, per-family reframing, runtime format
 //! announcement, and — most importantly — the same **pool-bounded emission discipline**
 //! (spec: the backpressure rule; the movie OOM). Read them side by side.
@@ -32,19 +32,19 @@
 //! [`Ctx::alloc_exact`] (right-sized, never a slot-sized over-allocation per small sample).
 //! Unbounded `ctx.alloc` in a demuxer is **banned** — it OOM'd a real movie.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::{Buffer, BufferFlags};
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::buffer::{Buffer, BufferFlags};
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{OfferDesc, ValueDesc};
-use streamcraft_core::id::{FormatId, PadId};
-use streamcraft_core::memory::Memory;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{OfferDesc, ValueDesc};
+use profluens_core::id::{FormatId, PadId};
+use profluens_core::memory::Memory;
+use profluens_core::time::Timestamp;
 
 use crate::codec::{self, Reframer};
 use crate::reader::{Mp4Error, Mp4Reader, SamplePayload};
@@ -166,7 +166,7 @@ enum CarryPayload {
 
 /// Demultiplexes a progressive MP4 byte stream into one src pad per track (spec: dynamic
 /// pads). See the module docs for the constructor-supplied discovery and the pool-bounded
-/// emission discipline (both mirroring [`sc_mkv::MkvDemux`]).
+/// emission discipline (both mirroring [`pf_mkv::MkvDemux`]).
 pub struct Mp4Demux {
     /// The file head handed in at construction — resolved in `preroll` to discover tracks.
     head: Vec<u8>,
@@ -190,7 +190,7 @@ pub struct Mp4Demux {
     out_fmt: FormatId,
     /// Reused NAL→Annex B reframe buffer: each length-prefixed → Annex B conversion refills
     /// this in place ([`Reframer::reframe_into`]), so the per-sample reframe allocates nothing
-    /// on the global heap (mirrors `sc_mkv::MkvDemux`). Passthrough leaves it untouched.
+    /// on the global heap (mirrors `pf_mkv::MkvDemux`). Passthrough leaves it untouched.
     reframe_buf: Vec<u8>,
 }
 
@@ -733,7 +733,7 @@ fn own_remainder(bytes: &[u8], off: usize) -> Vec<u8> {
     bytes[off..].to_vec()
 }
 
-/// Map a resolver error to a worded `streamcraft` error (loud, at preroll).
+/// Map a resolver error to a worded `profluens` error (loud, at preroll).
 // COLD: builds an error string only on a preroll resolve failure — never per-sample.
 #[allow(clippy::disallowed_methods)]
 fn map_resolve_err(e: Mp4Error) -> Error {

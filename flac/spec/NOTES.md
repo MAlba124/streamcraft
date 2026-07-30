@@ -1,4 +1,4 @@
-# sc-flac spec notes
+# pf-flac spec notes
 
 Interpretation decisions and errata for the FLAC implementation, per the codec
 conventions (spec: First-party codecs — "Spec errata and interpretation decisions get

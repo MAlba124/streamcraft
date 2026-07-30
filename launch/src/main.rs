@@ -1,4 +1,4 @@
-//! `streamcraft` — the CLI: `launch` (gst-launch), `inspect` (gst-inspect), `dot`
+//! `profluens` — the CLI: `launch` (gst-launch), `inspect` (gst-inspect), `dot`
 //! (spec: Plugins — "a gst-launch equivalent is cheap once the registry exists and
 //! invaluable for debugging and bug reports").
 //!
@@ -6,12 +6,12 @@
 //! registry; `launch` parses a pipeline into a [`Pipeline`] and drives it to EOS.
 //!
 //! ```text
-//! streamcraft launch filesrc path=in.wav ! wavparse ! flacenc ! filesink path=out.flac
-//! streamcraft launch --counters testsrc total=65536 ! testsink
-//! streamcraft launch --pool 4194304x16 videotestsrc width=1280 height=720 frames=30 ! videocksink
-//! streamcraft dot testsrc total=65536 ! testsink
-//! streamcraft inspect flacenc
-//! streamcraft inspect            # list every registered element
+//! profluens launch filesrc path=in.wav ! wavparse ! flacenc ! filesink path=out.flac
+//! profluens launch --counters testsrc total=65536 ! testsink
+//! profluens launch --pool 4194304x16 videotestsrc width=1280 height=720 frames=30 ! videocksink
+//! profluens dot testsrc total=65536 ! testsink
+//! profluens inspect flacenc
+//! profluens inspect            # list every registered element
 //! ```
 //!
 //! Switches come **first**; everything after the first non-switch argument is the
@@ -48,36 +48,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use streamcraft_core::counters::TapHandle;
-use streamcraft_core::id::ElementId;
-use streamcraft_core::log::Level;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::registry::Registry;
+use profluens_core::counters::TapHandle;
+use profluens_core::id::ElementId;
+use profluens_core::log::Level;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::registry::Registry;
 
 /// Build the registry with every in-tree plugin crate's elements (spec: Plugins —
 /// each crate exposes `register`, the app calls them all). pipewire is omitted (heavy
 /// native dep, and a launch tool rarely wants a device sink).
 fn build_registry() -> Registry {
     let mut r = Registry::new();
-    streamcraft_elements::register(&mut r);
-    streamcraft_audio::register(&mut r);
-    sc_aac::register(&mut r);
-    sc_flac::register(&mut r);
-    sc_ogg::register(&mut r);
-    streamcraft_video::register(&mut r);
-    sc_vp8::register(&mut r);
-    sc_vp9::register(&mut r);
-    sc_av1::register(&mut r);
-    sc_h264::register(&mut r);
-    sc_h265::register(&mut r);
-    sc_mkv::register(&mut r);
-    sc_mp4::register(&mut r);
-    sc_mp3::register(&mut r);
-    sc_sdl3::register(&mut r);
+    profluens_elements::register(&mut r);
+    profluens_audio::register(&mut r);
+    pf_aac::register(&mut r);
+    pf_flac::register(&mut r);
+    pf_opus::register(&mut r);
+    pf_ogg::register(&mut r);
+    profluens_video::register(&mut r);
+    pf_vp8::register(&mut r);
+    pf_vp9::register(&mut r);
+    pf_av1::register(&mut r);
+    pf_h264::register(&mut r);
+    pf_h265::register(&mut r);
+    pf_mkv::register(&mut r);
+    pf_mp4::register(&mut r);
+    pf_mp3::register(&mut r);
+    pf_sdl3::register(&mut r);
     // Capability-gated: registers `vaapih264dec` only when the VA-API driver
-    // advertises the decode profile (and `SC_NO_VAAPI` is unset) — a machine
+    // advertises the decode profile (and `PF_NO_VAAPI` is unset) — a machine
     // without the hardware never sees the element.
-    sc_vaapi::register(&mut r);
+    pf_vaapi::register(&mut r);
     r
 }
 
@@ -203,7 +204,7 @@ fn parse_pool(spec: &str) -> Result<(usize, u32), String> {
 }
 
 fn usage() -> String {
-    "usage: streamcraft <command> …\n\
+    "usage: profluens <command> …\n\
      \n\
      commands:\n\
      \x20 launch [switches] ELEM prop=val ! ELEM ! …   run a pipeline to EOS\n\
@@ -248,7 +249,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 None => {
-                    eprintln!("no element '{name}' — 'streamcraft inspect' lists them all");
+                    eprintln!("no element '{name}' — 'profluens inspect' lists them all");
                     ExitCode::FAILURE
                 }
             };
@@ -446,9 +447,9 @@ fn fmt_size(bytes: u64) -> String {
 }
 
 /// Print each element's counters after the run (spec: Debuggability — per-element
-/// counters). Reads through the [`TapHandle`](streamcraft_core::counters::TapHandle),
+/// counters). Reads through the [`TapHandle`](profluens_core::counters::TapHandle),
 /// the zero-streaming-cost stats pull.
-fn print_counters(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraft_core::id::ElementId]) {
+fn print_counters(tap: &profluens_core::counters::TapHandle, ids: &[profluens_core::id::ElementId]) {
     println!("counters:");
     for &id in ids {
         match tap.snapshot(id) {
@@ -471,7 +472,7 @@ fn print_counters(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraf
 /// `--trace`: per-element latency table (spec: Debuggability). Quantiles are computed
 /// here, on the observer's side, from the histograms the scheduler filled — the tap
 /// model: the pipeline keeps counts, the observer does arithmetic.
-fn print_latency(tap: &streamcraft_core::counters::TapHandle, ids: &[streamcraft_core::id::ElementId]) {
+fn print_latency(tap: &profluens_core::counters::TapHandle, ids: &[profluens_core::id::ElementId]) {
     let fmt = |ns: u64| -> String {
         if ns >= 1_000_000_000 {
             format!("{:.2}s", ns as f64 / 1e9)

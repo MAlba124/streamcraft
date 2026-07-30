@@ -1,4 +1,4 @@
-//! streamcraft-audio — POD audio format descriptions and typed *views* over the
+//! profluens-audio — POD audio format descriptions and typed *views* over the
 //! opaque buffer: sample formats, rates, channel layouts, planar spans
 //! (spec: Crate layout). No new buffer types, no traits — free functions and plain
 //! structs. Views borrow, so misuse is a compile error and they cost nothing over
@@ -13,6 +13,7 @@ pub mod convert;
 pub mod convert_element;
 pub mod downmix_element;
 pub mod format;
+pub mod quality;
 pub mod resample;
 pub mod resample_element;
 pub mod wav;
@@ -30,8 +31,8 @@ pub use format::{
 };
 pub use wav::{parse_wav_header, write_pcm_wav, WavError, WavHeader, WavParse};
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! wavparse ! audioconvert format=s16 ! …")`). Typed `use` + constructor

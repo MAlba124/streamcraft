@@ -4,10 +4,10 @@
 //!
 //! All multi-byte scalars in EBML are **big-endian** (RFC 8794 §7.1: "stored … with the
 //! most significant octet first"), which is the opposite of Ogg — do not copy the
-//! `to_le_bytes` habit from `sc-ogg` here.
+//! `to_le_bytes` habit from `pf-ogg` here.
 //!
 //! Everything appends into a caller-owned `Vec<u8>` (no per-call allocation), matching the
-//! `sc-ogg` writer style so the muxer can build a whole header/cluster in one buffer.
+//! `pf-ogg` writer style so the muxer can build a whole header/cluster in one buffer.
 
 /// Canonical Matroska Element IDs, **pre-encoded** as their on-the-wire big-endian bytes
 /// (spec `§ID-tree`). A Matroska ID *is* a VINT including its length-descriptor bits (RFC
@@ -261,7 +261,7 @@ pub fn write_binary(out: &mut Vec<u8>, element_id: &[u8], value: &[u8]) {
 // the parser once more bytes arrive), so these primitives only ever see a contiguous window.
 // =====================================================================================
 
-/// A parse failure. The demuxer maps this to a `streamcraft` [`Error`](streamcraft_core::error::Error);
+/// A parse failure. The demuxer maps this to a `profluens` [`Error`](profluens_core::error::Error);
 /// [`Incomplete`](ReadError::Incomplete) is special — it means "need more bytes", not
 /// "corrupt", so the demuxer buffers and retries rather than erroring out.
 #[derive(Clone, PartialEq, Eq, Debug)]

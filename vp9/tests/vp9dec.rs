@@ -18,21 +18,21 @@ use std::sync::{Arc, Mutex};
 
 use oxideav_vp9::decode_intra_frame;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::harness::Harness;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::harness::Harness;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
-use sc_vp9::Vp9Dec;
+use pf_vp9::Vp9Dec;
 
 /// A real 64x48 VP9 keyframe (8-bit 4:2:0), one frame, generated with
 /// `ffmpeg -f lavfi -i testsrc2=64x48 -frames:v 1 -c:v libvpx-vp9 -g 1 …` and stored
@@ -114,7 +114,7 @@ impl Element for FrameSrc {
     fn stop(&mut self, _ctx: &mut Ctx) {}
 }
 
-// The record sink accepts any `video/raw` — the pixfmt set matches sc-vp9's src offer.
+// The record sink accepts any `video/raw` — the pixfmt set matches pf-vp9's src offer.
 static PIXFMTS: [ValueDesc; 12] = [
     ValueDesc::Id("i420"),
     ValueDesc::Id("i422"),
@@ -435,7 +435,7 @@ fn flush_start_drops_the_pending_carry_and_no_stale_frame_leaks() {
 /// ffmpeg is missing or the encode fails (no libvpx-vp9).
 fn ffmpeg_vp9_keyframes(width: u32, height: u32) -> Option<Vec<Vec<u8>>> {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("sc_vp9_oracle_{width}x{height}_{}.ivf", std::process::id()));
+    let path = dir.join(format!("pf_vp9_oracle_{width}x{height}_{}.ivf", std::process::id()));
     let status = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!("testsrc2=size={width}x{height}:rate=1:duration=2"))

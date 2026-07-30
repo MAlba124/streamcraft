@@ -1,37 +1,38 @@
 [package]
-name = "streamcraft-cli"
-description = "The streamcraft command: launch (gst-launch), inspect (gst-inspect), dot (spec: Plugins)"
+name = "profluens-cli"
+description = "The profluens command: launch (gst-launch), inspect (gst-inspect), dot (spec: Plugins)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "streamcraft"
+name = "profluens"
 path = "src/main.rs"
 
 [dependencies]
-streamcraft-core = { path = "../core" }
+profluens-core = { path = "../core" }
 # Every crate that exposes `register(&mut Registry)`; the binary aggregates them into
 # one registry (spec: Plugins). pipewire is intentionally omitted — it pulls a heavy
 # native libpipewire dependency the launch tool has no need for.
-streamcraft-elements = { path = "../elements" }
-streamcraft-audio = { path = "../audio" }
-sc-aac = { path = "../aac" }
-sc-flac = { path = "../flac" }
-sc-ogg = { path = "../ogg" }
+profluens-elements = { path = "../elements" }
+profluens-audio = { path = "../audio" }
+pf-aac = { path = "../aac" }
+pf-flac = { path = "../flac" }
+pf-opus = { path = "../opus" }
+pf-ogg = { path = "../ogg" }
 # The raw-video path (videotestsrc / rawvideoparse / videocksink) plus the five
 # hand-wired video decoders.
-streamcraft-video = { path = "../video" }
-sc-vp8 = { path = "../vp8" }
-sc-vp9 = { path = "../vp9" }
-sc-av1 = { path = "../av1" }
-sc-h264 = { path = "../h264" }
-sc-h265 = { path = "../h265" }
-sc-mkv = { path = "../mkv" }
-sc-mp4 = { path = "../mp4" }
-sc-mp3 = { path = "../mp3" }
+profluens-video = { path = "../video" }
+pf-vp8 = { path = "../vp8" }
+pf-vp9 = { path = "../vp9" }
+pf-av1 = { path = "../av1" }
+pf-h264 = { path = "../h264" }
+pf-h265 = { path = "../h265" }
+pf-mkv = { path = "../mkv" }
+pf-mp4 = { path = "../mp4" }
+pf-mp3 = { path = "../mp3" }
 # The display sink (SDL3 window + GPU-accelerated presentation).
-sc-sdl3 = { path = "../sdl3" }
+pf-sdl3 = { path = "../sdl3" }
 # Hardware decode (capability-gated registration: no VA-API device, no element).
-sc-vaapi = { path = "../vaapi" }
+pf-vaapi = { path = "../vaapi" }

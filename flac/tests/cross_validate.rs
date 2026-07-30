@@ -9,7 +9,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use sc_flac::{FlacEncoder, SampleFormat};
+use pf_flac::{FlacEncoder, SampleFormat};
 
 fn have_flac() -> bool {
     Command::new("flac")
@@ -21,7 +21,7 @@ fn have_flac() -> bool {
 
 fn temp_path(tag: &str, ext: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_flac_xv_{}_{}.{}", tag, std::process::id(), ext));
+    p.push(format!("pf_flac_xv_{}_{}.{}", tag, std::process::id(), ext));
     p
 }
 
@@ -43,7 +43,7 @@ fn write_flac(tag: &str, n: usize, channels: u32, rate: u32) -> (std::path::Path
     let mut frames = Vec::new();
     enc.encode_interleaved(&interleaved, &mut frames).unwrap();
     let body = enc.finish();
-    header[sc_flac::streaminfo_offset()..sc_flac::streaminfo_offset() + body.len()]
+    header[pf_flac::streaminfo_offset()..pf_flac::streaminfo_offset() + body.len()]
         .copy_from_slice(&body);
 
     let path = temp_path(tag, "flac");

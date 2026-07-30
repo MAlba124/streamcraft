@@ -1,7 +1,7 @@
 //! Hardware-encode a test pattern into an MKV file:
 //! `videotestsrc → vaapi{h264,h265,vp8}enc → mkvmuxn → filesink`.
 //!
-//! Usage: `cargo run -p sc-vaapi --example hw_encode_mkv -- <h264|h265|vp8> [out.mkv] [frames]`
+//! Usage: `cargo run -p pf-vaapi --example hw_encode_mkv -- <h264|h265|vp8> [out.mkv] [frames]`
 //!
 //! This is the external-validation vehicle for the encoders: the produced file
 //! must open in ffprobe *and* headless mpv (the workspace's muxer rule — the two
@@ -12,11 +12,11 @@
 
 use std::path::PathBuf;
 
-use sc_mkv::MkvMuxN;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Rational;
-use streamcraft_elements::io::FileSink;
-use streamcraft_video::{PixelFormat, VideoFormat, VideoTestSrc};
+use pf_mkv::MkvMuxN;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Rational;
+use profluens_elements::io::FileSink;
+use profluens_video::{PixelFormat, VideoFormat, VideoTestSrc};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -24,10 +24,10 @@ fn main() {
     let out = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/sc_hw_{codec}.mkv")));
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/pf_hw_{codec}.mkv")));
     let frames: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
 
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("no VA-API device available");
         std::process::exit(1);
     };
@@ -61,9 +61,9 @@ fn main() {
     // be deeper than the GOP, or the pipeline deadlocks: writer waits for frame
     // N+1, encoder waits for a slot the writer holds.
     let enc = match codec.as_str() {
-        "h264" => p.add(sc_vaapi::VaapiH264Enc::new().with_gop(30)),
-        "h265" => p.add(sc_vaapi::VaapiH265Enc::new().with_gop(30)),
-        _ => p.add(sc_vaapi::VaapiVp8Enc::new().with_gop(30)),
+        "h264" => p.add(pf_vaapi::VaapiH264Enc::new().with_gop(30)),
+        "h265" => p.add(pf_vaapi::VaapiH265Enc::new().with_gop(30)),
+        _ => p.add(pf_vaapi::VaapiVp8Enc::new().with_gop(30)),
     };
     // Per-element pools also break shared-pool deadlock cycles (the class the
     // RTP payloader hit): compressed output must not compete with the source's

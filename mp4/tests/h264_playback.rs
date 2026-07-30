@@ -1,6 +1,6 @@
 //! End-to-end **H.264-in-MP4 playback path** (spec: `spec/NOTES.md`; Milestone applications
 //! §5). Mirrors `mkv/tests/vp8_playback.rs`, but the source is a real committed MP4 fixture
-//! demuxed through [`Mp4Demux`] and decoded through `sc-h264`'s [`H264Dec`].
+//! demuxed through [`Mp4Demux`] and decoded through `pf-h264`'s [`H264Dec`].
 //!
 //! The load-bearing property: the committed baseline H.264 MP4 (`tiny_h264.mp4`, 15 frames,
 //! 128x96, no B-frames) demuxes — the demuxer reframes the length-prefixed NALs to Annex B
@@ -14,20 +14,20 @@
 
 use std::sync::{Arc, Mutex};
 
-use sc_h264::H264Dec;
-use sc_mp4::Mp4Demux;
+use pf_h264::H264Dec;
+use pf_mp4::Mp4Demux;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 const W: i64 = 128;
 const H: i64 = 96;

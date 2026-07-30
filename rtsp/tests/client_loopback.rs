@@ -8,8 +8,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread::JoinHandle;
 
-use sc_rtsp::client::{RtspClient, RtspError};
-use sc_rtsp::sdp::MediaKind;
+use pf_rtsp::client::{RtspClient, RtspError};
+use pf_rtsp::sdp::MediaKind;
 
 /// A connected loopback socket pair: (client end, server end).
 fn pair() -> (TcpStream, TcpStream) {
@@ -196,7 +196,7 @@ fn describe_setup_play_keepalive_teardown() {
     assert_eq!(d.raw, SDP_BODY);
 
     let video_ctrl =
-        sc_rtsp::client::resolve_control(&d.base, d.sdp.media[0].control.as_deref().unwrap());
+        pf_rtsp::client::resolve_control(&d.base, d.sdp.media[0].control.as_deref().unwrap());
     let t = client.setup(&video_ctrl, 5000).unwrap();
     assert_eq!(t.server_port, Some((6000, 6001)));
     assert_eq!(t.client_port, Some((5000, 5001)));
@@ -206,7 +206,7 @@ fn describe_setup_play_keepalive_teardown() {
     assert_eq!(session.timeout_secs, 30);
 
     let audio_ctrl =
-        sc_rtsp::client::resolve_control(&d.base, d.sdp.media[1].control.as_deref().unwrap());
+        pf_rtsp::client::resolve_control(&d.base, d.sdp.media[1].control.as_deref().unwrap());
     let t = client.setup(&audio_ctrl, 5002).unwrap();
     assert_eq!(t.server_port, Some((6002, 6003)));
 
@@ -222,7 +222,7 @@ fn describe_setup_play_keepalive_teardown() {
 /// expected `response` is pinned from hand-computed hashes (RFC 2617
 /// §3.2.2, verified with coreutils md5sum):
 ///
-/// - `HA1 = MD5("mufasa:streamcraft:circle-of-life")` (§3.2.2.2:
+/// - `HA1 = MD5("mufasa:profluens:circle-of-life")` (§3.2.2.2:
 ///   `A1 = unq(username) ":" unq(realm) ":" passwd`)
 ///   = `c8059ca7382ba5fb48f2144d7efccda7`
 /// - `HA2 = MD5("DESCRIBE:rtsp://127.0.0.1/test")` (§3.2.2.3:
@@ -242,7 +242,7 @@ fn digest_401_retry_no_qop() {
         respond(
             s,
             &req,
-            "401 Unauthorized\nWWW-Authenticate: Digest realm=\"streamcraft\", nonce=\"1bcf5417a2\"",
+            "401 Unauthorized\nWWW-Authenticate: Digest realm=\"profluens\", nonce=\"1bcf5417a2\"",
             "",
         );
 
@@ -259,7 +259,7 @@ fn digest_401_retry_no_qop() {
             })
         };
         assert_eq!(get("username").as_deref(), Some("mufasa"));
-        assert_eq!(get("realm").as_deref(), Some("streamcraft"));
+        assert_eq!(get("realm").as_deref(), Some("profluens"));
         assert_eq!(get("nonce").as_deref(), Some("1bcf5417a2"));
         // §3.2.2: digest-uri is the Request-URI of the request line.
         assert_eq!(get("uri").as_deref(), Some("rtsp://127.0.0.1/test"));
@@ -305,7 +305,7 @@ fn digest_401_retry_qop_auth_and_nc_increments() {
         respond(
             s,
             &req,
-            "401 Unauthorized\nWWW-Authenticate: Digest realm=\"streamcraft\", \
+            "401 Unauthorized\nWWW-Authenticate: Digest realm=\"profluens\", \
              nonce=\"1bcf5417a2\", qop=\"auth\", opaque=\"cafef00d\"",
             "",
         );
@@ -367,7 +367,7 @@ fn basic_401_retry() {
         respond(
             s,
             &req,
-            "401 Unauthorized\nWWW-Authenticate: Basic realm=\"streamcraft\"",
+            "401 Unauthorized\nWWW-Authenticate: Basic realm=\"profluens\"",
             "",
         );
 

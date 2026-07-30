@@ -54,18 +54,18 @@
 //! v1 text is bottom-centre; the bitmap path honours the PGS placement. No
 //! positioning/karaoke/colour overrides on the text path (future work, noted in the crate docs).
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
-use streamcraft_video::format::PixelFormat;
-use streamcraft_video::frame::VideoFrameMut;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
+use profluens_video::format::PixelFormat;
+use profluens_video::frame::VideoFrameMut;
 
 use crate::font;
 use crate::pgs;
@@ -345,7 +345,7 @@ impl Element for SubtitleOverlay {
             let lines = self.active_text(buf.pts);
             if !lines.is_empty() {
                 if let Some((w, h, pixfmt)) = geom {
-                    let need = streamcraft_video::geometry::frame_size(pixfmt, w, h);
+                    let need = profluens_video::geometry::frame_size(pixfmt, w, h);
                     let data = buf.memory.as_mut_full();
                     if data.len() >= need {
                         if let Some(mut frame) =
@@ -364,7 +364,7 @@ impl Element for SubtitleOverlay {
             let mut drew_bitmap = false;
             if let Some((w, h, pixfmt)) = geom {
                 if let Some(ds) = self.active_bitmap(buf.pts) {
-                    let need = streamcraft_video::geometry::frame_size(pixfmt, w, h);
+                    let need = profluens_video::geometry::frame_size(pixfmt, w, h);
                     let data = buf.memory.as_mut_full();
                     if data.len() >= need {
                         if let Some(mut frame) =
@@ -400,7 +400,7 @@ impl Element for SubtitleOverlay {
 /// The negotiated `(width, height, pixfmt)` on the video sink, or `None` if not yet fixed /
 /// an unsupported pixfmt. Read by name off the negotiated caps (the audioconvert pattern).
 fn negotiated_video(ctx: &Ctx) -> Option<(u32, u32, PixelFormat)> {
-    use streamcraft_core::format::Value;
+    use profluens_core::format::Value;
     let fixed = ctx.negotiated(VIDEO)?;
     let int = |name: &str| -> Option<i64> {
         ctx.field_id(name).and_then(|id| fixed.get(id)).and_then(|v| match v {
@@ -853,7 +853,7 @@ fn clamp_u8(v: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use streamcraft_video::geometry::frame_size;
+    use profluens_video::geometry::frame_size;
 
     fn overlay_with_cue(text: &str, start_ns: u64, dur_ns: u64) -> SubtitleOverlay {
         let mut o = SubtitleOverlay::new();

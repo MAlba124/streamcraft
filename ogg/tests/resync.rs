@@ -3,7 +3,7 @@
 //! so a decoder can "regain synchronisation after parsing a corrupted stream"; and the
 //! decoder-safety P0: a crash on any bitstream is unacceptable).
 
-use sc_ogg::{demux_all, mux_packets, OggReader};
+use pf_ogg::{demux_all, mux_packets, OggReader};
 
 struct Rng(u64);
 impl Rng {
@@ -71,7 +71,7 @@ fn corruption_in_the_middle_drops_one_page_recovers_after() {
     // One packet per page so a corrupted page loses exactly one packet. Flush between
     // packets (not after the last) so `finish()` puts eos on the final data page rather
     // than a separate nil eos page — keeping "N packets, one per page".
-    let mut w = sc_ogg::OggWriter::new(1);
+    let mut w = pf_ogg::OggWriter::new(1);
     let mut stream = Vec::new();
     for (i, p) in pkts.iter().enumerate() {
         if i > 0 {
@@ -83,7 +83,7 @@ fn corruption_in_the_middle_drops_one_page_recovers_after() {
 
     // Find the second page and corrupt a byte in its body (not the capture pattern, so
     // the CRC check is what rejects it).
-    use sc_ogg::PageHeader;
+    use pf_ogg::PageHeader;
     let first = PageHeader::parse(&stream).unwrap();
     let second_off = first.len();
     let second = PageHeader::parse(&stream[second_off..]).unwrap();
@@ -135,7 +135,7 @@ fn interior_garbage_between_pages() {
     let pkts: Vec<Vec<u8>> = (0..5u32).map(|i| payload(200 + i as u64, 80)).collect();
     // Flush between packets (not after the last) → one packet per page, eos on the
     // final data page, no separate nil eos page.
-    let mut w = sc_ogg::OggWriter::new(3);
+    let mut w = pf_ogg::OggWriter::new(3);
     let mut good = Vec::new();
     for (i, p) in pkts.iter().enumerate() {
         if i > 0 {
@@ -145,7 +145,7 @@ fn interior_garbage_between_pages() {
     }
     w.finish(&mut good);
 
-    use sc_ogg::PageHeader;
+    use pf_ogg::PageHeader;
     // Split into pages, then rejoin with junk between each.
     let mut pages = Vec::new();
     let mut off = 0;

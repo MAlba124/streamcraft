@@ -7,7 +7,7 @@
 //! [`Reactor`] is the backend contract. Core ships [`SyncReactor`] — a
 //! dependency-free, synchronous, positioned-IO backend (`read_at`/`write_at`),
 //! executed by the scheduler between element passes. A truly-async backend
-//! (io_uring on Linux, in `streamcraft-elements` behind a feature) implements the
+//! (io_uring on Linux, in `profluens-elements` behind a feature) implements the
 //! same trait and is injected via `Pipeline::set_reactor` — element code is
 //! unchanged. Positioned IO (explicit offsets) keeps ops order-independent and
 //! makes sources seek-ready.
@@ -676,7 +676,7 @@ mod tests {
             want: IoResult,
         }
         let cases = [
-            Case { name: "full", send: Some(b"streamcraft body"), want: IoResult::Ok(16) },
+            Case { name: "full", send: Some(b"profluens body"), want: IoResult::Ok(16) },
             Case { name: "short", send: Some(b"hi"), want: IoResult::Ok(2) },
             Case { name: "early-eof", send: None, want: IoResult::Ok(0) },
         ];

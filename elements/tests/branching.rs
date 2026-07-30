@@ -4,18 +4,18 @@
 //! pad (A = pattern, B = pattern+1) proves each pad reaches its *own* sink, so a
 //! mis-routing (both pads to one ring) would fail loudly.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
 
 // A two-output tee: forwards each input buffer to `src0` unchanged and to `src1` with
 // every byte incremented, so the two branches carry distinct streams. Active, so it is

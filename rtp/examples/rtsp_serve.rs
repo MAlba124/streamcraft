@@ -1,7 +1,7 @@
-//! `rtsp_serve` — a pure-streamcraft RTSP server streaming an MKV's H.264
+//! `rtsp_serve` — a pure-profluens RTSP server streaming an MKV's H.264
 //! track (spec: Milestone applications — network streaming, send side).
 //!
-//! The app is the controller (spec: no-bins): `sc_rtsp::server::RtspServer`
+//! The app is the controller (spec: no-bins): `pf_rtsp::server::RtspServer`
 //! owns the *protocol* (DESCRIBE/SETUP/PLAY/TEARDOWN, sessions, timeouts) and
 //! reports `ServerEvent`s; this app owns the *pipeline* — on `Play` it builds
 //! `camsrc ! rtph264pay ! udpsink(client)` and runs it, clock-paced by
@@ -23,29 +23,29 @@
 //! one codebase. ffplay/mpv consume it as well (interop check).
 //!
 //! ```text
-//! cargo run --release -p sc-rtp --example rtsp_serve -- FILE.mkv [--port 8554] [--loop]
+//! cargo run --release -p pf-rtp --example rtsp_serve -- FILE.mkv [--port 8554] [--loop]
 //! ```
 
 use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::mpsc;
 
-use sc_mkv::codec::{nal_head_from_config, Reframer};
-use sc_mkv::MatroskaReader;
-use sc_rtp::elements::{RtpH264Pay, UdpSink};
-use sc_rtsp::server::{RtspServer, ServerConfig, ServerEvent};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_mkv::codec::{nal_head_from_config, Reframer};
+use pf_mkv::MatroskaReader;
+use pf_rtp::elements::{RtpH264Pay, UdpSink};
+use pf_rtsp::server::{RtspServer, ServerConfig, ServerEvent};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::io::IoResult;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::io::IoResult;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 /// RFC 4648 §4 base64 (encode side — the SDP layer only ships a decoder).
 fn encode_base64(data: &[u8]) -> String {
@@ -97,7 +97,7 @@ fn header_prefix(path: &str) -> Vec<u8> {
     head.truncate(n);
     let cluster = head
         .windows(4)
-        .position(|w| w == sc_mkv::ebml::id::CLUSTER)
+        .position(|w| w == pf_mkv::ebml::id::CLUSTER)
         .expect("no Cluster in the first 8 MiB — not a (supported) MKV?");
     head.truncate(cluster);
     head
@@ -294,7 +294,7 @@ impl Element for CamSrc {
         }
         if !self.read_in_flight {
             if let Some(buf) = ctx.try_alloc(CAM_SRC) {
-                let handle = streamcraft_core::io::FileHandle(ctx.element().0);
+                let handle = profluens_core::io::FileHandle(ctx.element().0);
                 ctx.io().submit_read(handle, self.read_offset, buf, 0);
                 self.read_in_flight = true;
             }
@@ -354,7 +354,7 @@ fn main() {
     let sdp = format!(
         "v=0\r\n\
          o=- 0 0 IN IP4 127.0.0.1\r\n\
-         s=streamcraft\r\n\
+         s=profluens\r\n\
          t=0 0\r\n\
          m=video 0 RTP/AVP 96\r\n\
          a=rtpmap:96 H264/90000\r\n\
@@ -378,7 +378,7 @@ fn main() {
 
     // One viewer at a time (v1): Play builds and runs the pipeline from the
     // file start; Teardown stops it; then wait for the next viewer.
-    let mut running: Option<(streamcraft_core::pipeline::StopHandle, std::thread::JoinHandle<()>)> =
+    let mut running: Option<(profluens_core::pipeline::StopHandle, std::thread::JoinHandle<()>)> =
         None;
     for event in rx {
         match event {
@@ -403,9 +403,9 @@ fn main() {
                 // default receiver buffers (see UdpSink::with_packet_gap).
                 let sink = p.add(UdpSink::new(client_rtp));
                 p.link((pay, "src"), (sink, "sink")).expect("pay ! udpsink");
-                // SC_SERVE_STATS=1: per-element counter deltas every 3 s — the
+                // PF_SERVE_STATS=1: per-element counter deltas every 3 s — the
                 // sender-side stall diagnostic (which element stopped moving).
-                if std::env::var_os("SC_SERVE_STATS").is_some() {
+                if std::env::var_os("PF_SERVE_STATS").is_some() {
                     let tap = p.tap_handle();
                     let watched = [("camsrc", src), ("pay", pay), ("udpsink", sink)];
                     std::thread::spawn(move || {

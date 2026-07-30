@@ -11,19 +11,19 @@
 
 use std::sync::{Arc, Mutex};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{
     ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc,
 };
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 const ZERO_LAT: LatencyDesc = LatencyDesc {
     min: Timestamp::ZERO,

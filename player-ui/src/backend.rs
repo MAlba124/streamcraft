@@ -1,13 +1,13 @@
 //! The player's SDL3 backend — the crate's only `unsafe` module.
 //!
-//! This is a *video-augmented* copy of `streamcraft-scope`'s `ui::backend::Backend`
+//! This is a *video-augmented* copy of `profluens-scope`'s `ui::backend::Backend`
 //! (we do not modify the scope crate; its `Backend` exposes no video layer). It keeps
 //! the exact scope flow — refcounted SDL video init, one window + `SDL_Renderer`, the
 //! font-atlas texture, the per-frame `Input` event pump, and the `DrawList` flush via
 //! `SDL_RenderGeometryRaw` — and adds ONE thing: a **streaming YUV texture** the media
 //! frame is uploaded to and drawn *under* the UI each frame.
 //!
-//! # Frame composition order (spec: streamcraft.md UI `<update>` §1209)
+//! # Frame composition order (spec: profluens.md UI `<update>` §1209)
 //!
 //! Per presented frame:
 //! 1. clear to black;
@@ -27,7 +27,7 @@
 //! and pass it to `SDL_RenderTexture`.
 //!
 //! SDL calls are cited at their point of use. The `unsafe` here is the same posture as
-//! `scope::ui::backend` and `sc_sdl3::video`: SDL video on the Linux drivers this targets
+//! `scope::ui::backend` and `pf_sdl3::video`: SDL video on the Linux drivers this targets
 //! is a single-threaded in-process protocol client, and every handle is owned by the one
 //! thread that holds the `Backend`.
 
@@ -37,12 +37,12 @@ use std::ffi::{c_int, c_void, CStr, CString};
 
 use sdl3_sys::everything::*;
 
-use streamcraft_scope::ui::draw::{Batch, DrawList, TexId};
-use streamcraft_scope::ui::font::Font;
-use streamcraft_scope::ui::{Input, Key, Mods, MouseButton};
+use profluens_scope::ui::draw::{Batch, DrawList, TexId};
+use profluens_scope::ui::font::Font;
+use profluens_scope::ui::{Input, Key, Mods, MouseButton};
 
 use crate::gl::GlVideo;
-use sc_vaapi::gpuframe::GpuFrame;
+use pf_vaapi::gpuframe::GpuFrame;
 
 use crate::framesink::SlotPix;
 
@@ -60,7 +60,7 @@ pub struct BackendError(pub String);
 
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "scplay-ui: {}", self.0)
+        write!(f, "pfplay-ui: {}", self.0)
     }
 }
 impl std::error::Error for BackendError {}
@@ -110,13 +110,13 @@ pub struct Backend {
     /// Persistent input state (level fields survive between frames).
     input: Input,
     /// Reusable per-frame geometry arena (bump; reset each render) — the scope arena type.
-    arena: streamcraft_scope::ui::Arena,
+    arena: profluens_scope::ui::Arena,
     fullscreen: bool,
 }
 
 // SAFETY: the raw SDL handles are used only from the thread that owns the Backend; SDL
 // video on the Linux drivers this targets is a single-threaded in-process protocol client
-// (same posture as scope::ui::backend and sc_sdl3::video). Backend is moved whole, never
+// (same posture as scope::ui::backend and pf_sdl3::video). Backend is moved whole, never
 // shared, so Send but not Sync.
 unsafe impl Send for Backend {}
 
@@ -157,7 +157,7 @@ impl Backend {
             // provides an EGL display; this line makes a failed import diagnosable at a glance.
             let drv = SDL_GetCurrentVideoDriver();
             if !drv.is_null() {
-                eprintln!("scplay-ui: SDL video driver = {}", CStr::from_ptr(drv).to_string_lossy());
+                eprintln!("pfplay-ui: SDL video driver = {}", CStr::from_ptr(drv).to_string_lossy());
             }
             // The window flags: OPENGL when we may use the GLES backend (a renderer and a GL
             // context cannot both own the window; the flag is harmless if we fall back and
@@ -211,7 +211,7 @@ impl Backend {
                 window,
                 video,
                 input,
-                arena: streamcraft_scope::ui::Arena::with_capacity(1 << 16),
+                arena: profluens_scope::ui::Arena::with_capacity(1 << 16),
                 fullscreen: false,
             })
         }
@@ -247,7 +247,7 @@ impl Backend {
         let rname = SDL_GetRendererName(renderer);
         if !rname.is_null() {
             eprintln!(
-                "scplay-ui: video path = SDL texture upload (SDL render driver = {})",
+                "pfplay-ui: video path = SDL texture upload (SDL render driver = {})",
                 std::ffi::CStr::from_ptr(rname).to_string_lossy()
             );
         }

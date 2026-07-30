@@ -1,5 +1,5 @@
 //! Rough polyphase-resampler throughput benchmark. Run in release:
-//!   cargo run --release --example bench -p streamcraft-audio
+//!   cargo run --release --example bench -p profluens-audio
 //!
 //! Resamples a few seconds of synthetic mono/stereo audio at the common rate conversions and
 //! reports MB/s of *input* PCM (f32-domain, the resampler's working type) for each. This is the
@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use streamcraft_audio::{output_len, ChannelResampler, PolyphaseFilter};
+use profluens_audio::{output_len, ChannelResampler, PolyphaseFilter};
 
 const PI: f64 = std::f64::consts::PI;
 const HALF_TAPS: usize = 32;

@@ -1164,8 +1164,8 @@ impl H264CodecDecoder {
             self.ref_store.insert(current_entry.dpb_key, pic.clone());
             self.dpb_entries.push(current_entry);
 
-            // Reclaim evicted reference pictures (streamcraft patch; see
-            // STREAMCRAFT-PATCHES.md): `perform_marking` + the `retain` above
+            // Reclaim evicted reference pictures (profluens patch; see
+            // PROFLUENS-PATCHES.md): `perform_marking` + the `retain` above
             // decide which `DpbEntry`s stay live, but nothing dropped the
             // corresponding `Picture`s from `ref_store` — every reference frame
             // ever decoded stayed resident (~1.5 MB each at 720p, unbounded).
@@ -1484,8 +1484,8 @@ impl H264CodecDecoder {
             self.ref_store.insert(key, pic);
             self.dpb_entries.push(entry);
 
-            // Reclaim what the sliding window above evicted (streamcraft patch;
-            // see STREAMCRAFT-PATCHES.md — same sweep as the finalize path).
+            // Reclaim what the sliding window above evicted (profluens patch;
+            // see PROFLUENS-PATCHES.md — same sweep as the finalize path).
             let live: Vec<u32> = self.dpb_entries.iter().map(|e| e.dpb_key).collect();
             self.ref_store.retain_keys(&live);
 

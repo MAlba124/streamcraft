@@ -1,9 +1,9 @@
-//! The introspection-protocol client (spec: Introspection protocol and scraft-scope).
+//! The introspection-protocol client (spec: Introspection protocol and pf-scope).
 //!
 //! Owns the Unix-socket connection to a serving pipeline: handshake, a background
 //! reader thread that decodes pushed and reply frames into a shared [`Model`], and a
 //! request side the UI drives once per frame via [`Client::poll`]. Decoding reuses
-//! `streamcraft_core::introspect::wire` — the same codecs the server's tests pin —
+//! `profluens_core::introspect::wire` — the same codecs the server's tests pin —
 //! so client and server cannot drift.
 //!
 //! Threading: the reader thread blocks in `read_frame` (no read timeout, so framing
@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use streamcraft_core::introspect::wire::{self, kind, stream, submask};
+use profluens_core::introspect::wire::{self, kind, stream, submask};
 
 /// How often [`Client::poll`] re-requests counters.
 const COUNTER_POLL: Duration = Duration::from_millis(100);

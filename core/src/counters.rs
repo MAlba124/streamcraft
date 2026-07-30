@@ -117,7 +117,7 @@ impl LatencySnapshot {
 ///
 /// The three latency histograms (spec: Debuggability — latency instrumentation)
 /// fill only while [`Pipeline::set_tracing`](crate::pipeline::Pipeline::set_tracing)
-/// (or `STREAMCRAFT_TRACE=1`) is on — the timestamp reads they need are the cost
+/// (or `PROFLUENS_TRACE=1`) is on — the timestamp reads they need are the cost
 /// the flag gates; the histograms themselves are always allocated (≈1.3 KB/element).
 #[derive(Default)]
 pub struct ElementCounters {
@@ -233,7 +233,7 @@ impl TapHandle {
 
     /// Snapshots of one element's latency histograms — `(process, queue_wait,
     /// sink_wait_lateness)` (spec: Debuggability). All-zero unless tracing is on
-    /// (`Pipeline::set_tracing` / `STREAMCRAFT_TRACE=1`). `None` for an unknown id.
+    /// (`Pipeline::set_tracing` / `PROFLUENS_TRACE=1`). `None` for an unknown id.
     pub fn latency(
         &self,
         el: ElementId,

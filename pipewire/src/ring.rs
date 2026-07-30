@@ -1,5 +1,5 @@
 //! Lock-free single-producer / single-consumer **byte** ring — the PCM hand-off between
-//! the streamcraft render thread (producer) and PipeWire's real-time process callback
+//! the profluens render thread (producer) and PipeWire's real-time process callback
 //! (consumer).
 //!
 //! The RT callback must never lock a mutex or allocate, so this ring is designed around

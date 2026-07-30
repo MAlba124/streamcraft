@@ -15,19 +15,19 @@
 
 use std::sync::{Arc, Mutex};
 
-use sc_avi::riff::{self, MoviWalker, StreamKind};
-use sc_avi::AviDemux;
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_avi::riff::{self, MoviWalker, StreamKind};
+use pf_avi::AviDemux;
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::io::FileSrc;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::io::FileSrc;
 
 const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.avi");
 
@@ -192,7 +192,7 @@ fn seek_index_from_idx1_has_video_keyframes() {
     let file_len = std::fs::metadata(TINY).unwrap().len();
     let (idx1_off, idx1_size) = find_idx1(TINY, file_len).expect("tiny.avi has an idx1");
     let payload = read_at(TINY, idx1_off + 8, idx1_size as usize);
-    let si = sc_avi::build_seek_index(&header, &payload, file_len).expect("build seek index");
+    let si = pf_avi::build_seek_index(&header, &payload, file_len).expect("build seek index");
     assert!(!si.entries.is_empty(), "at least one video keyframe indexed");
     assert_eq!(si.entries[0].0, 0, "first keyframe at time 0");
     assert_eq!(si.file_len, Some(file_len));

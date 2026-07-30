@@ -10,16 +10,16 @@
 //! pattern), so downstream re-fixates and reads the format via `ctx.negotiated`. It also
 //! offers `bytes` on the sink so it links directly after a `filesrc`.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{Constraint, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::{Rational, Timestamp};
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{Constraint, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::time::{Rational, Timestamp};
 
 use crate::format::{
     PixelFormat, VideoFormat, FAMILY, FIELD_FPS, FIELD_HEIGHT, FIELD_PIXFMT, FIELD_WIDTH,

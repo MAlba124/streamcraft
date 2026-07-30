@@ -4,7 +4,7 @@
 //! misbehaves.
 //!
 //! ```text
-//! cargo run --release -p sc-h265 --example decode_annexb -- IN.h265 [chunk_bytes]
+//! cargo run --release -p pf-h265 --example decode_annexb -- IN.h265 [chunk_bytes]
 //! ```
 
 use oxideav_h265::SequenceDecoder;

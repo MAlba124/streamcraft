@@ -1,5 +1,5 @@
 [package]
-name = "streamcraft-core"
+name = "profluens-core"
 description = "Dependency-free core: buffers, formats, topology, scheduler, clock, events, bus"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 autotests = false
 
 [lib]
-name = "streamcraft_core"
+name = "profluens_core"
 
 [[test]]
 name = "all"
@@ -23,7 +23,7 @@ path = "tests/all.rs"
 name = "ring_hop"
 harness = false
 
-# No dependencies. Ever. (streamcraft.md: Crate layout)
+# No dependencies. Ever. (profluens.md: Crate layout)
 [dependencies]
 
 # Dev-only, and only under `--cfg loom`: model-checks the lock-free ring core
@@ -32,7 +32,7 @@ harness = false
 loom = "0.7"
 
 [features]
-# Serve the introspection protocol (streamcraft.md: scraft-scope). Zero cost unattached.
+# Serve the introspection protocol (profluens.md: pf-scope). Zero cost unattached.
 introspect = []
 
 # `--cfg loom` is a custom cfg (set via RUSTFLAGS for the loom model tests in

@@ -1,4 +1,4 @@
-//! Layered (Sugiyama-style) DAG layout for the scraft-scope graph view.
+//! Layered (Sugiyama-style) DAG layout for the pf-scope graph view.
 //!
 //! Pure, deterministic, dependency-free (std only, no `unsafe`). Topology in
 //! ([`Node`] + [`Edge`]), pixel positions out ([`Layout`]). Called once per

@@ -10,22 +10,22 @@
 //! A compositor without `wl_subcompositor`/`wp_viewporter`, or a failed window open, disables the
 //! sink (frames drop) rather than failing the pipeline — a headless box should degrade.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::clock::WaitOutcome;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::clock::WaitOutcome;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{
     ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc,
 };
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
 use crate::ui::WindowUi;
 use crate::window::Window;
@@ -270,7 +270,7 @@ impl WaylandRawSink {
 
         // Open the window on the first frame, sized to the video.
         if self.window.is_none() {
-            match Window::open("streamcraft", fmt.width as i32, fmt.height as i32) {
+            match Window::open("profluens", fmt.width as i32, fmt.height as i32) {
                 Ok(w) => {
                     if !w.has_gui() {
                         log!(&*ctx, Level::Warn, "no_subcompositor");

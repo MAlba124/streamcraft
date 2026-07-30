@@ -3,8 +3,8 @@
 //!
 //! # Why a serialized byte payload (and not a metadata side-channel)
 //!
-//! streamcraft's [`Buffer`](streamcraft_core::buffer::Buffer) carries a byte
-//! [`Memory`](streamcraft_core::memory::Memory) and POD timestamps — there is no generic
+//! profluens's [`Buffer`](profluens_core::buffer::Buffer) carries a byte
+//! [`Memory`](profluens_core::memory::Memory) and POD timestamps — there is no generic
 //! out-of-band metadata slot, and the `ExternalMemory`/dma-buf `Memory` variant is a
 //! documented stub, not yet plumbed through the scheduler/pool. Rather than grow the core
 //! buffer model for one consumer, the zero-copy path carries the descriptor *as the
@@ -31,7 +31,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
 
 use crate::va::ExportedPlane;
 

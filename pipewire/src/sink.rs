@@ -5,7 +5,7 @@
 //! bounded lock-free SPSC byte ring ([`crate::ring`]); a dedicated PipeWire thread runs the
 //! device loop and its **real-time** callback pulls from that ring to fill device buffers.
 //! The RT callback must never lock or allocate, so the ring's consumer side is wait-free —
-//! the only blocking (a full-ring producer parking; the EOS drain) happens on the streamcraft
+//! the only blocking (a full-ring producer parking; the EOS drain) happens on the profluens
 //! render thread. When the ring is full, `process()` blocks, so the whole pipeline is paced
 //! by the audio device (backpressure is the clock; full clock-slaving through PipeWire for
 //! A/V sync is a follow-up). The PCM format is data-dependent, so the sink advertises a broad
@@ -22,17 +22,17 @@ use pw::spa;
 use pw::spa::pod::Pod;
 use pw::spa::sys as spa_sys;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::clock::{Clock, ClockWait};
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::clock::{Clock, ClockWait};
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 use crate::ring::{self, Consumer, Producer};
 
@@ -153,7 +153,7 @@ fn run_pw(
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::NODE_LATENCY => format!("{QUANTUM}/{rate}").as_str(),
     };
-    let stream = pw::stream::Stream::new(&core, "streamcraft", props)?;
+    let stream = pw::stream::Stream::new(&core, "profluens", props)?;
 
     // The RT process callback: pull PCM from the ring to fill the device buffer. This runs
     // on PipeWire's real-time thread, so `Consumer::pull` is wait-free and allocation-free —
@@ -249,7 +249,7 @@ fn run_pw(
         &mut params,
     )?;
 
-    // Cross-thread quit: the streamcraft side sends `()` on stop; quit the loop.
+    // Cross-thread quit: the profluens side sends `()` on stop; quit the loop.
     let weak = mainloop.downgrade();
     let _recv = quit_rx.attach(mainloop.loop_(), move |_| {
         if let Some(ml) = weak.upgrade() {
@@ -408,7 +408,7 @@ impl PipeWireAudioSink {
         let (tx, rx) = pw::channel::channel::<()>();
         let pb = Arc::clone(&self.playback);
         let handle = std::thread::Builder::new()
-            .name("sc-pipewire".into())
+            .name("pf-pipewire".into())
             .spawn(move || {
                 // `consumer` is moved onto the PW thread and pulled from its RT callback; on
                 // any early exit it drops here, closing the ring so a parked producer wakes.

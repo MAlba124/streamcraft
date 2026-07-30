@@ -5,8 +5,8 @@
 //!
 //! The probe is cached in a process-lifetime [`OnceLock`]: opening a display is
 //! non-trivial and the answer never changes within a run. Environment overrides:
-//! `SC_NO_VAAPI=1` forces "no device" (honored before any hardware is touched);
-//! `SC_VAAPI_DEVICE=/dev/dri/renderDNNN` pins the node instead of scanning.
+//! `PF_NO_VAAPI=1` forces "no device" (honored before any hardware is touched);
+//! `PF_VAAPI_DEVICE=/dev/dri/renderDNNN` pins the node instead of scanning.
 
 // Entire module is one-time, process-lifetime capability probing (cached in a
 // OnceLock); no per-frame work here, so heap allocation for the caps tables is fine.
@@ -39,7 +39,7 @@ pub struct VaCaps {
     pub vendor: String,
     /// VA-API version reported by `vaInitialize` (major, minor).
     pub version: (i32, i32),
-    /// streamcraft decode families the driver advertises a VLD entrypoint for, in a
+    /// profluens decode families the driver advertises a VLD entrypoint for, in a
     /// stable order (e.g. `["h264/annexb", "h265/annexb", "vp9"]`).
     pub decode_families: Vec<&'static str>,
     /// Families the driver advertises an encode entrypoint for (EncSlice or the
@@ -70,10 +70,10 @@ pub fn probe() -> Option<&'static VaCaps> {
     CAPS.get_or_init(probe_uncached).as_ref()
 }
 
-/// The candidate DRM render nodes, honoring `SC_VAAPI_DEVICE`, else scanning
+/// The candidate DRM render nodes, honoring `PF_VAAPI_DEVICE`, else scanning
 /// `/dev/dri/renderD*` in ascending order (128, 129, …).
 fn candidate_nodes() -> Vec<PathBuf> {
-    if let Ok(dev) = std::env::var("SC_VAAPI_DEVICE") {
+    if let Ok(dev) = std::env::var("PF_VAAPI_DEVICE") {
         if !dev.is_empty() {
             return vec![PathBuf::from(dev)];
         }
@@ -96,7 +96,7 @@ fn candidate_nodes() -> Vec<PathBuf> {
 
 fn probe_uncached() -> Option<VaCaps> {
     // Env kill switch, before any device is opened.
-    if std::env::var("SC_NO_VAAPI").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("PF_NO_VAAPI").map(|v| v == "1").unwrap_or(false) {
         return None;
     }
     for node in candidate_nodes() {
@@ -107,7 +107,7 @@ fn probe_uncached() -> Option<VaCaps> {
     None
 }
 
-/// Map a VA profile to a streamcraft decode family (only the ones this plugin can
+/// Map a VA profile to a profluens decode family (only the ones this plugin can
 /// route). Unknown/uninteresting profiles map to `None`.
 fn family_of(profile: ffi::VAProfile) -> Option<&'static str> {
     match profile {

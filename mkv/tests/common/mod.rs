@@ -1,5 +1,5 @@
 //! A minimal, in-crate **EBML reader** used by the structural round-trip tests. It is
-//! deliberately tiny — just enough to walk the element tree `sc-mkv` produces and verify it
+//! deliberately tiny — just enough to walk the element tree `pf-mkv` produces and verify it
 //! reads back byte-for-byte (spec: `mkv/spec/MATROSKA.md`; RFC 8794). It is *not* a general
 //! Matroska demuxer (that is a future crate); it only needs to handle the subset the muxer
 //! emits: shortest-length and 8-octet sizes, the `0xFF` unknown-size streamed masters, and
@@ -125,7 +125,7 @@ fn walk_range(
 /// Info/Tracks/Cluster*) and Cluster (contains Timestamp/SimpleBlock*); a Cluster ends at
 /// the next Cluster; a Segment ends at `end`.
 fn next_streamed_master(data: &[u8], start: usize, end: usize, open_id: &[u8], masters: &[&[u8]]) -> usize {
-    use sc_mkv::ebml::id;
+    use pf_mkv::ebml::id;
     // A Cluster's children terminate at the next Cluster ID.
     if open_id == id::CLUSTER {
         let mut off = start;
@@ -178,7 +178,7 @@ pub fn parse_simple_block(data: &[u8]) -> SimpleBlock {
 // the scaffolding honest on its own.
 #[test]
 fn vint_reader_matches_writer() {
-    use sc_mkv::ebml;
+    use pf_mkv::ebml;
     for &v in &[0u64, 1, 126, 127, 128, 16_000, 1_000_000] {
         let mut buf = Vec::new();
         ebml::write_size(&mut buf, v);

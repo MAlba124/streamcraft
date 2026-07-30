@@ -1,4 +1,4 @@
-//! sc-flac — a hand-written, dependency-free FLAC codec plugin for streamcraft.
+//! pf-flac — a hand-written, dependency-free FLAC codec plugin for profluens.
 //!
 //! Milestone 3: `filesrc ! wavparse ! flacenc ! filesink` converts WAV to FLAC
 //! (spec: Milestone applications §3; First-party codecs). Everything here is written
@@ -6,14 +6,14 @@
 //! Audio Codec"), cross-referenced in comments as `§9.2.7` etc. — review means
 //! reading the code against the normative text, not a blog post.
 //!
-//! Layout mirrors the `sc-http` plugin: a thin `lib.rs` re-exporting the public
+//! Layout mirrors the `pf-http` plugin: a thin `lib.rs` re-exporting the public
 //! surface, submodules for the actual work, and the spec in `spec/`.
 //!
 //! ## What exists
 //! - [`BitWriter`]/[`BitReader`] — big-endian bit I/O plus FLAC Rice/unary coding and
 //!   the two frame CRCs ([`bitstream`]).
 //! - [`FlacEncoder`] — a raw interleaved-PCM → FLAC-stream encoder, and [`FlacEnc`],
-//!   its streamcraft [`Element`](streamcraft_core::element::Element) wrapper.
+//!   its profluens [`Element`](profluens_core::element::Element) wrapper.
 //! - [`FlacDecoder`] — decodes what the encoder emits, so round-trip losslessness is
 //!   provable in-crate without any external tool.
 //! - [`OggFlacDeframe`] — the FLAC-in-Ogg de-framer element: reconstructs a native FLAC
@@ -52,12 +52,12 @@ pub use flacdec::FlacDec;
 pub use flacenc::FlacEnc;
 pub use oggflac::OggFlacDeframe;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! flacenc ! …")`). Typed `use` + constructor stays primary; this powers
-/// `scraft-launch` and one-liner tests. Descriptors are `&'static`, taken from a
+/// `pf-launch` and one-liner tests. Descriptors are `&'static`, taken from a
 /// throwaway default instance. `flacenc` reads its `rate`/`channels`/`format` props in
 /// `start()`; `flacdec`/`oggflacdeframe` are config-free.
 pub fn register(registry: &mut Registry) {

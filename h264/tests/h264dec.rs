@@ -19,21 +19,21 @@ use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_h264::encoder::{EncodedFrameRef, Encoder, EncoderConfig, YuvFrame};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::harness::Harness;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::harness::Harness;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
-use sc_h264::H264Dec;
+use pf_h264::H264Dec;
 
 /// 128x96 = 8x6 MBs exactly, so the decoder's MB-aligned output equals the coded
 /// dimensions (no crop padding) — stride == width, the packed-I420 case the
@@ -316,7 +316,7 @@ fn corrupt_access_unit_warns_and_recovers_at_next_idr() {
     // (a start-code-delimited NAL of nonsense). The garbage unit must fail
     // per-buffer (bus warning, drop) without corrupting decoder state, and the
     // IDR + P must both still decode — the P reconstructs against the intact IDR
-    // reference. Mirrors sc-vp8's corrupt-frame recovery test.
+    // reference. Mirrors pf-vp8's corrupt-frame recovery test.
     let good = encode_i_then_p(1); // [IDR, P]
     let reference = reference_decode(&good);
     assert_eq!(reference.len(), 2, "clean stream decodes to two pictures");

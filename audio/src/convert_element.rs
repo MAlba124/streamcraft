@@ -1,4 +1,4 @@
-//! `audioconvert` — the streamcraft element wrapping the [`crate::convert`] library (spec:
+//! `audioconvert` — the profluens element wrapping the [`crate::convert`] library (spec:
 //! Formats — dynamic caps; Writing elements). Interleaved `audio/raw` PCM arrives on the
 //! sink pad; the same audio in a target [`SampleFormat`] leaves on the src pad. Same rate,
 //! same channels — only the sample *representation* changes (rate conversion is a separate
@@ -13,7 +13,7 @@
 //!   producer side, using the `&'static` field/value names the scheduler resolves).
 //! * It learns its **input** format from the negotiated caps on the sink pad (spec: dynamic
 //!   caps — the consumer side). Every field is read **by name** off the negotiated
-//!   [`FixedFormat`] through the shared [`Vocabulary`](streamcraft_core::format::Vocabulary):
+//!   [`FixedFormat`] through the shared [`Vocabulary`](profluens_core::format::Vocabulary):
 //!   `ctx.field_id("rate")` resolves the field id, `f.get(id)` the value, and
 //!   `ctx.value_name(id)` reverses the interned `sample` id back to a caps name (the same
 //!   pattern `flacdec` and `pipewireaudiosink` use). So [`AudioConvert::new`] **infers** the
@@ -25,16 +25,16 @@
 //! If the input sample format already equals the target, the payload passes through byte for
 //! byte (the announcement still fires, so downstream sees the format).
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{Constraint, ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 use crate::convert::{convert_interleaved, converted_len};
 use crate::format::{AudioFormat, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
@@ -146,7 +146,7 @@ impl AudioConvert {
     ///
     /// The whole input [`AudioFormat`] — **rate**, **channels** *and* **sample format** — is
     /// read by name off the negotiated [`FixedFormat`] via the shared
-    /// [`Vocabulary`](streamcraft_core::format::Vocabulary): `ctx.field_id("rate")` /
+    /// [`Vocabulary`](profluens_core::format::Vocabulary): `ctx.field_id("rate")` /
     /// `"channels"` / `"sample"`, then `ctx.value_name(id)` reverses the interned `sample` id
     /// to its caps name (the [`flacdec`]/[`pipewireaudiosink`] pattern). No out-of-band hint
     /// is needed; it works the moment the sink carries a concrete `audio/raw` format (a
@@ -158,8 +158,8 @@ impl AudioConvert {
     /// [`start`]: Element::start
     /// [`event`]: Element::event
     /// [`process`]: Element::process
-    /// [`flacdec`]: https://docs.rs/sc-flac
-    /// [`pipewireaudiosink`]: https://docs.rs/sc-pipewire
+    /// [`flacdec`]: https://docs.rs/pf-flac
+    /// [`pipewireaudiosink`]: https://docs.rs/pf-pipewire
     // COLD: constructs the element once; `carry`/`scratch` are reused cross-buffer buffers, not per-buffer scratch.
     #[allow(clippy::disallowed_methods)]
     pub fn new(target: SampleFormat) -> Self {

@@ -24,11 +24,11 @@ years, so the fixtures don't rot. Regenerate with:
 for id in a b; do
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca_$id.key
   openssl req -x509 -key ca_$id.key -out ca_$id.pem -days 36500 \
-    -subj "/CN=streamcraft test CA $id" \
+    -subj "/CN=profluens test CA $id" \
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=keyCertSign"
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out leaf_$id.key
   openssl req -new -key leaf_$id.key -out leaf_$id.csr \
-    -subj "/CN=streamcraft test leaf $id"
+    -subj "/CN=profluens test leaf $id"
   printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n" > ext_$id.cnf
   openssl x509 -req -in leaf_$id.csr -CA ca_$id.pem -CAkey ca_$id.key \
     -CAcreateserial -out leaf_$id.pem -days 36500 -extfile ext_$id.cnf

@@ -4,8 +4,8 @@
 //! classifier over the file's first few bytes — the honest v1 of GStreamer's `typefind`.
 //!
 //! Every discriminator cites the spec that fixes the magic at the point of use (repo
-//! standing rule: a non-trivial constant names its authority; see the `sc-mkv`
-//! `ebml`/`codec` modules and the `sc-mp3` `id3v2_len` for the tone). The order below is
+//! standing rule: a non-trivial constant names its authority; see the `pf-mkv`
+//! `ebml`/`codec` modules and the `pf-mp3` `id3v2_len` for the tone). The order below is
 //! deliberate: the containers whose magic sits at a fixed offset (EBML, ISO-BMFF, Ogg,
 //! FLAC, RIFF) are unambiguous and tried first; the elementary MPEG-audio classifiers
 //! (ID3 tag / raw sync, ADTS) are self-syncing byte streams and come last so a container
@@ -25,7 +25,7 @@ pub enum Kind {
     /// running the demuxer (v1: FLAC-in-Ogg decodes; Vorbis/Opus/Theora drop cleanly).
     Ogg,
     /// AVI (RIFF). The classic `.avi` container — XviD/DivX (MPEG-4 Part 2) video + AC-3/MP3
-    /// audio in the wild. One demuxer (`sc-avi`) covers it; tracks discovered at preroll.
+    /// audio in the wild. One demuxer (`pf-avi`) covers it; tracks discovered at preroll.
     Avi,
     /// A raw native FLAC stream (`.flac`), no container.
     Flac,
@@ -131,7 +131,7 @@ pub fn probe(prefix: &[u8]) -> Result<Kind, String> {
     }
 
     // MP3, ID3-tagged form: a leading `ID3` tag (id3.org ID3v2.4 §3.1 — `"ID3"` then two
-    // version bytes). The audio follows the tag; the byte reader in `sc-mp3` skips the
+    // version bytes). The audio follows the tag; the byte reader in `pf-mp3` skips the
     // tag, so naming it MP3 here is enough.
     if prefix.starts_with(b"ID3") {
         return Ok(Kind::Mp3);

@@ -1,4 +1,4 @@
-//! `sc-present` — a minimal, zero-allocation Wayland presenter for streamcraft, spoken directly
+//! `pf-present` — a minimal, zero-allocation Wayland presenter for profluens, spoken directly
 //! on the display socket (no libwayland, no SDL).
 //!
 //! ## Why
@@ -9,7 +9,7 @@
 //! the wire format itself ([`wire`]), serializing into a **reused** send buffer and recycling
 //! `wl_buffer`s on release, so the steady-state present path allocates nothing.
 //!
-//! ## Model (spec: scraft-scope + the zero-copy VA→dmabuf path)
+//! ## Model (spec: pf-scope + the zero-copy VA→dmabuf path)
 //!
 //! A window is an `xdg_toplevel` with two child surfaces the compositor composites (ideally on
 //! hardware overlay planes):

@@ -1,9 +1,9 @@
-//! sc-mp3 — the MPEG-1/2 Audio Layer III (MP3) codec plugin.
+//! pf-mp3 — the MPEG-1/2 Audio Layer III (MP3) codec plugin.
 //!
-//! Like sc-vp8, this crate is **not** hand-written: it wraps
+//! Like pf-vp8, this crate is **not** hand-written: it wraps
 //! [`oxideav-mp3`](https://github.com/OxideAV/oxideav-mp3), a pure-Rust MPEG-1 / MPEG-2
 //! / MPEG-2.5 Audio Layer III decoder (and CBR/VBR encoder + demuxer we do not use),
-//! adopted after review (2026-07-24) under the same rubric as sc-vp8 (see
+//! adopted after review (2026-07-24) under the same rubric as pf-vp8 (see
 //! `vp8/src/lib.rs`). The spec's codec taboo is FFI walls — a foreign allocator,
 //! threading model, and timestamp semantics behind a boundary our batches can't cross
 //! (spec: First-party codecs; Non-goals). `oxideav-mp3` has none of that: **pure Rust,
@@ -27,7 +27,7 @@
 //! ## Scope and debt (tracked in PLAN.md)
 //!
 //! - **Decoder only.** `oxideav-mp3` also ships a CBR/VBR encoder and a `Read + Seek`
-//!   container demuxer; neither is wired here. streamcraft frames the byte stream
+//!   container demuxer; neither is wired here. profluens frames the byte stream
 //!   itself (via the crate's [`FrameWalker`](oxideav_mp3::frame::FrameWalker)) so no
 //!   `Seek` source is required — a plain `filesrc` byte stream decodes.
 //! - **Published 0.1.3 vs upstream HEAD.** Our lock pins the published `0.1.3`
@@ -40,7 +40,7 @@
 //!   decoder emits every reconstructed sample (the ~half-frame codec-delay priming and
 //!   the frame-padded tail included), so output is a few hundred samples longer than a
 //!   gapless reference. Documented on [`Mp3Dec`], not a defect.
-//! - **`decode_into` pool memory.** As with sc-vp8, the upstream trait decoder returns
+//! - **`decode_into` pool memory.** As with pf-vp8, the upstream trait decoder returns
 //!   owned planar `Vec`s; [`Mp3Dec`] pays one interleave-into-pool copy per frame. A
 //!   `decode_into` upstream contribution would remove it without changing this element.
 //! - **Stale crate-level doc.** `oxideav-mp3`'s own `lib.rs` header still reads
@@ -51,12 +51,12 @@ pub mod mp3dec;
 
 pub use mp3dec::Mp3Dec;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! mp3dec ! …")`). Typed `use` + constructor stays primary; this powers
-/// `streamcraft launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// `profluens launch` and one-liner tests. The descriptor is `&'static`, taken from a
 /// throwaway default instance; [`Mp3Dec`] is config-free (rate/channels come from the
 /// frame header, announced at runtime).
 pub fn register(registry: &mut Registry) {

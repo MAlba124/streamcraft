@@ -532,7 +532,7 @@ mod tests {
         // Unknown type letters (x=), unhandled known ones (b=, k=, z=, r=),
         // unknown attributes, and LF-only line endings — all tolerated.
         let text = "v=0\no=- 1 1 IN IP4 10.0.0.1\ns=x\nb=AS:256\nt=0 0\nz=0 0\n\
-                    x=experimental\na=tool:sc-test\nm=video 5000 RTP/AVP 96\n\
+                    x=experimental\na=tool:pf-test\nm=video 5000 RTP/AVP 96\n\
                     k=clear:obsolete\na=rtpmap:96 VP8/90000\na=weird\n";
         let sdp = parse(text).unwrap();
         assert_eq!(sdp.media.len(), 1);

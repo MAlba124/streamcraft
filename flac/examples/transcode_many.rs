@@ -6,7 +6,7 @@
 //! streaming paths pay nothing for it (spec: Taps).
 //!
 //! ```text
-//! cargo run --release -p sc-flac --example transcode_many -- OUT_DIR IN1.flac IN2.flac …
+//! cargo run --release -p pf-flac --example transcode_many -- OUT_DIR IN1.flac IN2.flac …
 //! ```
 //!
 //! The shared pool is the one cross-chain coupling point, so it is sized for the sum
@@ -20,9 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sc_flac::{FlacDec, FlacEnc, SampleFormat};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use pf_flac::{FlacDec, FlacEnc, SampleFormat};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn main() {
     let mut args = std::env::args().skip(1);

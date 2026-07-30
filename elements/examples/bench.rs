@@ -1,14 +1,14 @@
 //! Rough throughput benchmarks. Run in release:
-//!   cargo run --release --features io-uring --example bench -p streamcraft-elements
+//!   cargo run --release --features io-uring --example bench -p profluens-elements
 //!
 //! Numbers are page-cache-warm (no disk sync) so file copy is an apples-to-apples
 //! framework-overhead comparison against `cp`, not a disk benchmark.
 
 use std::time::Instant;
 
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
-use streamcraft_elements::testing::{TestSink, TestSrc};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
+use profluens_elements::testing::{TestSink, TestSrc};
 
 fn gbps(bytes: u64, secs: f64) -> f64 {
     bytes as f64 / secs / 1e9
@@ -17,7 +17,7 @@ fn gbps(bytes: u64, secs: f64) -> f64 {
 fn main() {
     // 0. Ring primitive: pure lock-free SPSC handoff of u64 across two threads.
     {
-        use streamcraft_core::ring::spsc;
+        use profluens_core::ring::spsc;
         let n = 200_000_000u64;
         let (p, c) = spsc::<u64>(1024);
         let prod = std::thread::spawn(move || {
@@ -68,8 +68,8 @@ fn main() {
 
     // 2. File copy vs cp (page-cache warm).
     let n: u64 = 1 << 30; // 1 GiB
-    let inp = std::env::temp_dir().join("sc_bench_in.bin");
-    let outp = std::env::temp_dir().join("sc_bench_out.bin");
+    let inp = std::env::temp_dir().join("pf_bench_in.bin");
+    let outp = std::env::temp_dir().join("pf_bench_out.bin");
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&inp).unwrap();
@@ -95,10 +95,10 @@ fn main() {
 
     #[cfg(feature = "io-uring")]
     {
-        use streamcraft_elements::io::IoUringReactor;
+        use profluens_elements::io::IoUringReactor;
         let mut p = Pipeline::new();
         p.set_reactor_factory(std::sync::Arc::new(|| {
-            Ok(Box::new(IoUringReactor::new()?) as Box<dyn streamcraft_core::io::Reactor>)
+            Ok(Box::new(IoUringReactor::new()?) as Box<dyn profluens_core::io::Reactor>)
         }));
         let s = p.add(FileSrc::new(&inp));
         let k = p.add(FileSink::new(&outp));

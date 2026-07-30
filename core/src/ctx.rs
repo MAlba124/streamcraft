@@ -582,7 +582,7 @@ impl Ctx {
         // re-checks below don't touch it, so there's no reason to rebuild it per tick — doing so
         // was the single largest source of small heap allocations during playback, since a
         // device-clock `new_wait` allocates an `Arc<Wake>` (and a clock `Arc`) every call and a
-        // multi-tick wait called it tens of times (streamcraft patch).
+        // multi-tick wait called it tens of times (profluens patch).
         let wait = c.new_wait();
         loop {
             // A pending seek makes the buffer this wait paces stale: bail as an
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn ctx_gate_suppresses_levels_below_threshold() {
-        // Hermetic: the `LevelFilter` is set directly (no `STREAMCRAFT_DEBUG`), so the
+        // Hermetic: the `LevelFilter` is set directly (no `PROFLUENS_DEBUG`), so the
         // gate — not the environment — decides what passes.
         let filter = Arc::new(LevelFilter::with_level(Level::Warn));
         let (sink, drain) = log_channel(64);

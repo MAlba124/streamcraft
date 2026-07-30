@@ -1,4 +1,4 @@
-//! `scraft-nvr` — N RTSP cameras in, rotated self-contained MKV segments out,
+//! `pf-nvr` — N RTSP cameras in, rotated self-contained MKV segments out,
 //! with a live mosaic wall (spec: Milestone applications — the framework's
 //! broadest stress test: live clocks, fan-out, fan-in, segmented muxing with
 //! back-patches, long-run memory flatness).
@@ -19,7 +19,7 @@
 //! — a held small buffer must never pin a frame-sized slot.
 //!
 //! ```text
-//! scraft-nvr [--record DIR] [--segment SECS] [--no-mosaic] [--cell WxH]
+//! pf-nvr [--record DIR] [--segment SECS] [--no-mosaic] [--cell WxH]
 //!            [--stats] [--max-secs N] rtsp://... [rtsp://... ...]
 //! ```
 //! `q`⏎ stops cleanly (segments finalize via the sink's teardown path).
@@ -32,15 +32,15 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::net::UdpSocket;
 
-use sc_rtp::elements::{RtpH264Depay, RtpSession, RtpStreamDesc, UdpSrc};
-use sc_rtsp::client::RtspClient;
-use sc_rtsp::sdp::{decode_base64, MediaKind};
-use sc_vaapi::h264parse::{parse_sps, NAL_SPS};
-use streamcraft_core::id::ElementId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_nvr::segment_sink::SegmentStats;
-use streamcraft_nvr::mosaic::CamGeom;
-use streamcraft_nvr::{MkvSegmentSink, Mosaic};
+use pf_rtp::elements::{RtpH264Depay, RtpSession, RtpStreamDesc, UdpSrc};
+use pf_rtsp::client::RtspClient;
+use pf_rtsp::sdp::{decode_base64, MediaKind};
+use pf_vaapi::h264parse::{parse_sps, NAL_SPS};
+use profluens_core::id::ElementId;
+use profluens_core::pipeline::Pipeline;
+use profluens_nvr::segment_sink::SegmentStats;
+use profluens_nvr::mosaic::CamGeom;
+use profluens_nvr::{MkvSegmentSink, Mosaic};
 
 /// One camera's negotiated transport + stream parameters, ready to wire.
 struct Cam {
@@ -111,7 +111,7 @@ fn setup_cam(url: &str, index: usize) -> Result<Cam, String> {
             }
         }
     };
-    let control = sc_rtsp::client::resolve_control(&base, media.control.as_deref().unwrap_or(""));
+    let control = pf_rtsp::client::resolve_control(&base, media.control.as_deref().unwrap_or(""));
     client.setup(&control, rtp_port).map_err(|e| format!("{url}: SETUP: {e:?}"))?;
     println!("cam{index}: {url} — {}x{} pt={pt} rate={clock_rate}", geom.crop_w, geom.crop_h);
     Ok(Cam { name: format!("cam{index}"), client, rtp_sock, pt, clock_rate, sprop, geom })
@@ -144,7 +144,7 @@ fn main() {
     let args = args;
     if args.is_empty() {
         eprintln!(
-            "usage: scraft-nvr [--record DIR] [--segment SECS] [--no-mosaic] [--cell WxH] \
+            "usage: pf-nvr [--record DIR] [--segment SECS] [--no-mosaic] [--cell WxH] \
              [--stats] [--max-secs N] rtsp://URL..."
         );
         std::process::exit(2);
@@ -156,7 +156,7 @@ fn main() {
         match setup_cam(url, i) {
             Ok(c) => cams.push(c),
             Err(e) => {
-                eprintln!("scraft-nvr: {e}");
+                eprintln!("pf-nvr: {e}");
                 std::process::exit(1);
             }
         }
@@ -217,10 +217,10 @@ fn main() {
         let seg_id = p.add(seg);
 
         if let Some(mos) = mosaic_id {
-            let tee = p.add(streamcraft_elements::flow::Tee::new(2));
+            let tee = p.add(profluens_elements::flow::Tee::new(2));
             p.link((depay, "src"), (tee, "sink")).expect("depay ! tee");
             p.link((tee, "src_0"), (seg_id, "sink")).expect("tee ! segsink");
-            let dec = p.add(sc_h264::H264Dec::new());
+            let dec = p.add(pf_h264::H264Dec::new());
             // Decoded frames: big slots (1080p I420 ≈ 3.1 MB).
             p.set_element_pool(dec, 4 * 1024 * 1024, 12);
             p.set_queue_capacity(dec, 16);
@@ -234,7 +234,7 @@ fn main() {
         watch.push((format!("{}:seg", cam.name), seg_id));
     }
     if let Some(mos) = mosaic_id {
-        let sink = p.add_boxed(Box::new(sc_sdl3::Sdl3VideoSink::new().with_title("scraft-nvr")));
+        let sink = p.add_boxed(Box::new(pf_sdl3::Sdl3VideoSink::new().with_title("pf-nvr")));
         p.link((mos, "src"), (sink, "sink")).expect("mosaic ! sdl3videosink");
         watch.push(("mosaic".into(), mos));
         watch.push(("wall".into(), sink));
@@ -329,7 +329,7 @@ fn main() {
 
     let result = p.run();
     while let Some(msg) = p.bus().try_recv() {
-        if let streamcraft_core::bus::BusMessage::Warning { error, .. } = msg {
+        if let profluens_core::bus::BusMessage::Warning { error, .. } = msg {
             eprintln!("warning: {error:?}");
         }
     }

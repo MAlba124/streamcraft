@@ -26,7 +26,7 @@ use std::sync::Arc;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConnection, RootCertStore};
 
-use streamcraft_core::error::Error;
+use profluens_core::error::Error;
 
 /// Well-known system CA bundle locations, tried in order (after `SSL_CERT_FILE`).
 /// The usual suspects across distro families; the first path that exists wins.

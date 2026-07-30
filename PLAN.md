@@ -1,11 +1,11 @@
-# streamcraft — roadmap / next stages
+# profluens — roadmap / next stages
 
 A hand-off for the next agent. Priorities of the project: **performance #1, perfect
-latency #2.** Core (`streamcraft-core`) stays **zero-dependency** and
+latency #2.** Core (`profluens-core`) stays **zero-dependency** and
 `#![deny(unsafe_code)]` (except the audited `memory`/`ring` modules). Everything is
-hand-written; the only external deps live in isolated plugin crates (`sc-pipewire` binds
+hand-written; the only external deps live in isolated plugin crates (`pf-pipewire` binds
 libpipewire — a device backend is the one "buy, don't build"). The design doc is
-`streamcraft.md`.
+`profluens.md`.
 
 ## Where things stand (2026-07-24)
 
@@ -40,7 +40,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > `VideoFrameRef`/`Mut`, `VideoTestSrc`, `RawVideoParse`, clock-driven `VideoCkSink`
 > (chroma rounds **up**, ffmpeg convention). (2) **Stage 5 DONE**: `core/src/registry.rs`
 > (panic-free parse), `Pipeline::{add_boxed,set_str}` (string props ride `Value::Id`),
-> props+`make_default` on the common elements, `launch/` = **scraft-launch** with
+> props+`make_default` on the common elements, `launch/` = **pf-launch** with
 > `--dump-dot/--counters/--log/--list`. (3) **`MkvDemux`**: incremental EBML reader
 > (RFC 8794/9559 in `mkv/spec/`), per-track dynamic pads (constructor-supplied header
 > bytes for preroll discovery — mid-pipeline elements get no preroll input), all lacing
@@ -56,13 +56,13 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 
 > **Update — session 3c (2026-07-24): all five OxideAV video decoders wired.** Four
 > parallel agents vetted-then-adopted, all WIRE verdicts, judged by source/tests
-> (every crates.io blurb was stale, in both directions): **sc-h264** (0.1.7 is a
+> (every crates.io blurb was stale, in both directions): **pf-h264** (0.1.7 is a
 > *full* I/P/B CAVLC+CABAC decoder + encoder despite an "empty" blurb; `h264/annexb`
 > in, i420 out, DPB display-order via a feed-order pts FIFO — B-frame pts caveat
-> documented); **sc-h265** (0.0.9 is production-complete HEVC — Main/Main10, inter,
+> documented); **pf-h265** (0.0.9 is production-complete HEVC — Main/Main10, inter,
 > SAO, byte-exact vs ffmpeg; `h265/annexb` in, i420 out, honest pts reorder window);
-> **sc-av1** (0.1.16 decodes byte-exact vs dav1d; one temporal unit per buffer,
-> i420/gray8 out, multi-frame TU carry); **sc-vp9** (0.0.12 is **intra-only** — the
+> **pf-av1** (0.1.16 decodes byte-exact vs dav1d; one temporal unit per buffer,
+> i420/gray8 out, multi-frame TU carry); **pf-vp9** (0.0.12 is **intra-only** — the
 > one real subset; element splits superframes itself; git HEAD has inter+encoder but
 > is unpublished — re-evaluate on next release). Non-i420 outputs (10/12-bit,
 > 4:2:2/4:4:4) decode upstream but are refused per-buffer until the video vocab +
@@ -149,9 +149,9 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > reject). `ZERO-COPY.md` (repo root) = staged plan to true zero-copy; a Fable agent
 > is on Stages 1–2 (demux slices + mux scatter, mp4/mkv only). **Latency tracing**:
 > per-element power-of-2 histograms (process time / ring residency / sink wait
-> overshoot), `Pipeline::set_tracing` / `STREAMCRAFT_TRACE=1`, `TapHandle::latency`,
-> `streamcraft launch --trace` p50/p99/max table. **Colored logs** on TTY stderr
-> (level + stable per-element hue; `NO_COLOR`/`STREAMCRAFT_LOG_COLOR` honored).
+> overshoot), `Pipeline::set_tracing` / `PROFLUENS_TRACE=1`, `TapHandle::latency`,
+> `profluens launch --trace` p50/p99/max table. **Colored logs** on TTY stderr
+> (level + stable per-element hue; `NO_COLOR`/`PROFLUENS_LOG_COLOR` honored).
 
 > **Update — session 4e (2026-07-24): pause transport + zero-copy merged.** Playback
 > pause landed spec-conformant ("pause is a clock op, not a state"): `PauseHandle`
@@ -183,7 +183,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > rings, inline hand-offs, and the queue's forward hop (fan-in stays
 > pre-positioned — documented). **Leaky rings integrated**
 > (set_queue_leaky(el, DropNewest), drops surfaced in producer counters).
-> **Pause UX**: 'p'/'q' stdin control in `streamcraft launch` and `play_file`.
+> **Pause UX**: 'p'/'q' stdin control in `profluens launch` and `play_file`.
 > New Ctx APIs: pad_linked (skip unlinked tracks — wire into demuxers next),
 > out_format. **In flight**: multi-track audio remux agent (aac/esds +
 > MkvMux::multi fan-in — merge on completion).
@@ -224,7 +224,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > the speed story).
 
 > **Update — session 4i (2026-07-25): graphics ride SDL3.** Spec update executed:
-> **`wayland/` + `vk/` deleted**, replaced by `sdl3/` (**sc-sdl3**) binding
+> **`wayland/` + `vk/` deleted**, replaced by `sdl3/` (**pf-sdl3**) binding
 > `sdl3-sys` (pure bindings, the ash/pipewire pattern; system SDL3 via
 > pkg-config, flake provides 3.4.8). `Sdl3VideoSink` keeps the WaylandVideoSink
 > contract verbatim; presentation is one streaming `SDL_PIXELFORMAT_IYUV`
@@ -258,7 +258,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > upstream `RefPicStore` has insert and no eviction (~35 MB/s growth; heaptrack
 > peak 89.8% in `finalize_in_progress_picture`). Fixed in `c69bed0` by
 > vendoring 0.1.7 (`vendor/oxideav-h264`, `[patch.crates-io]`) with a
-> documented `retain_keys` sweep (STREAMCRAFT-PATCHES.md, upstream-PR
+> documented `retain_keys` sweep (PROFLUENS-PATCHES.md, upstream-PR
 > candidate); crate's 1288-test suite green, RSS flat 177→188 MiB over 2 min.
 > Movie now plays smoothly. **Known follow-ups**: the decoder's internal churn
 > (51.8M allocs / 35 s — CABAC temporaries; nativization debt), spin-yield
@@ -266,7 +266,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > pts (B-frame reorder caveat — sink saw pts go backwards), and mkvdemux
 > announces no fps so sink QoS is disarmed.
 
-> **Update — session 4k (2026-07-25): AAC decode adopted.** `sc-aac`/`AacDec`
+> **Update — session 4k (2026-07-25): AAC decode adopted.** `pf-aac`/`AacDec`
 > over oxideav-aac 0.1.6 (raw `decode_raw_data_block` + ASC API — the Decoder
 > trait is ADTS/LOAS-only), MkvDemux A_AAC wiring (family/offers/ASC-head/
 > announce), launch registration, `decode_adts` diagnostic example. Gates:
@@ -290,15 +290,15 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > (3) **the real one** (`4efa3ab`): perf showed 40.9% of the process in libm
 > `__cos_fma` — upstream oxideav-aac computes the IMDCT as a naive O(N²) sum
 > with a cos() per term (~200M/s at 48 kHz stereo). Vendored with a Chebyshev
-> three-term-recurrence patch (STREAMCRAFT-PATCHES.md #2): crate suite green,
+> three-term-recurrence patch (PROFLUENS-PATCHES.md #2): crate suite green,
 > oracle SNR identical to the digit, audio holds realtime, video back at
 > 25 fps. Example also gained mimalloc + thin-LTO release (adopted decoders
-> are alloc/call-heavy) and SC_AUDIO_DROP / SC_FORCE_WALL discriminators.
+> are alloc/call-heavy) and PF_AUDIO_DROP / PF_FORCE_WALL discriminators.
 > Soak: minutes of A+V, all counters realtime. Upstream debt list for
 > oxideav-aac grows: N·log N IMDCT is the real fix; the ~15 dB real-content
 > fidelity + clustered AU failures remain from 4k.
 
-> **Update — session 4m (2026-07-25): introspection protocol + scraft-scope live.**
+> **Update — session 4m (2026-07-25): introspection protocol + pf-scope live.**
 > Three parallel Opus agents + inline integration. (1) **Core** (`3cc31ec`,
 > `core/src/introspect/`, feature `introspect`, still zero-dep/`deny(unsafe_code)`):
 > the **SCIP v1.0 wire format** — LE length-prefixed POD frames, 8 B header
@@ -313,7 +313,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > send lock (never steals from the app); **log tap** rides `LogDrainThread`;
 > `build_logging` wires threshold-off channels (cap 256) when serving so streaming
 > cost stays byte-identical. `pipeline.serve_introspection(path)` or
-> `STREAMCRAFT_INTROSPECT=<path>` env (zero-code attach). 22 pinned wire/round-trip
+> `PROFLUENS_INTROSPECT=<path>` env (zero-code attach). 22 pinned wire/round-trip
 > tests. (2) **scope UI** (`755364e`): immediate-mode toolkit on
 > `SDL_RenderGeometryRaw` — per-frame bump arena, batched draw list w/ clip stack,
 > original CC0 8x8 bitmap font atlas, panels/kv/fill-bar/button/toggle/tabs/log
@@ -323,7 +323,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > 17 golden/invariant tests). (4) **Integration** (`adcbda7`): protocol client
 > (blocking reader thread — framing never torn; `Model` + topo_gen; counters
 > polled 100 ms, re-GetTopology on mutation cues), graph/elements/events+logs
-> panels, `scraft-scope <sock> [--frames N]`, `Scope::spawn` embed (same app on a
+> panels, `pf-scope <sock> [--frames N]`, `Scope::spawn` embed (same app on a
 > temp socket). **E2E**: play_pattern + env attach → headless scope decodes
 > 2 elements/1 edge + live counters, both exit 0. Deferred: MCP server, step(),
 > prop-editing UI, latency panel, TCP, buffer peeking.
@@ -362,8 +362,8 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > rotated geometry. (3) Graph: **minimap** (bottom-right overview, draggable
 > viewport rectangle), group hulls reserve a label strip (nodes no longer
 > cover the name), edge labels draw above nodes. (4) **Launcher mode**:
-> `scraft-scope <command> [args…]` spawns the target with
-> `STREAMCRAFT_INTROSPECT` on a private socket, attaches, kills the child on
+> `pf-scope <command> [args…]` spawns the target with
+> `PROFLUENS_INTROSPECT` on a private socket, attaches, kills the child on
 > exit (attach mode now requires an actual socket file type). (5) **Dockable
 > panes** (`ui/dock.rs`, simprof's dock model): generic tree of splits with
 > tabbed leaves → flat layout geometry; drag a tab → ghost + VS Code drop
@@ -421,7 +421,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > lands 2690.0s, paused seek lands 1075.0s, stays paused, resumes clean.
 > Known limit: http has no Range-based seek; plain pause/resume still
 > excises the device drain (pre-existing, noted). Also landed (`47772fa`):
-> **GStreamer-style pipeline diagnostics** — `STREAMCRAFT_DEBUG=pipeline:debug`
+> **GStreamer-style pipeline diagnostics** — `PROFLUENS_DEBUG=pipeline:debug`
 > logs add/negotiate (offer menus, failed probes)/link (resolved caps)/dynamic
 > pads/clock selection/thread groups at build time; runtime `format_change`
 > rides the element ring.
@@ -456,7 +456,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > 100 ms Tick + burst re-prime while progressed); `ClockWait::wait_ticked` so
 > MockClock waits observe seeks. Also: HttpSrc ported to the Reactor, release
 > profile `debug="line-tables-only"` (heaptrack), nightly toolchain for codec
-> SIMD, GStreamer-style build-phase pipeline logging (`STREAMCRAFT_DEBUG=
+> SIMD, GStreamer-style build-phase pipeline logging (`PROFLUENS_DEBUG=
 > pipeline:debug`), duration/progress end-to-end in scope.
 
 > **Update — session 4r (2026-07-25): colorimetry + owned GPU renderer + vaapi
@@ -474,8 +474,8 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > our SPIR-V shaders (offline glslang bake), color science in Rust as uniforms
 > (BT.601/709/2020 matrices, BT.1886/sRGB/PQ/HLG EOTFs, 203-nit BT.2408
 > normalize + Reinhard tone-map slot v1 — BT.2390 EETF is the named follow-up),
-> classic-renderer fallback + `SC_RENDER` override, 16 tests incl. two real
-> on-device YCbCr goldens. (3) **sc-vaapi** (agent `81024f8` + fix round
+> classic-renderer fallback + `PF_RENDER` override, 16 tests incl. two real
+> on-device YCbCr goldens. (3) **pf-vaapi** (agent `81024f8` + fix round
 > `72b071c`): hand-rolled libva FFI (~26 fns, size-asserted structs),
 > capability-gated registration, working `vaapih264dec` (DPB/POC/ref-lists,
 > NV12 readback). Post-merge fixes that made it actually play: DRM node opened
@@ -492,7 +492,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > **Update — session 5n (2026-07-26): the NVR milestone app + three core
 > liveness bugs it flushed out.** The chosen stress-test application (breadth
 > over depth: live clocks, fan-out, fan-in, segmented muxing, long-run memory)
-> is LIVE end-to-end, pure-sc: `scraft-nvr` (new `nvr/` crate) records N RTSP
+> is LIVE end-to-end, pure-sc: `pf-nvr` (new `nvr/` crate) records N RTSP
 > cameras into rotated **self-contained MKV segments** (Cues + SeekHead + a new
 > `MatroskaWriter::reserve_duration`/`duration_patch` back-patch) while a
 > **mosaic wall** (fan-in `InputPolicy::Any` latest-frame compositor,
@@ -534,7 +534,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 
 > **Update — session 4s (2026-07-25/26): RTP/RTSP network streaming + the
 > scheduler finally parks.** The network milestone, receive-first, three
-> parallel agents + inline elements. **sc-rtp** (RFCs 3550/3551/6184/7587 in
+> parallel agents + inline elements. **pf-rtp** (RFCs 3550/3551/6184/7587 in
 > tree): packet view (frozen first, scaffold commit `2529eef` — agents built
 > against pinned stubs, zero merge conflicts), A.1 extended seq, jitter buffer
 > (pure state machine, latency-held gaps, late-uncounts-loss), RTCP SR/RR,
@@ -547,7 +547,7 @@ libpipewire — a device backend is the one "buy, don't build"). The design doc 
 > get batches via the param, the MkvMuxN lesson re-learned), depay/pay
 > (payloaders **Active** — a demuxer branches only from its group tail),
 > clock-paced udpsink (`wait_until(pts)` = ffmpeg's `-re` by construction).
-> **sc-rtsp** (RFC 2326/8866/2617 + hand-rolled MD5/base64): SDP parser,
+> **pf-rtsp** (RFC 2326/8866/2617 + hand-rolled MD5/base64): SDP parser,
 > client (digest auth, control-URL append-not-RFC1808, interleaved demuxer)
 > live-validated vs mediamtx; server (Transport parse, 454/455/459/461 paths,
 > session timeout) loopback-tested against our own client. **play_file
@@ -577,16 +577,16 @@ Working, ~261 tests green (`nix develop --command cargo test --workspace`, exit 
   a shared `format::Vocabulary` so elements read their negotiated format **by name**
   (`ctx.field_id`/`value_name`); thread-group scheduler with lock-free SPSC rings
   (loom-checked); pluggable `Reactor` (sync + hand-rolled io_uring); logging (POD records
-  → per-element ring → stderr drain, gated by `STREAMCRAFT_DEBUG`); per-element counters;
+  → per-element ring → stderr drain, gated by `PROFLUENS_DEBUG`); per-element counters;
   `dump_dot`; cooperative cancellation (`StopHandle`); **EOS delivered to elements'
   `event()` in chain order** (sinks drain, muxers flush).
-- **Elements** (`streamcraft-elements`): filesrc/filesink (reactor-native, seekable),
+- **Elements** (`profluens-elements`): filesrc/filesink (reactor-native, seekable),
   passthrough, testsrc/testsink.
-- **Plugin crates**: `sc-http` (custom HTTP/1.1 source), `sc-flac` (encoder + decoder +
-  incremental `StreamDecoder`, `FlacEnc`/`FlacDec` elements, RFC 9639 in-tree), `sc-ogg`
-  (page reader/writer + single-stream `OggMux`/`OggDemux`, RFC 3533), `streamcraft-audio`
+- **Plugin crates**: `pf-http` (custom HTTP/1.1 source), `pf-flac` (encoder + decoder +
+  incremental `StreamDecoder`, `FlacEnc`/`FlacDec` elements, RFC 9639 in-tree), `pf-ogg`
+  (page reader/writer + single-stream `OggMux`/`OggDemux`, RFC 3533), `profluens-audio`
   (`audio/raw` vocab, `AudioFrameRef`, `WavParse`, `AudioConvert` + conversion lib),
-  `sc-pipewire` (`PipeWireAudioSink`).
+  `pf-pipewire` (`PipeWireAudioSink`).
 - **Milestones done**: file copy, HTTP download, wav→flac, **play an audio file**
   (`filesrc ! flacdec ! pipewireaudiosink`, paced by the device via backpressure).
 
@@ -608,7 +608,7 @@ clock wait via `StopHandle` (see [[clock-wired]]).
   changes are delicate — keep them to one agent (usually the main one).
 - **Style**: match surrounding code exactly; tests + benches land with the code; codecs
   check their spec/RFC into the crate's `spec/`.
-- `streamcraft.md` has in-flight user WIP (Taps, Dynamic element properties) — don't
+- `profluens.md` has in-flight user WIP (Taps, Dynamic element properties) — don't
   clobber it; add new spec sections around it.
 
 ---
@@ -684,7 +684,7 @@ and is far more achievable than a from-scratch Opus decoder. Milestone:
 `filesrc ! oggdemux ! oggflacdeframe ! flacdec ! pipewireaudiosink` playing a `.oga`/
 `.ogg` FLAC file.
 
-**Approach**: a small **FLAC-in-Ogg mapping** element in `sc-ogg` or `sc-flac` — packet 0
+**Approach**: a small **FLAC-in-Ogg mapping** element in `pf-ogg` or `pf-flac` — packet 0
 of the logical stream is the `0x7F "FLAC"` mapping header carrying STREAMINFO; subsequent
 packets are FLAC frames. The deframer reconstructs a native FLAC byte stream (`fLaC` +
 STREAMINFO metadata block + frames) that `FlacDec`'s `StreamDecoder` already handles, and
@@ -714,20 +714,20 @@ Three loose ends from Stage-0 dynamic caps (see `memory/runtime-caps-gap.md`):
 
 > **Update — session 3d (2026-07-24): MILESTONE 5 SHIPPED.** `play_mkv` plays a
 > VP8-in-MKV file in a real window (`filesrc ! mkvdemux ! vp8dec ! waylandvideosink`,
-> clock-paced, clean EOS), and `streamcraft launch videotestsrc frames=60 !
-> waylandvideosink` opens a window from a one-liner. Landed: **sc-wayland** (hand-written
+> clock-paced, clean EOS), and `profluens launch videotestsrc frames=60 !
+> waylandvideosink` opens a window from a one-liner. Landed: **pf-wayland** (hand-written
 > wire-protocol client + shm sink; BT.601 §-cited per the new **algorithm-citation rule**
-> — every algorithm cites its standard/paper, clean-room, see memory), the **streamcraft
+> — every algorithm cites its standard/paper, clean-room, see memory), the **profluens
 > CLI** (launch/dot/inspect/list; switches-first + unquoted pipeline; `registry::describe`
 > cards), **parallel-forest transcode** proven (6×60s FLACs in 0.8s, one pipeline,
-> ~12 threads; inline-gate livelock fix + `set_pool`), **sc-mp3 wired** (84–102 dB vs
-> ffmpeg), **sc-opus REJECTED** (published 0.0.13 fails the official RFC 6716 vectors —
+> ~12 threads; inline-gate livelock fix + `set_pool`), **pf-mp3 wired** (84–102 dB vs
+> ffmpeg), **pf-opus REJECTED** (published 0.0.13 fails the official RFC 6716 vectors —
 > silence/noise; the desired decoder exists only at unpublished git HEAD; turnkey
 > re-vet recipe in `opus/src/lib.rs`). **Decision: containers are hand-written**
-> (like sc-mkv/sc-ogg) — the oxideav-mp4 adoption was stopped; agents in flight:
+> (like pf-mkv/pf-ogg) — the oxideav-mp4 adoption was stopped; agents in flight:
 > hand-written `Mp4Demux` (oxideav-mp4 demoted to dev-oracle; muxer is a follow-up
-> task) and **sc-vk** (clean-room Vulkan renderer: render into exported DMA-BUFs,
-> present via sc-wayland's `zwp_linux_dmabuf_v1`; `ash` only; cited algorithms).
+> task) and **pf-vk** (clean-room Vulkan renderer: render into exported DMA-BUFs,
+> present via pf-wayland's `zwp_linux_dmabuf_v1`; `ash` only; cited algorithms).
 
 > **Update — session 3e (2026-07-24): real-file playback + the GPU renderer.**
 > `play_file` plays a real **1080p HEVC BluRay MKV** (4 tracks: HEVC→h265dec, AAC/PGS
@@ -737,19 +737,19 @@ Three loose ends from Stage-0 dynamic caps (see `memory/runtime-caps-gap.md`):
 > (right-sized heap fallback, never a 4 MiB slot per 15 KB sample); ring-fed group
 > heads now cap their input backlog at INLINE_INPUT_CAP (closed-and-drained guard).
 > Video decoders went **Active** (a decode is ms, not the inline ns budget; also
-> keeps a branching demuxer a legal group tail). **sc-vk landed, built in-session**
+> keeps a branching demuxer a legal group tail). **pf-vk landed, built in-session**
 > (agents kept OOMing the box — policy now: max ONE background agent): compute-only
-> Vulkan → exported LINEAR dma-bufs → presented by sc-wayland's hand-written client
+> Vulkan → exported LINEAR dma-bufs → presented by pf-wayland's hand-written client
 > via `zwp_linux_dmabuf_v1` (salvaged+reviewed from the dead agent's worktree);
 > BT.601 §-cited GLSL + committed SPIR-V; byte-exact vs the CPU path on a Quadro
-> P620; `vkvideosink` registered, `play_file --vk`. **sc-mp3 salvaged + merged**
-> (agent finished, OOM'd before committing). **sc-opus REJECTED** on official
+> P620; `vkvideosink` registered, `play_file --vk`. **pf-mp3 salvaged + merged**
+> (agent finished, OOM'd before committing). **pf-opus REJECTED** on official
 > RFC 6716 vectors (0.0.13 emits noise/silence; recipe in opus/src/lib.rs).
 > Test heavy pipelines under `systemd-run --scope -p MemoryMax=3G`. Workspace 90
 > binaries green. In flight: hand-written Mp4Demux (containers stay hand-written —
 > user decision; oxideav-mp4 is dev-oracle only). Follow-ups: per-link pools, h26x
 > pts reorder exactness, Opus re-vet on next upstream publish, explicit-sync +
-> scaling/HDR ladder for sc-vk.
+> scaling/HDR ladder for pf-vk.
 
 ## Stage 5 — Registry + parse-launch · MED
 
@@ -801,8 +801,8 @@ one-liners and debugging.
   known soft spots — a fenceless fast-path variant of the SPSC ring (the SeqCst Dekker
   fence dominates the ~51 ns/item hop) and a deeper-queue / batched-submission io_uring
   reactor.
-- **TLS/https for `sc-http`** — *decided (2026-07-24): rustls.* The sanctioned dependency
-  for this plugin (like libpipewire for `sc-pipewire`); core stays at zero deps.
+- **TLS/https for `pf-http`** — *decided (2026-07-24): rustls.* The sanctioned dependency
+  for this plugin (like libpipewire for `pf-pipewire`); core stays at zero deps.
   - **Why rustls**: pure Rust, audited (Cure53/ISRG), and — decisive here — a **sans-IO
     core**: `ClientConnection` never owns the socket (`read_tls`/`write_tls` +
     `reader()`/`writer()` pump buffers), so it drops into today's blocking-`TcpStream`
@@ -826,7 +826,7 @@ one-liners and debugging.
     plain-HTTP build keeps its current footprint. Client-only, TLS 1.2+1.3.
   - **Verify at adoption time** (not from memory): exact provider crate names/versions
     and graviola's current maturity — check the rustls provider docs when wiring.
-- **Spec** (`streamcraft.md`): write the **dynamic-caps two-layer** section and an
+- **Spec** (`profluens.md`): write the **dynamic-caps two-layer** section and an
   **audio-sink / clocking** section (work *around* the user's WIP blocks).
 
 ## Backlog (lower priority / larger)
@@ -834,19 +834,19 @@ one-liners and debugging.
 - **Structural property sets while `Playing`**: the subgraph-local micro-transition
   (drain the element, `stop`/`start`, re-preroll) that `PropHandle` currently refuses;
   also unlocks `Pipeline::remove`/`relink` while playing.
-- **Introspection protocol** (spec: scraft-scope): length-prefixed POD frames over a
+- **Introspection protocol** (spec: pf-scope): length-prefixed POD frames over a
   socket, feature-gated. The substrate is now uniform (CounterSnapshot/TapHandle, bus,
   log records, dump_dot) — the protocol is a thin frame-encoder over those snapshots.
   Best landed together with the latency instrumentation so the wire format is designed
   once.
 
-- **More codecs** (hand-written, spec in-tree): Opus (`sc-opus`, RFC 6716 — large: SILK +
+- **More codecs** (hand-written, spec in-tree): Opus (`pf-opus`, RFC 6716 — large: SILK +
   CELT), Vorbis, then video (VP8/VP9/AV1).
-- **Video path**: `streamcraft-video` vocab (pixel formats, `VideoFrameRef`), a video sink,
+- **Video path**: `profluens-video` vocab (pixel formats, `VideoFrameRef`), a video sink,
   a first video codec — the "play a video file" / "play A+V" milestones (need Stage 2
   clocking for sync).
 - **More containers**: MKV/WebM, MP4.
-- **scraft-scope inspector**: the introspection protocol (length-prefixed POD frames over a
+- **pf-scope inspector**: the introspection protocol (length-prefixed POD frames over a
   socket, feature-gated in core) + a Slint GUI + MCP tools — the logging/counters/bus
   plumbing already exists to feed it.
 - **Hard-interrupt cancellation**: fold reactor-cancel + `ClockWait::interrupt` into

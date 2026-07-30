@@ -29,17 +29,17 @@
 //! A mid-stream resolution change is not supported in v1 (the recorder rotates
 //! on it; the wall would need a re-announce).
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::memory::Memory;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::memory::Memory;
+use profluens_core::time::Timestamp;
 
 /// The static pad table's sink budget (grids up to 4×4).
 pub const MAX_CAMS: usize = 16;
@@ -310,7 +310,7 @@ impl Element for Mosaic {
         }
         buf.memory.set_len(need);
         if self.emitted == 0 {
-            if let Some(path) = std::env::var_os("SC_MOSAIC_DUMP") {
+            if let Some(path) = std::env::var_os("PF_MOSAIC_DUMP") {
                 // Diagnostic escape hatch (env-gated, first composed frame
                 // only): raw I420 dump for offline inspection — a debug
                 // one-shot, not a streaming path (clippy.toml exception).

@@ -1,5 +1,5 @@
 [package]
-name = "streamcraft-scope"
+name = "profluens-scope"
 description = "Immediate-mode SDL3 inspector GUI + MCP server over the core introspection protocol"
 version.workspace = true
 edition.workspace = true
@@ -7,10 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "streamcraft_scope"
+name = "profluens_scope"
 
 [[bin]]
-name = "scraft-scope"
+name = "pf-scope"
 path = "src/main.rs"
 
 # Standalone demo of the immediate-mode UI layer with fake pipeline data.
@@ -20,7 +20,7 @@ name = "ui_demo"
 path = "src/bin/ui_demo.rs"
 
 [dependencies]
-streamcraft-core = { path = "../core", features = ["introspect"] }
+profluens-core = { path = "../core", features = ["introspect"] }
 # The scope UI rides SDL3, exactly as the video sink does: pure auto-generated
 # bindings linked against the system libSDL3 via pkg-config (the `ash`/`pipewire`
 # pattern; never `build-from-source` — the repo toolchain has no SDL cmake/clang

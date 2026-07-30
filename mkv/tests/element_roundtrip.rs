@@ -5,27 +5,27 @@
 //! minimal in-crate EBML reader and assert it is a well-formed MKV: EBML Header at the
 //! start, one A_FLAC TrackEntry with the CodecPrivate the element was constructed with, and
 //! one SimpleBlock per input frame carrying the exact frame bytes on track 1. This mirrors
-//! `sc-ogg`'s `element_roundtrip.rs` scaffold (a byte-collecting sink around the mux).
+//! `pf-ogg`'s `element_roundtrip.rs` scaffold (a byte-collecting sink around the mux).
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 
 use common::{parse_simple_block, walk};
-use sc_flac::{FlacEncoder, SampleFormat};
-use sc_mkv::ebml::id;
-use sc_mkv::MkvMux;
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_flac::{FlacEncoder, SampleFormat};
+use pf_mkv::ebml::id;
+use pf_mkv::MkvMux;
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 const MASTERS: &[&[u8]] = &[
     id::EBML,
@@ -39,7 +39,7 @@ const MASTERS: &[&[u8]] = &[
 
 // =====================================================================================
 // A source that emits a fixed list of byte buffers (one per frame), then EOS. Copied in
-// shape from sc-ogg's element_roundtrip PacketSrc.
+// shape from pf-ogg's element_roundtrip PacketSrc.
 // =====================================================================================
 
 static SRC_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
@@ -101,7 +101,7 @@ impl Element for FrameSrc {
 }
 
 // =====================================================================================
-// A sink concatenating all received bytes (the raw MKV stream). Same shape as sc-ogg's
+// A sink concatenating all received bytes (the raw MKV stream). Same shape as pf-ogg's
 // ByteSink.
 // =====================================================================================
 
@@ -172,7 +172,7 @@ fn make_flac(sample_rate: u32, channels: u32, block: usize, n: usize) -> (Vec<u8
         frames.push(frame);
     }
     let body = enc.finish();
-    let off = sc_flac::streaminfo_offset();
+    let off = pf_flac::streaminfo_offset();
     header[off..off + body.len()].copy_from_slice(&body);
     (header, frames)
 }

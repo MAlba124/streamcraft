@@ -1,6 +1,6 @@
 //! POD video format vocabulary + the `video/raw` negotiation offer (spec: Formats;
 //! Crate layout). Plain structs and free functions — no new buffer types, no traits,
-//! mirroring `streamcraft-audio`'s `format` module.
+//! mirroring `profluens-audio`'s `format` module.
 //!
 //! The `video/raw` family names four fields — `width` / `height` (Int px), `pixfmt`
 //! (a categorical id like `i420`) and `fps` (a `Rat`, e.g. `30000/1001`) — matching the
@@ -8,8 +8,8 @@
 //! is the single source of truth for the categorical names, so offers, raw-video parsing,
 //! and frame views never drift.
 
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::time::Rational;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::time::Rational;
 
 /// The negotiation family for uncompressed (raster) video frames.
 pub const FAMILY: &str = "video/raw";

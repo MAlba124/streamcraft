@@ -66,8 +66,8 @@ const POW43_MAX: usize = 8191;
 ///
 /// This replaces a `cbrt` **per spectral coefficient** (~1024 per frame per channel) with a
 /// table lookup — profiling a zero-copy-video playback showed this `cbrt` was the single
-/// hottest audio-decode op once the video path stopped touching the CPU (streamcraft patch,
-/// see `STREAMCRAFT-PATCHES.md`). Each entry is the **same** `abs · abs.cbrt()` the scalar
+/// hottest audio-decode op once the video path stopped touching the CPU (profluens patch,
+/// see `PROFLUENS-PATCHES.md`). Each entry is the **same** `abs · abs.cbrt()` the scalar
 /// path computed, so the dequantized spectrum is **byte-identical** — no accuracy change, the
 /// conformance gate is unaffected. 64 KiB, built lazily.
 fn pow43_table() -> &'static [f64; POW43_MAX + 1] {
@@ -155,7 +155,7 @@ pub fn rescale_spectrum(
 /// [`rescale_spectrum`] generalised over the output allocator. The hot decode path passes a
 /// per-frame `&bumpalo::Bump` so the rescaled `Vec<Vec<f64>>` scratch — which is consumed by
 /// `quant_to_spec` and immediately dropped — comes from the frame arena instead of the heap
-/// (streamcraft patch). `A: Copy` because a `Vec<Vec<f64, A>, A>` needs the same allocator for
+/// (profluens patch). `A: Copy` because a `Vec<Vec<f64, A>, A>` needs the same allocator for
 /// the outer vec and each inner vec; `Global` and `&Bump` are both `Copy`.
 pub fn rescale_spectrum_in<
     A: std::alloc::Allocator + Copy,

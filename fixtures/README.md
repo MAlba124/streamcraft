@@ -1,8 +1,8 @@
-# fixtures — streamcraft validation corpus
+# fixtures — profluens validation corpus
 
 A small, fast-to-generate set of test-media clips plus a matrix runner, used to
-smoke-test the general-purpose player (`scplay`) across the container/codec
-combinations streamcraft is expected to handle — including a few **negative**
+smoke-test the general-purpose player (`pfplay`) across the container/codec
+combinations profluens is expected to handle — including a few **negative**
 fixtures that must fail cleanly.
 
 Nothing here is checked in except the scripts: the media lives in `out/`, which
@@ -13,7 +13,7 @@ is git-ignored and regenerated on demand.
 | file             | what                                                        |
 |------------------|-------------------------------------------------------------|
 | `gen.sh`         | generate the corpus into `out/` with ffmpeg (idempotent)    |
-| `run-matrix.sh`  | run every fixture through `scplay`, tabulate PASS/FAIL      |
+| `run-matrix.sh`  | run every fixture through `pfplay`, tabulate PASS/FAIL      |
 | `out/`           | generated media (git-ignored)                               |
 
 ## Regenerating
@@ -54,14 +54,14 @@ table (streams + size), so a corrupt/empty write is caught immediately.
 ## Running the matrix
 
 ```sh
-./run-matrix.sh /path/to/scplay          # default (hardware) decode path
-./run-matrix.sh --sw /path/to/scplay     # software path (SC_NO_VAAPI=1)
+./run-matrix.sh /path/to/pfplay          # default (hardware) decode path
+./run-matrix.sh --sw /path/to/pfplay     # software path (PF_NO_VAAPI=1)
 ```
 
-The player CLI contract (frozen — `scplay` is built to this spec):
+The player CLI contract (frozen — `pfplay` is built to this spec):
 
 ```
-scplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
+pfplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
 ```
 
 * prints `track <padname>: ...` lines to stdout;
@@ -70,11 +70,11 @@ scplay [--no-window] [--no-audio] [--stats] [--max-secs N] FILE
   track links to any decoder.
 
 For each expected-**pass** fixture the runner invokes
-`scplay --no-window --no-audio --max-secs 10 <file>` and counts exit 0 as PASS.
+`pfplay --no-window --no-audio --max-secs 10 <file>` and counts exit 0 as PASS.
 Expected-**fail** fixtures PASS when the exit code is nonzero *and* the process
 did not hang. Every invocation is wrapped in `timeout 30`, so a hang surfaces as
 a FAIL (exit 124) rather than wedging the whole matrix. `--sw` prepends
-`SC_NO_VAAPI=1` to every run to exercise the pure-software decoders.
+`PF_NO_VAAPI=1` to every run to exercise the pure-software decoders.
 
 The runner prints one aligned row per fixture (name, expectation, exit code,
 PASS/FAIL, first `track` line or first stderr line), a summary count, and exits
@@ -84,7 +84,7 @@ shows as `SKIP` and does not count against the run.
 ## Why the negative fixtures fail (by design)
 
 * **`ogg_vorbis.ogg`** and the Vorbis audio track in **`webm_vp8_vorbis.webm`** —
-  streamcraft has **no in-tree Vorbis decoder** (nor Opus, nor Theora). In the
+  profluens has **no in-tree Vorbis decoder** (nor Opus, nor Theora). In the
   WebM the VP8 video still plays and the Vorbis track drops into a
   drop-sink, so the run PASSES. The Vorbis-only Ogg has nothing left to play, so
   no track links to a decoder and the player exits nonzero — that nonzero exit is

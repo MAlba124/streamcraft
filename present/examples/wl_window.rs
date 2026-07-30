@@ -2,14 +2,14 @@
 //! buffers, drawing an animated GUI frame each vsync for ~2s. Proves the GUI present path
 //! (no GPU, compositor blends) end to end against a live compositor.
 //!
-//! Run:  `WAYLAND_DISPLAY=wayland-1 cargo run -p sc-present --example wl_window`
+//! Run:  `WAYLAND_DISPLAY=wayland-1 cargo run -p pf-present --example wl_window`
 
 use std::io;
 
-use sc_present::window::Window;
+use pf_present::window::Window;
 
 fn main() -> io::Result<()> {
-    let mut win = Window::open("streamcraft — sc-present GUI demo", 800, 450)?;
+    let mut win = Window::open("profluens — pf-present GUI demo", 800, 450)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut frames = 0u32;
@@ -39,7 +39,7 @@ fn main() -> io::Result<()> {
     }
 
     println!(
-        "sc-present GUI demo: {frames} frame(s) rendered + recycled, clean exit ({})",
+        "pf-present GUI demo: {frames} frame(s) rendered + recycled, clean exit ({})",
         if win.should_close() { "toplevel close" } else { "2s deadline" }
     );
     Ok(())

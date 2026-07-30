@@ -7,11 +7,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use streamcraft_core::clock::MockClock;
-use streamcraft_core::id::ElementId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::testing::{TimedTestSink, TimedTestSrc};
+use profluens_core::clock::MockClock;
+use profluens_core::id::ElementId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::testing::{TimedTestSink, TimedTestSrc};
 
 /// Poll until `cond` or ~200 ms of real time (the negative-assertion pattern from
 /// the pause tests).

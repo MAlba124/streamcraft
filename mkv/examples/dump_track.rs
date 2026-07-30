@@ -4,11 +4,11 @@
 //! or a reference decoder).
 //!
 //! ```text
-//! cargo run --release -p sc-mkv --example dump_track -- IN.mkv OUT.bin [max_frames]
+//! cargo run --release -p pf-mkv --example dump_track -- IN.mkv OUT.bin [max_frames]
 //! ```
 
-use sc_mkv::codec::{family_for, nal_head_from_config, Reframer};
-use sc_mkv::MatroskaReader;
+use pf_mkv::codec::{family_for, nal_head_from_config, Reframer};
+use pf_mkv::MatroskaReader;
 use std::io::{Read, Write};
 
 fn main() {

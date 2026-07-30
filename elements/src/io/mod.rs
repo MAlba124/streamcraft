@@ -2,7 +2,7 @@
 //!
 //! Elements are reactor-native: they submit reads/writes through `ctx.io()` and
 //! drain completions in `process()` (spec: IO). The scheduler runs them against a
-//! [`streamcraft_core::io::Reactor`] — the dependency-free `SyncReactor` by default,
+//! [`profluens_core::io::Reactor`] — the dependency-free `SyncReactor` by default,
 //! or the hand-rolled [`IoUringReactor`] (Linux, `io-uring` feature) injected via
 //! `Pipeline::set_reactor`.
 

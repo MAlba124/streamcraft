@@ -2,15 +2,15 @@
 //! solid colour from a `wl_shm` buffer, driven by a time-bounded event loop. Proves the wire
 //! codec + `SCM_RIGHTS` fd passing + the registry/xdg/shm handshake against a live compositor.
 //!
-//! Run:  `WAYLAND_DISPLAY=wayland-1 cargo run -p sc-present --example wl_spike`
+//! Run:  `WAYLAND_DISPLAY=wayland-1 cargo run -p pf-present --example wl_spike`
 
 #![allow(unsafe_code)]
 
 use std::io;
 use std::os::unix::io::RawFd;
 
-use sc_present::conn::{Connection, DISPLAY_ID};
-use sc_present::protocol as p;
+use pf_present::conn::{Connection, DISPLAY_ID};
+use pf_present::protocol as p;
 
 const W: i32 = 640;
 const H: i32 = 360;
@@ -101,7 +101,7 @@ fn main() -> io::Result<()> {
     c.request(s.wm_base, p::wm_base::GET_XDG_SURFACE).u32(s.xdg_surface).object(s.surface).finish();
     s.toplevel = c.alloc_id();
     c.request(s.xdg_surface, p::xdg_surface::GET_TOPLEVEL).u32(s.toplevel).finish();
-    c.request(s.toplevel, p::xdg_toplevel::SET_TITLE).string("streamcraft (sc-present spike)").finish();
+    c.request(s.toplevel, p::xdg_toplevel::SET_TITLE).string("profluens (pf-present spike)").finish();
     c.request(s.surface, p::surface::COMMIT).finish();
     c.flush()?;
 
@@ -121,7 +121,7 @@ fn main() -> io::Result<()> {
     }
 
     println!(
-        "sc-present spike: window up, {} frame(s) presented, clean exit ({})",
+        "pf-present spike: window up, {} frame(s) presented, clean exit ({})",
         s.frames,
         if s.should_close { "toplevel close" } else { "2s deadline" }
     );
@@ -155,7 +155,7 @@ fn paint_solid(c: &mut Connection, s: &mut State) -> io::Result<()> {
     let stride = W * 4;
     let size = (stride * H) as usize;
     let (fd, map) = shm_alloc(size)?;
-    // 0x00RRGGBB in XRGB8888 (native-endian u32) — a streamcraft dark slate.
+    // 0x00RRGGBB in XRGB8888 (native-endian u32) — a profluens dark slate.
     let color: u32 = 0x0020_3550;
     // SAFETY: `map` points at `size` writable bytes we own for this scope.
     unsafe {
@@ -191,7 +191,7 @@ fn paint_solid(c: &mut Connection, s: &mut State) -> io::Result<()> {
 /// (to hand to `wl_shm.create_pool`) and the mapping pointer.
 fn shm_alloc(size: usize) -> io::Result<(RawFd, *mut libc::c_void)> {
     // SAFETY: memfd_create with a static name; fd checked below.
-    let fd = unsafe { libc::memfd_create(c"sc-present".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"pf-present".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -8,7 +8,7 @@
 //! EXTERNAL_OES) → samplerExternalOES → letterboxed quad → SDL_GL_SwapWindow`. The decoded
 //! frame's pixels live in GPU memory the entire time; the only bytes that crossed the
 //! process/thread boundary were the ~40-byte descriptor + a handful of fds
-//! ([`sc_vaapi::gpuframe`]).
+//! ([`pf_vaapi::gpuframe`]).
 //!
 //! # Extensions + the flow, cited at point of use
 //!
@@ -40,9 +40,9 @@ use std::ffi::{c_int, c_void, CString};
 use sdl3_sys::everything::*;
 
 use loader::*;
-use sc_vaapi::gpuframe::GpuFrame;
-use streamcraft_scope::ui::draw::{Batch, DrawList, TexId};
-use streamcraft_scope::ui::font::Font;
+use pf_vaapi::gpuframe::GpuFrame;
+use profluens_scope::ui::draw::{Batch, DrawList, TexId};
+use profluens_scope::ui::font::Font;
 
 use crate::backend::letterbox;
 
@@ -257,7 +257,7 @@ impl GlVideo {
         // The font atlas as an RGBA8 GL_TEXTURE_2D.
         let font_tex = upload_font_atlas(&gl, font);
 
-        eprintln!("scplay-ui: video path = zero-copy VA-API/EGL (GLES external-image backend live)");
+        eprintln!("pfplay-ui: video path = zero-copy VA-API/EGL (GLES external-image backend live)");
 
         Some(GlVideo {
             gl,
@@ -304,7 +304,7 @@ impl GlVideo {
         if image == EGL_NO_IMAGE_KHR {
             let e = (self.gl.eglGetError)();
             eprintln!(
-                "scplay-ui: eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) failed (EGL error {e:#x}); \
+                "pfplay-ui: eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) failed (EGL error {e:#x}); \
                  frame skipped — check the DMA-BUF fourcc/modifier the driver exported"
             );
             // frame drops here → its fds close; the old imported frame stays displayed.
@@ -343,7 +343,7 @@ impl GlVideo {
     ///
     /// # Safety
     /// GL context current; `dl`'s batch slices live for the call.
-    pub unsafe fn render(&mut self, ww: f32, wh: f32, dl: &DrawList, arena: &mut streamcraft_scope::ui::Arena) -> bool {
+    pub unsafe fn render(&mut self, ww: f32, wh: f32, dl: &DrawList, arena: &mut profluens_scope::ui::Arena) -> bool {
         let gl = &self.gl;
         (gl.Viewport)(0, 0, ww as GLsizei, wh as GLsizei);
         (gl.ClearColor)(0.0, 0.0, 0.0, 1.0);
@@ -419,7 +419,7 @@ impl GlVideo {
     ///
     /// # Safety
     /// Context current; batch slices valid for the call.
-    unsafe fn draw_ui(&mut self, ww: f32, wh: f32, dl: &DrawList, arena: &mut streamcraft_scope::ui::Arena) {
+    unsafe fn draw_ui(&mut self, ww: f32, wh: f32, dl: &DrawList, arena: &mut profluens_scope::ui::Arena) {
         let batches = dl.build(arena);
         let gl = &self.gl;
         (gl.UseProgram)(self.ui_prog);
@@ -532,7 +532,7 @@ pub fn dmabuf_egl_attribs(frame: &GpuFrame) -> Vec<EGLint> {
     a.push(EGL_LINUX_DRM_FOURCC_EXT);
     a.push(frame.drm_format as EGLint);
 
-    let has_mod = frame.drm_modifier != sc_vaapi::ffi::DRM_FORMAT_MOD_INVALID;
+    let has_mod = frame.drm_modifier != pf_vaapi::ffi::DRM_FORMAT_MOD_INVALID;
     let mod_lo = (frame.drm_modifier & 0xFFFF_FFFF) as EGLint;
     let mod_hi = (frame.drm_modifier >> 32) as EGLint;
 
@@ -599,7 +599,7 @@ unsafe fn link_program(gl: &Gl, vs: &str, fs: &str) -> Option<GLuint> {
         let mut len: GLsizei = 0;
         (gl.GetProgramInfoLog)(prog, 512, &mut len, log.as_mut_ptr() as *mut GLchar);
         eprintln!(
-            "scplay-ui: GL program link failed: {}",
+            "pfplay-ui: GL program link failed: {}",
             String::from_utf8_lossy(&log[..len.max(0) as usize])
         );
         return None;
@@ -624,7 +624,7 @@ unsafe fn compile(gl: &Gl, kind: GLenum, src: &str) -> Option<GLuint> {
         let mut l: GLsizei = 0;
         (gl.GetShaderInfoLog)(s, 512, &mut l, log.as_mut_ptr() as *mut GLchar);
         eprintln!(
-            "scplay-ui: GL shader compile failed: {}",
+            "pfplay-ui: GL shader compile failed: {}",
             String::from_utf8_lossy(&log[..l.max(0) as usize])
         );
         (gl.DeleteShader)(s);
@@ -682,20 +682,20 @@ unsafe fn upload_font_atlas(gl: &Gl, font: &Font) -> GLuint {
 
 /// Log the reason the zero-copy GL path was declined and that the SDL_Renderer path is used.
 fn log_fallback(why: &str) {
-    eprintln!("scplay-ui: zero-copy GLES backend unavailable ({why}); video path = SDL texture upload");
+    eprintln!("pfplay-ui: zero-copy GLES backend unavailable ({why}); video path = SDL texture upload");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sc_vaapi::gpuframe::GpuFrame;
-    use sc_vaapi::ExportedPlane;
+    use pf_vaapi::gpuframe::GpuFrame;
+    use pf_vaapi::ExportedPlane;
 
     fn nv12_frame(modifier: u64) -> GpuFrame {
         GpuFrame {
             token: 1,
             fds: vec![7], // one object, both planes index it
-            drm_format: sc_vaapi::ffi::DRM_FORMAT_NV12,
+            drm_format: pf_vaapi::ffi::DRM_FORMAT_NV12,
             drm_modifier: modifier,
             coded_w: 1920,
             coded_h: 1088,
@@ -719,7 +719,7 @@ mod tests {
         // Width/height/fourcc present.
         assert!(a.windows(2).any(|w| w == [EGL_WIDTH, 1920]));
         assert!(a.windows(2).any(|w| w == [EGL_HEIGHT, 1088]));
-        assert!(a.windows(2).any(|w| w == [EGL_LINUX_DRM_FOURCC_EXT, sc_vaapi::ffi::DRM_FORMAT_NV12 as EGLint]));
+        assert!(a.windows(2).any(|w| w == [EGL_LINUX_DRM_FOURCC_EXT, pf_vaapi::ffi::DRM_FORMAT_NV12 as EGLint]));
         // Both plane fd keys present, pointing at fd 7 (object 0).
         assert!(a.windows(2).any(|w| w == [EGL_DMA_BUF_PLANE0_FD_EXT, 7]));
         assert!(a.windows(2).any(|w| w == [EGL_DMA_BUF_PLANE1_FD_EXT, 7]));
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     fn egl_attribs_omit_invalid_modifier() {
-        let f = nv12_frame(sc_vaapi::ffi::DRM_FORMAT_MOD_INVALID);
+        let f = nv12_frame(pf_vaapi::ffi::DRM_FORMAT_MOD_INVALID);
         let a = dmabuf_egl_attribs(&f);
         assert!(!a.iter().any(|&k| k == EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT));
         assert!(!a.iter().any(|&k| k == EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT));

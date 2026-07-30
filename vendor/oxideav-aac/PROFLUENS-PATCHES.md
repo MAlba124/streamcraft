@@ -1,4 +1,4 @@
-# streamcraft patches on top of oxideav-aac 0.1.6 (crates.io)
+# profluens patches on top of oxideav-aac 0.1.6 (crates.io)
 
 Vendored via `[patch.crates-io]` in the workspace root. Minimal diffs, intended
 to be offered upstream.
@@ -40,7 +40,7 @@ bit-reversal tables) are built once per `Filterbank`.
 The literal O(N²) sum stays in-tree as the executable reference;
 `fast_imdct_matches_the_reference_sum` pins the two against each other over
 dense random spectra at N = 8/256/2048 (observed error ~1e−13, asserted
-< 1e−9). The crate suite (727 tests incl. conformance) and sc-aac's ffmpeg
+< 1e−9). The crate suite (727 tests incl. conformance) and pf-aac's ffmpeg
 SNR oracle are unchanged. Playback CPU (30 s movie, hw video decode):
 22769 → 16427 cycle samples — the audio decoder no longer appears in the
 top functions.
@@ -48,7 +48,7 @@ top functions.
 ## 3. Inverse-quantization x^(4/3) lookup table
 
 `dequant::inverse_quantize` computed `|x|^(4/3)` as `|x|·|x|.cbrt()` per spectral
-coefficient (~1024 per frame per channel). Re-profiled once the streamcraft
+coefficient (~1024 per frame per channel). Re-profiled once the profluens
 video path went fully zero-copy (VA-API surface → EGL/GLES, no CPU touch), this
 `cbrt` was the single hottest scalar op in audio decode.
 
@@ -93,7 +93,7 @@ the `fast_imdct_matches_the_reference_sum` oracle pass unchanged.
 Re-profiled with patch 4 in, `__memcpy` was the #1 leaf (4.2%) — the audio PCM
 handoff, not the (zero-copy) video. The decoder rendered a fresh interleaved
 `Vec<i16>` per frame (`decode_raw_data_block` → `pcm::interleave_s16`), and the
-streamcraft `aacdec` element then copied that `Vec` into its pipeline pool slot
+profluens `aacdec` element then copied that `Vec` into its pipeline pool slot
 with a per-sample little-endian write: two passes and an allocation for data
 that is produced and consumed once.
 
@@ -110,7 +110,7 @@ Two additive pieces (no behaviour change to existing callers):
   with no intermediate `Vec<i16>`. `interleave_le_into_matches_the_two_step_path`
   pins it byte-for-byte against `interleave_s16` + `to_le_bytes`.
 
-The streamcraft element carries the planar frame through its backpressure carry
+The profluens element carries the planar frame through its backpressure carry
 and renders the PCM directly into the pool slot at emit time — removing one
 per-frame allocation and one full copy. Bit-identical (same `to_s16`, same
 interleave order, same little-endian layout); 1551 tests pass (1548 + 3 new).
@@ -145,7 +145,7 @@ of the spectral/scalefactor reconstruction. Several were removed outright first
 (`read_and_apply_signs` → stack `[bool;4]`; pre-sized scalefactor vecs;
 `reconstruct_pre_pair` no longer clones the whole `SpectralData` on the
 common no-pulse path — it borrows). The rest are genuine per-frame scratch, so
-the decode path is now **generic over a scratch allocator** and the streamcraft
+the decode path is now **generic over a scratch allocator** and the profluens
 pipeline hands it a frame arena.
 
 `#![feature(allocator_api)]`. The reconstruction entry points gained an
@@ -158,12 +158,12 @@ and the PCM output escape into the PNS/TNS/filterbank tail and stay heap `Vec`s.
 The original signatures remain as thin `Global` wrappers, so `decode_frame` /
 `decode_all` / every test are byte-for-byte unchanged (1553 pass).
 
-`A` is a **trait** (`std::alloc::Allocator`) — the crate names no streamcraft
-type and takes no streamcraft dependency, so the patch stays upstreamable.
-streamcraft's `Ctx::scratch()` arena implements `Allocator` (a ~20-line
+`A` is a **trait** (`std::alloc::Allocator`) — the crate names no profluens
+type and takes no profluens dependency, so the patch stays upstreamable.
+profluens's `Ctx::scratch()` arena implements `Allocator` (a ~20-line
 `unsafe impl Allocator for &Arena` in `core/src/memory.rs`; `deallocate` is a
 no-op, the scheduler `reset`s the arena after each `process()`), and the
-`sc-aac` element passes `ctx.scratch()` into
+`pf-aac` element passes `ctx.scratch()` into
 `decode_raw_data_block_planar` — so the AAC decoder's per-frame scratch now
 lives in the pipeline's recycled arena with no steady-state heap traffic.
 Currently backs the `rescaled` buffer; the same generic seam extends to the

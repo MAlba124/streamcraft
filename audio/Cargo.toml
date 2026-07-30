@@ -1,5 +1,5 @@
 [package]
-name = "streamcraft-audio"
+name = "profluens-audio"
 description = "POD audio format descriptions and typed views over the opaque buffer"
 version.workspace = true
 edition.workspace = true
@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-streamcraft-core = { path = "../core" }
+profluens-core = { path = "../core" }
 
 [dev-dependencies]
 # For the wavparse integration test and the wav -> flac milestone example.
-streamcraft-elements = { path = "../elements" }
-sc-flac = { path = "../flac" }
+profluens-elements = { path = "../elements" }
+pf-flac = { path = "../flac" }

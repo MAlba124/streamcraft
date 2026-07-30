@@ -1,5 +1,5 @@
 //! Rough Ogg mux/demux throughput benchmark. Run in release:
-//!   cargo run --release --example bench -p sc-ogg
+//!   cargo run --release --example bench -p pf-ogg
 //!
 //! Muxes and demuxes a large synthetic packet stream and reports MB/s of container
 //! payload for each direction, plus the framing overhead (page headers + lacing as a
@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use sc_ogg::{demux_all, mux_packets, OggReader};
+use pf_ogg::{demux_all, mux_packets, OggReader};
 
 /// SplitMix64 for reproducible packet contents.
 struct Rng(u64);

@@ -3,7 +3,7 @@
 //! sink pad — the coded-picture-per-buffer demuxer contract, start-code-delimited
 //! NAL units (VPS/SPS/PPS out-of-band plus one coded picture's slices) — and raw
 //! I420 video leaves on the src pad, one frame per buffer, planes packed Y then Cb
-//! then Cr (the `video/raw` layout the streamcraft-video helpers describe).
+//! then Cr (the `video/raw` layout the profluens-video helpers describe).
 //!
 //! Frame dimensions live in the SPS, not in a static descriptor, so the src pad
 //! advertises a broad, `dynamic` `video/raw` template and **announces** the concrete
@@ -41,21 +41,21 @@ use std::collections::BinaryHeap;
 
 use oxideav_h265::{DecodedFrame, SequenceDecoder};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_video::color;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_video::color;
+use profluens_core::time::Timestamp;
 
 // `video/raw` family/field/value names. Kept as literals (not a dep on
-// streamcraft-video) so sc-h265 stays core-only, exactly as sc-vp8 does for
+// profluens-video) so pf-h265 stays core-only, exactly as pf-vp8 does for
 // `video/raw`; the pipeline interns by string, so the ids line up with any video
 // peer using the same names.
 const FAMILY: &str = "video/raw";
@@ -81,7 +81,7 @@ static SRC_FIELDS: [FieldDesc; 7] = [
     FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_PIXFMT, allowed: ConstraintDesc::Set(&PIXFMT_VALUES), preferred: None },
-    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via streamcraft-video's
+    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via profluens-video's
     // color vocab): announced only when the demuxer declared it upstream.
     FieldDesc { field: color::FIELD_MATRIX, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: color::FIELD_RANGE, allowed: ConstraintDesc::Any, preferred: None },
@@ -527,7 +527,7 @@ fn pack_i420(f: &DecodedFrame) -> Option<Vec<u8>> {
 /// Colorimetry passthrough (spec: Formats — dynamic caps): forward the container's
 /// announced colour fields from the negotiated sink format onto `video/raw`, names
 /// re-anchored to `'static` through the closed color vocabulary (ITU-T H.273 via
-/// `streamcraft_video::color`). Absent/unknown fields stay unannounced — the
+/// `profluens_video::color`). Absent/unknown fields stay unannounced — the
 /// renderer defaults by resolution.
 fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDesc)>) {
     let Some(fmt) = ctx.negotiated(pad) else { return };
@@ -540,7 +540,7 @@ fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDe
     ];
     for (field, statify) in table {
         let Some(fid) = ctx.field_id(field) else { continue };
-        let Some(streamcraft_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
+        let Some(profluens_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
         let Some(stat) = ctx.value_name(vid).and_then(statify) else { continue };
         out.push((field, ValueDesc::Id(stat)));
     }

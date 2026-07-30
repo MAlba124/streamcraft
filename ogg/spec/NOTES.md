@@ -1,4 +1,4 @@
-# sc-ogg spec notes
+# pf-ogg spec notes
 
 Interpretation decisions and errata for the Ogg implementation, per the plugin
 conventions (spec: First-party codecs — "Spec errata and interpretation decisions get
@@ -109,12 +109,12 @@ meaning is left to the media mapping, unaltered here.
 
 ## Not yet / follow-ups
 
-- **streamcraft elements** (`OggMux` / `OggDemux`). A demuxer needs one dynamic src pad
+- **profluens elements** (`OggMux` / `OggDemux`). A demuxer needs one dynamic src pad
   *per discovered logical stream* and a muxer one dynamic sink pad per input; the
   milestone-1 Element pad model is static (`PadDesc { dynamic: false }`) and the scheduler
-  has no per-stream pad add/remove. As `sc-flac` shipped the codec core before element
+  has no per-stream pad add/remove. As `pf-flac` shipped the codec core before element
   polish, the tested reader/writer **library** is the deliverable; elements land when the
-  core grows dynamic pads. The library depends on `streamcraft-core` only nominally and
+  core grows dynamic pads. The library depends on `profluens-core` only nominally and
   drops into an element wrapper unchanged.
 - **Skeleton / chained-stream seeking metadata**, and granule→time conversion, are the
   concern of the media mapping / a higher layer, not the container.

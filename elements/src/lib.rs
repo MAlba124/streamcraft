@@ -1,22 +1,22 @@
-//! streamcraft-elements — the built-in, pure-Rust elements.
+//! profluens-elements — the built-in, pure-Rust elements.
 //!
 //! Milestone 1: [`io::FileSrc`] ! [`io::FileSink`] (spec: Milestone applications).
 //! The reference elements are kept exemplary — element authors copy the nearest one
 //! (spec: Writing elements), so the nearest one must be perfect.
 //!
-//! (The HTTP source lives in its own `sc-http` plugin crate, not here — it will grow
+//! (The HTTP source lives in its own `pf-http` plugin crate, not here — it will grow
 //! a TLS dependency that must not leak into the framework crates.)
 
 pub mod flow;
 pub mod io;
 pub mod testing;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register the built-in elements for name-based construction (spec: Plugins —
 /// `parse("filesrc path=x ! …")`). The typed `use` + constructor path is primary;
-/// this powers `scraft-launch` and one-liner tests. Each descriptor is `&'static`
+/// this powers `pf-launch` and one-liner tests. Each descriptor is `&'static`
 /// (it lives in its element's module), taken here from a throwaway default instance.
 pub fn register(registry: &mut Registry) {
     registry.register(io::FileSrc::new("").desc());

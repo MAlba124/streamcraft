@@ -10,11 +10,11 @@
 //!      (`ffmpeg -i clip.hevc -f rawvideo -pix_fmt yuv420p ref.yuv`) is compared frame
 //!      for frame.
 //!   2. **Decode fps at 1080p** — the whole point of hardware decode is to hold
-//!      realtime for the two 1080p movies the software `sc-h265` path cannot.
+//!      realtime for the two 1080p movies the software `pf-h265` path cannot.
 //!
 //! Usage:
 //! ```text
-//! cargo run --release -p sc-vaapi --example hevc_decode -- <clip.hevc> [ref.yuv] [max_frames]
+//! cargo run --release -p pf-vaapi --example hevc_decode -- <clip.hevc> [ref.yuv] [max_frames]
 //! ```
 //!
 //! When no VA-API device (or no HEVC Main profile) is present, the element degrades
@@ -23,10 +23,10 @@
 
 use std::time::Instant;
 
-use streamcraft_core::harness::Harness;
-use streamcraft_core::time::Timestamp;
+use profluens_core::harness::Harness;
+use profluens_core::time::Timestamp;
 
-use sc_vaapi::VaapiH265Dec;
+use pf_vaapi::VaapiH265Dec;
 
 // 1080p I420 ≈ 3.1 MiB; size pool slots generously so the emit path is never the
 // bottleneck of the fps measurement.
@@ -47,7 +47,7 @@ fn main() {
 
     // Probe first so the "no device" case reports cleanly (and the fps number is
     // meaningful only on-device).
-    match sc_vaapi::probe() {
+    match pf_vaapi::probe() {
         Some(caps) => {
             eprintln!(
                 "device={} va={}.{} vendor={:?}",
@@ -67,7 +67,7 @@ fn main() {
         }
         None => {
             eprintln!(
-                "NOTE: no VA-API device (or SC_NO_VAAPI=1). vaapih265dec will \
+                "NOTE: no VA-API device (or PF_NO_VAAPI=1). vaapih265dec will \
                  warn+disable and emit no frames — nothing to decode on-device here."
             );
         }
@@ -95,7 +95,7 @@ fn main() {
     let mut h = Harness::with_slot_size(VaapiH265Dec::new(), SLOT);
     h.start().expect("start");
 
-    let mut frames: Vec<streamcraft_core::buffer::Buffer> = Vec::new();
+    let mut frames: Vec<profluens_core::buffer::Buffer> = Vec::new();
     let start = Instant::now();
     for (i, au) in aus.iter().enumerate() {
         if frames.len() >= max_frames {
@@ -116,8 +116,8 @@ fn main() {
 
     for m in h.bus_messages() {
         match m {
-            streamcraft_core::bus::BusMessage::Warning { error, .. } => eprintln!("warn: {error:?}"),
-            streamcraft_core::bus::BusMessage::Error { error, .. } => eprintln!("error: {error:?}"),
+            profluens_core::bus::BusMessage::Warning { error, .. } => eprintln!("warn: {error:?}"),
+            profluens_core::bus::BusMessage::Error { error, .. } => eprintln!("error: {error:?}"),
             _ => {}
         }
     }
@@ -137,7 +137,7 @@ fn main() {
         if let (Some(w_id), Some(h_id), Some(pf_id)) =
             (vocab.field_id("width"), vocab.field_id("height"), vocab.field_id("pixfmt"))
         {
-            use streamcraft_core::format::Value;
+            use profluens_core::format::Value;
             if let Some(Value::Int(w)) = announced.get(w_id) {
                 width = w as u32;
             }

@@ -8,17 +8,17 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-use streamcraft_core::buffer::{Buffer, BufferFlags};
-use streamcraft_core::id::{ElementId, FormatId};
-use streamcraft_core::io::{
+use profluens_core::buffer::{Buffer, BufferFlags};
+use profluens_core::id::{ElementId, FormatId};
+use profluens_core::io::{
     fadvise, sync_file_range, FileHandle, IoResult, OpId, OpKind, Reactor, StreamHygiene,
     Submission, SyncReactor, POSIX_FADV_DONTNEED, POSIX_FADV_SEQUENTIAL, SYNC_FILE_RANGE_WRITE,
 };
-use streamcraft_core::memory::Pool;
-use streamcraft_core::time::Timestamp;
+use profluens_core::memory::Pool;
+use profluens_core::time::Timestamp;
 
 fn tmp_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sc_io_hygiene_{tag}_{}", std::process::id()))
+    std::env::temp_dir().join(format!("pf_io_hygiene_{tag}_{}", std::process::id()))
 }
 
 /// An invalid fd must surface as an `Err` (EBADF on Linux/x86_64) — never a

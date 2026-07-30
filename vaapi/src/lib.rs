@@ -1,17 +1,17 @@
-//! sc-vaapi — VA-API hardware-accelerated video decode **and encode** for
-//! streamcraft.
+//! pf-vaapi — VA-API hardware-accelerated video decode **and encode** for
+//! profluens.
 //!
 //! This crate wraps the system **libva** (the Video Acceleration API) to offload
 //! H.264 decode and H.264/H.265/VP8 encode onto the GPU's fixed-function video
 //! engine. Unlike the pure-Rust codec crates, VA-API is a *device boundary* — the
-//! same class as `sc-pipewire`'s libpipewire — so a small, hand-rolled FFI surface
+//! same class as `pf-pipewire`'s libpipewire — so a small, hand-rolled FFI surface
 //! is the sanctioned tool. There is no `-sys` crate and no bindgen: [`ffi`]
 //! transcribes the functions and structs these paths need directly from the libva
 //! 2.23 headers, with `size_of` assertions locking every struct's ABI, and [`va`]
 //! wraps them in RAII types so `unsafe` never escapes those two modules.
 //!
 //! ## What it provides
-//! - [`probe`] — a cached capability probe (`SC_NO_VAAPI` / `SC_VAAPI_DEVICE`
+//! - [`probe`] — a cached capability probe (`PF_NO_VAAPI` / `PF_VAAPI_DEVICE`
 //!   honored) reporting which decode/encode families the driver accelerates.
 //! - [`register`] — adds each element **only when its entrypoint exists**, so a
 //!   machine without the hardware never advertises it.
@@ -20,7 +20,7 @@
 //! - [`h265dec::VaapiH265Dec`] — the HEVC decoder: parses Annex-B VPS/SPS/PPS + slice
 //!   segment headers ([`h265parse`], ITU-T H.265), tracks the DPB by POC + Reference
 //!   Picture Sets, and reads the decoded NV12 surface back as planar I420 (matching
-//!   the software `sc-h265`). Main profile, 8-bit 4:2:0 only.
+//!   the software `pf-h265`). Main profile, 8-bit 4:2:0 only.
 //! - [`h264dec::VaapiH264Dec`] — the decoder: parses Annex-B parameter sets + slice
 //!   headers ([`h264parse`], ITU-T H.264), maintains the DPB and reference lists,
 //!   drives `vaBeginPicture`/`vaRenderPicture`/`vaEndPicture`, and reads the decoded
@@ -73,8 +73,8 @@ pub use probe::{probe, VaCaps};
 pub use va::{ExportedPlane, ExportedSurface};
 pub use vp8enc::VaapiVp8Enc;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins).
 /// Gated on the probe: `vaapih264dec` is only registered when the VA-API driver
@@ -86,7 +86,7 @@ pub fn register(registry: &mut Registry) {
             registry.register(VaapiH264Dec::new().desc());
         }
         // HEVC hardware decode: registered only when the driver advertises HEVC Main
-        // VLD (probe → `"h265/annexb"`). Same gate discipline as h264 (SC_NO_VAAPI is
+        // VLD (probe → `"h265/annexb"`). Same gate discipline as h264 (PF_NO_VAAPI is
         // honored inside probe). vp9 decode is still probe-only (no element yet).
         if caps.supports("h265/annexb") {
             registry.register(VaapiH265Dec::new().desc());

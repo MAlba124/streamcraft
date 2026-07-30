@@ -1,4 +1,4 @@
-# streamcraft patches on top of oxideav-h264 0.1.7 (crates.io)
+# profluens patches on top of oxideav-h264 0.1.7 (crates.io)
 
 Vendored via `[patch.crates-io]` in the workspace root. Minimal diffs, intended
 to be offered upstream.

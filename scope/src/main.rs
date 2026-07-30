@@ -1,12 +1,12 @@
-//! `scraft-scope` — the inspector binary.
+//! `pf-scope` — the inspector binary.
 //!
 //! Two ways in, one UI:
 //!
-//! - **Attach**: `scraft-scope <socket-path>` connects to a running streamcraft app
+//! - **Attach**: `pf-scope <socket-path>` connects to a running profluens app
 //!   that is already serving the protocol (core feature `introspect` + either
-//!   `pipeline.serve_introspection(path)` or `STREAMCRAFT_INTROSPECT=<path>`).
-//! - **Launch**: `scraft-scope [--] <command> [args…]` spawns the command with
-//!   `STREAMCRAFT_INTROSPECT` pointing at a fresh private socket, waits for the app
+//!   `pipeline.serve_introspection(path)` or `PROFLUENS_INTROSPECT=<path>`).
+//! - **Launch**: `pf-scope [--] <command> [args…]` spawns the command with
+//!   `PROFLUENS_INTROSPECT` pointing at a fresh private socket, waits for the app
 //!   to serve it, and attaches — no socket paths to wire up by hand. The target
 //!   must be built with core's `introspect` feature or the env var is ignored.
 //!   Closing the scope terminates the launched command.
@@ -17,11 +17,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use streamcraft_scope::app::{self, AppOpts};
+use profluens_scope::app::{self, AppOpts};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: scraft-scope [--frames N] <socket-path>\n       scraft-scope [--frames N] [--] <command> [args...]"
+        "usage: pf-scope [--frames N] <socket-path>\n       pf-scope [--frames N] [--] <command> [args...]"
     );
     std::process::exit(2);
 }
@@ -78,24 +78,24 @@ fn main() {
         None => launch_and_attach(&positionals, opts),
     };
     if let Err(e) = result {
-        eprintln!("scraft-scope: {e}");
+        eprintln!("pf-scope: {e}");
         std::process::exit(1);
     }
 }
 
-/// Launch mode: spawn `argv` with `STREAMCRAFT_INTROSPECT` set to a private socket,
+/// Launch mode: spawn `argv` with `PROFLUENS_INTROSPECT` set to a private socket,
 /// wait for the app to serve it, attach. The child dies with the scope.
 fn launch_and_attach(argv: &[String], opts: AppOpts) -> Result<(), String> {
-    let sock = std::env::temp_dir().join(format!("scraft-scope-{}.sock", std::process::id()));
+    let sock = std::env::temp_dir().join(format!("pf-scope-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
 
     let child = Command::new(&argv[0])
         .args(&argv[1..])
-        .env("STREAMCRAFT_INTROSPECT", &sock)
+        .env("PROFLUENS_INTROSPECT", &sock)
         .spawn()
         .map_err(|e| format!("launch {:?}: {e} (not a running app's socket path either)", argv[0]))?;
     let mut guard = ChildGuard(child);
-    eprintln!("scraft-scope: launched {:?}, waiting for {}", argv.join(" "), sock.display());
+    eprintln!("pf-scope: launched {:?}, waiting for {}", argv.join(" "), sock.display());
 
     // The app serves the socket when its pipeline reaches run(); building/decoding
     // may take a while, so wait generously — but bail as soon as the child dies.

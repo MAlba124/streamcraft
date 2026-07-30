@@ -3,7 +3,7 @@
 //! drains them and applies them to the pipeline's pause/seek/stop handles; the app publishes
 //! `duration` + `paused` back so the HUD can draw a real timeline + play/pause glyph.
 //!
-//! Kept a neutral command queue (no pipeline types) so `sc-present` stays free of the player
+//! Kept a neutral command queue (no pipeline types) so `pf-present` stays free of the player
 //! plumbing — the app owns the handles and does the mapping.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

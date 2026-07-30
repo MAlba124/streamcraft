@@ -1,6 +1,6 @@
-//! sc-rtsp — RTSP 1.0 (RFC 2326) client + SDP (RFC 8866) parser, from scratch.
+//! pf-rtsp — RTSP 1.0 (RFC 2326) client + SDP (RFC 8866) parser, from scratch.
 //!
-//! Layered like the other protocol crates (sc-http, sc-rtp): **pure protocol
+//! Layered like the other protocol crates (pf-http, pf-rtp): **pure protocol
 //! modules** with no framework types — [`sdp`] (the DESCRIBE payload:
 //! session/media sections, `rtpmap`/`fmtp`/`control` attributes, plus the
 //! RFC 4648 base64 H.264 `sprop-parameter-sets` needs), [`client`] (a

@@ -15,29 +15,29 @@
 //! composited frame's luma **changes inside the caption rectangle** (the white bitmap burned
 //! in) and is **byte-for-byte unchanged everywhere else**. Headless — no display.
 //!
-//! Run: `nix develop --command cargo run --release -p sc-text --example pgs_overlay`
+//! Run: `nix develop --command cargo run --release -p pf-text --example pgs_overlay`
 
 use std::sync::{Arc, Mutex};
 
-use sc_text::pgs;
-use sc_text::{PgsDec, SubtitleOverlay};
+use pf_text::pgs;
+use pf_text::{PgsDec, SubtitleOverlay};
 
-use streamcraft_elements::flow::Queue;
+use profluens_elements::flow::Queue;
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
-use streamcraft_video::format::PixelFormat;
-use streamcraft_video::geometry::frame_size;
+use profluens_video::format::PixelFormat;
+use profluens_video::geometry::frame_size;
 
 /// The frame and caption geometry the proof asserts against.
 const FRAME_W: u32 = 128;
@@ -278,10 +278,10 @@ impl Element for PgsSrc {
 }
 
 static PIXFMTS: [ValueDesc; 1] = [ValueDesc::Id("i420")];
-static VIDEO_SRC_FIELDS: [streamcraft_core::format::FieldDesc; 3] = [
-    streamcraft_core::format::FieldDesc { field: "width", allowed: streamcraft_core::format::ConstraintDesc::Any, preferred: None },
-    streamcraft_core::format::FieldDesc { field: "height", allowed: streamcraft_core::format::ConstraintDesc::Any, preferred: None },
-    streamcraft_core::format::FieldDesc { field: "pixfmt", allowed: streamcraft_core::format::ConstraintDesc::Set(&PIXFMTS), preferred: None },
+static VIDEO_SRC_FIELDS: [profluens_core::format::FieldDesc; 3] = [
+    profluens_core::format::FieldDesc { field: "width", allowed: profluens_core::format::ConstraintDesc::Any, preferred: None },
+    profluens_core::format::FieldDesc { field: "height", allowed: profluens_core::format::ConstraintDesc::Any, preferred: None },
+    profluens_core::format::FieldDesc { field: "pixfmt", allowed: profluens_core::format::ConstraintDesc::Set(&PIXFMTS), preferred: None },
 ];
 static VIDEO_SRC_OFFERS: [OfferDesc; 1] =
     [OfferDesc { family: "video/raw", fields: &VIDEO_SRC_FIELDS }];
@@ -364,10 +364,10 @@ impl Element for VideoSrc {
 }
 
 static REC_PIXFMTS: [ValueDesc; 2] = [ValueDesc::Id("i420"), ValueDesc::Id("nv12")];
-static REC_FIELDS: [streamcraft_core::format::FieldDesc; 3] = [
-    streamcraft_core::format::FieldDesc { field: "width", allowed: streamcraft_core::format::ConstraintDesc::Any, preferred: None },
-    streamcraft_core::format::FieldDesc { field: "height", allowed: streamcraft_core::format::ConstraintDesc::Any, preferred: None },
-    streamcraft_core::format::FieldDesc { field: "pixfmt", allowed: streamcraft_core::format::ConstraintDesc::Set(&REC_PIXFMTS), preferred: None },
+static REC_FIELDS: [profluens_core::format::FieldDesc; 3] = [
+    profluens_core::format::FieldDesc { field: "width", allowed: profluens_core::format::ConstraintDesc::Any, preferred: None },
+    profluens_core::format::FieldDesc { field: "height", allowed: profluens_core::format::ConstraintDesc::Any, preferred: None },
+    profluens_core::format::FieldDesc { field: "pixfmt", allowed: profluens_core::format::ConstraintDesc::Set(&REC_PIXFMTS), preferred: None },
 ];
 static REC_OFFERS: [OfferDesc; 1] = [OfferDesc { family: "video/raw", fields: &REC_FIELDS }];
 static REC_PADS: [PadDesc; 1] = [PadDesc {

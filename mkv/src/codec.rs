@@ -20,10 +20,10 @@
 //! [`Err`], never a panic or an out-of-range slice. The demuxer warns-and-drops on such an
 //! error rather than killing the pipeline.
 
-use streamcraft_core::format::OfferDesc;
+use profluens_core::format::OfferDesc;
 
 /// The demuxer announce family for a video (or audio) track, keyed by CodecID (RFC 9559 §12
-/// codec mappings). The families match the sink offers of the streamcraft decoders so a
+/// codec mappings). The families match the sink offers of the profluens decoders so a
 /// dynamic pad linking `mkvdemux.video_N ! vp8dec.sink` negotiates:
 /// - `V_VP8` → `vp8`, `V_VP9` → `vp9`, `V_AV1` → `av1`;
 /// - `V_MPEG4/ISO/AVC` → `h264/annexb`, `V_MPEGH/ISO/HEVC` → `h265/annexb`;
@@ -34,13 +34,13 @@ use streamcraft_core::format::OfferDesc;
 /// - *Text* (`S_TEXT/*`): `S_TEXT/UTF8` → `subtitle/srt` (SubRip cue text), `S_TEXT/ASS` and
 ///   `S_TEXT/SSA` → `subtitle/ass` (Advanced/legacy SubStation Alpha — the same Dialogue
 ///   grammar, so one family), `S_TEXT/WEBVTT` → `subtitle/vtt` (W3C WebVTT). Each Block is one
-///   cue's raw text; `sc-text`'s `subparse` links on the announced family and normalises markup
+///   cue's raw text; `pf-text`'s `subparse` links on the announced family and normalises markup
 ///   to plain `subtitle/events` for the overlay.
 /// - *Bitmap* (`S_HDMV/PGS`) → `subtitle/pgs` (HDMV Presentation Graphics Stream — the
 ///   image-based BluRay subtitle). Each Block is one PGS **Display Set** (bare PGS segments,
 ///   no `.sup` `PG`/timestamp header — that framing is a raw-`.sup` concern, not the mkv one);
-///   `sc-text`'s `pgsdec` decodes the RLE bitmap + palette to `subtitle/bitmap` RGBA for the
-///   overlay's `image` pad. See `sc-text`'s `pgs` module for the segment grammar.
+///   `pf-text`'s `pgsdec` decodes the RLE bitmap + palette to `subtitle/bitmap` RGBA for the
+///   overlay's `image` pad. See `pf-text`'s `pgs` module for the segment grammar.
 ///
 /// Timing rides the buffer PTS + duration on every subtitle path (see [`Reframer::Passthrough`]
 /// and the demuxer's BlockDuration plumbing — a PGS Display Set is one Block, so its
@@ -53,7 +53,7 @@ pub fn family_for(codec_id: &str) -> &'static str {
         "A_FLAC" => "flac",
         "A_AAC" => "aac",
         // Surround/other audio (Matroska codec registry): AC-3 (ATSC A/52) and E-AC-3 (Dolby
-        // Digital Plus) decode via `sc-ac3`; MP3 via `sc-mp3`. DTS/Opus/Vorbis are named so the
+        // Digital Plus) decode via `pf-ac3`; MP3 via `pf-mp3`. DTS/Opus/Vorbis are named so the
         // autoplugger reports "no decoder for <codec>" rather than an opaque `bytes` drop —
         // and so a future decoder wires in by family with no demuxer change.
         "A_AC3" => "ac3",
@@ -99,7 +99,7 @@ pub fn offers_for(codec_id: &str) -> &'static [OfferDesc] {
     static H264: [OfferDesc; 2] = [OfferDesc::any("h264/annexb"), OfferDesc::any("bytes")];
     static H265: [OfferDesc; 2] = [OfferDesc::any("h265/annexb"), OfferDesc::any("bytes")];
     // Subtitle text menus (RFC 9559 §12.7): the announced family + the `bytes` escape, so
-    // `sc-text`'s `subparse` selects on the family while a generic byte peer can still tap it.
+    // `pf-text`'s `subparse` selects on the family while a generic byte peer can still tap it.
     static SRT: [OfferDesc; 2] = [OfferDesc::any("subtitle/srt"), OfferDesc::any("bytes")];
     static ASS: [OfferDesc; 2] = [OfferDesc::any("subtitle/ass"), OfferDesc::any("bytes")];
     static VTT: [OfferDesc; 2] = [OfferDesc::any("subtitle/vtt"), OfferDesc::any("bytes")];

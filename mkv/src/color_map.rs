@@ -1,7 +1,7 @@
 //! ITU-T H.273 code points ↔ the pipeline's categorical colorimetry names
 //! (spec: Formats; RFC 9559 §5.1.4.1.31 — mkv's `Colour` element carries these
 //! integers). mkv stays dependency-free, so the closed mapping is transcribed
-//! here; the names match `streamcraft-video`'s color vocabulary and are pinned
+//! here; the names match `profluens-video`'s color vocabulary and are pinned
 //! by that crate's tests.
 
 /// H.273 §8.3 `MatrixCoefficients` → `matrix` name. `None` = unspecified/exotic.
@@ -95,13 +95,13 @@ pub(crate) fn primaries_name_h273(name: &str) -> Option<u8> {
 // COLD: once per stream at writer header setup; owns each color-name string briefly.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn colour_from_format(
-    ctx: &streamcraft_core::ctx::Ctx,
-    f: &streamcraft_core::format::FixedFormat,
+    ctx: &profluens_core::ctx::Ctx,
+    f: &profluens_core::format::FixedFormat,
 ) -> Option<crate::writer::ColourConfig> {
     let name = |field: &str| -> Option<String> {
         let id = ctx.field_id(field)?;
         match f.get(id)? {
-            streamcraft_core::format::Value::Id(v) => ctx.value_name(v).map(str::to_owned),
+            profluens_core::format::Value::Id(v) => ctx.value_name(v).map(str::to_owned),
             _ => None,
         }
     };

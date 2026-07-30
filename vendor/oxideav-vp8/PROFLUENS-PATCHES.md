@@ -1,4 +1,4 @@
-# streamcraft patches to oxideav-vp8 0.2.6
+# profluens patches to oxideav-vp8 0.2.6
 
 Vendored from crates.io `oxideav-vp8 0.2.6` (wired via `[patch.crates-io]`,
 same arrangement as `vendor/oxideav-h264` / `vendor/oxideav-aac`). One
@@ -20,7 +20,7 @@ encoder — `Macroblock(BoolDecoder(EndOfStream))` in the mode/mv partition and
 the very last macroblock — and the same failure class applies to libvpx
 streams whose tail happens to need the padding.
 
-The patch (all sites marked `STREAMCRAFT PATCH`):
+The patch (all sites marked `PROFLUENS PATCH`):
 
 - `BoolDecoder` gains a `virtual_zeros` counter; both renormalisation byte
   pulls (`renormalize()` and the batched `read_literal` fast path) feed a zero
@@ -30,5 +30,5 @@ The patch (all sites marked `STREAMCRAFT PATCH`):
   `end_of_stream_pads_virtual_zeros_then_surfaces`, asserting the padded reads
   succeed and the cap still fires.
 
-Verified by `sc-vaapi`'s `vp8_hw_encode_sw_decode_round_trip` (24/24 hardware
-frames decode, mean PSNR gate) and the unchanged sc-vp8 suite.
+Verified by `pf-vaapi`'s `vp8_hw_encode_sw_decode_round_trip` (24/24 hardware
+frames decode, mean PSNR gate) and the unchanged pf-vp8 suite.

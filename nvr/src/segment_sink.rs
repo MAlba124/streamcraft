@@ -37,21 +37,21 @@
 use std::fs::File;
 use std::path::PathBuf;
 
-use sc_mkv::writer::{MatroskaWriter, MuxOut, MuxPiece, SeekHeadPatch, TrackConfig};
-use sc_vaapi::h264parse::{parse_sps, split_nals, NAL_PPS, NAL_SLICE_IDR, NAL_SPS};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::{Buffer, BufferFlags};
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_mkv::writer::{MatroskaWriter, MuxOut, MuxPiece, SeekHeadPatch, TrackConfig};
+use pf_vaapi::h264parse::{parse_sps, split_nals, NAL_PPS, NAL_SLICE_IDR, NAL_SPS};
+use profluens_core::batch::Inputs;
+use profluens_core::buffer::{Buffer, BufferFlags};
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::FormatId;
-use streamcraft_core::io::IoResult;
-use streamcraft_core::memory::{Memory, Pool};
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::FormatId;
+use profluens_core::io::IoResult;
+use profluens_core::memory::{Memory, Pool};
+use profluens_core::time::Timestamp;
 
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("h264/annexb")];
 
@@ -274,7 +274,7 @@ impl MkvSegmentSink {
     /// scratch memory (they alias the arena, which `reclaim` reuses); payloads
     /// forward the frame's own [`Memory`] refcount — no copy.
     fn submit_pieces(&mut self, ctx: &mut Ctx) {
-        let handle = streamcraft_core::io::FileHandle(ctx.element().0);
+        let handle = profluens_core::io::FileHandle(ctx.element().0);
         let credits = ctx.io().credits();
         let Self { seg, scratch, in_flight, write_offset, .. } = self;
         let Some(seg) = seg.as_mut() else { return };
@@ -347,7 +347,7 @@ impl MkvSegmentSink {
         };
         Self::compute_finalize(seg);
         self.submit_pieces(ctx); // the Cues tail (resumes across passes)
-        let handle = streamcraft_core::io::FileHandle(ctx.element().0);
+        let handle = profluens_core::io::FileHandle(ctx.element().0);
         let Self { seg, scratch, in_flight, .. } = self;
         let seg = seg.as_mut().expect("finalizing segment");
         while *in_flight < ctx.io().credits() {
@@ -510,7 +510,7 @@ impl Element for MkvSegmentSink {
             );
         }
         let Some(mut seg) = self.seg.take() else { return };
-        if std::env::var_os("SC_SEG_DEBUG").is_some() {
+        if std::env::var_os("PF_SEG_DEBUG").is_some() {
             let backlog: usize = seg
                 .out
                 .pieces()

@@ -1,4 +1,4 @@
-//! `AviDemux` — the streamcraft **element** wrapping the hand-written [`crate::riff`]
+//! `AviDemux` — the profluens **element** wrapping the hand-written [`crate::riff`]
 //! parser: an AVI (RIFF) byte stream in on the `sink` pad, one **dynamic src pad per
 //! stream** out (spec: dynamic pads). It is a **passive** byte→packet transform that inlines
 //! into the upstream group exactly like `MkvDemux`/`OggDemux` — encoded frames leave stamped
@@ -31,20 +31,20 @@
 //! `bytes`-family (undecodable) track is still emitted for a byte peer but a one-shot warning
 //! is posted so a missing decoder is diagnosable.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::buffer::BufferFlags;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::buffer::BufferFlags;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
 use crate::codec;
 use crate::riff::{self, MoviWalker, Stream, StreamKind};

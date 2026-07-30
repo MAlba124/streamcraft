@@ -8,10 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use streamcraft_core::clock::MockClock;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::testing::{TestSink, TestSrc};
+use profluens_core::clock::MockClock;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::testing::{TestSink, TestSrc};
 
 const TOTAL: u64 = 256 * 1024;
 
@@ -73,7 +73,7 @@ fn tap_reads_live_while_streaming_and_reconciles_at_eos() {
 
 /// The observer-side arithmetic the spec prescribes: cumulative bytes over a
 /// running-time window. (Helper so the test reads like the doc example.)
-fn p_counters_bytes(tap: &streamcraft_core::counters::TapHandle, el: streamcraft_core::id::ElementId) -> u64 {
+fn p_counters_bytes(tap: &profluens_core::counters::TapHandle, el: profluens_core::id::ElementId) -> u64 {
     tap.snapshot(el).map(|s| s.bytes_out).unwrap_or(0)
 }
 

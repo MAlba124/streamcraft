@@ -2,7 +2,7 @@
 //!
 //! COPIED VERBATIM from `scope/src/ui/font_data.rs` (+ its `font_atlas.a8`) so this
 //! pure-CPU element carries a self-contained bitmap font without depending on
-//! `streamcraft-scope` (which pulls SDL3/GPU — far too heavy for a CPU blit). The
+//! `profluens-scope` (which pulls SDL3/GPU — far too heavy for a CPU blit). The
 //! `bake_font.py` tool and the origin live in the `scope` crate; the atlas is a fixed
 //! offline artifact, so a copy is the right call (see `text/src/font.rs`).
 //!

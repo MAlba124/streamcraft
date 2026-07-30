@@ -1,13 +1,13 @@
-//! sc-vp9 — the VP9 (v0.7 bitstream spec) codec plugin.
+//! pf-vp9 — the VP9 (v0.7 bitstream spec) codec plugin.
 //!
-//! Like `sc-vp8`, this crate is **not** hand-written: it wraps
+//! Like `pf-vp8`, this crate is **not** hand-written: it wraps
 //! [`oxideav-vp9`](https://github.com/OxideAV/oxideav-vp9), a pure-Rust, clean-room VP9
 //! decoder adopted after review (2026-07-24). The spec's codec taboo is FFI walls — a
 //! foreign allocator, threading model, and timestamp semantics dragged in behind a
 //! boundary our batches can't cross (spec: First-party codecs; Non-goals).
 //! `oxideav-vp9` has none of that: pure Rust, **zero `unsafe`**, **no `build.rs`**, MIT,
 //! and its code cross-references the VP9 v0.7 spec section-by-section exactly like our
-//! own codec crates. Adopting it is the same "buy, don't build" call as `sc-vp8`.
+//! own codec crates. Adopting it is the same "buy, don't build" call as `pf-vp8`.
 //!
 //! # Adoption verdict: WIRE (with a loudly-enforced subset)
 //!
@@ -56,7 +56,7 @@
 //! - **`oxideav-core` dependency**: unlike `oxideav-vp8` (truly zero-dep), 0.0.12
 //!   depends unconditionally on `oxideav-core` for a no-op `register!` plugin hook,
 //!   pulling `serde_json` / `thiserror` / `bytemuck` transitively. These are already in
-//!   the workspace lock via the sibling `sc-h264` / `sc-h265` / `sc-av1` stubs, so no
+//!   the workspace lock via the sibling `pf-h264` / `pf-h265` / `pf-av1` stubs, so no
 //!   *new* weight is added — but it is a heavier tail than the vp8 adoption, and no
 //!   published version drops it (0.0.12 is the latest). A candidate upstream feature-gate.
 //! - **Official conformance vectors**: 0.0.12 validates against its own clean-room
@@ -68,12 +68,12 @@ pub mod vp9dec;
 
 pub use vp9dec::Vp9Dec;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! vp9dec ! …")`). Typed `use` + constructor stays primary; this powers
-/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// `pf-launch` and one-liner tests. The descriptor is `&'static`, taken from a
 /// throwaway default instance; [`Vp9Dec`] is config-free (dimensions come from the
 /// frame header, announced at runtime).
 pub fn register(registry: &mut Registry) {

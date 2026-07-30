@@ -1,7 +1,7 @@
-//! `sc-ac3` — a pure-Rust **AC-3 (ATSC A/52)** + **E-AC-3 (Dolby Digital Plus,
+//! `pf-ac3` — a pure-Rust **AC-3 (ATSC A/52)** + **E-AC-3 (Dolby Digital Plus,
 //! A/52 Annex E)** audio decoder, hand-written clean-room from the standard.
 //!
-//! Unlike `sc-mp3` / `sc-aac` (which adopt a vetted third-party pure-Rust codec),
+//! Unlike `pf-mp3` / `pf-aac` (which adopt a vetted third-party pure-Rust codec),
 //! this crate implements the decoder itself, from ATSC A/52 (Digital Audio
 //! Compression (AC-3, E-AC-3) Standard) — no libav, no liba52, no oxideav. Every
 //! non-trivial step cites its A/52 section at the point of use (the repo's
@@ -96,12 +96,12 @@ pub mod tables;
 
 pub use element::{Ac3Dec, Eac3Dec};
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register both decoder elements for name-based construction (spec: Plugins —
 /// `parse("… ! ac3dec ! …")`). Typed `use` + constructor stays primary; this
-/// powers `streamcraft launch` and one-liner tests. Both descriptors are
+/// powers `profluens launch` and one-liner tests. Both descriptors are
 /// `&'static`, taken from throwaway default instances; the decoders are
 /// config-free (rate/channels come from the stream, announced at runtime).
 pub fn register(registry: &mut Registry) {

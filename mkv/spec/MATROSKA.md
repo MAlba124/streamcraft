@@ -1,4 +1,4 @@
-# EBML + Matroska (MKV) — spec summary for `sc-mkv`
+# EBML + Matroska (MKV) — spec summary for `pf-mkv`
 
 Interpretation notes and the normative element layout for the hand-written Matroska
 **muxer**, per the plugin conventions (spec: First-party codecs — "the RFC/spec gets
@@ -88,8 +88,8 @@ what the muxer writes.
     18538067  Segment                      [m]  (unknown-size, streamed — see Sizing)
       1549A966  Info                       [m]
         2AD7B1  TimestampScale             uint (1_000_000 ns → ms tick)
-        4D80    MuxingApp                  str  ("sc-mkv")
-        5741    WritingApp                 str  ("sc-mkv")
+        4D80    MuxingApp                  str  ("pf-mkv")
+        5741    WritingApp                 str  ("pf-mkv")
       1654AE6B  Tracks                     [m]
         AE      TrackEntry                 [m]   (one per configured track)
           D7    TrackNumber                uint (1-based)

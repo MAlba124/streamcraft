@@ -11,15 +11,15 @@
 //! The signal is a pure 1 kHz sine at 44100; after resampling to 48000 the recovered PCM must
 //! still be a 1 kHz sine (dominant frequency preserved) with the ratio-correct sample count.
 
-use streamcraft_audio::{output_len, AudioFormat, AudioResample, SampleFormat};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::FileSink;
+use profluens_audio::{output_len, AudioFormat, AudioResample, SampleFormat};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::FileSink;
 
 const PI: f64 = std::f64::consts::PI;
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_audioresample_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_audioresample_{}_{}.bin", tag, std::process::id()));
     p
 }
 
@@ -27,17 +27,17 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
 /// link-time negotiation fixes those on the resampler's sink and `AudioResample::new` can infer
 /// its input format — the piece `filesrc` (a `bytes` pad) can't provide. Emits S16 mono @ 44100.
 mod raw_src {
-    use streamcraft_audio::{FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
-    use streamcraft_core::batch::Inputs;
-    use streamcraft_core::ctx::Ctx;
-    use streamcraft_core::element::{
+    use profluens_audio::{FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
+    use profluens_core::batch::Inputs;
+    use profluens_core::ctx::Ctx;
+    use profluens_core::element::{
         Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
     };
-    use streamcraft_core::error::Error;
-    use streamcraft_core::event::Event;
-    use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-    use streamcraft_core::id::PadId;
-    use streamcraft_core::time::Timestamp;
+    use profluens_core::error::Error;
+    use profluens_core::event::Event;
+    use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+    use profluens_core::id::PadId;
+    use profluens_core::time::Timestamp;
 
     pub const RATE: i64 = 44_100;
     pub const CHANNELS: i64 = 1;

@@ -1,5 +1,5 @@
 //! [`AacDec`] — AAC audio decoder element over `oxideav-aac` (spec: Elements;
-//! adoption rubric in `sc-vp8`). Mirrors [`Mp3Dec`]'s contract: compressed audio
+//! adoption rubric in `pf-vp8`). Mirrors [`Mp3Dec`]'s contract: compressed audio
 //! in, **interleaved s16 `audio/raw`** out, format announced via dynamic caps the
 //! moment the first frame decodes.
 //!
@@ -21,25 +21,25 @@
 //! naturally (AAC frames are independent apart from the overlap-add tail). An
 //! unparseable ASC is a loud per-element error — nothing downstream can be right.
 //!
-//! [`Mp3Dec`]: ../../sc_mp3/index.html
+//! [`Mp3Dec`]: ../../pf_mp3/index.html
 
 use oxideav_aac::asc::AudioSpecificConfig;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::pcm::{interleave_s16_into, s16_slice_le_into};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
 const SRC_PAD: PadId = PadId(1);
 
@@ -122,7 +122,7 @@ struct Cfg {
 /// interleaved to §4.6.11 integer PCM the moment the frame is decoded. The planar decode borrows
 /// the per-`process()` arena (`ctx.scratch()`), so the decoded `PlanarFrame<&Arena>` cannot be
 /// parked across `process()` calls — it is consumed into `pending_pcm` (Global) inside the
-/// arena-borrow scope, and only this arena-free geometry is carried (streamcraft patch).
+/// arena-borrow scope, and only this arena-free geometry is carried (profluens patch).
 #[derive(Clone, Copy)]
 struct PendingPcm {
     /// Output channel count of the parked frame.

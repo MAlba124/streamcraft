@@ -30,7 +30,7 @@ use std::ffi::{c_void, CStr};
 
 use sdl3_sys::everything::*;
 
-use streamcraft_core::error::Error;
+use profluens_core::error::Error;
 
 use super::color::{ChromaMode, Colorimetry, FragUniforms};
 use super::{VIDEO_FRAG_SPV, VIDEO_VERT_SPV};

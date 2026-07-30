@@ -1,33 +1,33 @@
 //! Decode a raw AC-3 or E-AC-3 elementary stream through the real element to
 //! interleaved s16le — the direct-library probe for the two target files (the
-//! `sc-aac` `decode_adts` / `sc-h265` `decode_annexb` precedent: adoption gates
+//! `pf-aac` `decode_adts` / `pf-h265` `decode_annexb` precedent: adoption gates
 //! must include a real file, not just fixtures).
 //!
 //! Feeds the raw byte stream in chunks so the self-syncing framer
-//! ([`sc_ac3::parse`]) is exercised exactly as an AVI chunk / `filesrc` split
+//! ([`pf_ac3::parse`]) is exercised exactly as an AVI chunk / `filesrc` split
 //! would exercise it, then dumps the decoded PCM (channel order L,R,C,LFE,Ls,Rs).
 //!
 //! ```text
 //! ffmpeg -i movie.mkv -map 0:a:0 -c copy audio.eac3
-//! cargo run --release -p sc-ac3 --example decode_ac3 -- eac3 audio.eac3 out.s16le [max_frames]
+//! cargo run --release -p pf-ac3 --example decode_ac3 -- eac3 audio.eac3 out.s16le [max_frames]
 //! ffmpeg -i audio.eac3 -f s16le -ac 6 ref.s16le   # then compare (see snr.rs test)
 //! ```
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use sc_ac3::{Ac3Dec, Eac3Dec};
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_ac3::{Ac3Dec, Eac3Dec};
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 static BYTES_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 static SRC_PADS: [PadDesc; 1] = [PadDesc {
@@ -159,7 +159,7 @@ fn main() {
 
     let mut warns = 0;
     while let Some(msg) = p.bus().try_recv() {
-        if let streamcraft_core::bus::BusMessage::Warning { error, .. } = msg {
+        if let profluens_core::bus::BusMessage::Warning { error, .. } = msg {
             if warns < 8 {
                 eprintln!("warning: {error:?}");
             }

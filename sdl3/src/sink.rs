@@ -19,22 +19,22 @@
 //! `stop`). No compositor / no display degrades to dropping frames, not failure —
 //! a headless CI box must still finish the pipeline.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::clock::WaitOutcome;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::clock::WaitOutcome;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{
     ConstraintDesc, FieldDesc, FixedFormat, OfferDesc, Value, ValueDesc,
 };
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
 use crate::gpu::renderer::PlaneFormat;
 use crate::gpu::{Colorimetry, GpuRenderer};
@@ -43,7 +43,7 @@ use crate::video::VideoWindow;
 const SINK: PadId = PadId(0);
 
 // `video/raw` vocabulary — literals so the crate does not pin field-name identity to
-// streamcraft-video (the pipeline interns by string, so ids line up with any video peer).
+// profluens-video (the pipeline interns by string, so ids line up with any video peer).
 const FAMILY: &str = "video/raw";
 const F_WIDTH: &str = "width";
 const F_HEIGHT: &str = "height";
@@ -161,7 +161,7 @@ enum Backend {
     Classic,
 }
 
-/// The `SC_RENDER` env override: `gpu` forces the GPU path (no fallback attempt is
+/// The `PF_RENDER` env override: `gpu` forces the GPU path (no fallback attempt is
 /// skipped, but classic is not tried first), `classic` forces the classic path, and
 /// anything else (or unset) is `auto` — try GPU, fall back to classic.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -173,7 +173,7 @@ enum BackendPref {
 
 impl BackendPref {
     fn from_env() -> BackendPref {
-        match std::env::var("SC_RENDER").ok().as_deref() {
+        match std::env::var("PF_RENDER").ok().as_deref() {
             Some("gpu") => BackendPref::Gpu,
             Some("classic") => BackendPref::Classic,
             _ => BackendPref::Auto,
@@ -209,7 +209,7 @@ impl Sdl3VideoSink {
     #[allow(clippy::disallowed_methods)]
     pub fn new() -> Self {
         Self {
-            title: "streamcraft".to_string(),
+            title: "profluens".to_string(),
             window: None,
             gpu: None,
             backend: Backend::Classic,
@@ -300,7 +300,7 @@ impl Sdl3VideoSink {
         Ok(())
     }
 
-    /// Open a window and choose the presentation backend: `SC_RENDER=gpu|classic`
+    /// Open a window and choose the presentation backend: `PF_RENDER=gpu|classic`
     /// forces one; otherwise (auto) try the owned GPU pipeline and fall back to the
     /// classic `SDL_Renderer` path on any GPU init failure. Failing to open any window
     /// (headless / CI) disables the sink (frames drop) — never fails the pipeline.

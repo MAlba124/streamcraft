@@ -1,6 +1,6 @@
-//! streamcraft-core — the dependency-free heart of streamcraft.
+//! profluens-core — the dependency-free heart of profluens.
 //!
-//! The spec lives in `streamcraft.md` at the repo root; module ↔ spec map:
+//! The spec lives in `profluens.md` at the repo root; module ↔ spec map:
 //!
 //! - [`time`], [`id`], [`buffer`], [`batch`] — the vocabulary (spec: Buffer, Batching)
 //! - [`memory`] — pools, allocator vtable, refcounted views (spec: Memory)
@@ -27,7 +27,7 @@
 // so those modules can locally `#[allow(unsafe_code)]`.
 #![deny(unsafe_code)]
 // Temporary: the skeleton defines the type vocabulary before the modules are wired
-// together. Remove as the build order in streamcraft.md is worked through.
+// together. Remove as the build order in profluens.md is worked through.
 #![allow(dead_code)]
 
 pub mod batch;
@@ -42,7 +42,7 @@ pub mod event;
 pub mod format;
 pub mod harness;
 pub mod id;
-/// The introspection protocol + server (spec: Introspection protocol and scraft-scope).
+/// The introspection protocol + server (spec: Introspection protocol and pf-scope).
 /// Feature-gated; zero cost — and zero code — when `introspect` is off.
 #[cfg(feature = "introspect")]
 pub mod introspect;

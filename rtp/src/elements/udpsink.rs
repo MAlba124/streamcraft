@@ -12,15 +12,15 @@
 
 use std::net::{SocketAddr, UdpSocket};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::time::Timestamp;
 
 /// Accepts RTP packets or raw datagrams — either way, one buffer = one send.
 static OFFERS: [OfferDesc; 2] = [OfferDesc::any("rtp"), OfferDesc::any("datagram")];

@@ -1,18 +1,18 @@
 // temporary probe — decode a fixture via the element at two chunk sizes, dump stats.
 use std::sync::{Arc, Mutex};
 
-use sc_mp3::Mp3Dec;
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_mp3::Mp3Dec;
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 static BYTES_OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
 static SRC_PADS: [PadDesc; 1] = [PadDesc { name: "src", direction: Direction::Src, offers: &BYTES_OFFERS, dynamic: false, validate: None }];

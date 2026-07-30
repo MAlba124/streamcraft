@@ -2,7 +2,7 @@
 //! Formats — dynamic caps). H.264 Annex B access units arrive on the sink pad —
 //! **one access unit per buffer**, the demuxer contract — and raw I420 video
 //! leaves on the src pad, one frame per buffer, planes packed Y then U then V (the
-//! `video/raw` layout the streamcraft-video helpers describe).
+//! `video/raw` layout the profluens-video helpers describe).
 //!
 //! Unlike VP8 (RFC 6386 §9.1: one keyframe carries the dimensions and every frame
 //! is self-delimiting), H.264 dimensions live in the SPS (ITU-T H.264 §7.3.2.1),
@@ -31,23 +31,23 @@ use oxideav_h264::h264_decoder::H264CodecDecoder;
 
 use oxideav_core::{CodecId, Decoder, Error as OxError, Frame, Packet, TimeBase, VideoFrame};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
-use streamcraft_video::color;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
+use profluens_video::color;
 
 // `video/raw` family/field/value names. Kept as literals (not a dep on
-// streamcraft-video) so sc-h264 stays core-only, exactly as sc-vp8 does; the
+// profluens-video) so pf-h264 stays core-only, exactly as pf-vp8 does; the
 // pipeline interns by string, so the ids line up with any video peer using the
 // same names.
 const FAMILY: &str = "video/raw";
@@ -72,7 +72,7 @@ static SRC_FIELDS: [FieldDesc; 7] = [
     FieldDesc { field: F_WIDTH, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_HEIGHT, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: F_PIXFMT, allowed: ConstraintDesc::Set(&PIXFMT_VALUES), preferred: None },
-    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via streamcraft-video's
+    // Colorimetry passthrough (spec: Formats; ITU-T H.273 via profluens-video's
     // color vocab): announced only when the demuxer declared it upstream.
     FieldDesc { field: color::FIELD_MATRIX, allowed: ConstraintDesc::Any, preferred: None },
     FieldDesc { field: color::FIELD_RANGE, allowed: ConstraintDesc::Any, preferred: None },
@@ -193,7 +193,7 @@ impl H264Dec {
             pending: None,
             pts_fifo: VecDeque::new(),
             alloc_stalled: false,
-            // `TimeBase` here is cosmetic — streamcraft carries timing on the
+            // `TimeBase` here is cosmetic — profluens carries timing on the
             // buffer, not the packet — so a unit base keeps the library's pts
             // rescale a no-op. `data` starts empty and is refilled per frame.
             packet: Packet::new(0, TimeBase::new(1, 1), Vec::new()),
@@ -469,7 +469,7 @@ impl Element for H264Dec {
 /// Colorimetry passthrough (spec: Formats — dynamic caps): forward the container's
 /// announced colour fields from the negotiated sink format onto `video/raw`, names
 /// re-anchored to `'static` through the closed color vocabulary (ITU-T H.273 via
-/// `streamcraft_video::color`). Absent/unknown fields stay unannounced — the
+/// `profluens_video::color`). Absent/unknown fields stay unannounced — the
 /// renderer defaults by resolution.
 fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDesc)>) {
     let Some(fmt) = ctx.negotiated(pad) else { return };
@@ -482,7 +482,7 @@ fn color_passthrough(ctx: &Ctx, pad: PadId, out: &mut Vec<(&'static str, ValueDe
     ];
     for (field, statify) in table {
         let Some(fid) = ctx.field_id(field) else { continue };
-        let Some(streamcraft_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
+        let Some(profluens_core::format::Value::Id(vid)) = fmt.get(fid) else { continue };
         let Some(stat) = ctx.value_name(vid).and_then(statify) else { continue };
         out.push((field, ValueDesc::Id(stat)));
     }

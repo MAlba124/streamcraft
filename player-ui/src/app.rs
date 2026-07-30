@@ -1,6 +1,6 @@
 //! The application glue: build the [`Player`] with external video, splice in the
 //! frame-slot sink, spawn the streaming thread, and drive the GUI loop on the main thread
-//! (spec: streamcraft.md UI `<update>` §1209).
+//! (spec: profluens.md UI `<update>` §1209).
 //!
 //! # Threading (why this shape)
 //!
@@ -21,15 +21,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sc_play::{Player, SinkChoice, SinkPolicy};
-use sc_vaapi::gpuframe::GpuFrameChannel;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::id::ElementId;
-use streamcraft_core::pipeline::{SeekHandle, SeekIndex};
-use streamcraft_core::time::Timestamp;
+use pf_play::{Player, SinkChoice, SinkPolicy};
+use pf_vaapi::gpuframe::GpuFrameChannel;
+use profluens_core::bus::BusMessage;
+use profluens_core::id::ElementId;
+use profluens_core::pipeline::{SeekHandle, SeekIndex};
+use profluens_core::time::Timestamp;
 
-use streamcraft_scope::ui::widgets::UiState;
-use streamcraft_scope::ui::{Font, Key, Ui};
+use profluens_scope::ui::widgets::UiState;
+use profluens_scope::ui::{Font, Key, Ui};
 
 use crate::backend::Backend;
 use crate::framesink::{FrameSlot, FrameSlotSink};
@@ -105,7 +105,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // decoder's shared pool (the same lesson autoplug applies to the SDL sink's peer).
     player.pipeline.set_queue_capacity(sink_id, 8);
     eprintln!(
-        "scplay-ui: decode path = {}",
+        "pfplay-ui: decode path = {}",
         if zerocopy { "VA-API zero-copy (DMA-BUF → EGL)" } else { "CPU frame-slot (readback/software)" }
     );
 
@@ -122,7 +122,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let tap = player.pipeline.tap_handle();
 
     // Spawn the streaming thread: run() blocks to EOS/stop. We surface bus Warnings/Qos
-    // after it returns, like scplay.
+    // after it returns, like pfplay.
     let stream = std::thread::spawn(move || {
         let result = player.run();
         let mut warnings = Vec::new();
@@ -162,10 +162,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
 /// The transport handles + read-only tables the GUI loop drives against.
 struct GuiHandles<'a> {
-    pause: streamcraft_core::pipeline::PauseHandle,
+    pause: profluens_core::pipeline::PauseHandle,
     seek: SeekHandle,
-    stop: &'a streamcraft_core::pipeline::StopHandle,
-    tap: streamcraft_core::counters::TapHandle,
+    stop: &'a profluens_core::pipeline::StopHandle,
+    tap: profluens_core::counters::TapHandle,
     seek_index: SeekIndex,
     duration: Timestamp,
 }
@@ -231,14 +231,14 @@ fn gui_loop(
     // reports what actually happened — but a zero-copy DECODER wired to a fallen-back
     // SDL_Renderer backend cannot display (`video/gpu` has no CPU pixels), so the caller only
     // requests zero-copy when it does not force headless (see `run`).
-    let mut backend = Backend::open("streamcraft — scplay-ui", 1280, 720, &font, zerocopy)
+    let mut backend = Backend::open("profluens — pfplay-ui", 1280, 720, &font, zerocopy)
         .map_err(|e| format!("open window: {e}"))?;
     if zerocopy && !backend.is_gl() {
         // The decoder is exporting DMA-BUFs but the GLES/EGL backend did not stand up — there
         // is no CPU-pixel path for `video/gpu`. Report it honestly; the video will not show,
         // but audio + UI still run (a degraded, not crashed, state the user can see).
         eprintln!(
-            "scplay-ui: WARNING — zero-copy decoder is active but the GLES/EGL backend did not \
+            "pfplay-ui: WARNING — zero-copy decoder is active but the GLES/EGL backend did not \
              initialize; video will not display. Re-run on a machine with EGL DMA-BUF import, or \
              the SDL_Renderer fallback (software/readback decode) will show video."
         );
@@ -257,7 +257,7 @@ fn gui_loop(
     // Zero-copy: the token of the frame currently on screen. We release it only when the NEXT
     // frame replaces it — NOT right after import — so the decoder can't reclaim+overwrite a
     // surface that's still being displayed (that caused the on-seek stale-frame flashes).
-    let mut held_token: Option<sc_vaapi::gpuframe::FrameToken> = None;
+    let mut held_token: Option<pf_vaapi::gpuframe::FrameToken> = None;
 
     // fps + delta tracking. `prev` holds the last stats snapshot per watched element.
     let mut prev_counters: Vec<(u64, u64)> = vec![(0, 0); watched.len()];
@@ -400,7 +400,7 @@ fn gui_loop(
         }
 
         // Position: running time from the tap clock (the audio DAC timeline), which is what
-        // the transport bar and the timeline report — the same source scplay prints.
+        // the transport bar and the timeline report — the same source pfplay prints.
         let position = h.tap.now();
         let paused = h.pause.is_paused();
         let (ww, wh) = backend.window_size();
@@ -519,7 +519,7 @@ fn apply_actions(h: &GuiHandles, a: UiActions) {
 
 /// Seek to an absolute stream time via the seek index (resolve time→byte, then
 /// `seek(byte, landed)` — seek to the RESOLVED cue, not the request, per SeekIndex::resolve
-/// and scplay's digit-seek).
+/// and pfplay's digit-seek).
 fn seek_absolute(h: &GuiHandles, target: Timestamp) {
     if let Some((byte, landed)) = h.seek_index.resolve(target, h.duration) {
         h.seek.seek(byte, landed);

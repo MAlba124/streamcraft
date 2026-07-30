@@ -1,4 +1,4 @@
-//! streamcraft-video integration tests (spec: Milestone applications §5 — the
+//! profluens-video integration tests (spec: Milestone applications §5 — the
 //! no-decoder video path; Testing — one integration binary per crate). One binary to
 //! keep link time down:
 //!
@@ -16,24 +16,24 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::clock::MockClock;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::clock::MockClock;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::{Rational, Timestamp};
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::{Rational, Timestamp};
 
-use streamcraft_elements::io::FileSrc;
-use streamcraft_video::format::PixelFormat;
-use streamcraft_video::geometry::{frame_size, plane_count, plane_geometry, plane_offset};
-use streamcraft_video::sink::checksum;
-use streamcraft_video::testsrc::{frame_pattern_byte, frame_pts};
-use streamcraft_video::{RawVideoParse, VideoCkSink, VideoFormat, VideoTestSrc};
+use profluens_elements::io::FileSrc;
+use profluens_video::format::PixelFormat;
+use profluens_video::geometry::{frame_size, plane_count, plane_geometry, plane_offset};
+use profluens_video::sink::checksum;
+use profluens_video::testsrc::{frame_pattern_byte, frame_pts};
+use profluens_video::{RawVideoParse, VideoCkSink, VideoFormat, VideoTestSrc};
 
 // --- 1. Geometry tables -------------------------------------------------------------
 
@@ -168,7 +168,7 @@ fn filesrc_rawvideoparse_chunks_a_raw_file_into_frames() {
         }
     }
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("sc_video_test_{}.raw", std::process::id()));
+    let path = dir.join(format!("pf_video_test_{}.raw", std::process::id()));
     std::fs::write(&path, &raw).expect("write temp raw file");
 
     let clock = MockClock::new();
@@ -324,7 +324,7 @@ fn incompatible_pixfmt_fails_negotiation_at_link() {
 
 #[test]
 fn videotestsrc_props_override_constructor_defaults() {
-    use streamcraft_core::format::Value;
+    use profluens_core::format::Value;
 
     // Placeholder construction values — every one is overridden below.
     let ctor = VideoFormat::new(320, 240, PixelFormat::Rgb24, Rational::new(25, 1));

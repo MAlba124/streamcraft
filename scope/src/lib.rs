@@ -1,7 +1,7 @@
-//! streamcraft-scope — the inspector (spec: Introspection protocol and scraft-scope).
+//! profluens-scope — the inspector (spec: Introspection protocol and pf-scope).
 //!
 //! Two modes over one binary protocol:
-//! - **Attach**: the `scraft-scope` binary connects to any running streamcraft app
+//! - **Attach**: the `pf-scope` binary connects to any running profluens app
 //!   by socket — zero code in the target beyond core's `introspect` feature.
 //! - **Embed**: [`Scope::spawn`] runs the same UI in-process on its own thread
 //!   for dev builds — one line in `main`, same protocol underneath.
@@ -25,7 +25,7 @@ pub mod client;
 pub mod layout;
 pub mod ui;
 
-use streamcraft_core::pipeline::Pipeline;
+use profluens_core::pipeline::Pipeline;
 
 /// In-process inspector handle (embed mode).
 pub struct Scope {
@@ -42,15 +42,15 @@ impl Scope {
     /// window creation to the main thread; attach mode is the primary path, embed
     /// is best-effort for dev builds.
     pub fn spawn(pipeline: &mut Pipeline) -> std::io::Result<Scope> {
-        let path = std::env::temp_dir().join(format!("scraft-scope-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pf-scope-{}.sock", std::process::id()));
         pipeline
             .serve_introspection(&path)
             .map_err(|e| std::io::Error::other(format!("serve_introspection: {e:?}")))?;
         let thread = std::thread::Builder::new()
-            .name("scraft-scope".into())
+            .name("pf-scope".into())
             .spawn(move || {
                 if let Err(e) = app::run(&path, app::AppOpts::default()) {
-                    eprintln!("scraft-scope (embed): {e}");
+                    eprintln!("pf-scope (embed): {e}");
                 }
             })?;
         Ok(Scope { thread: Some(thread) })

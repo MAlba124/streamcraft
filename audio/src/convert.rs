@@ -329,7 +329,7 @@ const M3DB: f32 = std::f32::consts::FRAC_1_SQRT_2; // 0.70710677
 /// stereo mix). This is what lets a 5.1 AC-3/E-AC-3 track (which has no stereo companion,
 /// unlike the AAC movie tracks that ship an explicit 2-channel mix) play on a stereo device.
 ///
-/// **Channel order is assumed canonical SMPTE/ITU order** — the order the streamcraft AC-3 /
+/// **Channel order is assumed canonical SMPTE/ITU order** — the order the profluens AC-3 /
 /// E-AC-3 decoder emits: `L, R, C, LFE, Ls, Rs` (and, for 7.1, `…, Lb, Rb`). Decoders that
 /// emit a different interleave (e.g. raw AAC's `C, L, R, …`) must reorder to this canonical
 /// order *before* the downmix, or route their explicit stereo track instead. The layout is

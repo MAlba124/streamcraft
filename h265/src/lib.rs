@@ -1,6 +1,6 @@
-//! sc-h265 — the H.265 / HEVC (ITU-T H.265 | ISO/IEC 23008-2) codec plugin.
+//! pf-h265 — the H.265 / HEVC (ITU-T H.265 | ISO/IEC 23008-2) codec plugin.
 //!
-//! Like sc-vp8, this crate is **not** hand-written: it wraps
+//! Like pf-vp8, this crate is **not** hand-written: it wraps
 //! [`oxideav-h265`](https://github.com/OxideAV/oxideav-h265), a pure-Rust HEVC
 //! decoder adopted after review (2026-07-24). The spec's codec taboo is FFI walls —
 //! a foreign allocator, threading model, and timestamp semantics dragged in behind a
@@ -16,7 +16,7 @@
 //! ## Why it passed the rubric (vet, 2026-07-24)
 //!
 //! The crates.io blurb still calls it a "bitstream parser + decoder scaffold", but —
-//! exactly as with sc-vp8's stale blurb — the README / CHANGELOG / tests / source
+//! exactly as with pf-vp8's stale blurb — the README / CHANGELOG / tests / source
 //! tell a different, production-complete story, and a byte-exact test against a real
 //! x265-produced stream settled it:
 //!
@@ -68,7 +68,7 @@
 //!
 //! ## The one wart, and the nativization debt (tracked in PLAN.md)
 //!
-//! - **Non-zero dependency, unlike sc-vp8.** At 0.0.9 (the only non-yanked version)
+//! - **Non-zero dependency, unlike pf-vp8.** At 0.0.9 (the only non-yanked version)
 //!   `oxideav-h265` depends unconditionally on `oxideav-core`, which pulls
 //!   `serde_json` + `thiserror` + `bytemuck` (and their build-time proc-macro tree)
 //!   transitively. `oxideav-core` is used **only** in the crate's `decoder` / `encoder`
@@ -97,12 +97,12 @@ pub mod h265dec;
 
 pub use h265dec::H265Dec;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! h265dec ! …")`). Typed `use` + constructor stays primary; this powers
-/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// `pf-launch` and one-liner tests. The descriptor is `&'static`, taken from a
 /// throwaway default instance; [`H265Dec`] is config-free (dimensions come from the
 /// SPS, announced at runtime).
 pub fn register(registry: &mut Registry) {

@@ -1,7 +1,7 @@
 //! The opt-in element registry and the parse-launch grammar (spec: Plugins). `use`
 //! plus typed construction (`pipeline.add(FileSrc::new(path))`) stays the primary
 //! path — rustc is the registry there. This module is the *second* layer: "element by
-//! name", for `scraft-launch`, quick tests, and bug-report one-liners.
+//! name", for `pf-launch`, quick tests, and bug-report one-liners.
 //!
 //! A plugin crate exposes `pub fn register(&mut Registry)` handing over its elements'
 //! `&'static ElementDesc`s (each with a `make_default` factory and `props`

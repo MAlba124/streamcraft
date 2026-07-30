@@ -1,29 +1,29 @@
 //! End-to-end tests for the registry / parse-launch path (spec: Plugins). These build
-//! real pipelines from launch strings — the same surface `scraft-launch` drives — and
+//! real pipelines from launch strings — the same surface `pf-launch` drives — and
 //! run them to EOS, so a regression in the grammar, the descriptors, or the string
 //! props shows up here.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sc_flac::FlacDecoder;
-use streamcraft_audio::{write_pcm_wav, AudioFormat, SampleFormat};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::registry::Registry;
+use pf_flac::FlacDecoder;
+use profluens_audio::{write_pcm_wav, AudioFormat, SampleFormat};
+use profluens_core::pipeline::Pipeline;
+use profluens_core::registry::Registry;
 
-/// The registry every test uses — the same aggregation `scraft-launch` builds.
+/// The registry every test uses — the same aggregation `pf-launch` builds.
 fn registry() -> Registry {
     let mut r = Registry::new();
-    streamcraft_elements::register(&mut r);
-    streamcraft_audio::register(&mut r);
-    sc_flac::register(&mut r);
-    sc_ogg::register(&mut r);
-    streamcraft_video::register(&mut r);
-    sc_vp8::register(&mut r);
-    sc_vp9::register(&mut r);
-    sc_av1::register(&mut r);
-    sc_h264::register(&mut r);
-    sc_h265::register(&mut r);
+    profluens_elements::register(&mut r);
+    profluens_audio::register(&mut r);
+    pf_flac::register(&mut r);
+    pf_ogg::register(&mut r);
+    profluens_video::register(&mut r);
+    pf_vp8::register(&mut r);
+    pf_vp9::register(&mut r);
+    pf_av1::register(&mut r);
+    pf_h264::register(&mut r);
+    pf_h265::register(&mut r);
     r
 }
 
@@ -32,7 +32,7 @@ fn temp_path(stem: &str, ext: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("sc_launch_{stem}_{pid}_{n}.{ext}"))
+    std::env::temp_dir().join(format!("pf_launch_{stem}_{pid}_{n}.{ext}"))
 }
 
 /// Generate a small stereo S16 WAV (a 440 Hz sine, 0.1 s) in the temp dir.

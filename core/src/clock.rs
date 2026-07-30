@@ -100,7 +100,7 @@ pub struct InstantClock {
     /// One wake station shared by every wait this clock hands out, so `new_wait` is
     /// allocation-free (it clones an `Arc`, not a fresh `Mutex`+`Condvar`). `new_wait` is
     /// called per pacing wait — once per buffer per element — and profiled as ~5% of *all*
-    /// heap allocations when each call built its own `Wake` (streamcraft patch). Real time
+    /// heap allocations when each call built its own `Wake` (profluens patch). Real time
     /// advances on its own, so the shared condvar is only ever touched by `interrupt`, which
     /// production never calls on a real-clock wait (interruption goes through `wait_ticked` +
     /// the caller's seek-generation re-check); a spurious cross-waiter wake is re-checked and

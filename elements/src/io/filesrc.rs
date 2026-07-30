@@ -6,19 +6,19 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{Constraint, OfferDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::io::{FileHandle, IoResult};
-use streamcraft_core::log;
-use streamcraft_core::log::Level;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{Constraint, OfferDesc};
+use profluens_core::id::PadId;
+use profluens_core::io::{FileHandle, IoResult};
+use profluens_core::log;
+use profluens_core::log::Level;
+use profluens_core::time::Timestamp;
 
 /// A file is an untyped byte stream — offer the open `bytes` family, no fields.
 static OFFERS: [OfferDesc; 1] = [OfferDesc::any("bytes")];
@@ -35,7 +35,7 @@ static PADS: [PadDesc; 1] = [PadDesc {
 /// string: `Constraint::Any` (paths ride `Value::Id`; see [`Pipeline::set_str`]).
 /// Structural (`live: false`): opening the file is a `start()`-time act.
 ///
-/// [`Pipeline::set_str`]: streamcraft_core::pipeline::Pipeline::set_str
+/// [`Pipeline::set_str`]: profluens_core::pipeline::Pipeline::set_str
 static PROPS: [PropDesc; 1] = [PropDesc {
     name: "path",
     allowed: Constraint::Any,
@@ -96,7 +96,7 @@ impl Element for FileSrc {
         // A parsed `path=` overrides the constructor value (spec: Plugins — the string
         // rides `Value::Id`, resolved by name off the value vocabulary). Falls back to
         // the constructor path when unset (the typed `FileSrc::new(path)` path).
-        if let Some(streamcraft_core::format::Value::Id(id)) = ctx.prop("path") {
+        if let Some(profluens_core::format::Value::Id(id)) = ctx.prop("path") {
             if let Some(s) = ctx.value_name(id) {
                 self.path = PathBuf::from(s);
             }

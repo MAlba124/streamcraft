@@ -60,7 +60,7 @@ use crate::md5::md5_hex;
 use crate::sdp::{self, encode_base64, Sdp};
 
 /// Cap on a response head, so a peer that never terminates its headers
-/// can't make us buffer unboundedly (same guard as sc-http's).
+/// can't make us buffer unboundedly (same guard as pf-http's).
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 /// Cap on a response body — DESCRIBE SDP payloads are a few KB; anything
@@ -484,7 +484,7 @@ impl RtspClient {
 
         // §6.1 Request-Line: Method SP Request-URI SP RTSP-Version CRLF.
         let mut req = format!("{method} {url} RTSP/1.0\r\nCSeq: {cseq}\r\n");
-        req.push_str("User-Agent: streamcraft\r\n");
+        req.push_str("User-Agent: profluens\r\n");
         if let Some(s) = &self.session {
             req.push_str(&format!("Session: {}\r\n", s.id));
         }

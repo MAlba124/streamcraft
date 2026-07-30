@@ -3,7 +3,7 @@
 //!
 //! Presentation path: one streaming **IYUV** texture (`SDL_PIXELFORMAT_IYUV` *is*
 //! tightly-packed planar I420, chroma dims `ceil(w/2) × ceil(h/2)` — the same
-//! ffmpeg-convention layout `streamcraft-video` uses), uploaded per frame with
+//! ffmpeg-convention layout `profluens-video` uses), uploaded per frame with
 //! `SDL_UpdateYUVTexture` and drawn with letterboxed logical presentation. YUV→RGB
 //! happens on the GPU via SDL's renderer — the CPU conversion the old shm sink
 //! carried is gone. Gray8 presents as IYUV with constant-128 chroma planes
@@ -11,7 +11,7 @@
 //!
 //! Threading: everything here runs on the calling element's thread. SDL officially
 //! prefers video on the process main thread; on Linux (Wayland/X11 drivers — this
-//! crate's posture, like `sc-pipewire`) the video subsystem is an in-process
+//! crate's posture, like `pf-pipewire`) the video subsystem is an in-process
 //! protocol client and works from a single non-main thread. One window per
 //! process — matching the one-video-sink-per-pipeline reality.
 
@@ -21,7 +21,7 @@ use std::ffi::{c_int, CStr, CString};
 
 use sdl3_sys::everything::*;
 
-use streamcraft_core::error::Error;
+use profluens_core::error::Error;
 
 /// The last SDL error as a `String` (empty when SDL has none).
 fn sdl_error() -> String {

@@ -1,30 +1,30 @@
 //! Decode an ADTS AAC file through `AacDec` to raw s16le — the direct-library
-//! probe for real-world files (the `sc-h265` `decode_annexb` precedent: adoption
+//! probe for real-world files (the `pf-h265` `decode_annexb` precedent: adoption
 //! gates must include a real file, not just fixtures). Strips the ADTS framing
 //! (ISO/IEC 14496-3 §1.A.2.2) into the raw AUs + synthesized ASC our demuxers
 //! deliver, so it exercises exactly the container-shaped element contract.
 //!
 //! ```text
 //! ffmpeg -i movie.mkv -map 0:a -c copy -f adts audio.adts
-//! cargo run --release -p sc-aac --example decode_adts -- audio.adts out.s16le [max_aus]
+//! cargo run --release -p pf-aac --example decode_adts -- audio.adts out.s16le [max_aus]
 //! ffmpeg -i audio.adts -f s16le ref.s16le   # then compare
 //! ```
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use sc_aac::AacDec;
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use pf_aac::AacDec;
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 fn adts_to_aus(data: &[u8], max: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut aus = Vec::new();
@@ -169,7 +169,7 @@ fn main() {
     p.link((dec, "src"), (sink, "sink")).expect("aacdec ! sink");
     p.run().expect("run");
     while let Some(msg) = p.bus().try_recv() {
-        if let streamcraft_core::bus::BusMessage::Warning { error, .. } = msg {
+        if let profluens_core::bus::BusMessage::Warning { error, .. } = msg {
             eprintln!("warning: {error:?}");
         }
     }

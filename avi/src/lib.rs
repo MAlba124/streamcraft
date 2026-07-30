@@ -1,11 +1,11 @@
-//! sc-avi — a hand-written, dependency-free **AVI (RIFF) container demuxer** for streamcraft.
+//! pf-avi — a hand-written, dependency-free **AVI (RIFF) container demuxer** for profluens.
 //!
 //! AVI is a RIFF document (Microsoft *AVI RIFF File Reference*,
 //! `learn.microsoft.com/windows/win32/directshow/avi-riff-file-reference`; the
 //! `OpenDML AVI File Format Extensions v1.02` specification for the >1 GB extensions). This
 //! crate implements the read/demux side entirely by hand — no libavformat, no libav — with
 //! the byte grammar and structure cited at point of use in [`riff`]. Layout mirrors the
-//! `sc-mkv`/`sc-ogg` plugins: a thin `lib.rs` re-exporting the public surface, a
+//! `pf-mkv`/`pf-ogg` plugins: a thin `lib.rs` re-exporting the public surface, a
 //! core-independent parser ([`riff`]), a codec→family map ([`codec`]), and the demuxer
 //! element ([`element`]).
 //!
@@ -19,9 +19,9 @@
 //! - [`codec`] — the fourcc / WAVEFORMATEX-tag → announce-family map ([`family_for`]) and the
 //!   per-stream offer menus. Video keys on the fourcc (`XVID`/`DX50`/`DIVX`/… → `mpeg4/asp`,
 //!   case-insensitive; `H264`/`avc1` → `h264/annexb`); audio on the tag (`0x2000`/`0x2001` →
-//!   `ac3`, `0x0055` → `mp3`, `0x0001` → `audio/raw`). The families match the streamcraft
+//!   `ac3`, `0x0055` → `mp3`, `0x0001` → `audio/raw`). The families match the profluens
 //!   decoders' sink offers so negotiation-driven autoplug selects the right one.
-//! - [`AviDemux`] — the streamcraft demuxer **element** ([`element`]): an AVI byte stream in
+//! - [`AviDemux`] — the profluens demuxer **element** ([`element`]): an AVI byte stream in
 //!   on `sink`, one **dynamic src pad per stream** out. Track discovery is
 //!   constructor-supplied ([`AviDemux::new`] takes the header prefix — a mid-pipeline element
 //!   gets no input during preroll), one demuxed chunk per output buffer stamped with a PTS,
@@ -63,9 +63,9 @@ pub use riff::{
     MoviWalker, Stream, StreamKind,
 };
 
-use streamcraft_core::element::Element;
-use streamcraft_core::pipeline::SeekIndex;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::pipeline::SeekIndex;
+use profluens_core::registry::Registry;
 
 /// Build a time→byte [`SeekIndex`] for an AVI file from its header prefix + its raw `idx1`
 /// payload (the bytes of the `idx1` chunk *after* its 8-byte id+size header). This is the

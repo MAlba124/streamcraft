@@ -9,17 +9,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
 
 static SRC_FIELDS: [FieldDesc; 1] =
     [FieldDesc { field: "rate", allowed: ConstraintDesc::Any, preferred: None }];
@@ -173,7 +173,7 @@ fn mid_batch_position_survives_a_forwarding_transport() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut p = Pipeline::new();
     let src = p.add(AnnSrc { emitted: false });
-    let q = p.add(streamcraft_elements::flow::Queue::new());
+    let q = p.add(profluens_elements::flow::Queue::new());
     let snk = p.add(OrderSink { seen: Arc::clone(&seen) });
     p.link((src, "src"), (q, "sink")).expect("src!q");
     p.link((q, "src"), (snk, "sink")).expect("q!snk");

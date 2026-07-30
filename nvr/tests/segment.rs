@@ -10,10 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::FileSrc;
-use streamcraft_elements::testing::TestSink;
-use streamcraft_nvr::MkvSegmentSink;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::FileSrc;
+use profluens_elements::testing::TestSink;
+use profluens_nvr::MkvSegmentSink;
 
 fn tool(name: &str) -> Option<PathBuf> {
     let out = Command::new("which").arg(name).output().ok()?;
@@ -47,7 +47,7 @@ fn header_prefix(path: &Path) -> Vec<u8> {
     head.truncate(n);
     let cluster = head
         .windows(4)
-        .position(|w| w == sc_mkv::ebml::id::CLUSTER)
+        .position(|w| w == pf_mkv::ebml::id::CLUSTER)
         .expect("no Cluster in fixture head");
     head.truncate(cluster);
     head
@@ -107,7 +107,7 @@ fn segments_rotate_and_validate_externally() {
     // One AU per buffer is the sink's contract; 4 MiB slots dwarf any 640x360 AU.
     p.set_pool(4 * 1024 * 1024, 24);
     let src = p.add(FileSrc::new(fixture.to_str().unwrap()));
-    let demux = p.add(sc_mkv::MkvDemux::new(header));
+    let demux = p.add(pf_mkv::MkvDemux::new(header));
     p.link((src, "src"), (demux, "sink")).expect("src ! demux");
     let added = p.preroll().expect("preroll");
 
@@ -140,7 +140,7 @@ fn segments_rotate_and_validate_externally() {
     for (i, seg) in segments.iter().enumerate() {
         // (a) our reader: parses, and the patched Duration is real (not 0).
         let head = header_prefix(seg);
-        let mut r = sc_mkv::MatroskaReader::new();
+        let mut r = pf_mkv::MatroskaReader::new();
         r.push(&head).expect("segment header parses");
         let dur_ns = r.duration_ns().expect("segment has a Duration");
         assert!(dur_ns > 0, "Duration patch applied on {}", seg.display());

@@ -1,59 +1,60 @@
 [package]
-name = "sc-play"
-description = "General-purpose media player for streamcraft: probe a container, autoplug the pipeline, and play"
+name = "pf-play"
+description = "General-purpose media player for profluens: probe a container, autoplug the pipeline, and play"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_play"
+name = "pf_play"
 
 [[bin]]
-name = "scplay"
-path = "src/bin/scplay.rs"
+name = "pfplay"
+path = "src/bin/pfplay.rs"
 
 [dependencies]
 # The framework: pipeline, negotiation-driven linking, the seek index, the tap/pause/
 # stop handles the controller drives.
-streamcraft-core = { path = "../core" }
+profluens-core = { path = "../core" }
 # The byte source and the drop sink (headless / no-decoder pads).
-streamcraft-elements = { path = "../elements" }
+profluens-elements = { path = "../elements" }
 # Audio glue for the "decoder → sink negotiation failed" fallback (convert, then
 # convert+resample) and the WAV parser for elementary .wav files.
-streamcraft-audio = { path = "../audio" }
+profluens-audio = { path = "../audio" }
 # The headless video drop sink: `VideoCkSink` accepts `video/raw`, which `TestSink`
 # (bytes only) cannot — a decoded frame must land somewhere on `--no-window`.
-streamcraft-video = { path = "../video" }
+profluens-video = { path = "../video" }
 # Demuxers.
-sc-mkv = { path = "../mkv" }
-sc-mp4 = { path = "../mp4" }
-sc-ogg = { path = "../ogg" }
-sc-avi = { path = "../avi" }
+pf-mkv = { path = "../mkv" }
+pf-mp4 = { path = "../mp4" }
+pf-ogg = { path = "../ogg" }
+pf-avi = { path = "../avi" }
 # Audio decoders.
-sc-aac = { path = "../aac" }
-sc-flac = { path = "../flac" }
-sc-mp3 = { path = "../mp3" }
+pf-aac = { path = "../aac" }
+pf-flac = { path = "../flac" }
+pf-opus = { path = "../opus" }
+pf-mp3 = { path = "../mp3" }
 # AC-3 (ATSC A/52) + E-AC-3 (Dolby Digital Plus) — the 5.1 tracks in BluRay/WEB-DL rips.
-sc-ac3 = { path = "../ac3" }
+pf-ac3 = { path = "../ac3" }
 # Subtitles: the SRT/WebVTT/ASS parser + the non-blocking overlay compositor the autoplug
 # controller inserts between the video decoder and the sink when a file carries subtitles.
-sc-text = { path = "../text" }
+pf-text = { path = "../text" }
 # Software video decoders.
-sc-vp8 = { path = "../vp8" }
-sc-vp9 = { path = "../vp9" }
-sc-av1 = { path = "../av1" }
-sc-h264 = { path = "../h264" }
-sc-h265 = { path = "../h265" }
+pf-vp8 = { path = "../vp8" }
+pf-vp9 = { path = "../vp9" }
+pf-av1 = { path = "../av1" }
+pf-h264 = { path = "../h264" }
+pf-h265 = { path = "../h265" }
 # MPEG-4 Part 2 (ASP / XviD / DivX) — the video in classic `.avi` rips.
-sc-mpeg4p2 = { path = "../mpeg4p2" }
-# Hardware-first video decode, capability-gated (respects SC_NO_VAAPI).
-sc-vaapi = { path = "../vaapi" }
+pf-mpeg4p2 = { path = "../mpeg4p2" }
+# Hardware-first video decode, capability-gated (respects PF_NO_VAAPI).
+pf-vaapi = { path = "../vaapi" }
 # The raw-wire Wayland presenter: `waylandvideosink` (zero-copy dmabuf) + `waylandrawsink`
 # (software video/raw → wl_shm). No SDL — this is the whole window path now.
-sc-present = { path = "../present" }
-sc-pipewire = { path = "../pipewire" }
-# The h264 decoder churns malloc internally (see sdl3/examples/play_file.rs) — the `scplay`
+pf-present = { path = "../present" }
+pf-pipewire = { path = "../pipewire" }
+# The h264 decoder churns malloc internally (see sdl3/examples/play_file.rs) — the `pfplay`
 # binary swaps the global allocator to mimalloc for playback headroom. Only the binary uses
 # it (`#[global_allocator]`); the library stays allocator-agnostic. Gated behind the default
 # `mimalloc` feature so an allocation profile can build with the system allocator
@@ -62,7 +63,7 @@ mimalloc = { version = "0.1.52", optional = true }
 
 [features]
 default = ["mimalloc"]
-# Enables the mimalloc global allocator in the `scplay` binary. Turn off
-# (`cargo build -p sc-play --no-default-features`) for heaptrack/valgrind, which need the
+# Enables the mimalloc global allocator in the `pfplay` binary. Turn off
+# (`cargo build -p pf-play --no-default-features`) for heaptrack/valgrind, which need the
 # system allocator to observe the decode-path allocations.
 mimalloc = ["dep:mimalloc"]

@@ -4,11 +4,11 @@
 //! which keeps the generator trivial and seeking exact.
 //!
 //! ```text
-//! cargo run --release -p sc-mkv --example make_vp8_sample -- OUT.mkv [SECONDS] [WIDTH HEIGHT]
+//! cargo run --release -p pf-mkv --example make_vp8_sample -- OUT.mkv [SECONDS] [WIDTH HEIGHT]
 //! ```
 
 use oxideav_vp8::encoder::{encode_keyframe, I420Frame, KeyframeParams};
-use sc_mkv::{MatroskaWriter, TrackConfig};
+use pf_mkv::{MatroskaWriter, TrackConfig};
 
 const FPS: u64 = 30;
 

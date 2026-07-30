@@ -1,22 +1,22 @@
 //! Hardware VA-API decode tests. These *require a real device* and skip cleanly
-//! (print + return) when [`sc_vaapi::probe`] reports none (or `SC_NO_VAAPI=1`), so
+//! (print + return) when [`pf_vaapi::probe`] reports none (or `PF_NO_VAAPI=1`), so
 //! the suite is green on a machine without the hardware and exercises the real GPU
 //! path where one exists.
 //!
 //! The end-to-end decode pulls the first access units of `../output.mkv` (a real
-//! `V_MPEG4/ISO/AVC` file) through the element via `sc-mkv`'s reader + AVCC→Annex-B
+//! `V_MPEG4/ISO/AVC` file) through the element via `pf-mkv`'s reader + AVCC→Annex-B
 //! reframer, and asserts plausible NV12 frames come out. Skipped when the fixture
 //! is absent.
 
 use std::path::Path;
 
-use sc_mkv::{nal_head_from_config, MatroskaReader, Reframer};
-use streamcraft_core::event::Event;
-use streamcraft_core::format::Value;
-use streamcraft_core::harness::Harness;
-use streamcraft_core::time::Timestamp;
+use pf_mkv::{nal_head_from_config, MatroskaReader, Reframer};
+use profluens_core::event::Event;
+use profluens_core::format::Value;
+use profluens_core::harness::Harness;
+use profluens_core::time::Timestamp;
 
-use sc_vaapi::VaapiH264Dec;
+use pf_vaapi::VaapiH264Dec;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../output.mkv");
 // The decoder frames can be large (e.g. 1920x1080 NV12 ≈ 3.1 MiB); size pool slots
@@ -24,12 +24,12 @@ const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../output.mkv");
 const SLOT: usize = 8 * 1024 * 1024;
 
 fn hw_available() -> bool {
-    sc_vaapi::probe().is_some()
+    pf_vaapi::probe().is_some()
 }
 
 #[test]
 fn probe_reports_h264() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip probe_reports_h264: no VA-API device");
         return;
     };
@@ -124,7 +124,7 @@ fn decode_output_mkv_first_aus() {
     let mut h = Harness::with_slot_size(VaapiH264Dec::new(), SLOT);
     h.start().expect("start");
 
-    let mut frames: Vec<streamcraft_core::buffer::Buffer> = Vec::new();
+    let mut frames: Vec<profluens_core::buffer::Buffer> = Vec::new();
     for (i, (au, _kf)) in aus.iter().enumerate() {
         let mut buf = h.alloc(au);
         buf.pts = Timestamp::from_nanos(i as u64 * 40_000_000);
@@ -141,8 +141,8 @@ fn decode_output_mkv_first_aus() {
     // Report any warnings so a partial decode is visible.
     for m in h.bus_messages() {
         match m {
-            streamcraft_core::bus::BusMessage::Warning { error, .. } => eprintln!("warn: {error:?}"),
-            streamcraft_core::bus::BusMessage::Error { error, .. } => eprintln!("error: {error:?}"),
+            profluens_core::bus::BusMessage::Warning { error, .. } => eprintln!("warn: {error:?}"),
+            profluens_core::bus::BusMessage::Error { error, .. } => eprintln!("error: {error:?}"),
             _ => {}
         }
     }
@@ -251,8 +251,8 @@ fn flush_then_continue() {
     }
     for m in h.bus_messages() {
         match m {
-            streamcraft_core::bus::BusMessage::Warning { error, .. } => eprintln!("warn: {error:?}"),
-            streamcraft_core::bus::BusMessage::Error { error, .. } => eprintln!("error: {error:?}"),
+            profluens_core::bus::BusMessage::Warning { error, .. } => eprintln!("warn: {error:?}"),
+            profluens_core::bus::BusMessage::Error { error, .. } => eprintln!("error: {error:?}"),
             _ => {}
         }
     }

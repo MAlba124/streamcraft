@@ -1,17 +1,17 @@
 [package]
-name = "sc-rtsp"
-description = "Hand-written, dependency-free RTSP 1.0 (RFC 2326) client + SDP (RFC 8866) parser plugin for streamcraft: request/response framing, Basic/Digest auth, interleaved-TCP demux"
+name = "pf-rtsp"
+description = "Hand-written, dependency-free RTSP 1.0 (RFC 2326) client + SDP (RFC 8866) parser plugin for profluens: request/response framing, Basic/Digest auth, interleaved-TCP demux"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_rtsp"
+name = "pf_rtsp"
 
 [dependencies]
 # std-only networking — no RTSP/SDP/crypto crate (MD5 for Digest auth is
 # implemented from RFC 1321 in-tree). The protocol modules (sdp/client/
-# interleaved/md5) are pure and framework-free; streamcraft-core is here for
-# the eventual element wiring (rtspsrc), mirroring sc-http/sc-rtp.
-streamcraft-core = { path = "../core" }
+# interleaved/md5) are pure and framework-free; profluens-core is here for
+# the eventual element wiring (rtspsrc), mirroring pf-http/pf-rtp.
+profluens-core = { path = "../core" }

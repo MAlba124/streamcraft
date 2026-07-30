@@ -123,7 +123,7 @@ impl RefPicStore {
     /// marking made real for the *storage*: `DpbEntry` marking decides liveness,
     /// but nothing ever reclaimed the `Picture`s, so a playing stream grew by one
     /// full reference picture (~1.5 MB at 720p) per finalized reference frame,
-    /// forever (streamcraft patch; see STREAMCRAFT-PATCHES.md). Called after the
+    /// forever (profluens patch; see PROFLUENS-PATCHES.md). Called after the
     /// marking of each finalized picture settles. Keys are minted monotonically,
     /// so the slot vector itself stays (it holds `None`s — bytes, not pictures).
     pub fn retain_keys(&mut self, live: &[u32]) {

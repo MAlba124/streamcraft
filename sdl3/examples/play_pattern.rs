@@ -2,7 +2,7 @@
 //! Wayland shm sink (spec: Milestone applications §5). Opens a real window and plays a
 //! deterministic test pattern at ~640x360@30 for a few seconds, paced on the pipeline clock.
 //!
-//! Usage: `cargo run -p sc-sdl3 --example play_pattern`
+//! Usage: `cargo run -p pf-sdl3 --example play_pattern`
 //!
 //! Requires a running Wayland session (`$WAYLAND_DISPLAY` set). With no compositor the sink
 //! degrades to dropping frames, so this still runs to completion headless — but you only see
@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
-use streamcraft_core::clock::InstantClock;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Rational;
-use streamcraft_video::format::PixelFormat;
-use streamcraft_video::{VideoFormat, VideoTestSrc};
+use profluens_core::clock::InstantClock;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Rational;
+use profluens_video::format::PixelFormat;
+use profluens_video::{VideoFormat, VideoTestSrc};
 
-use sc_sdl3::Sdl3VideoSink;
+use pf_sdl3::Sdl3VideoSink;
 
 fn main() {
     // 640x360 I420 at 30 fps, a few seconds' worth of frames.
@@ -36,7 +36,7 @@ fn main() {
     p.set_clock(Arc::new(InstantClock::new()));
 
     let src = p.add(VideoTestSrc::new(format, 0xC0FFEE, count));
-    let sink = p.add(Sdl3VideoSink::new().with_title("streamcraft — play_pattern"));
+    let sink = p.add(Sdl3VideoSink::new().with_title("profluens — play_pattern"));
     p.link((src, "src"), (sink, "sink"))
         .expect("videotestsrc -> sdl3videosink");
 

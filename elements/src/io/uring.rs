@@ -1,6 +1,6 @@
 //! A hand-rolled io_uring reactor backend (spec: IO: built for the io_uring era).
 //!
-//! Implements [`streamcraft_core::io::Reactor`] against Linux io_uring via raw
+//! Implements [`profluens_core::io::Reactor`] against Linux io_uring via raw
 //! syscalls (`libc` only — no higher-level wrapper). Registered files are addressed
 //! by fd; each element op becomes an `IORING_OP_READ`/`WRITE` SQE with `user_data`
 //! set to the op id, and the owning `Buffer` is parked in an in-flight table until
@@ -19,8 +19,8 @@ use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use streamcraft_core::id::ElementId;
-use streamcraft_core::io::{
+use profluens_core::id::ElementId;
+use profluens_core::io::{
     fadvise, Completion, IoResult, OpId, OpKind, Reactor, StreamHygiene, Submission,
     POSIX_FADV_SEQUENTIAL,
 };
@@ -187,7 +187,7 @@ struct InflightOp {
     /// [`StreamHygiene`] watermark.
     file: u32,
     offset: u64,
-    buf: streamcraft_core::buffer::Buffer,
+    buf: profluens_core::buffer::Buffer,
 }
 
 /// Contiguous-completion watermark: uring completes ops in any order, but cache

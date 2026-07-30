@@ -1,5 +1,5 @@
-//! sc-mkv — a hand-written, dependency-free Matroska (MKV) container **muxer + demuxer** for
-//! streamcraft.
+//! pf-mkv — a hand-written, dependency-free Matroska (MKV) container **muxer + demuxer** for
+//! profluens.
 //!
 //! Matroska ([RFC 9559](https://www.rfc-editor.org/rfc/rfc9559.txt)) is an
 //! [EBML](https://www.rfc-editor.org/rfc/rfc8794.txt) (RFC 8794) document: a tree of typed,
@@ -11,7 +11,7 @@
 //! `§sizing`, `§simpleblock`, and `RFC 9559 §10.3`. Review means reading the code against
 //! that spec text.
 //!
-//! Layout mirrors the `sc-ogg` plugin — the nearest analog (a hand-written container with a
+//! Layout mirrors the `pf-ogg` plugin — the nearest analog (a hand-written container with a
 //! reader/writer + mux/demux elements + spec in-tree): a thin `lib.rs` re-exporting the
 //! public surface, submodules for the work, and the spec in `spec/`.
 //!
@@ -29,9 +29,9 @@
 //!   Cluster / SimpleBlock and BlockGroup+Block — **all three lacing modes** (RFC 9559
 //!   §10.3) — into per-track [`Frame`]s with an absolute ns pts. Every field is
 //!   bounds-checked; truncated / malformed input errors, never panics.
-//! - [`MkvMux`] — the streamcraft muxer **element** wrapping the writer, with a single static
+//! - [`MkvMux`] — the profluens muxer **element** wrapping the writer, with a single static
 //!   sink pad (single-track): encoded frames in on `sink`, MKV bytes out on `bytes`.
-//! - [`MkvDemux`] — the streamcraft demuxer **element** ([`element`]): a Matroska byte stream
+//! - [`MkvDemux`] — the profluens demuxer **element** ([`element`]): a Matroska byte stream
 //!   in on `sink`, one **dynamic src pad per track** out. Track discovery is
 //!   constructor-supplied (a mid-pipeline element gets no input during preroll, and the
 //!   scheduler freezes topology after preroll), so [`MkvDemux::new`] takes the stream head and
@@ -46,7 +46,7 @@
 //! the frame bytes are all caller-supplied on the mux side and read back on the demux side.
 //! For FLAC the frames are stored natively, one per SimpleBlock, with no transformation. On
 //! demux the native FLAC byte stream is **reconstructed** (CodecPrivate = `fLaC` + STREAMINFO,
-//! then every frame) so `sc-flac`'s `FlacDec` decodes it directly — exactly the way
+//! then every frame) so `pf-flac`'s `FlacDec` decodes it directly — exactly the way
 //! `oggflacdeframe` reconstructs the native stream from the Ogg mapping. The demux src pad
 //! announces family `flac` (rate/channels/sample) via dynamic caps, `bytes` for unknown codec
 //! ids.
@@ -102,8 +102,8 @@ pub use writer::{
     WriteError, APP_NAME, DEFAULT_TIMESTAMP_SCALE,
 };
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based lookup (spec: Plugins — `--list` and
 /// descriptor introspection). Typed `use` + constructor stays the primary path.

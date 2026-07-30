@@ -7,13 +7,13 @@
 //! cross-buffer sample carry (input buffers do not align to frame boundaries) is
 //! correct.
 
-use sc_flac::{FlacDecoder, FlacEnc, SampleFormat};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use pf_flac::{FlacDecoder, FlacEnc, SampleFormat};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_flac_elem_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_flac_elem_{}_{}.bin", tag, std::process::id()));
     p
 }
 

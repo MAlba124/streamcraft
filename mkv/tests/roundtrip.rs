@@ -5,7 +5,7 @@
 //! assert the EBML Header is present, each TrackEntry carries `CodecID == "A_FLAC"` and the
 //! expected `CodecPrivate`, and every Cluster's SimpleBlocks carry the input frames with the
 //! right track number and monotonically non-decreasing absolute timestamps. Frames are real
-//! `A_FLAC` frames produced by the hand-written `sc-flac` encoder, so the whole chain is
+//! `A_FLAC` frames produced by the hand-written `pf-flac` encoder, so the whole chain is
 //! exercised without any external tool.
 //!
 //! An OPTIONAL `ffmpeg` oracle cross-validates the file if the binary is present, and
@@ -15,9 +15,9 @@
 mod common;
 
 use common::{parse_simple_block, walk, SimpleBlock};
-use sc_flac::{FlacEncoder, SampleFormat};
-use sc_mkv::ebml::id;
-use sc_mkv::{MatroskaWriter, TrackConfig};
+use pf_flac::{FlacEncoder, SampleFormat};
+use pf_mkv::ebml::id;
+use pf_mkv::{MatroskaWriter, TrackConfig};
 
 /// Every master ID our muxer emits — the reader descends into these (spec `§ID-tree`).
 const MASTERS: &[&[u8]] = &[
@@ -32,7 +32,7 @@ const MASTERS: &[&[u8]] = &[
 
 /// Produce a real native FLAC stream head (`fLaC` + finalised STREAMINFO) plus a list of
 /// FLAC frames for `n_frames` blocks of `block` interchannel samples of S16 audio. Returns
-/// `(codec_private, frames)`. Uses the hand-written `sc-flac` encoder so the bytes are
+/// `(codec_private, frames)`. Uses the hand-written `pf-flac` encoder so the bytes are
 /// genuine, back-patched STREAMINFO and real frame data.
 fn make_flac(sample_rate: u32, channels: u32, block: usize, n_frames: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
     let (mut enc, mut header) = FlacEncoder::new(sample_rate, channels, SampleFormat::S16).expect("encoder");
@@ -56,7 +56,7 @@ fn make_flac(sample_rate: u32, channels: u32, block: usize, n_frames: usize) -> 
     // Back-patch STREAMINFO with the real min/max sizes + total samples (spec: A_FLAC =
     // native FLAC head). `header` now holds fLaC + the finalised STREAMINFO block.
     let body = enc.finish();
-    let off = sc_flac::streaminfo_offset();
+    let off = pf_flac::streaminfo_offset();
     header[off..off + body.len()].copy_from_slice(&body);
     (header, frames)
 }
@@ -236,7 +236,7 @@ fn ffmpeg_oracle_if_present() {
     w.finalize(&mut out);
 
     // Write to a unique temp file.
-    let path = std::env::temp_dir().join(format!("sc-mkv-oracle-{}.mkv", std::process::id()));
+    let path = std::env::temp_dir().join(format!("pf-mkv-oracle-{}.mkv", std::process::id()));
     std::fs::write(&path, &out).expect("write temp mkv");
 
     // `ffmpeg -i <file>` prints stream info to stderr and exits non-zero (no output file),
@@ -248,11 +248,11 @@ fn ffmpeg_oracle_if_present() {
         .output()
         .expect("run ffmpeg");
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    // Keep the file for manual inspection when SC_MKV_KEEP is set; otherwise clean up.
-    if std::env::var_os("SC_MKV_KEEP").is_none() {
+    // Keep the file for manual inspection when PF_MKV_KEEP is set; otherwise clean up.
+    if std::env::var_os("PF_MKV_KEEP").is_none() {
         let _ = std::fs::remove_file(&path);
     } else {
-        eprintln!("SC_MKV_KEEP set — left oracle file at {}", path.display());
+        eprintln!("PF_MKV_KEEP set — left oracle file at {}", path.display());
     }
 
     assert!(

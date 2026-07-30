@@ -6,7 +6,7 @@
 //! round-robin order — exactly how a real muxer lays out grouped streams. The demuxer,
 //! which keys reassembly by serial number, must separate them again.
 
-use sc_ogg::{demux_all, OggWriter, Packet};
+use pf_ogg::{demux_all, OggWriter, Packet};
 
 /// SplitMix64 for reproducible payloads.
 struct Rng(u64);
@@ -33,7 +33,7 @@ type PacketSet = Vec<(Vec<u8>, u64)>;
 fn split_pages(stream: &[u8]) -> Vec<Vec<u8>> {
     // Re-parse to page boundaries using the reader's own page view would be ideal, but
     // the public API exposes `PageHeader`. Walk it.
-    use sc_ogg::PageHeader;
+    use pf_ogg::PageHeader;
     let mut pages = Vec::new();
     let mut off = 0;
     while off < stream.len() {

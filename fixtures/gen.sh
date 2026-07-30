@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# gen.sh — generate the streamcraft validation corpus.
+# gen.sh — generate the profluens validation corpus.
 #
 # Short (~5 s), tiny (320x180) test clips covering the container/codec matrix
-# that scplay is expected to handle, plus a few negative fixtures that MUST
+# that pfplay is expected to handle, plus a few negative fixtures that MUST
 # fail cleanly (no in-tree vorbis decoder; Mp4Demux needs a faststart layout).
 #
 # Idempotent: an existing, non-empty output is left alone. Set FORCE=1 to
@@ -164,7 +164,7 @@ b_ogg_flac() {
 }
 
 b_ogg_vorbis() {
-    # Negative fixture: vorbis-in-ogg, no other track. streamcraft has no
+    # Negative fixture: vorbis-in-ogg, no other track. profluens has no
     # vorbis decoder → nothing links → clean nonzero exit.
     has_enc libvorbis || return 42
     run -f lavfi -i "$ASRC" -c:a libvorbis -b:a 96k -f ogg "$1"

@@ -1,9 +1,9 @@
-//! `sc-sdl3` — SDL3 windowing/presentation for streamcraft (spec: scraft-scope
+//! `pf-sdl3` — SDL3 windowing/presentation for profluens (spec: pf-scope
 //! update — "use SDL3 … swap our custom wayland and vulkan stuff to use sdl3
 //! instead. Graphics sucks and we shouldn't waste time on it.").
 //!
-//! This crate replaces the hand-written `sc-wayland` shm client *and* the
-//! clean-room `sc-vk` Vulkan renderer with one thin layer over SDL3: window,
+//! This crate replaces the hand-written `pf-wayland` shm client *and* the
+//! clean-room `pf-vk` Vulkan renderer with one thin layer over SDL3: window,
 //! events, and a GPU-accelerated presentation path. Two backends exist. The
 //! **owned GPU render pipeline** ([`gpu`]) uses custom SPIR-V shaders doing
 //! colorimetry-aware YCbCr→RGB (with a tone-map slot for HDR) on the SDL3 GPU API —
@@ -29,11 +29,11 @@ pub mod video;
 
 pub use sink::Sdl3VideoSink;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
-/// `streamcraft launch … ! sdl3videosink`). Typed `use` + constructor stays
+/// `profluens launch … ! sdl3videosink`). Typed `use` + constructor stays
 /// primary; the descriptor is `&'static`, taken from a throwaway default instance.
 pub fn register(registry: &mut Registry) {
     registry.register(Sdl3VideoSink::new().desc());

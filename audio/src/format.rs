@@ -6,7 +6,7 @@
 //! the pipeline interns at link time. [`SampleFormat::caps_name`] is the single source of
 //! truth for those categorical names, so offers, WAV parsing, and views never drift.
 
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
 
 /// The negotiation family for uncompressed interleaved PCM.
 pub const FAMILY: &str = "audio/raw";

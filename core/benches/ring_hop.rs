@@ -4,7 +4,7 @@
 //! plain `Instant` timing with warmup and median-of-N reporting.
 //!
 //! Registered with `harness = false` in `core/Cargo.toml`, so `main` *is* the
-//! harness: `cargo bench -p streamcraft-core --bench ring_hop`.
+//! harness: `cargo bench -p profluens-core --bench ring_hop`.
 //!
 //! Two shapes are measured, both reporting ns *per item*:
 //!
@@ -52,7 +52,7 @@
 
 use std::time::Instant;
 
-use streamcraft_core::ring::spsc;
+use profluens_core::ring::spsc;
 
 /// Items per same-thread trial. Single-core, cheap (~10-20 ns/item), so a large
 /// count both dwarfs the `Instant` overhead at the divisor and gives a stable median.

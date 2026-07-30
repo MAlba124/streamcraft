@@ -1,5 +1,5 @@
 //! The inspector application: the live panels over the protocol client (spec:
-//! Introspection protocol and scraft-scope — "what it shows, all live").
+//! Introspection protocol and pf-scope — "what it shows, all live").
 //!
 //! Panels: the **graph view** (topology via the layered layout; pan with left-drag,
 //! zoom with the wheel, click an edge to pin its negotiated format, hover for a
@@ -101,7 +101,7 @@ struct ElemRate {
     drops: u64,
 }
 
-/// The dockable panels (spec: what scraft-scope shows; the dock model follows
+/// The dockable panels (spec: what pf-scope shows; the dock model follows
 /// simprof's tree-of-splits-with-tabbed-leaves).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PanelId {
@@ -124,7 +124,7 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
     let mut client = Client::connect(path).map_err(|e| format!("connect {path:?}: {e}"))?;
 
     let font = Font::new();
-    let mut backend = Backend::open("scraft-scope", 1100, 700, &font)
+    let mut backend = Backend::open("pf-scope", 1100, 700, &font)
         .map_err(|e| format!("open window: {e}"))?;
 
     let mut ui_state = UiState::default();
@@ -194,7 +194,7 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
             // progress, time), matching the pause button's vertical centre.
             let mid = pad + (top_h - 6.0) * 0.5;
             let text_y = (mid - font.line_h() * 0.5).floor();
-            let tw = ui.text(pad, text_y, "scraft-scope", text);
+            let tw = ui.text(pad, text_y, "pf-scope", text);
 
             // Transport block right of centre: [progress bar] mm:ss / mm:ss.
             let mut left_limit = btn.x - 12.0;
@@ -307,7 +307,7 @@ pub fn run(path: &Path, opts: AppOpts) -> Result<(), String> {
         let m = client.model.lock().unwrap_or_else(|e| e.into_inner());
         let (nel, ned) = m.topo.as_ref().map(|t| (t.elements.len(), t.edges.len())).unwrap_or((0, 0));
         eprintln!(
-            "scraft-scope: {frame} frames, {nel} elements, {ned} edges, counters={}, log lines={}, duration={}",
+            "pf-scope: {frame} frames, {nel} elements, {ned} edges, counters={}, log lines={}, duration={}",
             m.cur.is_some(),
             log.len(),
             m.duration_ns.map(fmt_time).unwrap_or_else(|| "unknown".into()),

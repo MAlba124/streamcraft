@@ -7,7 +7,7 @@
 //! partition order 0 for odd blocks, which this exercises). Each case is encoded with
 //! [`FlacEncoder`], decoded with [`FlacDecoder`], and every sample compared exactly.
 
-use sc_flac::{FlacDecoder, FlacEncoder, SampleFormat};
+use pf_flac::{FlacDecoder, FlacEncoder, SampleFormat};
 
 /// Deterministic PRNG (SplitMix64) so "white noise" cases are reproducible.
 struct Rng(u64);
@@ -130,7 +130,7 @@ fn round_trip(planar: &[Vec<i64>], fmt: SampleFormat, rate: u32) -> (Vec<i64>, u
     enc.encode_interleaved(&interleaved, &mut frames).expect("encode");
     let body = enc.finish();
     // Patch the finalised STREAMINFO body over the placeholder.
-    header[sc_flac::streaminfo_offset()..sc_flac::streaminfo_offset() + body.len()]
+    header[pf_flac::streaminfo_offset()..pf_flac::streaminfo_offset() + body.len()]
         .copy_from_slice(&body);
 
     let mut stream = header;
@@ -217,7 +217,7 @@ fn empty_stream_is_valid() {
     let mut frames = Vec::new();
     enc.encode_interleaved(&[], &mut frames).unwrap();
     let body = enc.finish();
-    header[sc_flac::streaminfo_offset()..sc_flac::streaminfo_offset() + body.len()]
+    header[pf_flac::streaminfo_offset()..pf_flac::streaminfo_offset() + body.len()]
         .copy_from_slice(&body);
     assert!(frames.is_empty());
     let dec = FlacDecoder::decode(&header).unwrap();

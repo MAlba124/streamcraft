@@ -613,7 +613,7 @@ pub fn hcod1_encode(idx: u32) -> Result<(u8, u16)> {
 /// walks all `2¹¹` 11-bit prefixes.
 pub fn hcod1_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 1 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD1, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD1, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD1, HCOD1_MAX_LEN));
@@ -780,7 +780,7 @@ pub fn hcod2_encode(idx: u32) -> Result<(u8, u16)> {
 /// `2⁹` 9-bit prefixes.
 pub fn hcod2_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 2 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD2, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD2, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD2, HCOD2_MAX_LEN));
@@ -962,7 +962,7 @@ pub fn hcod3_encode(idx: u32) -> Result<(u8, u16)> {
 /// coefficient in low-frequency-first order.
 pub fn hcod3_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 3 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD3, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD3, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD3, HCOD3_MAX_LEN));
@@ -1143,7 +1143,7 @@ pub fn hcod4_encode(idx: u32) -> Result<(u8, u16)> {
 /// coefficient in low-frequency-first order.
 pub fn hcod4_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 4 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD4, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD4, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD4, HCOD4_MAX_LEN));
@@ -1326,7 +1326,7 @@ pub fn hcod5_encode(idx: u32) -> Result<(u8, u16)> {
 /// `offset = LAV = 4` §4.6.3.3 polynomial.
 pub fn hcod5_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 5 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD5, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD5, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD5, HCOD5_MAX_LEN));
@@ -1504,7 +1504,7 @@ pub fn hcod6_encode(idx: u32) -> Result<(u8, u16)> {
 /// `offset = LAV = 4` shift.
 pub fn hcod6_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 6 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD6, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD6, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD6, HCOD6_MAX_LEN));
@@ -1673,7 +1673,7 @@ pub fn hcod7_encode(idx: u32) -> Result<(u8, u16)> {
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod7_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 7 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD7, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD7, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD7, HCOD7_MAX_LEN));
@@ -1853,7 +1853,7 @@ pub fn hcod8_encode(idx: u32) -> Result<(u8, u16)> {
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod8_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 8 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD8, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD8, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD8, HCOD8_MAX_LEN));
@@ -2129,7 +2129,7 @@ pub fn hcod9_encode(idx: u32) -> Result<(u8, u16)> {
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod9_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 9 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD9, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD9, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD9, HCOD9_MAX_LEN));
@@ -2412,7 +2412,7 @@ pub fn hcod10_encode(idx: u32) -> Result<(u8, u16)> {
 /// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
 pub fn hcod10_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 10 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD10, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD10, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD10, HCOD10_MAX_LEN));
@@ -2846,7 +2846,7 @@ pub fn hcod11_encode(idx: u32) -> Result<(u8, u16)> {
 /// either slot.
 pub fn hcod11_decode(reader: &mut BitReader<'_>) -> Result<u32> {
     // Peek-and-lookup over Table 4.A codebook 11 (was an O(entries*max_len) linear scan
-    // per symbol; streamcraft patch). The table is a pure function of HCOD11, so the
+    // per symbol; profluens patch). The table is a pure function of HCOD11, so the
     // decoded index is identical to the scan's.
     static TABLE: OnceLock<PrefixTable> = OnceLock::new();
     let table = TABLE.get_or_init(|| PrefixTable::build(&HCOD11, HCOD11_MAX_LEN));

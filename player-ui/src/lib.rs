@@ -1,5 +1,5 @@
-//! `scplay-ui` — the SDL3 immediate-mode GUI media player, streamcraft's flagship
-//! front-end (spec: streamcraft.md Milestone applications §5 + the UI `<update>` §1209 —
+//! `pfplay-ui` — the SDL3 immediate-mode GUI media player, profluens's flagship
+//! front-end (spec: profluens.md Milestone applications §5 + the UI `<update>` §1209 —
 //! "use SDL3 with a custom UI library on top … the UI must be the same philosophy as the
 //! rest of SC (very performant, per-frame arenas)").
 //!
@@ -8,9 +8,9 @@
 //! A media player cannot have two SDL windows fighting, so this crate owns **the** window
 //! and pulls video across the thread boundary through a lock-light frame slot:
 //!
-//! - the **streaming thread** runs [`sc_play::Player`] to EOS; its video branch ends in a
+//! - the **streaming thread** runs [`pf_play::Player`] to EOS; its video branch ends in a
 //!   [`FrameSlotSink`](framesink::FrameSlotSink) — an active, clock-paced sink that paces
-//!   each frame on the pipeline clock exactly like [`sc_sdl3::Sdl3VideoSink`] but, instead
+//!   each frame on the pipeline clock exactly like [`pf_sdl3::Sdl3VideoSink`] but, instead
 //!   of presenting, copies the released frame into a shared [`FrameSlot`](framesink::FrameSlot);
 //! - the **GUI thread** (the main thread — SDL wants the event pump there) owns the window,
 //!   uploads the latest slot frame to a streaming YUV texture, letterboxes it, draws the
@@ -24,7 +24,7 @@
 //!
 //! When the video decodes on the GPU (VA-API) and a GLES/EGL DMA-BUF-import context stands
 //! up, the player runs a **zero-copy** path: the decoder exports each decoded surface as a
-//! DMA-BUF ([`sc_vaapi::gpuframe`]) that the GLES backend ([`gl`]) imports straight into a
+//! DMA-BUF ([`pf_vaapi::gpuframe`]) that the GLES backend ([`gl`]) imports straight into a
 //! `GL_TEXTURE_EXTERNAL_OES` and samples — the decoded pixels never touch the CPU. Otherwise
 //! (software decode, or no EGL DMABUF import) it uses the classic [`FrameSlot`] → SDL_Renderer
 //! YUV-texture-upload path. The choice is made once at startup and logged (`video path = …`).

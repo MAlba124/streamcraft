@@ -4,13 +4,13 @@
 //! reader (a) parses every page, (b) recomputes each page's CRC to the exact value
 //! libogg stamped, and (c) reassembles a sensible number of packets. When `oggenc` is
 //! absent the test no-ops with a printed note — the in-crate round-trip and the baked-in
-//! real-page known-answer test ([`sc_ogg::page`]) remain the gate; this is the extra
+//! real-page known-answer test ([`pf_ogg::page`]) remain the gate; this is the extra
 //! net (spec: First-party codecs — cross-checked against a reference).
 
 use std::io::Write;
 use std::process::Command;
 
-use sc_ogg::{page_crc, OggReader, PageHeader};
+use pf_ogg::{page_crc, OggReader, PageHeader};
 
 fn have_oggenc() -> bool {
     Command::new("oggenc")
@@ -22,7 +22,7 @@ fn have_oggenc() -> bool {
 
 fn temp_path(tag: &str, ext: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_ogg_xv_{}_{}.{}", tag, std::process::id(), ext));
+    p.push(format!("pf_ogg_xv_{}_{}.{}", tag, std::process::id(), ext));
     p
 }
 

@@ -1,10 +1,10 @@
 //! The introspection protocol + server (spec: Introspection protocol and
-//! scraft-scope). A compact, length-prefixed binary protocol of POD frames served
+//! pf-scope). A compact, length-prefixed binary protocol of POD frames served
 //! over a Unix socket, feature-gated in core: it costs nothing until a client
 //! connects, and observation stays observation — every reply is a snapshot of data
 //! the pipeline already maintains, never a lock on a streaming path.
 //!
-//! Module map (spec: scraft-scope — the inspector):
+//! Module map (spec: pf-scope — the inspector):
 //! - [`wire`] — the pinned wire format: frame headers, rows, primitives, and BOTH
 //!   encode and decode helpers (the scope/ GUI client consumes this as public API).
 //! - [`strtab`] — the per-connection string table (names sent once as `StrDef`,

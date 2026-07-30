@@ -15,7 +15,7 @@
 //! * `EGL_EXT_image_dma_buf_import` — the `EGL_LINUX_DMA_BUF_EXT` target + the
 //!   `EGL_DMA_BUF_PLANE*_{FD,OFFSET,PITCH,MODIFIER_*}_EXT` attributes.
 
-// A hand-rolled GL/EGL binding surface (like `sc_vaapi::ffi`): the full set of constants +
+// A hand-rolled GL/EGL binding surface (like `pf_vaapi::ffi`): the full set of constants +
 // the two-plane-NV12 fallback's R8/RG8 formats + a couple of reserved entry points are kept
 // documented even when the active COMPOSED-NV12 path doesn't touch every one, so `dead_code`
 // is allowed here exactly as it is on the libva FFI.
@@ -266,7 +266,7 @@ impl Gl {
                 match gl_sym(concat!($name, "\0").as_bytes()) {
                     Some(p) => std::mem::transmute(p),
                     None => {
-                        eprintln!("scplay-ui: gl: SDL_GL_GetProcAddress returned NULL for {}", $name);
+                        eprintln!("pfplay-ui: gl: SDL_GL_GetProcAddress returned NULL for {}", $name);
                         return None;
                     }
                 }
@@ -277,7 +277,7 @@ impl Gl {
                 match egl_sym(concat!($name, "\0").as_bytes()) {
                     Some(p) => std::mem::transmute(p),
                     None => {
-                        eprintln!("scplay-ui: gl: SDL_EGL_GetProcAddress returned NULL for {} (SDL not on the EGL path? force EGL)", $name);
+                        eprintln!("pfplay-ui: gl: SDL_EGL_GetProcAddress returned NULL for {} (SDL not on the EGL path? force EGL)", $name);
                         return None;
                     }
                 }

@@ -1,6 +1,6 @@
-//! sc-rtp — RTP/RTCP (RFC 3550) from scratch, receive-first.
+//! pf-rtp — RTP/RTCP (RFC 3550) from scratch, receive-first.
 //!
-//! Layered like the other protocol crates (sc-http, sc-flac): **pure protocol
+//! Layered like the other protocol crates (pf-http, pf-flac): **pure protocol
 //! modules** with no framework types — [`packet`] (the wire view), [`seq`]
 //! (extended sequence arithmetic), [`jitter`] (the reorder/dejitter state
 //! machine), [`rtcp`] (compound reports, the SR NTP↔RTP sync anchor),

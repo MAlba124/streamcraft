@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use streamcraft_core::clock::MockClock;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::testing::{TimedTestSink, TimedTestSrc};
+use profluens_core::clock::MockClock;
+use profluens_core::pipeline::Pipeline;
+use profluens_core::time::Timestamp;
+use profluens_elements::testing::{TimedTestSink, TimedTestSrc};
 
 /// `src ! sink` (both Active — one ring between them) under a MockClock the test
 /// releases, with tracing on: all three histograms fill for the sink; the source

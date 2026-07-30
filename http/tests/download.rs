@@ -9,13 +9,13 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
-use sc_http::HttpSrc;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::FileSink;
+use pf_http::HttpSrc;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::FileSink;
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_m2_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_m2_{}_{}.bin", tag, std::process::id()));
     p
 }
 
@@ -166,7 +166,7 @@ fn downloads_file_byte_identically() {
 fn body_that_spills_into_header_read_is_preserved() {
     // Small body that the server sends in the *same* write as the headers, so it
     // arrives in the client's header read and must be replayed from `leftover`.
-    let body = b"hello, streamcraft body".to_vec();
+    let body = b"hello, profluens body".to_vec();
     let port = serve_once("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", body.clone());
 
     let outp = temp_path("spill_out");
@@ -407,14 +407,14 @@ fn empty_eof_body_terminates() {
 #[cfg(feature = "io-uring")]
 #[test]
 fn downloads_over_io_uring_reactor() {
-    use streamcraft_elements::io::IoUringReactor;
+    use profluens_elements::io::IoUringReactor;
 
     fn run_over_uring(head: &'static str, wire: Vec<u8>, tag: &str) -> Vec<u8> {
         let port = serve_once(head, wire);
         let outp = temp_path(tag);
         let mut p = Pipeline::new();
         p.set_reactor_factory(std::sync::Arc::new(|| {
-            Ok(Box::new(IoUringReactor::new()?) as Box<dyn streamcraft_core::io::Reactor>)
+            Ok(Box::new(IoUringReactor::new()?) as Box<dyn profluens_core::io::Reactor>)
         }));
         let src = p.add(HttpSrc::new(format!("http://127.0.0.1:{port}/file")));
         let sink = p.add(FileSink::new(&outp));

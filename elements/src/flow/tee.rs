@@ -9,18 +9,18 @@
 //! silent (the `MkvMuxN` static-pad convention while dynamic sink/src growth
 //! is core-side pending work).
 //!
-//! [`Memory`]: streamcraft_core::memory::Memory
+//! [`Memory`]: profluens_core::memory::Memory
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 /// The static pad table's src pad budget.
 pub const MAX_BRANCHES: usize = 8;
@@ -97,7 +97,7 @@ impl Element for Tee {
             // tee keeps its fence on branch 0 only (spec: Device memory — CPU
             // buffers, the tee's use today, carry `sync: None` anyway).
             for i in 1..self.n {
-                let copy = streamcraft_core::buffer::Buffer {
+                let copy = profluens_core::buffer::Buffer {
                     memory: buf.memory.clone(),
                     pts: buf.pts,
                     dts: buf.dts,

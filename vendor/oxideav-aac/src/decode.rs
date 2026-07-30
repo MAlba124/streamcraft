@@ -83,11 +83,11 @@ pub struct DecodedFrame {
 /// rendering. This is the shape [`StreamDecoder::decode_raw_data_block`] builds internally and
 /// then folds through [`crate::pcm::interleave_s16`]; exposing it lets a caller render the
 /// integer PCM straight into its own output buffer (via
-/// [`crate::pcm::interleave_s16_le_into`]) with no intermediate `Vec<i16>` (streamcraft patch).
+/// [`crate::pcm::interleave_s16_le_into`]) with no intermediate `Vec<i16>` (profluens patch).
 ///
 /// Generic over the allocator `A` so the hot path can build the whole planar frame — the outer
 /// channel list *and* every per-channel PCM buffer — in the caller's per-`process()` arena
-/// (`Vec<Vec<f64, A>, A>`), off the heap (streamcraft patch). The default `A = Global` keeps the
+/// (`Vec<Vec<f64, A>, A>`), off the heap (profluens patch). The default `A = Global` keeps the
 /// public [`StreamDecoder::decode_raw_data_block_planar`] / [`decode_frame`] surface a plain
 /// owned `PlanarFrame`, so existing callers and tests are unchanged.
 #[derive(Debug, Clone)]
@@ -218,7 +218,7 @@ impl StreamDecoder {
         // core time signals plus any SBR extension payload that
         // followed the element in a FIL. The per-element channel PCM
         // (`channels`) and the element list itself are per-frame transients
-        // drawn from the caller's `scratch` arena (streamcraft patch).
+        // drawn from the caller's `scratch` arena (profluens patch).
         struct ElementOut<A: std::alloc::Allocator> {
             key: (u8, u8),
             kind: IdSynEle,

@@ -1,13 +1,13 @@
 //! Milestone 1: `filesrc ! filesink` copies a file byte-identically with zero
 //! steady-state payload allocations (spec: Milestone applications §1).
 
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use profluens_core::bus::BusMessage;
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("sc_m1_{}_{}.bin", tag, std::process::id()));
+    p.push(format!("pf_m1_{}_{}.bin", tag, std::process::id()));
     p
 }
 
@@ -59,7 +59,7 @@ fn copies_bytes_identically_with_flat_allocation() {
 #[cfg(feature = "io-uring")]
 #[test]
 fn copies_bytes_identically_on_io_uring() {
-    use streamcraft_elements::io::IoUringReactor;
+    use profluens_elements::io::IoUringReactor;
 
     let inp = temp_path("uring_in");
     let outp = temp_path("uring_out");
@@ -68,7 +68,7 @@ fn copies_bytes_identically_on_io_uring() {
 
     let mut p = Pipeline::new();
     p.set_reactor_factory(std::sync::Arc::new(|| {
-        Ok(Box::new(IoUringReactor::new()?) as Box<dyn streamcraft_core::io::Reactor>)
+        Ok(Box::new(IoUringReactor::new()?) as Box<dyn profluens_core::io::Reactor>)
     }));
     let src = p.add(FileSrc::new(&inp));
     let sink = p.add(FileSink::new(&outp));

@@ -1,5 +1,5 @@
 //! The pinned introspection wire format (spec: Introspection protocol and
-//! scraft-scope). PUBLIC API under the `introspect` feature: the scope/ GUI client is
+//! pf-scope). PUBLIC API under the `introspect` feature: the scope/ GUI client is
 //! written against these exact bytes, so the layout here is a contract — every offset,
 //! row size, and tag is fixed and pinned by golden tests in `core/tests/introspect.rs`.
 //!
@@ -29,7 +29,7 @@ pub const VER_MAJOR: u16 = 1;
 /// Wire protocol minor version (additive kinds + appended row fields).
 pub const VER_MINOR: u16 = 2;
 
-/// The 4-byte magic in the `Hello` frame — "SCIP" (StreamCraft Introspection Protocol).
+/// The 4-byte magic in the `Hello` frame — "SCIP" (Profluens Introspection Protocol).
 pub const MAGIC: [u8; 4] = *b"SCIP";
 
 /// Frame header size in bytes (`len`, `kind`, `seq`).

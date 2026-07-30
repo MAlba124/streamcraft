@@ -1,18 +1,18 @@
 [package]
-name = "sc-mp3"
-description = "MPEG-1/2 Audio Layer III (MP3) codec plugin for streamcraft, backed by the pure-Rust oxideav-mp3"
+name = "pf-mp3"
+description = "MPEG-1/2 Audio Layer III (MP3) codec plugin for profluens, backed by the pure-Rust oxideav-mp3"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_mp3"
+name = "pf_mp3"
 
 [dependencies]
-streamcraft-core = { path = "../core" }
+profluens-core = { path = "../core" }
 # The one sanctioned kind of dependency for a plugin crate (like libpipewire for
-# sc-pipewire, oxideav-vp8 for sc-vp8): pure Rust, no build.rs, no unsafe, MIT. See
+# pf-pipewire, oxideav-vp8 for pf-vp8): pure Rust, no build.rs, no unsafe, MIT. See
 # lib.rs for the adoption evidence (ffmpeg-oracle SNR gate) and the planned
 # nativization steps (decode-into-pool-memory, MPEG-2.5/free-format fix bump).
 oxideav-mp3 = { version = "0.1", default-features = false }
@@ -21,4 +21,4 @@ oxideav-mp3 = { version = "0.1", default-features = false }
 oxideav-core = "0.1"
 
 [dev-dependencies]
-streamcraft-elements = { path = "../elements" }
+profluens-elements = { path = "../elements" }

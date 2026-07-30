@@ -37,20 +37,20 @@ use oxideav_core::{CodecId, CodecParameters, Frame as AvFrame, Packet, SampleFor
 use oxideav_mp3::codec_decoder::make_decoder;
 use oxideav_mp3::frame::{parse_header, Mp3FrameHeader};
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::bus::BusMessage;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 // `audio/raw` family/field/value names. Kept as literals (not a dep on
-// streamcraft-audio) so sc-mp3 stays core-only, exactly as sc-flac / sc-vp8 do; the
+// profluens-audio) so pf-mp3 stays core-only, exactly as pf-flac / pf-vp8 do; the
 // pipeline interns by string, so the ids line up with any audio peer using the same
 // names.
 const FAMILY: &str = "audio/raw";

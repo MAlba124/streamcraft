@@ -7,7 +7,7 @@
 //! [`OggWriter`] and demuxed with [`OggReader`]; every packet, its order, and its
 //! bos/eos flags are compared.
 
-use sc_ogg::{demux_all, mux_packets, OggReader, OggWriter, Packet};
+use pf_ogg::{demux_all, mux_packets, OggReader, OggWriter, Packet};
 
 /// Deterministic PRNG (SplitMix64) so generated packet sets are reproducible.
 struct Rng(u64);

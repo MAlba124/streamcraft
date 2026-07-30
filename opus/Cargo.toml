@@ -14,9 +14,10 @@ profluens-core = { path = "../core" }
 # Pure-Rust Opus, the one sanctioned kind of plugin dependency (like oxideav-mp3 for
 # pf-mp3): no build.rs, no unsafe, MIT, RFC 6716/7845-annotated. The *published* 0.0.13
 # is an "orphan-rebuild scaffold" that decodes real Opus to silence/noise (see src/lib.rs
-# history), so we pin git master — the working clean-room decoder + encoder — by rev.
+# history), so we vendor git master — the working clean-room decoder + encoder — with a
+# minimal `decode_packet_into` no-alloc patch (vendor/oxideav-opus/PROFLUENS-PATCHES.md).
 # Its only dependency is oxideav-core (no serde_json, unlike the other OxideAV crates).
-oxideav-opus = { git = "https://github.com/OxideAV/oxideav-opus", rev = "f7dd682d049864d0f12592a90d41af5bedb26823" }
+oxideav-opus = { path = "../vendor/oxideav-opus" }
 
 [dev-dependencies]
 # Conformance gate: decode RFC 6716 test vectors and cross-check an ffmpeg/libopus oracle.

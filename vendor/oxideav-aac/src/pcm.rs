@@ -119,7 +119,7 @@ pub fn interleave_s16(channels: &[Vec<f64>]) -> Result<Vec<i16>> {
 /// `out` is cleared and refilled (`out[n·C + c] = to_s16(channels[c][n])`), so a caller that
 /// parks one frame at a time reuses a single owned buffer across frames — it allocates once (when
 /// the buffer first grows to the frame size) and thereafter only re-fills, imposing no
-/// steady-state heap traffic (streamcraft patch — the AAC element parks its decoded frame here).
+/// steady-state heap traffic (profluens patch — the AAC element parks its decoded frame here).
 /// Generic over the per-channel allocator `CA` so it accepts arena-backed planar buffers
 /// (`Vec<f64, &Arena>`) directly, without a heap copy of the planar data first.
 ///
@@ -175,7 +175,7 @@ pub fn s16_slice_le_into(samples: &[i16], dst: &mut [u8]) -> Result<usize> {
 /// This is exactly [`interleave_s16`] followed by an `i16 → little-endian bytes` copy, fused
 /// into one pass: `dst[(n·C + c)·2 ..][..2] = to_s16(channels[c][n]).to_le_bytes()`. It lets a
 /// caller render straight into an output/pipeline buffer with no intermediate `Vec<i16>` and no
-/// second copy (streamcraft patch — the AAC element interleaves into its pool slot here).
+/// second copy (profluens patch — the AAC element interleaves into its pool slot here).
 ///
 /// `dst` must hold at least `frame_len · num_channels · 2` bytes (checked; a short buffer is
 /// rejected with [`Error::PcmInvalid`] rather than truncating). Every channel buffer must be the

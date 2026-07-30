@@ -2,9 +2,9 @@
 //! (spec: Testing). No files, no sockets — this exercises the scheduler's non-IO
 //! path and verifies the data arrives with no loss, duplication, or reordering.
 
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::flow::PassThrough;
-use streamcraft_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::flow::PassThrough;
+use profluens_elements::testing::{fold, pattern_byte, TestSink, TestSrc, FNV_OFFSET};
 
 /// The digest `TestSink` should compute for the first `n` pattern bytes.
 fn expected_hash(n: u64) -> u64 {
@@ -96,7 +96,7 @@ fn dump_dot_shows_topology_and_groups() {
     p.link((mid, "src"), (snk, "sink")).unwrap();
 
     let dot = p.dump_dot();
-    assert!(dot.contains("digraph streamcraft"));
+    assert!(dot.contains("digraph profluens"));
     assert!(dot.contains("testsrc") && dot.contains("passthrough") && dot.contains("testsink"));
     assert!(dot.contains("e0 -> e1") && dot.contains("e1 -> e2"));
     // testsrc (active) + passthrough (passive) share group 0; testsink is group 1.

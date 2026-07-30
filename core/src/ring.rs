@@ -652,7 +652,7 @@ mod tests {
 // *not* modelled, but the *lock-free half* of their wake handshake — the part that
 // must not lose a wakeup — is modelled directly in `no_lost_wakeup_on_empty_edge`.
 //
-// Run with: `RUSTFLAGS="--cfg loom" cargo test -p streamcraft-core --lib loom`
+// Run with: `RUSTFLAGS="--cfg loom" cargo test -p profluens-core --lib loom`
 #[cfg(loom)]
 mod loom_tests {
     use super::*;

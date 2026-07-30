@@ -1,6 +1,6 @@
-//! sc-h264 — the H.264 / AVC (ITU-T Rec. H.264 | ISO/IEC 14496-10) codec plugin.
+//! pf-h264 — the H.264 / AVC (ITU-T Rec. H.264 | ISO/IEC 14496-10) codec plugin.
 //!
-//! Like [`sc-vp8`](../sc_vp8/index.html) this crate is **not** hand-written: it
+//! Like [`pf-vp8`](../pf_vp8/index.html) this crate is **not** hand-written: it
 //! wraps [`oxideav-h264`](https://github.com/OxideAV/oxideav-h264), a pure-Rust
 //! H.264 decoder + encoder, adopted after review (2026-07-24). The spec's codec
 //! taboo is FFI walls — a foreign allocator, threading model, and timestamp
@@ -60,7 +60,7 @@
 //!   v1 caveat — downstream A/V sync should prefer container display timestamps
 //!   until a proper DTS→PTS reorder buffer lands (backlog).
 //!
-//! ## Dependency situation (heavier than sc-vp8, called out)
+//! ## Dependency situation (heavier than pf-vp8, called out)
 //!
 //! Unlike `oxideav-vp8` (zero deps with default features off), `oxideav-h264
 //! 0.1.7` pulls `oxideav-core` and `thiserror` **mandatorily** — there is no
@@ -90,12 +90,12 @@ pub mod h264dec;
 
 pub use h264dec::H264Dec;
 
-use streamcraft_core::element::Element;
-use streamcraft_core::registry::Registry;
+use profluens_core::element::Element;
+use profluens_core::registry::Registry;
 
 /// Register this crate's elements for name-based construction (spec: Plugins —
 /// `parse("… ! h264dec ! …")`). Typed `use` + constructor stays primary; this powers
-/// `scraft-launch` and one-liner tests. The descriptor is `&'static`, taken from a
+/// `pf-launch` and one-liner tests. The descriptor is `&'static`, taken from a
 /// throwaway default instance; [`H264Dec`] is config-free (dimensions come from the
 /// SPS, announced at runtime).
 pub fn register(registry: &mut Registry) {

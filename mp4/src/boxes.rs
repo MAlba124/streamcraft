@@ -19,7 +19,7 @@
 //! Every field is bounds-checked and every declared length is validated against the
 //! remaining window; a truncated or structurally impossible box yields a [`BoxError`],
 //! never a panic or an out-of-range slice. The demuxer maps such an error to a loud
-//! `streamcraft` error.
+//! `profluens` error.
 //!
 //! ## Writer note (a muxer is a separate follow-up)
 //! The box grammar is symmetric — a muxer would write the same headers this reader
@@ -79,7 +79,7 @@ pub mod boxtype {
     pub const MDAT: FourCc = fourcc(b"mdat"); // §8.1.1 Media Data
 }
 
-/// A parse failure. The demuxer maps this to a `streamcraft` error; there is no
+/// A parse failure. The demuxer maps this to a `profluens` error; there is no
 /// "incomplete" variant here because the box layer always parses a fully-buffered header
 /// slice (the constructor-supplied head, or a `stbl` already buffered by the reader) — the
 /// streaming/cross-boundary buffering lives one layer up in [`crate::reader`].

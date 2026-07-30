@@ -1,29 +1,29 @@
 [package]
-name = "sc-mkv"
-description = "Hand-written, dependency-free Matroska (EBML, RFC 8794) container muxer plugin for streamcraft"
+name = "pf-mkv"
+description = "Hand-written, dependency-free Matroska (EBML, RFC 8794) container muxer plugin for profluens"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sc_mkv"
+name = "pf_mkv"
 
 [dependencies]
 # Hand-written container — the whole point is zero container/codec dependencies. Only
 # the framework's core vocabulary (buffers, batches, the element contract) is pulled in
 # for the element wrapper; the EBML primitives and the writer are core-independent.
-streamcraft-core = { path = "../core" }
+profluens-core = { path = "../core" }
 
 [dev-dependencies]
 # Only for the end-to-end structural round-trip test: produce real A_FLAC frames +
 # STREAMINFO with the hand-written FLAC encoder, mux them, and read them back. No
-# dependency cycle: sc-flac does not depend on sc-mkv (the container is codec-agnostic),
+# dependency cycle: pf-flac does not depend on pf-mkv (the container is codec-agnostic),
 # so mkv depending on flac for tests is one-directional (mirrors how flac dev-deps ogg).
-sc-flac = { path = "../flac" }
+pf-flac = { path = "../flac" }
 # Only for the end-to-end VP8-in-MKV playback test: encode a few frames with oxideav-vp8,
-# mux them into a V_VP8 track, then demux + decode through sc-vp8's Vp8Dec and compare the
-# planes to a direct oxideav reference decode. Same one-directional dev-dep shape (sc-vp8
-# does not depend on sc-mkv), mirroring vp8/tests/vp8dec.rs.
-sc-vp8 = { path = "../vp8" }
+# mux them into a V_VP8 track, then demux + decode through pf-vp8's Vp8Dec and compare the
+# planes to a direct oxideav reference decode. Same one-directional dev-dep shape (pf-vp8
+# does not depend on pf-mkv), mirroring vp8/tests/vp8dec.rs.
+pf-vp8 = { path = "../vp8" }
 oxideav-vp8 = { version = "0.2", default-features = false }

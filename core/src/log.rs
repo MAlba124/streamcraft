@@ -98,7 +98,7 @@ impl Level {
     }
 }
 
-/// A runtime-adjustable verbosity gate (spec: `STREAMCRAFT_DEBUG=element:level`). One
+/// A runtime-adjustable verbosity gate (spec: `PROFLUENS_DEBUG=element:level`). One
 /// relaxed atomic; `0` = off. Per-element overrides live in [`DebugSpec::targets`] and are
 /// applied by the pipeline once element names resolve — this global gate is the fast path.
 pub struct LevelFilter {
@@ -135,10 +135,10 @@ impl LevelFilter {
         level.rank() <= self.threshold.load(Relaxed)
     }
 
-    /// Apply the global part of `STREAMCRAFT_DEBUG`, if set. Per-target rules are returned
+    /// Apply the global part of `PROFLUENS_DEBUG`, if set. Per-target rules are returned
     /// for the caller (pipeline) to apply later; here we only move the global gate.
     pub fn apply_env(&self) -> DebugSpec {
-        let spec = std::env::var("STREAMCRAFT_DEBUG")
+        let spec = std::env::var("PROFLUENS_DEBUG")
             .ok()
             .map(|s| DebugSpec::parse(&s))
             .unwrap_or_default();
@@ -155,7 +155,7 @@ impl Default for LevelFilter {
     }
 }
 
-/// A parsed `STREAMCRAFT_DEBUG` value: a global catch-all level plus per-target overrides
+/// A parsed `PROFLUENS_DEBUG` value: a global catch-all level plus per-target overrides
 /// (`name:level`). Levels are stored as ranks (`0..=5`); invalid tokens are ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DebugSpec {
@@ -166,7 +166,7 @@ pub struct DebugSpec {
 impl DebugSpec {
     /// Parse the gst-style syntax: comma-separated tokens, each either a bare level
     /// (global) or `name:level`. Whitespace-tolerant; malformed tokens are skipped.
-    // Parses the STREAMCRAFT_DEBUG env var once at startup, not per frame.
+    // Parses the PROFLUENS_DEBUG env var once at startup, not per frame.
     #[allow(clippy::disallowed_methods)]
     pub fn parse(s: &str) -> DebugSpec {
         let mut spec = DebugSpec::default();
@@ -387,7 +387,7 @@ impl LogDrain {
 
     /// Run this drain to completion, formatting each record to stderr — with ANSI
     /// colors when stderr is a terminal (see [`format_record_styled`]; `NO_COLOR` and
-    /// `STREAMCRAFT_LOG_COLOR=always|never` override). Intended for a dedicated
+    /// `PROFLUENS_LOG_COLOR=always|never` override). Intended for a dedicated
     /// low-priority thread (see [`LogDrain::spawn_stderr`]).
     pub fn run_to_stderr(self) {
         let styled = stderr_colors_enabled();
@@ -402,7 +402,7 @@ impl LogDrain {
     /// the thread lives until the sink is dropped.
     pub fn spawn_stderr(self) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
-            .name("sc-log-drain".into())
+            .name("pf-log-drain".into())
             .spawn(move || self.run_to_stderr())
             .expect("spawn log drain")
     }
@@ -575,13 +575,13 @@ fn element_sgr(id: ElementId) -> &'static str {
     PALETTE[id.0 as usize % PALETTE.len()]
 }
 
-/// Whether the stderr drain should emit ANSI colors: `STREAMCRAFT_LOG_COLOR`
+/// Whether the stderr drain should emit ANSI colors: `PROFLUENS_LOG_COLOR`
 /// (`always`/`never`) wins, then the `NO_COLOR` convention (https://no-color.org),
 /// then "is stderr actually a terminal" — so piping to a file stays clean bytes.
 /// Public so every stderr drain (the pipeline's multi-channel one included) applies
 /// one policy.
 pub fn stderr_colors_enabled() -> bool {
-    match std::env::var("STREAMCRAFT_LOG_COLOR").as_deref() {
+    match std::env::var("PROFLUENS_LOG_COLOR").as_deref() {
         Ok("always") => return true,
         Ok("never") => return false,
         _ => {}

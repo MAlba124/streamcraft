@@ -1,6 +1,6 @@
 //! Hardware VA-API **encode round-trip** tests: drive each encoder element with
 //! deterministic raw frames, then decode its output with this workspace's
-//! *independent, pure-Rust* decoders (sc-h264 / sc-h265 / sc-vp8) and gate on
+//! *independent, pure-Rust* decoders (pf-h264 / pf-h265 / pf-vp8) and gate on
 //! PSNR against the source. A hardware encoder validated by a software decoder
 //! that shares no code with it is the strongest hermetic check available — a
 //! bitstream-header bug, a reference-management bug, or a chroma swap all
@@ -13,12 +13,12 @@
 //! high and the PSNR gate is far from the noise floor) but with real motion (so
 //! P-frames actually predict).
 
-use streamcraft_core::format::ValueDesc;
-use streamcraft_core::harness::Harness;
-use streamcraft_core::buffer::{Buffer, BufferFlags};
-use streamcraft_core::time::Timestamp;
+use profluens_core::format::ValueDesc;
+use profluens_core::harness::Harness;
+use profluens_core::buffer::{Buffer, BufferFlags};
+use profluens_core::time::Timestamp;
 
-use sc_vaapi::h264parse;
+use pf_vaapi::h264parse;
 
 const W: usize = 320;
 const H: usize = 240;
@@ -115,7 +115,7 @@ fn decode_all(dec: &mut Harness, encoded: &[Buffer]) -> Vec<Vec<u8>> {
     // Surface decode-side warnings — when a frame fails to decode, the reason
     // rides the bus, and a silent count mismatch is undebuggable.
     for m in dec.bus_messages() {
-        use streamcraft_core::bus::BusMessage;
+        use profluens_core::bus::BusMessage;
         match m {
             BusMessage::Warning { error, .. } => eprintln!("decoder warning: {error:?}"),
             BusMessage::Error { error, .. } => eprintln!("decoder error: {error:?}"),
@@ -159,7 +159,7 @@ fn keyframe_flags_sane(encoded: &[Buffer], tag: &str) {
 
 #[test]
 fn h264_hw_encode_sw_decode_round_trip() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip h264 round trip: no VA-API device");
         return;
     };
@@ -168,7 +168,7 @@ fn h264_hw_encode_sw_decode_round_trip() {
         return;
     }
 
-    let mut enc = Harness::with_slot_size(sc_vaapi::VaapiH264Enc::new(), 512 * 1024);
+    let mut enc = Harness::with_slot_size(pf_vaapi::VaapiH264Enc::new(), 512 * 1024);
     let encoded = encode_all(&mut enc);
     keyframe_flags_sane(&encoded, "h264");
 
@@ -184,14 +184,14 @@ fn h264_hw_encode_sw_decode_round_trip() {
         "h264: first AU has an IDR slice, got {types:?}"
     );
 
-    let mut dec = Harness::with_slot_size(sc_h264::H264Dec::new(), 512 * 1024);
+    let mut dec = Harness::with_slot_size(pf_h264::H264Dec::new(), 512 * 1024);
     let decoded = decode_all(&mut dec, &encoded);
     assert_round_trip_quality(&decoded, "h264");
 }
 
 #[test]
 fn h265_hw_encode_sw_decode_round_trip() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip h265 round trip: no VA-API device");
         return;
     };
@@ -202,10 +202,10 @@ fn h265_hw_encode_sw_decode_round_trip() {
 
     // The PSNR round trip runs **all-intra** (gop = 1): the reference decoder
     // (oxideav-h265) rejects the inter tooling of real-world encoders
-    // (`InterNotSupported` — a documented sc-h265 caveat), so P frames cannot be
+    // (`InterNotSupported` — a documented pf-h265 caveat), so P frames cannot be
     // software-verified here regardless of encoder correctness. Inter output is
     // shape-checked below and validated externally (ffprobe/mpv, the muxer e2e).
-    let mut enc = Harness::with_slot_size(sc_vaapi::VaapiH265Enc::new().with_gop(1), 512 * 1024);
+    let mut enc = Harness::with_slot_size(pf_vaapi::VaapiH265Enc::new().with_gop(1), 512 * 1024);
     let encoded = encode_all(&mut enc);
     assert_eq!(encoded.len(), FRAMES, "h265: one AU per frame");
     for (i, b) in encoded.iter().enumerate() {
@@ -226,12 +226,12 @@ fn h265_hw_encode_sw_decode_round_trip() {
         assert!(types.contains(&want), "h265: first AU has {name}, got {types:?}");
     }
 
-    let mut dec = Harness::with_slot_size(sc_h265::H265Dec::new(), 512 * 1024);
+    let mut dec = Harness::with_slot_size(pf_h265::H265Dec::new(), 512 * 1024);
     let decoded = decode_all(&mut dec, &encoded);
     assert_round_trip_quality(&decoded, "h265");
 
     // Default-GOP shape check: P frames come out as TRAIL_R (type 1) AUs.
-    let mut enc = Harness::with_slot_size(sc_vaapi::VaapiH265Enc::new(), 512 * 1024);
+    let mut enc = Harness::with_slot_size(pf_vaapi::VaapiH265Enc::new(), 512 * 1024);
     let encoded = encode_all(&mut enc);
     keyframe_flags_sane(&encoded, "h265 (default gop)");
     let p_types: Vec<u8> =
@@ -246,7 +246,7 @@ fn h265_hw_encode_sw_decode_round_trip() {
 /// is measurable.
 #[test]
 fn h264_live_knobs_retarget_and_force_keyframe() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip live knobs: no VA-API device");
         return;
     };
@@ -255,8 +255,8 @@ fn h264_live_knobs_retarget_and_force_keyframe() {
         return;
     }
 
-    use streamcraft_core::event::Event;
-    use streamcraft_core::format::Value;
+    use profluens_core::event::Event;
+    use profluens_core::format::Value;
 
     // Deterministic per-frame noise — incompressible, so VBR frame sizes are
     // bitrate-bound, not content-bound.
@@ -276,7 +276,7 @@ fn h264_live_knobs_retarget_and_force_keyframe() {
     // VBR at 4000 kbit/s with a 500 ms HRD window; gop long enough that no
     // scheduled IDR lands inside the test.
     let mut enc = Harness::with_slot_size(
-        sc_vaapi::VaapiH264Enc::new().with_bitrate(4000).with_gop(200).with_hrd_ms(500),
+        pf_vaapi::VaapiH264Enc::new().with_bitrate(4000).with_gop(200).with_hrd_ms(500),
         512 * 1024,
     );
     enc.fix_format(
@@ -349,19 +349,19 @@ fn h264_live_knobs_retarget_and_force_keyframe() {
     // Decode integrity: the forced IDR must be a true random-access point — a
     // decoder joining at frame 60 (the teleconf late-joiner / loss-recovery
     // case) decodes everything from there. The *full* 64-frame stream is
-    // ffmpeg-verified valid (64/64 frames, zero errors), but sc-h264's
+    // ffmpeg-verified valid (64/64 frames, zero errors), but pf-h264's
     // underlying library mishandles GOPs longer than its inferred DPB window
     // (frames discarded un-output at the next IDR — a pre-existing decoder
     // caveat, like its h265 sibling's inter limitation), so the hermetic gate
     // here starts at the IDR.
-    let mut dec = Harness::with_slot_size(sc_h264::H264Dec::new(), 512 * 1024);
+    let mut dec = Harness::with_slot_size(pf_h264::H264Dec::new(), 512 * 1024);
     let decoded = decode_all(&mut dec, &out[60..]);
     assert_eq!(decoded.len(), 4, "the forced IDR opens a decodable stream from frame 60");
 }
 
 #[test]
 fn vp8_hw_encode_sw_decode_round_trip() {
-    let Some(caps) = sc_vaapi::probe() else {
+    let Some(caps) = pf_vaapi::probe() else {
         eprintln!("skip vp8 round trip: no VA-API device");
         return;
     };
@@ -370,7 +370,7 @@ fn vp8_hw_encode_sw_decode_round_trip() {
         return;
     }
 
-    let mut enc = Harness::with_slot_size(sc_vaapi::VaapiVp8Enc::new(), 512 * 1024);
+    let mut enc = Harness::with_slot_size(pf_vaapi::VaapiVp8Enc::new(), 512 * 1024);
     let encoded = encode_all(&mut enc);
     keyframe_flags_sane(&encoded, "vp8");
 
@@ -379,7 +379,7 @@ fn vp8_hw_encode_sw_decode_round_trip() {
     assert_eq!(encoded[0].memory.data()[0] & 1, 0, "vp8: first frame tagged key");
     assert_eq!(encoded[1].memory.data()[0] & 1, 1, "vp8: second frame tagged inter");
 
-    let mut dec = Harness::with_slot_size(sc_vp8::Vp8Dec::new(), 512 * 1024);
+    let mut dec = Harness::with_slot_size(pf_vp8::Vp8Dec::new(), 512 * 1024);
     let decoded = decode_all(&mut dec, &encoded);
     assert_round_trip_quality(&decoded, "vp8");
 }

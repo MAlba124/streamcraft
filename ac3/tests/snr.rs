@@ -8,7 +8,7 @@
 //! The reference fixtures are produced from a licensed movie the developer owns and
 //! are **not** committed; the test is `#[ignore]`d by default and only runs when the
 //! two files exist under `/tmp` (produced by the commands in the module docs). Run
-//! with `cargo test -p sc-ac3 -- --ignored` after generating them:
+//! with `cargo test -p pf-ac3 -- --ignored` after generating them:
 //!
 //! ```text
 //! ffmpeg -i "$HOME/Videos/Nord.2009.720p.BRRip.XviD.AC3-ViSiON.avi" -map 0:a:0 \
@@ -20,8 +20,8 @@
 // Integration test harness (not element code): plain std file IO is fine here.
 #![allow(clippy::disallowed_methods, clippy::chunks_exact_to_as_chunks)]
 
-use sc_ac3::frame::Frame;
-use sc_ac3::parse::{next_frame, Framed};
+use pf_ac3::frame::Frame;
+use pf_ac3::parse::{next_frame, Framed};
 
 /// Decode `data` (a raw AC-3/E-AC-3 elementary stream) through the framer + core,
 /// returning interleaved S16 PCM (ITU order L,R,C,LFE,Ls,Rs).

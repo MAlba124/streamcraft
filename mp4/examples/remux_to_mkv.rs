@@ -6,7 +6,7 @@
 //! survives verbatim and the whole run goes as fast as the disk allows (no clock —
 //! transcoding never paces).
 //!
-//!     cargo run -p sc-mp4 --example remux_to_mkv -- input.mp4 [output.mkv]
+//!     cargo run -p pf-mp4 --example remux_to_mkv -- input.mp4 [output.mkv]
 //!
 //! Tracks the muxer cannot carry (subtitles, unknown codecs, ASC-less mp4a) stay
 //! unlinked and are dropped by scheduler policy — counted, not buffered.
@@ -14,10 +14,10 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;
 
-use sc_mkv::MatroskaReader;
-use sc_mp4::{Mp4Demux, Mp4Reader, Track};
-use streamcraft_core::pipeline::Pipeline;
-use streamcraft_elements::io::{FileSink, FileSrc};
+use pf_mkv::MatroskaReader;
+use pf_mp4::{Mp4Demux, Mp4Reader, Track};
+use profluens_core::pipeline::Pipeline;
+use profluens_elements::io::{FileSink, FileSrc};
 
 /// Read the file head — everything up to (not including) `mdat` — by walking top-level
 /// box headers with seeks, so a multi-GB file is never slurped whole. Requires a
@@ -176,7 +176,7 @@ fn main() {
     let demux = p.add(Mp4Demux::passthrough(head));
     p.link((src, "src"), (demux, "sink")).expect("src -> demux");
     let added = p.preroll().expect("preroll");
-    let mux = p.add(sc_mkv::MkvMux::multi(picked.len()));
+    let mux = p.add(pf_mkv::MkvMux::multi(picked.len()));
     let sink = p.add(FileSink::new(&output));
     for (i, (pad_name, _)) in picked.iter().enumerate() {
         let ap = added

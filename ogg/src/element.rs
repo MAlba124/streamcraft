@@ -1,4 +1,4 @@
-//! `OggDemux` / `OggMux` — the streamcraft **elements** wrapping the tested
+//! `OggDemux` / `OggMux` — the profluens **elements** wrapping the tested
 //! [`OggReader`](crate::OggReader) / [`OggWriter`](crate::OggWriter) library (spec:
 //! Writing elements; RFC 3533). These are the **single logical bitstream** versions:
 //! one sink pad and one src pad each, fitting today's static pad model (spec: Elements
@@ -8,7 +8,7 @@
 //! bytes out, inlining into the upstream group like `flacdec` / `flacenc` (spec:
 //! Scheduling — passive elements run inline, never block).
 //!
-//! Both pads carry raw [`bytes`](streamcraft_core::format::OfferDesc::any): an Ogg byte
+//! Both pads carry raw [`bytes`](profluens_core::format::OfferDesc::any): an Ogg byte
 //! stream on the container side, codec packets on the elementary side. There is no typed
 //! format here — the container is codec-agnostic (§4: Ogg has "no concept of 'time'" and
 //! no knowledge of the media it carries); a downstream depacketiser/decoder is what reads
@@ -36,16 +36,16 @@
 //! EOS reaches elements). The `finish`-contract test in `tests/element_roundtrip.rs` covers
 //! the eos-terminated bytes.
 
-use streamcraft_core::batch::Inputs;
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::element::{
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
-use streamcraft_core::error::Error;
-use streamcraft_core::event::Event;
-use streamcraft_core::format::OfferDesc;
-use streamcraft_core::id::PadId;
-use streamcraft_core::time::Timestamp;
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
 
 use crate::reader::OggReader;
 use crate::writer::OggWriter;

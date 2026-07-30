@@ -58,15 +58,16 @@ fn split_bit(data: &[u8]) -> Vec<Vec<u8>> {
 fn decode_all(packets: &[Vec<u8>]) -> Vec<i16> {
     let mut dec = oxideav_opus::OpusDecoder::new();
     let mut out = Vec::new();
+    let mut pcm = Vec::new(); // reused across packets — validates the no-alloc `decode_packet_into`
     for p in packets {
-        if let Ok(a) = dec.decode_packet(p) {
-            if a.channels == 1 {
-                for s in a.pcm {
+        if let Ok(channels) = dec.decode_packet_into(p, &mut pcm) {
+            if channels == 1 {
+                for &s in &pcm {
                     out.push(s);
                     out.push(s); // upmix mono → stereo to match the reference
                 }
             } else {
-                out.extend_from_slice(&a.pcm);
+                out.extend_from_slice(&pcm);
             }
         }
     }

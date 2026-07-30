@@ -1,22 +1,22 @@
 //! [`Player`] — the thin controller API over probe → head → seek-index → autoplug (spec:
 //! Milestone applications §5 — "give it any supported file and it plays it"; no-bins — the
-//! player *is* the controller, the pipeline stays a flat graph). Deliberately thin: `scplay`
+//! player *is* the controller, the pipeline stays a flat graph). Deliberately thin: `pfplay`
 //! is the only consumer today, so this exposes just what a CLI needs — open, inspect the
 //! discovered tracks and duration, drive the transport handles, and run.
 //!
 //! The build sequence, in order:
 //! 1. read a small prefix, [`probe`](crate::probe) the magic → a [`Kind`];
 //! 2. per-container [`head`](crate::head) prep (MKV cluster scan / MP4 box walk);
-//! 3. build the [`SeekIndex`](streamcraft_core::pipeline::SeekIndex) from container metadata;
+//! 3. build the [`SeekIndex`](profluens_core::pipeline::SeekIndex) from container metadata;
 //! 4. `filesrc → demux` (or `filesrc → parser/decoder` for an elementary stream), then
-//!    [`preroll`](streamcraft_core::pipeline::Pipeline::preroll) to discover pads;
+//!    [`preroll`](profluens_core::pipeline::Pipeline::preroll) to discover pads;
 //! 5. [`autoplug`](crate::autoplug) each pad to a decoder + sink (or a drop sink).
 
 use std::collections::HashMap;
 
-use streamcraft_core::pipeline::{Pipeline, SeekIndex};
-use streamcraft_core::time::Timestamp;
-use streamcraft_elements::io::FileSrc;
+use profluens_core::pipeline::{Pipeline, SeekIndex};
+use profluens_core::time::Timestamp;
+use profluens_elements::io::FileSrc;
 
 use crate::autoplug::{self, SinkChoice, TrackOutcome, Wiring};
 use crate::probe::{self, Kind};
@@ -67,7 +67,7 @@ impl Player {
     pub fn open_zerocopy(
         path: &str,
         policy: SinkPolicy,
-        channel: std::sync::Arc<sc_vaapi::gpuframe::GpuFrameChannel>,
+        channel: std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>,
     ) -> Result<Player, String> {
         Self::open_inner(path, policy, Some(channel))
     }
@@ -75,7 +75,7 @@ impl Player {
     fn open_inner(
         path: &str,
         policy: SinkPolicy,
-        zc_channel: Option<std::sync::Arc<sc_vaapi::gpuframe::GpuFrameChannel>>,
+        zc_channel: Option<std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
     ) -> Result<Player, String> {
         let prefix = head::read_prefix(path, probe::PREFIX_LEN)
             .map_err(|e| format!("cannot read '{path}': {e}"))?;
@@ -106,7 +106,7 @@ impl Player {
         kind: Kind,
         file_len: u64,
         policy: SinkPolicy,
-        zc_channel: Option<&std::sync::Arc<sc_vaapi::gpuframe::GpuFrameChannel>>,
+        zc_channel: Option<&std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
     ) -> Result<(Wiring, SeekIndex, Option<u64>), String> {
         let src = p.add(FileSrc::new(path));
 
@@ -126,21 +126,21 @@ impl Player {
                 let info = seek::mkv_seek_index(path, &header, file_len);
                 // A throwaway reader parses the same header for each track's channel count;
                 // the pad name mirrors the demuxer's `src_track<track_number>`.
-                let mut probe = sc_mkv::MatroskaReader::new();
+                let mut probe = pf_mkv::MatroskaReader::new();
                 let _ = probe.push(&header);
                 for t in probe.tracks() {
                     if t.channels > 0 {
                         audio_channels.insert(format!("src_track{}", t.track_number), t.channels as u16);
                     }
                 }
-                (p.add(sc_mkv::MkvDemux::new(header)), info)
+                (p.add(pf_mkv::MkvDemux::new(header)), info)
             }
             Kind::Mp4 => {
                 let hb = head::mp4_head(path).map_err(|e| format!("mp4 head: {e}"))?;
                 // The reader resolves the sample tables from the same head bytes — reused for
                 // the (keyframe-exact) seek index AND the pad→family map, before the bytes are
                 // handed to the demuxer. The pad name mirrors the demuxer's `src_track<id>`.
-                let reader = sc_mp4::Mp4Reader::new(&hb)
+                let reader = pf_mp4::Mp4Reader::new(&hb)
                     .map_err(|e| format!("mp4 tables: {e:?}"))?;
                 for t in reader.tracks() {
                     mp4_families.insert(format!("src_track{}", t.track_id), t.family());
@@ -148,7 +148,7 @@ impl Player {
                 let info = seek::mp4_seek_index(&reader, file_len);
                 // Decode mode (`new`, not `passthrough`): NAL tracks reframe to Annex B, which
                 // is what the software/hardware decoders take.
-                (p.add(sc_mp4::Mp4Demux::new(hb)), info)
+                (p.add(pf_mp4::Mp4Demux::new(hb)), info)
             }
             Kind::Ogg => {
                 // Ogg's demuxer emits raw `bytes` packets on a single static pad (v1: first
@@ -163,14 +163,14 @@ impl Player {
                 let header = head::avi_head(path).map_err(|e| format!("avi head: {e}"))?;
                 let info = seek::avi_seek_index(&header, file_len);
                 // Per-stream channel counts for the stereo preference (pad `src_stream<index>`).
-                if let Ok((h, _)) = sc_avi::probe_header(&header) {
+                if let Ok((h, _)) = pf_avi::probe_header(&header) {
                     for s in &h.streams {
                         if s.channels > 0 {
                             audio_channels.insert(format!("src_stream{}", s.index), s.channels);
                         }
                     }
                 }
-                (p.add(sc_avi::AviDemux::new(header)), info)
+                (p.add(pf_avi::AviDemux::new(header)), info)
             }
             _ => unreachable!("build_container called with an elementary kind"),
         };
@@ -194,7 +194,7 @@ impl Player {
     /// Vorbis, Theora — no decoder in-tree) is reported and the file plays nothing.
     fn build_ogg(
         p: &mut Pipeline,
-        src: streamcraft_core::id::ElementId,
+        src: profluens_core::id::ElementId,
         prefix: &[u8],
         file_len: u64,
         policy: SinkPolicy,
@@ -206,8 +206,8 @@ impl Player {
             OggCodec::Flac => {
                 // filesrc → oggdemux → oggflacdeframe → flacdec → audio chain. The de-framer
                 // strips the Ogg-FLAC mapping header back to a native `fLaC` stream.
-                let demux = p.add(sc_ogg::OggDemux::new());
-                let deframe = p.add(sc_flac::OggFlacDeframe::new());
+                let demux = p.add(pf_ogg::OggDemux::new());
+                let deframe = p.add(pf_flac::OggFlacDeframe::new());
                 p.link((src, "src"), (demux, "sink")).map_err(|e| format!("filesrc ! oggdemux: {e:?}"))?;
                 p.link((demux, "src"), (deframe, "sink")).map_err(|e| format!("oggdemux ! oggflacdeframe: {e:?}"))?;
                 // The de-framer's byte src is the elementary FLAC stream — reuse the
@@ -215,7 +215,7 @@ impl Player {
                 let sub = autoplug::wire_elementary_audio(
                     p,
                     deframe,
-                    Box::new(sc_flac::FlacDec::new()),
+                    Box::new(pf_flac::FlacDec::new()),
                     "ogg/flac",
                     policy.audio,
                 );
@@ -247,10 +247,10 @@ impl Player {
 
         let wiring = match kind {
             Kind::Flac => autoplug::wire_elementary_audio(
-                p, src, Box::new(sc_flac::FlacDec::new()), "flac", policy.audio,
+                p, src, Box::new(pf_flac::FlacDec::new()), "flac", policy.audio,
             ),
             Kind::Mp3 => autoplug::wire_elementary_audio(
-                p, src, Box::new(sc_mp3::Mp3Dec::new()), "mp3", policy.audio,
+                p, src, Box::new(pf_mp3::Mp3Dec::new()), "mp3", policy.audio,
             ),
             Kind::Wav => Self::build_wav(p, src, path, policy)?,
             Kind::AdtsAac => {
@@ -258,11 +258,11 @@ impl Player {
                 // synthesizes the ASC head from the first ADTS frame and strips each frame's
                 // 7/9-byte header to the raw AU `aacdec` expects (spec: elementary-stream
                 // reframing — the counterpart of a container's CodecPrivate + framing).
-                let parse = p.add(sc_aac::AdtsParse::new());
+                let parse = p.add(pf_aac::AdtsParse::new());
                 p.link((src, "src"), (parse, "sink"))
                     .map_err(|e| format!("filesrc ! adtsparse: {e:?}"))?;
                 autoplug::wire_elementary_audio(
-                    p, parse, Box::new(sc_aac::AacDec::new()), "adts", policy.audio,
+                    p, parse, Box::new(pf_aac::AacDec::new()), "adts", policy.audio,
                 )
             }
             _ => unreachable!("build_elementary called with a container kind"),
@@ -276,11 +276,11 @@ impl Player {
     /// [`AudioConvert::with_input`]. For a drop sink the bytes ride straight through.
     fn build_wav(
         p: &mut Pipeline,
-        src: streamcraft_core::id::ElementId,
+        src: profluens_core::id::ElementId,
         path: &str,
         policy: SinkPolicy,
     ) -> Result<Wiring, String> {
-        use streamcraft_audio::{AudioConvert, SampleFormat, WavParse};
+        use profluens_audio::{AudioConvert, SampleFormat, WavParse};
 
         let parse = p.add(WavParse::new());
         p.link((src, "src"), (parse, "sink")).map_err(|e| format!("filesrc ! wavparse: {e:?}"))?;
@@ -292,7 +292,7 @@ impl Player {
                 // Parse the header up front (a small prefix read) to pin the converter input.
                 let hdr = wav_header(path).ok_or_else(|| "wavparse: unreadable WAV header".to_string())?;
                 let conv = p.add(AudioConvert::with_input(hdr, SampleFormat::S16));
-                let sink = p.add(sc_pipewire::PipeWireAudioSink::new());
+                let sink = p.add(pf_pipewire::PipeWireAudioSink::new());
                 p.link((parse, "src"), (conv, "sink")).map_err(|e| format!("wavparse ! audioconvert: {e:?}"))?;
                 p.link((conv, "src"), (sink, "sink")).map_err(|e| format!("audioconvert ! audiosink: {e:?}"))?;
                 w.audio_sink = Some(sink);
@@ -303,7 +303,7 @@ impl Player {
                 });
             }
             SinkChoice::Drop => {
-                use streamcraft_elements::testing::TestSink;
+                use profluens_elements::testing::TestSink;
                 let (ts, _s) = TestSink::new();
                 let sink = p.add(ts);
                 p.link((parse, "src"), (sink, "sink")).map_err(|e| format!("wavparse ! dropsink: {e:?}"))?;
@@ -328,10 +328,10 @@ impl Player {
         &self.wiring.tracks
     }
 
-    /// The raw-wire presenter's window↔app control channel (`SC_PRESENT`), if the
+    /// The raw-wire presenter's window↔app control channel (`PF_PRESENT`), if the
     /// `waylandvideosink` is in use — the CLI drains its clicks into pause/seek and publishes
     /// duration/pause back for the HUD.
-    pub fn player_control(&self) -> Option<std::sync::Arc<sc_present::PlayerControl>> {
+    pub fn player_control(&self) -> Option<std::sync::Arc<pf_present::PlayerControl>> {
         self.wiring.player_control.clone()
     }
 
@@ -355,7 +355,7 @@ impl Player {
     /// was opened with `SinkPolicy { video: SinkChoice::External, .. }` — the tap point an
     /// external presenter (the SDL3 GUI's clock-paced frame-slot appsink) links its own sink
     /// to. `None` unless `External` video was requested and a video track linked.
-    pub fn video_out(&self) -> Option<(streamcraft_core::id::ElementId, &'static str)> {
+    pub fn video_out(&self) -> Option<(profluens_core::id::ElementId, &'static str)> {
         self.wiring.video_out
     }
 
@@ -370,12 +370,12 @@ impl Player {
 
     /// The subtitle overlay element, if one was inserted (a video file with a text-subtitle
     /// track). A UI can toggle its visibility or inspect it.
-    pub fn overlay(&self) -> Option<streamcraft_core::id::ElementId> {
+    pub fn overlay(&self) -> Option<profluens_core::id::ElementId> {
         self.wiring.overlay
     }
 
     /// The ids the stats tap watches: `(label, id)` for each present decoder/sink.
-    pub fn watched(&self) -> Vec<(&'static str, streamcraft_core::id::ElementId)> {
+    pub fn watched(&self) -> Vec<(&'static str, profluens_core::id::ElementId)> {
         let w = &self.wiring;
         [
             ("vdec", w.video_dec),
@@ -390,7 +390,7 @@ impl Player {
 
     /// Drive the pipeline to EOS / stop (delegates to [`Pipeline::run`]). Blocks the calling
     /// thread; install transport controls off `self.pipeline`'s handles beforehand.
-    pub fn run(&mut self) -> Result<(), streamcraft_core::error::Error> {
+    pub fn run(&mut self) -> Result<(), profluens_core::error::Error> {
         self.pipeline.run()
     }
 }
@@ -398,14 +398,14 @@ impl Player {
 /// Parse a WAV file's `AudioFormat` from a small prefix (app-side controller IO, before the
 /// pipeline — the sanctioned `clippy.toml` exception). `None` on any read/parse failure.
 #[allow(clippy::disallowed_methods)] // app-side WAV header parse before the pipeline; see clippy.toml
-fn wav_header(path: &str) -> Option<streamcraft_audio::AudioFormat> {
+fn wav_header(path: &str) -> Option<profluens_audio::AudioFormat> {
     use std::io::Read;
     // 4 KiB comfortably covers the RIFF/fmt/data-header region before PCM data.
     let mut buf = vec![0u8; 4096];
     let mut f = std::fs::File::open(path).ok()?;
     let n = f.read(&mut buf).ok()?;
     buf.truncate(n);
-    streamcraft_audio::parse_wav_header(&buf).ok().map(|h| h.format)
+    profluens_audio::parse_wav_header(&buf).ok().map(|h| h.format)
 }
 
 /// The Ogg first-bitstream codec, from the BOS page's mapping-header magic.

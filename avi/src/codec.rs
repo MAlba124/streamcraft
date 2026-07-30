@@ -1,20 +1,20 @@
 //! Stream-format → src-pad **family** mapping and per-track offer menus, mirroring
-//! `sc-mkv`'s `codec::family_for` / `offers_for`. An AVI stream's codec is named two ways
+//! `pf-mkv`'s `codec::family_for` / `offers_for`. An AVI stream's codec is named two ways
 //! depending on the medium (AVI RIFF File Reference):
 //! - **video** by the `strh.fccHandler` / `strf.biCompression` **fourcc** (`XVID`, `DX50`,
 //!   `H264`, …);
 //! - **audio** by the `strf` WAVEFORMATEX **`wFormatTag`** (a registered 16-bit id — see the
 //!   Microsoft `mmreg.h` "WAVE_FORMAT_*" registry and the AC-3/DTS/MP3 assignments).
 //!
-//! The families are `&'static str` and must match the sink offers of the streamcraft
+//! The families are `&'static str` and must match the sink offers of the profluens
 //! **decoders** built by the other agents (this crate's brief pins the vocabulary):
 //! `mpeg4/asp`, `h264/annexb`, `ac3`, `mp3`, `audio/raw`. A stream we cannot classify maps
 //! to `bytes` (the escape a generic byte sink still taps; a warning is logged and downstream
 //! decode is skipped). Per-track menus are what make negotiation-driven autoplug *select* the
-//! right decoder (the same lesson `sc-mkv` documents: one shared all-families menu let the
+//! right decoder (the same lesson `pf-mkv` documents: one shared all-families menu let the
 //! wrong decoder link, then drop every packet at runtime).
 
-use streamcraft_core::format::OfferDesc;
+use profluens_core::format::OfferDesc;
 
 use crate::riff::{Stream, StreamKind};
 
@@ -104,7 +104,7 @@ pub fn is_video_family(family: &str) -> bool {
 /// `bytes` escape, so link-time negotiation *selects* the matching decoder while a generic
 /// byte peer can still tap the track. `any` offers — the concrete params ride the runtime
 /// announcement (rate/channels/width/height), whose field names the consumer's offers intern
-/// (the `sc-mkv` per-track-menu lesson).
+/// (the `pf-mkv` per-track-menu lesson).
 pub fn offers_for(stream: &Stream) -> &'static [OfferDesc] {
     static MPEG4: [OfferDesc; 2] = [OfferDesc::any("mpeg4/asp"), OfferDesc::any("bytes")];
     static H264: [OfferDesc; 2] = [OfferDesc::any("h264/annexb"), OfferDesc::any("bytes")];

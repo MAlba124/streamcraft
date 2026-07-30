@@ -12,10 +12,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use sc_mpeg4p2::bits::BitReader;
-use sc_mpeg4p2::decoder::{DecodeResult, Decoder};
-use sc_mpeg4p2::frame::Picture;
-use sc_mpeg4p2::headers::{self, startcode, VolHeader, VopType};
+use pf_mpeg4p2::bits::BitReader;
+use pf_mpeg4p2::decoder::{DecodeResult, Decoder};
+use pf_mpeg4p2::frame::Picture;
+use pf_mpeg4p2::headers::{self, startcode, VolHeader, VopType};
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -140,8 +140,8 @@ fn build_tiny() -> Option<(Vec<u8>, Vec<Vec<u8>>, usize, usize)> {
         return None;
     }
     let (w, h) = (176usize, 144usize);
-    let es = "/tmp/sc_m4p2_tiny.m4v";
-    let refp = "/tmp/sc_m4p2_tiny.yuv";
+    let es = "/tmp/pf_m4p2_tiny.m4v";
+    let refp = "/tmp/pf_m4p2_tiny.yuv";
     let ok = Command::new("ffmpeg")
         .args([
             "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=176x144:d=1:r=10",
@@ -251,7 +251,7 @@ fn garbage_never_panics() {
         let garbage: Vec<u8> = (0..300).map(|k| (k as u8).wrapping_mul(37).wrapping_add(seed as u8)).collect();
         let mut r = BitReader::new(&garbage);
         // Pretend it's an I-VOP header then MB data.
-        let vh = sc_mpeg4p2::headers::VopHeader {
+        let vh = pf_mpeg4p2::headers::VopHeader {
             coding_type: VopType::I,
             coded: true,
             rounding_type: 0,
@@ -268,15 +268,15 @@ fn garbage_never_panics() {
 
 #[test]
 fn element_registers_and_describes() {
-    use streamcraft_core::element::{Direction, Element};
-    use streamcraft_core::registry::Registry;
+    use profluens_core::element::{Direction, Element};
+    use profluens_core::registry::Registry;
 
     let mut reg = Registry::new();
-    sc_mpeg4p2::register(&mut reg);
+    pf_mpeg4p2::register(&mut reg);
 
     // The element's static descriptor must be well-formed: named `mpeg4p2dec`,
     // a `mpeg4/asp` (+ `bytes`) sink and a `video/raw` src.
-    let el = sc_mpeg4p2::Mpeg4p2Dec::new();
+    let el = pf_mpeg4p2::Mpeg4p2Dec::new();
     let d = el.desc();
     assert_eq!(d.name, "mpeg4p2dec");
     let sink = d.pads.iter().find(|p| p.direction == Direction::Sink).unwrap();

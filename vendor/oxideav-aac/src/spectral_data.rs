@@ -167,7 +167,7 @@ pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>
 
 /// [`sect_sfb_offset`] generalised over the output allocator — the band-offset `Vec<Vec<u32>>`
 /// is pure per-frame scratch (built here, read once during rescale/de-interleave, dropped), so
-/// the decode path allocates it from the caller's frame arena rather than the heap (streamcraft
+/// the decode path allocates it from the caller's frame arena rather than the heap (profluens
 /// patch). `A: Copy` because the nested `Vec<Vec<u32, A>, A>` shares one allocator.
 pub fn sect_sfb_offset_in<A: std::alloc::Allocator + Copy>(
     alloc: A,
@@ -225,7 +225,7 @@ pub struct SpectralData<A: std::alloc::Allocator = std::alloc::Global> {
 // Hand-written PartialEq / Eq (as for `AbsoluteScaleFactors`): a derive would bound
 // `A: PartialEq`, which `Global` and the arena allocators do not satisfy. `Vec<T, A1>:
 // PartialEq<Vec<T, A2>>` compares element-wise, so this stays a value comparison across
-// allocators. (streamcraft patch)
+// allocators. (profluens patch)
 impl<A1: std::alloc::Allocator, A2: std::alloc::Allocator> PartialEq<SpectralData<A2>>
     for SpectralData<A1>
 {
@@ -286,7 +286,7 @@ impl SpectralData {
     /// dropped) and the decoded `x_quant` come from `scratch`: the pipeline passes its
     /// per-`process()` arena, so the offset table AND the per-group coefficient buffers cost no
     /// heap malloc/free per channel per frame. The returned [`SpectralData<A>`] borrows the arena
-    /// for the life of the frame's decode (streamcraft patch). Tests call
+    /// for the life of the frame's decode (profluens patch). Tests call
     /// [`parse`](SpectralData::parse), inferring `A = Global`.
     pub fn parse_in<A: std::alloc::Allocator + Copy>(
         reader: &mut BitReader<'_>,
@@ -496,7 +496,7 @@ fn read_and_apply_signs(
     // At most `dim` (≤ 4) sign bits — one per non-zero coefficient. A fixed stack array holds
     // them so this hot per-tuple path allocates nothing (it was a `Vec<bool>` per tuple, which
     // profiled as ~20% of *all* heap allocations and ~75% of the 1-byte allocations during
-    // playback — streamcraft patch, see STREAMCRAFT-PATCHES.md).
+    // playback — profluens patch, see PROFLUENS-PATCHES.md).
     let nonzero = tuple.iter().take(dim).filter(|&&v| v != 0).count();
     let mut signs = [false; 4];
     for s in signs.iter_mut().take(nonzero) {

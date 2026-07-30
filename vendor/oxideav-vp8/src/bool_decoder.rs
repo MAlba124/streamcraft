@@ -90,7 +90,7 @@ pub struct BoolDecoder<'a> {
     /// of bits already shifted out of `value` since the last full byte
     /// was loaded. Range `0..=7`.
     bit_count: u32,
-    /// STREAMCRAFT PATCH: virtual zero bytes fed past the end of the
+    /// PROFLUENS PATCH: virtual zero bytes fed past the end of the
     /// partition, capped at [`MAX_VIRTUAL_ZERO_BYTES`]. Real encoders
     /// (libvpx, Intel iHD) do not flush the arithmetic coder's tail —
     /// the final symbols of a partition are recovered by renormalising
@@ -101,7 +101,7 @@ pub struct BoolDecoder<'a> {
     virtual_zeros: u32,
 }
 
-/// STREAMCRAFT PATCH: how many implicit zero bytes renormalisation may
+/// PROFLUENS PATCH: how many implicit zero bytes renormalisation may
 /// consume past the partition end before `EndOfStream` fires. Legitimate
 /// tail recovery needs at most the two-byte `value` window plus one
 /// renormalisation pull; 8 leaves margin while still failing fast on truly
@@ -252,7 +252,7 @@ impl<'a> BoolDecoder<'a> {
                 range <<= shift;
                 let next_bc = bit_count + shift;
                 if next_bc >= 8 {
-                    // STREAMCRAFT PATCH: past the partition end, feed implicit
+                    // PROFLUENS PATCH: past the partition end, feed implicit
                     // zero bytes (libvpx `bool_decoder_fill` semantics) up to
                     // the cap; only then surface EndOfStream.
                     let next: u8 = match input.split_first() {
@@ -346,7 +346,7 @@ impl<'a> BoolDecoder<'a> {
         self.range <<= shift;
         let bit_count = self.bit_count + shift;
         if bit_count >= 8 {
-            // STREAMCRAFT PATCH: past the partition end, feed implicit zero
+            // PROFLUENS PATCH: past the partition end, feed implicit zero
             // bytes (libvpx `bool_decoder_fill` semantics) up to the cap;
             // only then surface EndOfStream.
             let next: u8 = match self.input.split_first() {
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn end_of_stream_pads_virtual_zeros_then_surfaces() {
-        // STREAMCRAFT PATCH semantics: real encoders (libvpx, Intel iHD) do
+        // PROFLUENS PATCH semantics: real encoders (libvpx, Intel iHD) do
         // not flush the arithmetic coder's tail, so the final symbols of a
         // partition renormalise against implicit zero bytes — libvpx's own
         // `bool_decoder_fill` pads exactly like this. Reads past the end must

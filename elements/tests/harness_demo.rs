@@ -8,10 +8,10 @@
 //! provable in a handful of lines against the very same `pattern_byte`/`fold` golden the
 //! pipeline tests use.
 
-use streamcraft_core::element::Flow;
-use streamcraft_core::harness::Harness;
-use streamcraft_elements::flow::PassThrough;
-use streamcraft_elements::testing::{fold, pattern_byte, TestSrc, FNV_OFFSET};
+use profluens_core::element::Flow;
+use profluens_core::harness::Harness;
+use profluens_elements::flow::PassThrough;
+use profluens_elements::testing::{fold, pattern_byte, TestSrc, FNV_OFFSET};
 
 /// The FNV-1a digest of the first `n` `TestSrc` pattern bytes — the golden the pipeline
 /// tests assert against, reused here so the harness proves the *same* content.
@@ -41,8 +41,8 @@ fn passthrough_forwards_bytes_unchanged() {
 #[test]
 fn passthrough_batch_forwards_all() {
     // A whole batch through at once — passthrough drains its input in one `process()`.
-    use streamcraft_core::batch::Batch;
-    use streamcraft_core::id::FormatId;
+    use profluens_core::batch::Batch;
+    use profluens_core::id::FormatId;
     let mut h = Harness::new(PassThrough::new());
     let mut batch = Batch::new(FormatId(0));
     for chunk in [&[10u8, 11][..], &[12, 13, 14][..]] {

@@ -22,8 +22,8 @@
 //! the IDR/P single-reference GOP every element here uses. After a successful
 //! frame the element calls [`EncEngine::advance_recon`] to swap the pair.
 
-use streamcraft_core::ctx::Ctx;
-use streamcraft_core::format::{FixedFormat, Value};
+use profluens_core::ctx::Ctx;
+use profluens_core::format::{FixedFormat, Value};
 
 use crate::ffi;
 use crate::va::{self, Config, Context, Display, Surfaces, UploadImage, VaResult};

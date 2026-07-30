@@ -10,7 +10,7 @@
 //! Every case is also fed as **each of its prefixes** (truncation at every offset) so a cut
 //! at any byte is safe.
 
-use sc_mp4::Mp4Reader;
+use pf_mp4::Mp4Reader;
 
 /// Assemble a box: 8-byte header (size, type) + body. `size` is the total incl. header.
 fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -152,7 +152,7 @@ fn fragmented_movie_is_a_hard_error() {
     let mut head = ftyp();
     head.extend_from_slice(&moov);
     match Mp4Reader::new(&head) {
-        Err(sc_mp4::Mp4Error::Fragmented) => {}
+        Err(pf_mp4::Mp4Error::Fragmented) => {}
         Err(other) => panic!("moov/mvex should be Fragmented, got {other:?}"),
         Ok(_) => panic!("moov/mvex must not resolve as a progressive movie"),
     }

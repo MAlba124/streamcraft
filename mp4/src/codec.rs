@@ -8,10 +8,10 @@
 //! `av1C`, `dOps`, `esds`).
 //!
 //! This module extracts exactly what the demuxer announces and reframes with:
-//! - the announce **family** for the streamcraft decoders ([`family_for`]);
+//! - the announce **family** for the profluens decoders ([`family_for`]);
 //! - the visual **dimensions** / audio **rate/channels** from the sample entry;
 //! - the codec **configuration record** (`avcC`/`hvcC`) that seeds the Annex B reframer,
-//!   reusing `sc-mkv`'s [`nal_head_from_config`](sc_mkv::nal_head_from_config) parser (the
+//!   reusing `pf-mkv`'s [`nal_head_from_config`](pf_mkv::nal_head_from_config) parser (the
 //!   identical ISO/IEC 14496-15 record rides both an MKV `CodecPrivate` and an MP4
 //!   `avc1`/`hvc1` sample entry — one parser, no copy; see `mp4/NOTES.md`).
 //!
@@ -26,7 +26,7 @@
 
 use crate::boxes::{self, BoxError, BoxHeader};
 
-pub use sc_mkv::{nal_head_from_config, Reframer};
+pub use pf_mkv::{nal_head_from_config, Reframer};
 
 /// A parsed sample entry — the codec four-CC and the format params + reframing info the
 /// demuxer needs to announce the pad and slice frames. Built from one `stsd` child box.
@@ -34,7 +34,7 @@ pub use sc_mkv::{nal_head_from_config, Reframer};
 pub struct SampleEntry {
     /// The sample-entry box type (`avc1`, `vp09`, `mp4a`, …) as raw octets.
     pub kind: boxes::FourCc,
-    /// The announce family for the streamcraft decoders ([`family_for`]).
+    /// The announce family for the profluens decoders ([`family_for`]).
     pub family: &'static str,
     /// Video: coded width in pixels (0 for audio / unknown).
     pub width: u32,
@@ -61,7 +61,7 @@ pub struct SampleEntry {
 }
 
 /// The demuxer announce family for a sample-entry box type (§8.5.2; RFC 6381). The families
-/// match the sink offers of the streamcraft decoders so a dynamic pad linking
+/// match the sink offers of the profluens decoders so a dynamic pad linking
 /// `mp4demux.src_track1 ! h264dec.sink` (etc.) negotiates:
 /// - `avc1`/`avc3` → `h264/annexb`, `hvc1`/`hev1` → `h265/annexb`;
 /// - `vp09` → `vp9`, `av01` → `av1`;
