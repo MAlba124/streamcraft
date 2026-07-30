@@ -1,6 +1,6 @@
 use crate::convolution_2d::{binop_into, map_into, perform_valid_2d_conv_with_boundary};
 use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
-use ndarray::{arr2, Array1, Array2, ArrayBase, ArrayViewMut2, Axis, Data, Ix2};
+use ndarray::{arr2, Array2, ArrayBase, ArrayViewMut2, Axis, Data, Ix2};
 use profluens_core::memory::Arena;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
@@ -164,21 +164,26 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
     ) -> PatchSimilarityResult {
         let sim_map = self.compute_sim_map(&*ref_patch, &*deg_patch, arena);
 
-        let freq_band_deg_energy: Array1<f64> = deg_patch
-            .mean_axis(Axis(1))
-            .expect("Failed to compute mean for degraded signal!");
-        let freq_band_means: Array1<f64> = sim_map
-            .mean_axis(Axis(1))
-            .expect("Failed to compute mean for similarity map!");
-        let freq_band_std: Array1<f64> = sim_map.std_axis(Axis(1), 1.0);
-        let mean_freq_band_means = freq_band_means
-            .mean()
-            .expect("Failed to compute mean of means for degraded signal!");
+        // Per-band means straight into the result `Vec`s: same row-sum / ncols as
+        // `mean_axis(Axis(1)).to_vec()`, but without the intermediate owned `Array1`. This full
+        // measure runs ~twice per patch (backtrace + fine realignment), so those intermediates
+        // were a large share of the remaining allocations. `std_axis` stays as-is — ndarray's
+        // Welford variance isn't trivially reproducible bit-for-bit, and it's one alloc.
+        let dncols = deg_patch.ncols() as f64;
+        let freq_band_deg_energy: Vec<f64> =
+            (0..deg_patch.nrows()).map(|i| deg_patch.row(i).sum() / dncols).collect();
+        let sncols = sim_map.ncols() as f64;
+        let freq_band_means: Vec<f64> =
+            (0..sim_map.nrows()).map(|i| sim_map.row(i).sum() / sncols).collect();
+        let freq_band_std: Vec<f64> = sim_map.std_axis(Axis(1), 1.0).to_vec();
+        // `Array1::mean()` is `sum() / n`; `iter().sum()` folds the same row means in the same order.
+        let mean_freq_band_means =
+            freq_band_means.iter().sum::<f64>() / freq_band_means.len() as f64;
 
         PatchSimilarityResult::new(
-            freq_band_means.to_vec(),
-            freq_band_std.to_vec(),
-            freq_band_deg_energy.to_vec(),
+            freq_band_means,
+            freq_band_std,
+            freq_band_deg_energy,
             mean_freq_band_means,
         )
     }
