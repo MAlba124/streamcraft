@@ -135,6 +135,96 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
             self.filter_conditions_4[band] = z4;
         }
     }
+
+    /// Per-band filter energy `Σ y4²` for one frame (state starts at zero), computed directly — the
+    /// only thing the spectrogram builder needs from the filtered frame (RMS = `sqrt(energy / n)`),
+    /// so the full filtered `Array2` is never materialised. The band loop is the *inner* loop over
+    /// structure-of-arrays state, which vectorises: under AVX2 it runs 4 bands per instruction. The
+    /// float ops are the identical per-band cascade in the identical order (no FMA contraction), so
+    /// the result is bit-for-bit equal to `apply_filter`-then-sum-of-squares.
+    pub fn filter_frame_energy_into(&self, input: &[f64], energy: &mut [f64; NUM_BANDS]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: gated on runtime AVX2 detection; the body is plain safe Rust (no
+                // intrinsics) — `target_feature` only lets the autovectoriser use 256-bit lanes.
+                unsafe { self.filter_frame_energy_avx2(input, energy) };
+                return;
+            }
+        }
+        self.filter_frame_energy_kernel(input, energy);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn filter_frame_energy_avx2(&self, input: &[f64], energy: &mut [f64; NUM_BANDS]) {
+        self.filter_frame_energy_kernel(input, energy);
+    }
+
+    #[inline(always)]
+    fn filter_frame_energy_kernel(&self, input: &[f64], energy: &mut [f64; NUM_BANDS]) {
+        // Gather coefficients into fixed-size arrays so the band loop has no `Vec` bounds checks or
+        // aliasing and LLVM can vectorise it. Stage-1 numerators are pre-divided by the gain (`n1x`);
+        // stages 2–4 share `a0`/`a2` and differ only in the middle tap (`a12`/`a13`/`a14`).
+        let mut n10 = [0.0f64; NUM_BANDS];
+        let mut n11 = [0.0f64; NUM_BANDS];
+        let mut n12 = [0.0f64; NUM_BANDS];
+        let mut a0 = [0.0f64; NUM_BANDS];
+        let mut a12 = [0.0f64; NUM_BANDS];
+        let mut a13 = [0.0f64; NUM_BANDS];
+        let mut a14 = [0.0f64; NUM_BANDS];
+        let mut a2 = [0.0f64; NUM_BANDS];
+        let mut b1 = [0.0f64; NUM_BANDS];
+        let mut b2 = [0.0f64; NUM_BANDS];
+        for b in 0..NUM_BANDS {
+            let g = self.filter_coeff_gain[b];
+            n10[b] = self.filter_coeff_a0[b] / g;
+            n11[b] = self.filter_coeff_a11[b] / g;
+            n12[b] = self.filter_coeff_a2[b] / g;
+            a0[b] = self.filter_coeff_a0[b];
+            a12[b] = self.filter_coeff_a12[b];
+            a13[b] = self.filter_coeff_a13[b];
+            a14[b] = self.filter_coeff_a14[b];
+            a2[b] = self.filter_coeff_a2[b];
+            b1[b] = self.filter_coeff_b1[b];
+            b2[b] = self.filter_coeff_b2[b];
+        }
+
+        // Direct-Form-II-transposed state for the four cascaded sections, one lane per band, starting
+        // from zero — each frame is filtered independently (matches `build`'s per-frame reset).
+        let mut z10 = [0.0f64; NUM_BANDS];
+        let mut z11 = [0.0f64; NUM_BANDS];
+        let mut z20 = [0.0f64; NUM_BANDS];
+        let mut z21 = [0.0f64; NUM_BANDS];
+        let mut z30 = [0.0f64; NUM_BANDS];
+        let mut z31 = [0.0f64; NUM_BANDS];
+        let mut z40 = [0.0f64; NUM_BANDS];
+        let mut z41 = [0.0f64; NUM_BANDS];
+        let mut acc = [0.0f64; NUM_BANDS];
+
+        for &x in input {
+            for b in 0..NUM_BANDS {
+                let y1 = n10[b] * x + z10[b];
+                z10[b] = n11[b] * x + z11[b] - b1[b] * y1;
+                z11[b] = n12[b] * x - b2[b] * y1;
+
+                let y2 = a0[b] * y1 + z20[b];
+                z20[b] = a12[b] * y1 + z21[b] - b1[b] * y2;
+                z21[b] = a2[b] * y1 - b2[b] * y2;
+
+                let y3 = a0[b] * y2 + z30[b];
+                z30[b] = a13[b] * y2 + z31[b] - b1[b] * y3;
+                z31[b] = a2[b] * y2 - b2[b] * y3;
+
+                let y4 = a0[b] * y3 + z40[b];
+                z40[b] = a14[b] * y3 + z41[b] - b1[b] * y4;
+                z41[b] = a2[b] * y3 - b2[b] * y4;
+
+                acc[b] += y4 * y4;
+            }
+        }
+        *energy = acc;
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +268,44 @@ mod tests {
 
         for (&res, ex) in expected_output.iter().zip(filtered_signal) {
             assert_abs_diff_eq!(res, ex, epsilon = epsilon);
+        }
+    }
+
+    /// The fused (vectorised, AVX2-across-bands) energy kernel must equal `apply_filter` followed by
+    /// a per-band sum of squares — bit-for-bit, since the spectrogram RMS is derived from it.
+    #[test]
+    fn frame_energy_matches_apply_filter() {
+        let fs = 48000;
+        const NUM_BANDS: usize = 32;
+        let min_freq = 50.0f64;
+        let (mut filter_coeffs, _) = equivalent_rectangular_bandwidth::make_filters::<NUM_BANDS>(
+            fs,
+            min_freq,
+            fs as f64 / 2.0,
+        );
+        filter_coeffs.invert_axis(Axis(0));
+
+        // A non-trivial frame so the 4-stage state genuinely evolves.
+        let signal: Vec<f64> = (0..96)
+            .map(|i| (i as f64 * 0.37).sin() * 0.5 + (i as f64 * 0.11).cos() * 0.3)
+            .collect();
+
+        let mut fb = GammatoneFilterbank::<{ NUM_BANDS }>::new(min_freq);
+        fb.reset_filter_conditions();
+        fb.set_filter_coefficients(&filter_coeffs);
+
+        // Reference: exactly what `build` did before the fused kernel.
+        let filtered = fb.apply_filter(&signal);
+        let mut reference = [0.0f64; NUM_BANDS];
+        for (b, r) in reference.iter_mut().enumerate() {
+            *r = filtered.row(b).iter().map(|&e| e * e).sum();
+        }
+
+        let mut energy = [0.0f64; NUM_BANDS];
+        fb.filter_frame_energy_into(&signal, &mut energy);
+
+        for b in 0..NUM_BANDS {
+            assert_eq!(energy[b], reference[b], "band {b} energy differs from apply_filter");
         }
     }
 }

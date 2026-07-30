@@ -65,9 +65,9 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         let num_cols = 1 + ((time_domain_signal.len() - window.size) / hop_size);
         let mut out_matrix = Array2::<f64>::zeros((NUM_BANDS, num_cols));
         let window_size_f = window.size as f64;
-        // Reused across every frame: `apply_filter` used to mint a fresh (NUM_BANDS × window_size)
-        // `Array2` (~1 MB) per frame — thousands per spectrogram, the bulk of ViSQOL's byte churn.
-        let mut filtered_signal = Array2::<f64>::zeros((NUM_BANDS, window.size));
+        // Per-band filter energy for one frame, filled by the fused (vectorised, AVX2-across-bands)
+        // gammatone kernel — no per-frame filtered `Array2`, no per-frame reset.
+        let mut energy = [0.0f64; NUM_BANDS];
 
         for (index, frame) in time_domain_signal
             .windows(window.size)
@@ -75,21 +75,17 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
             .step_by(hop_size)
             .enumerate()
         {
-            self.filter_bank.reset_filter_conditions();
-            self.filter_bank.apply_filter_into(
+            self.filter_bank.filter_frame_energy_into(
                 frame
                     .as_slice()
                     .expect("Failed to convert audio frame to slice"),
-                &mut filtered_signal,
+                &mut energy,
             );
 
-            // Per-band RMS straight into the output column. Bit-identical to the previous
-            // square-in-place → `mean_axis(Axis(1))` → `sqrt` (same left-to-right Σe² over the
-            // contiguous row, same `/window`, same `sqrt`) but with no per-frame `mean_axis`/
-            // `to_vec` allocations.
+            // RMS straight into the output column: `sqrt(Σ y4² / window)`. Bit-identical to
+            // apply_filter → square → mean_axis → sqrt (same left-to-right Σ, same divide, sqrt).
             for band in 0..NUM_BANDS {
-                let sum_sq: f64 = filtered_signal.row(band).iter().map(|&e| e * e).sum();
-                out_matrix[(band, index)] = (sum_sq / window_size_f).sqrt();
+                out_matrix[(band, index)] = (energy[band] / window_size_f).sqrt();
             }
         }
 
