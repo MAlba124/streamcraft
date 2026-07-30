@@ -45,23 +45,41 @@ fn encode_stream(pcm: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Like [`encode_stream`], but splices a `VORBIS_COMMENT` metadata block after STREAMINFO — a
-/// valid FLAC tag chain (`fLaC` + STREAMINFO(not-last) + VORBIS_COMMENT(last) + frames).
-fn encode_stream_with_tags(pcm: &[u8], comments: &[&str]) -> Vec<u8> {
+/// Like [`encode_stream`], but splices a `VORBIS_COMMENT` (and optionally a `PICTURE`) metadata
+/// block after STREAMINFO — a valid FLAC tag chain (`fLaC` + STREAMINFO(not-last) +
+/// VORBIS_COMMENT(not-last if a picture follows) + [PICTURE(last)] + frames).
+fn encode_stream_with_tags(pcm: &[u8], comments: &[&str], picture: Option<(&str, &[u8])>) -> Vec<u8> {
     let (mut enc, mut header) =
         FlacEncoder::new_streaming(RATE, CHANNELS, SampleFormat::S16, 4096).expect("enc");
     header[4] &= 0x7f; // clear STREAMINFO's last-metadata-block flag
-    let mut body = Vec::new();
-    body.extend_from_slice(&3u32.to_le_bytes());
-    body.extend_from_slice(b"ref"); // vendor string
-    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+
+    // VORBIS_COMMENT — last unless a PICTURE block follows it.
+    let mut vc = Vec::new();
+    vc.extend_from_slice(&3u32.to_le_bytes());
+    vc.extend_from_slice(b"ref"); // vendor string
+    vc.extend_from_slice(&(comments.len() as u32).to_le_bytes());
     for c in comments {
-        body.extend_from_slice(&(c.len() as u32).to_le_bytes());
-        body.extend_from_slice(c.as_bytes());
+        vc.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        vc.extend_from_slice(c.as_bytes());
     }
-    header.push(0x80 | 4); // last-block | VORBIS_COMMENT
-    header.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
-    header.extend_from_slice(&body);
+    header.push(if picture.is_some() { 4 } else { 0x80 | 4 });
+    header.extend_from_slice(&(vc.len() as u32).to_be_bytes()[1..]);
+    header.extend_from_slice(&vc);
+
+    if let Some((mime, data)) = picture {
+        let mut pic = Vec::new();
+        pic.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+        pic.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        pic.extend_from_slice(mime.as_bytes());
+        pic.extend_from_slice(&0u32.to_be_bytes()); // description length
+        pic.extend_from_slice(&[0u8; 16]); // width, height, colour depth, indexed colours
+        pic.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        pic.extend_from_slice(data);
+        header.push(0x80 | 6); // last-block | PICTURE
+        header.extend_from_slice(&(pic.len() as u32).to_be_bytes()[1..]);
+        header.extend_from_slice(&pic);
+    }
+
     let mut out = header;
     enc.encode_interleaved(pcm, &mut out).expect("encode");
     out
@@ -136,7 +154,12 @@ fn flacdec_posts_tags_to_the_bus() {
     use profluens_core::bus::BusMessage;
 
     let (pcm, _) = gen_s16(4_000);
-    let flac = encode_stream_with_tags(&pcm, &["TITLE=Set Theory", "ARTIST=Carbon Based Lifeforms"]);
+    let art = b"\xFF\xD8\xFF\xE0jpeg-ish cover-art bytes";
+    let flac = encode_stream_with_tags(
+        &pcm,
+        &["TITLE=Set Theory", "ARTIST=Carbon Based Lifeforms"],
+        Some(("image/jpeg", art)),
+    );
 
     let mut h = Harness::new(pf_flac::FlacDec::new());
     for chunk in flac.chunks(700) {
@@ -159,4 +182,9 @@ fn flacdec_posts_tags_to_the_bus() {
     assert_eq!(tags.get("TITLE"), Some("Set Theory"));
     assert_eq!(tags.get("ARTIST"), Some("Carbon Based Lifeforms"));
     assert_eq!(tags.get("artist"), Some("Carbon Based Lifeforms"), "lookup is case-insensitive");
+
+    // The cover art is forwarded too — MIME + bytes intact, held zero-copy.
+    assert_eq!(tags.pictures().len(), 1, "one attached picture");
+    assert_eq!(&*tags.pictures()[0].mime, "image/jpeg");
+    assert_eq!(tags.pictures()[0].data.data(), art, "image bytes forwarded intact");
 }

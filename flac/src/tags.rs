@@ -166,4 +166,67 @@ mod tests {
         assert!(parse(&[]).is_empty());
         assert!(parse(b"fLaC").is_empty()); // marker only, no blocks
     }
+
+    /// A PICTURE block body (§8.7): type, MIME, description, dimensions, then the image bytes.
+    fn picture_block_body(mime: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&(3u32).to_be_bytes()); // description length
+        b.extend_from_slice(b"pic"); // description
+        b.extend_from_slice(&[0u8; 16]); // width, height, colour depth, indexed colours
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    #[test]
+    fn parses_pictures() {
+        // fLaC + STREAMINFO + PICTURE(last).
+        let mut flac = b"fLaC".to_vec();
+        flac.push(0);
+        flac.extend_from_slice(&[0, 0, 34]);
+        flac.extend_from_slice(&[0u8; 34]);
+        let body = picture_block_body("image/jpeg", b"\xFF\xD8\xFF\xE0jpeg-ish bytes");
+        flac.push(0x80 | 6); // last-block, PICTURE
+        flac.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        flac.extend_from_slice(&body);
+
+        let tags = parse(&flac);
+        assert_eq!(tags.pictures.len(), 1);
+        assert_eq!(tags.pictures[0].0, "image/jpeg");
+        assert_eq!(tags.pictures[0].1, b"\xFF\xD8\xFF\xE0jpeg-ish bytes");
+        assert!(tags.comments.is_empty());
+    }
+
+    #[test]
+    fn parses_comments_and_a_picture_together() {
+        // fLaC + STREAMINFO(not-last) + VORBIS_COMMENT(not-last) + PICTURE(last).
+        let mut flac = b"fLaC".to_vec();
+        flac.push(0);
+        flac.extend_from_slice(&[0, 0, 34]);
+        flac.extend_from_slice(&[0u8; 34]);
+        // VORBIS_COMMENT (not last)
+        let mut vc = Vec::new();
+        vc.extend_from_slice(&3u32.to_le_bytes());
+        vc.extend_from_slice(b"ref");
+        vc.extend_from_slice(&1u32.to_le_bytes());
+        vc.extend_from_slice(&("TITLE=X".len() as u32).to_le_bytes());
+        vc.extend_from_slice(b"TITLE=X");
+        flac.push(4);
+        flac.extend_from_slice(&(vc.len() as u32).to_be_bytes()[1..]);
+        flac.extend_from_slice(&vc);
+        // PICTURE (last)
+        let pic = picture_block_body("image/png", b"\x89PNG...");
+        flac.push(0x80 | 6);
+        flac.extend_from_slice(&(pic.len() as u32).to_be_bytes()[1..]);
+        flac.extend_from_slice(&pic);
+
+        let tags = parse(&flac);
+        assert_eq!(tags.comments, vec![("TITLE".to_string(), "X".to_string())]);
+        assert_eq!(tags.pictures.len(), 1);
+        assert_eq!(tags.pictures[0].0, "image/png");
+        assert_eq!(tags.pictures[0].1, b"\x89PNG...");
+    }
 }
