@@ -52,7 +52,8 @@ pf-flac = { path = "../flac" }
 name = "quality_search"
 required-features = ["libopus"]
 
-# FLAC→Opus demo CLI. NMR metric always; the ViSQOL metric compiles in with `--features qa`.
+# FLAC→Opus demo CLI with a ViSQOL-driven bitrate search. ViSQOL-only, so it requires `qa`
+# (which pulls the vendored visqol-rs and implies libopus).
 [[example]]
 name = "transcode"
-required-features = ["libopus"]
+required-features = ["qa"]
