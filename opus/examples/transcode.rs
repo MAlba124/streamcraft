@@ -167,14 +167,28 @@ fn encode_all(pcm: &[u8], channels: usize, bitrate: u32, complexity: u8) -> Vec<
 
 /// Encode at `bitrate`, decode back, return `(reconstruction_i16, actual_kbps)`.
 fn enc_dec(pcm: &[u8], orig: &[i16], channels: usize, bitrate: u32, complexity: u8) -> (Vec<i16>, f64) {
-    let packets = encode_all(pcm, channels, bitrate, complexity);
-    let total: usize = packets.iter().map(|p| p.len()).sum();
+    // Fused encode→decode: each frame is encoded into a reused `pkt` and decoded straight into
+    // `recon`, rather than collecting every packet into a `Vec<Vec<u8>>` first (a heap clone per
+    // frame — ~1500 allocations per call). `pkt`/`p` are reused across frames and `recon` is
+    // pre-sized, so the only allocations are the encoder/decoder setup. Same packets, same decode,
+    // so `recon` (and the resulting MOS) is bit-identical to the collect-then-decode form.
+    let cfg =
+        EncoderConfig { bitrate_bps: bitrate, complexity, ..EncoderConfig::new(channels as u8) };
+    let mut enc = LibopusEncoder::new(cfg).expect("libopus encoder");
+    let fb = enc.frame_bytes();
     let mut dec = LibopusDecoder::new();
     dec.set_channels(channels);
-    let mut recon = Vec::new();
+    let mut recon = Vec::<i16>::with_capacity(orig.len());
+    let mut pkt = Vec::new();
     let mut p = Vec::new();
-    for pk in &packets {
-        if dec.decode_packet_into(pk, &mut p).is_ok() {
+    let mut frame = vec![0u8; fb];
+    let mut total = 0usize;
+    for chunk in pcm.chunks(fb) {
+        frame[..chunk.len()].copy_from_slice(chunk);
+        frame[chunk.len()..].fill(0); // zero-pad a trailing partial frame
+        enc.encode(&frame, &mut pkt).expect("encode");
+        total += pkt.len();
+        if dec.decode_packet_into(&pkt, &mut p).is_ok() {
             recon.extend_from_slice(&p);
         }
     }
