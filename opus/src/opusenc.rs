@@ -45,40 +45,54 @@ const SINK: PadId = PadId(0);
 const SRC: PadId = PadId(1);
 
 /// The Opus encoder backend the element drives — selected at build time: the reference **libopus**
-/// C encoder (`libopus` feature, default) or the pure-Rust `oxideav-opus` CELT encoder. Both take
-/// interleaved 48 kHz `i16` frames and write one Opus packet into a reused buffer.
+/// C encoder (`libopus` feature, default) or the pure-Rust `oxideav-opus` CELT encoder.
+///
+/// The frame is passed as raw **`s16`-LE PCM bytes** (not `&[i16]`) so the zero-copy backend
+/// (libopus) can reinterpret an aligned input buffer in place, while the pure-Rust backend converts
+/// into its own reused `i16` scratch.
 trait EncBackend: Send {
-    /// Total interleaved `i16` values one [`Self::encode_frame`] consumes (`channels · frame`).
-    fn frame_len(&self) -> usize;
-    /// Encode one full frame into `out` (contents replaced). No per-call allocation in steady state.
-    fn encode_frame(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), String>;
+    /// Bytes of interleaved `s16` PCM one [`Self::encode`] consumes (`channels · frame · 2`).
+    fn frame_bytes(&self) -> usize;
+    /// Encode one full frame of `s16`-LE bytes into `out` (contents replaced). No per-call
+    /// allocation in steady state.
+    fn encode(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), String>;
     /// Reset carried inter-frame state (stream start / seek).
     fn reset(&mut self);
 }
 
 #[cfg(feature = "libopus")]
 impl EncBackend for crate::libopus::LibopusEncoder {
-    fn frame_len(&self) -> usize {
-        crate::libopus::LibopusEncoder::frame_len(self)
+    fn frame_bytes(&self) -> usize {
+        crate::libopus::LibopusEncoder::frame_bytes(self)
     }
-    fn encode_frame(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), String> {
-        crate::libopus::LibopusEncoder::encode_frame(self, pcm, out)
+    fn encode(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        crate::libopus::LibopusEncoder::encode(self, frame, out)
     }
     fn reset(&mut self) {
         crate::libopus::LibopusEncoder::reset(self)
     }
 }
 
+// Pure-Rust backend: `OpusEncoder` takes `&[i16]`, so wrap it with a reused conversion scratch.
 #[cfg(not(feature = "libopus"))]
-impl EncBackend for OpusEncoder {
-    fn frame_len(&self) -> usize {
-        OpusEncoder::frame_len(self)
+struct PureRust {
+    enc: OpusEncoder,
+    scratch: Vec<i16>,
+}
+
+#[cfg(not(feature = "libopus"))]
+impl EncBackend for PureRust {
+    fn frame_bytes(&self) -> usize {
+        self.enc.frame_len() * BYTES_PER_SAMPLE
     }
-    fn encode_frame(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), String> {
-        OpusEncoder::encode_frame(self, pcm, out).map_err(|e| format!("{e:?}"))
+    fn encode(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        self.scratch.clear();
+        let (pairs, _) = frame.as_chunks::<BYTES_PER_SAMPLE>();
+        self.scratch.extend(pairs.iter().map(|c| i16::from_le_bytes(*c)));
+        self.enc.encode_frame(&self.scratch, out).map_err(|e| format!("{e:?}"))
     }
     fn reset(&mut self) {
-        OpusEncoder::reset(self)
+        self.enc.reset()
     }
 }
 
@@ -92,7 +106,7 @@ fn make_backend(cfg: EncoderConfig) -> Result<Box<dyn EncBackend>, String> {
     #[cfg(not(feature = "libopus"))]
     {
         OpusEncoder::new(cfg)
-            .map(|e| Box::new(e) as Box<dyn EncBackend>)
+            .map(|e| Box::new(PureRust { enc: e, scratch: Vec::new() }) as Box<dyn EncBackend>)
             .map_err(|e| format!("{e:?}"))
     }
 }
@@ -108,6 +122,9 @@ const F_SAMPLE: &str = "sample";
 
 /// Default CELT frame duration: 20 ms (200 tenths) — the Opus-typical size.
 const DEFAULT_FRAME_TENTHS: u16 = 200;
+// Used by the pure-Rust backend's byte→i16 conversion and the tests; the libopus backend reads
+// bytes in place, so this is unreferenced in a `--features libopus` non-test build.
+#[allow(dead_code)]
 const BYTES_PER_SAMPLE: usize = 2;
 
 // Sink accepts only what CELT can take directly: 48 kHz, `s16`, mono/stereo. Autoplug inserts the
@@ -179,10 +196,9 @@ pub struct OpusEnc {
     /// Frame size in bytes (`channels · frame_samples · 2`); `0` until the encoder exists.
     frame_bytes: usize,
     announced: bool,
-    /// Reused raw-PCM accumulator: bytes not yet forming a full frame carry here.
+    /// Reused carry for a frame straddling two input buffers (only the boundary frame is buffered;
+    /// whole frames inside an input buffer are encoded directly from it — zero-copy).
     acc: Vec<u8>,
-    /// Reused `i16` frame scratch handed to the encoder.
-    frame_i16: Vec<i16>,
     /// Reused encoded-packet buffer.
     packet: Vec<u8>,
 }
@@ -205,7 +221,6 @@ impl OpusEnc {
             frame_bytes: 0,
             announced: false,
             acc: Vec::new(),
-            frame_i16: Vec::new(),
             packet: Vec::new(),
         }
     }
@@ -240,7 +255,7 @@ impl OpusEnc {
         };
         match make_backend(cfg) {
             Ok(enc) => {
-                self.frame_bytes = enc.frame_len() * BYTES_PER_SAMPLE;
+                self.frame_bytes = enc.frame_bytes();
                 self.channels = channels;
                 self.enc = Some(enc);
             }
@@ -268,15 +283,14 @@ impl OpusEnc {
         self.announced = true;
     }
 
-    /// Encode the frame currently in `frame_i16` into one packet and push it as a right-sized pool
-    /// buffer on the src pad. `frame_i16` must already hold exactly `frame_len()` samples.
-    fn encode_and_push(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
-        // Disjoint field borrows: the encoder (`self.enc`), its input (`self.frame_i16`), and the
-        // output scratch (`self.packet`) are distinct fields, so this needs no intermediate copy.
+    /// Encode one full `frame` of `s16`-LE PCM bytes and push the packet as a right-sized pool
+    /// buffer on the src pad. `frame` is borrowed from the caller (an input buffer or the carry) —
+    /// disjoint from `self.enc`/`self.packet`, so the zero-copy backend reads it in place.
+    fn encode_frame_bytes(&mut self, ctx: &mut Ctx, frame: &[u8]) -> Result<(), Error> {
         let Some(enc) = self.enc.as_mut() else {
             return Err(Error::Todo("opusenc: PCM arrived before the input format was known"));
         };
-        if let Err(e) = enc.encode_frame(&self.frame_i16, &mut self.packet) {
+        if let Err(e) = enc.encode(frame, &mut self.packet) {
             // A frame the encoder rejects (should not happen) is a per-frame error scope: warn-drop
             // rather than tearing down the stream.
             let element = ctx.element();
@@ -297,23 +311,45 @@ impl OpusEnc {
         Ok(())
     }
 
-    /// Drain every full frame currently buffered in `acc` (front-consumed, remainder carried). No
-    /// per-frame allocation: the front frame's bytes are decoded straight into the reused `i16`
-    /// scratch, then dropped from `acc` in place.
-    fn drain_frames(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
-        if self.frame_bytes == 0 {
+    /// Reframe `data` into full frames and encode each. **Whole frames sitting inside `data` are
+    /// encoded straight from the input buffer** (zero-copy — the libopus backend reinterprets the
+    /// aligned bytes in place); only a frame that straddles two input buffers is copied through
+    /// `acc`. Before the encoder is built, `data` accumulates in `acc`.
+    fn feed(&mut self, ctx: &mut Ctx, data: &[u8]) -> Result<(), Error> {
+        let fb = self.frame_bytes;
+        if fb == 0 {
+            self.acc.extend_from_slice(data);
             return Ok(());
         }
-        while self.acc.len() >= self.frame_bytes {
-            // Decode the front frame's LE bytes → i16 into the reused scratch (disjoint fields:
-            // `frame_i16` written from `acc`), then drop the consumed bytes (carry the remainder).
-            self.frame_i16.clear();
-            // frame_bytes is a whole number of `s16` samples, so `as_chunks` leaves no remainder.
-            let (pairs, _rest) = self.acc[..self.frame_bytes].as_chunks::<BYTES_PER_SAMPLE>();
-            self.frame_i16.extend(pairs.iter().map(|c| i16::from_le_bytes(*c)));
-            self.acc.drain(..self.frame_bytes);
-            self.encode_and_push(ctx)?;
+
+        let mut off = 0;
+        // First drain any frame carried in `acc` (a straddle, or pre-build buffering), completing a
+        // partial one from the front of `data`.
+        while !self.acc.is_empty() {
+            if self.acc.len() < fb {
+                let need = fb - self.acc.len();
+                let take = need.min(data.len() - off);
+                self.acc.extend_from_slice(&data[off..off + take]);
+                off += take;
+                if self.acc.len() < fb {
+                    return Ok(()); // still partial — wait for more input
+                }
+            }
+            // `acc` now holds ≥ one frame. Encode its front frame; keep any surplus. `mem::take`
+            // frees the borrow so `self` (enc/packet) is available to `encode_frame_bytes`.
+            let mut carry = std::mem::take(&mut self.acc);
+            self.encode_frame_bytes(ctx, &carry[..fb])?;
+            carry.drain(..fb);
+            self.acc = carry;
         }
+
+        // `acc` is empty: encode every whole frame directly from `data` (no copy).
+        while off + fb <= data.len() {
+            self.encode_frame_bytes(ctx, &data[off..off + fb])?;
+            off += fb;
+        }
+        // Carry the trailing partial frame.
+        self.acc.extend_from_slice(&data[off..]);
         Ok(())
     }
 }
@@ -347,8 +383,7 @@ impl Element for OpusEnc {
         }
         self.announce(ctx);
         while let Some(buf) = inputs.pop() {
-            self.acc.extend_from_slice(buf.memory.data());
-            self.drain_frames(ctx)?;
+            self.feed(ctx, buf.memory.data())?;
         }
         Ok(Flow::Ok)
     }
@@ -373,7 +408,10 @@ impl Element for OpusEnc {
             // input audio is dropped (standard final-frame pad).
             Event::Eos if self.frame_bytes > 0 && !self.acc.is_empty() => {
                 self.acc.resize(self.frame_bytes, 0);
-                self.drain_frames(ctx)?;
+                let mut carry = std::mem::take(&mut self.acc);
+                self.encode_frame_bytes(ctx, &carry[..self.frame_bytes])?;
+                carry.clear();
+                self.acc = carry;
             }
             _ => {}
         }

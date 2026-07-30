@@ -17,6 +17,9 @@ pub struct LibopusEncoder {
     channels: usize,
     /// Samples per channel per frame (a valid Opus frame size, e.g. 960 for 20 ms @ 48 kHz).
     frame_samples: usize,
+    /// Fallback aligned copy for a misaligned input frame (whole-sample upstreams like flacdec are
+    /// 2-aligned, so this stays empty; a `bytes`-bridge source that splits a sample could hit it).
+    aligned: Vec<i16>,
 }
 
 // SAFETY: the C encoder struct is owned solely here and only ever accessed through `&mut self`
@@ -28,6 +31,7 @@ unsafe impl Send for LibopusEncoder {}
 impl LibopusEncoder {
     /// Build a reference-libopus encoder for `cfg` (48 kHz, 1–2 channels). Errors with the
     /// libopus message on an unsupported config or a create failure.
+    #[allow(clippy::disallowed_methods)] // one-time per-stream construction; `aligned` is a reused fallback scratch
     pub fn new(cfg: EncoderConfig) -> Result<Self, String> {
         if cfg.sample_rate != OPUS_RATE {
             return Err(format!("libopus backend requires 48 kHz, got {}", cfg.sample_rate));
@@ -52,7 +56,7 @@ impl LibopusEncoder {
         }
 
         let frame_samples = (cfg.sample_rate as usize * cfg.frame_ms_tenths as usize) / 10_000;
-        let mut me = Self { st, channels, frame_samples };
+        let mut me = Self { st, channels, frame_samples, aligned: Vec::new() };
         // CBR at the target bitrate (matches the pure-Rust backend's default rate control).
         me.ctl_set(sys::OPUS_SET_BITRATE_REQUEST, cfg.bitrate_bps as i32);
         Ok(me)
@@ -63,26 +67,44 @@ impl LibopusEncoder {
         unsafe { sys::opus_encoder_ctl(self.st, request, value) };
     }
 
-    /// Total interleaved `i16` values one [`Self::encode_frame`] consumes (`channels · frame`).
-    pub fn frame_len(&self) -> usize {
-        self.channels * self.frame_samples
+    /// Bytes of interleaved `s16` PCM one [`Self::encode`] consumes (`channels · frame · 2`).
+    pub fn frame_bytes(&self) -> usize {
+        self.channels * self.frame_samples * 2
     }
 
-    /// Encode one frame of interleaved 48 kHz `i16` PCM into `out` (its previous contents replaced).
-    /// `out`'s capacity is reused across calls, so a steady encode does no allocation on this side,
-    /// and libopus itself allocates nothing on the hot path.
-    pub fn encode_frame(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), String> {
-        if pcm.len() != self.frame_len() {
-            return Err(format!("frame is {} samples, expected {}", pcm.len(), self.frame_len()));
+    /// Encode one frame of interleaved 48 kHz **`s16`-LE PCM bytes** into `out` (contents replaced).
+    ///
+    /// Zero-copy on the common path: on little-endian, `s16`-LE bytes *are* `i16`, so a 2-aligned
+    /// `frame` is handed straight to libopus with no conversion or copy (flacdec and the audio
+    /// elements emit whole 2-aligned samples). A misaligned frame (a `bytes` source that split a
+    /// sample) is copied once into a reused aligned buffer. `out`'s capacity is reused, and libopus
+    /// allocates nothing on the hot path, so a steady encode does no heap traffic.
+    pub fn encode(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        if frame.len() != self.frame_bytes() {
+            return Err(format!("frame is {} bytes, expected {}", frame.len(), self.frame_bytes()));
         }
         // Headroom over the §3.2.1 1275-byte max frame (VBR bursts / future multi-frame). Reused.
         const CAP: usize = 4000;
         out.clear();
         out.reserve(CAP);
-        // SAFETY: `out` has ≥ CAP bytes reserved; `pcm` holds channels·frame_samples samples;
-        // `frame_samples` is a valid Opus frame size; opus_encode writes `n ≤ CAP` bytes.
+
+        // s16-LE bytes reinterpreted as i16 (little-endian target). Aligned → in place; else copy.
+        #[cfg(target_endian = "big")]
+        compile_error!("libopus s16 reinterpret assumes a little-endian target");
+        let pcm: *const i16 = if (frame.as_ptr() as usize).is_multiple_of(2) {
+            frame.as_ptr().cast::<i16>()
+        } else {
+            self.aligned.clear();
+            let (pairs, _) = frame.as_chunks::<2>();
+            self.aligned.extend(pairs.iter().map(|c| i16::from_le_bytes(*c)));
+            self.aligned.as_ptr()
+        };
+
+        // SAFETY: `out` has ≥ CAP bytes reserved; `pcm` points at `frame_samples · channels`
+        // 2-aligned `i16` values (in-place aligned frame or the aligned copy); `frame_samples` is a
+        // valid Opus frame size; opus_encode writes `n ≤ CAP` bytes.
         let n = unsafe {
-            sys::opus_encode(self.st, pcm.as_ptr(), self.frame_samples as c_int, out.as_mut_ptr(), CAP as i32)
+            sys::opus_encode(self.st, pcm, self.frame_samples as c_int, out.as_mut_ptr(), CAP as i32)
         };
         if n < 0 {
             return Err(format!("opus_encode: {}", strerror(n)));
