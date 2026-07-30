@@ -38,3 +38,8 @@ profluens-audio = { path = "../audio" }
 pf-ogg = { path = "../ogg" }
 # Transcode alloc measurement (examples/transcode_alloc_check): a real filesrc→flacdec→opusenc chain.
 pf-flac = { path = "../flac" }
+
+# The quality-search tool drives the libopus wrappers directly (encode-many/decode-many).
+[[example]]
+name = "quality_search"
+required-features = ["libopus"]

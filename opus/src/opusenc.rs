@@ -158,10 +158,15 @@ static PADS: [PadDesc; 2] = [
     PadDesc { name: "src", direction: Direction::Src, offers: &SRC_OFFERS, dynamic: true, validate: None },
 ];
 
-/// `bitrate` — target **total** bitrate in bits/s (CBR). `0`/unset derives it from the channel
-/// count (64 kbps mono / 96 kbps stereo). Structural (`live: false`): the CBR budget is fixed when
-/// the encoder is built in `start()`/first `process()`.
-static PROPS: [PropDesc; 1] = [PropDesc { name: "bitrate", allowed: Constraint::Any, live: false }];
+/// Encoder knobs (structural — read once when the encoder is built):
+/// - `bitrate` — target bits/s (VBR average / CBR exact); `0`/unset derives from channels.
+/// - `vbr` — `1` = variable bitrate (default), `0` = CBR (libopus backend only).
+/// - `complexity` — 0–10 (libopus backend only; default 10).
+static PROPS: [PropDesc; 3] = [
+    PropDesc { name: "bitrate", allowed: Constraint::Any, live: false },
+    PropDesc { name: "vbr", allowed: Constraint::Any, live: false },
+    PropDesc { name: "complexity", allowed: Constraint::Any, live: false },
+];
 
 // `make_default` boxes one instance at registry/parse time, never per frame.
 #[allow(clippy::disallowed_methods)]
@@ -189,6 +194,10 @@ pub struct OpusEnc {
     bitrate_bps: u32,
     frame_ms_tenths: u16,
     application: Application,
+    /// `vbr` prop (default true = VBR).
+    vbr: bool,
+    /// `complexity` prop, 0–10 (default 10).
+    complexity: u8,
     /// The encoder backend (libopus or pure-Rust), built once the input channel count is known.
     enc: Option<Box<dyn EncBackend>>,
     /// Learned channel count (1 or 2); `0` until known.
@@ -216,6 +225,8 @@ impl OpusEnc {
             bitrate_bps: 0,
             frame_ms_tenths: DEFAULT_FRAME_TENTHS,
             application: Application::Audio,
+            vbr: true,
+            complexity: 10,
             enc: None,
             channels: 0,
             frame_bytes: 0,
@@ -252,6 +263,9 @@ impl OpusEnc {
             bitrate_bps: bitrate,
             application: self.application,
             frame_ms_tenths: self.frame_ms_tenths,
+            vbr: self.vbr,
+            complexity: self.complexity,
+            ..EncoderConfig::new(channels as u8)
         };
         match make_backend(cfg) {
             Ok(enc) => {
@@ -360,11 +374,17 @@ impl Element for OpusEnc {
     }
 
     fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
-        // A parsed `bitrate=` overrides the channel-derived default (spec: Plugins).
+        // Parsed knobs override the defaults (spec: Plugins).
         if let Some(Value::Int(b)) = ctx.prop("bitrate") {
             if b > 0 {
                 self.bitrate_bps = b as u32;
             }
+        }
+        if let Some(Value::Int(v)) = ctx.prop("vbr") {
+            self.vbr = v != 0;
+        }
+        if let Some(Value::Int(c)) = ctx.prop("complexity") {
+            self.complexity = c.clamp(0, 10) as u8;
         }
         self.enc = None;
         self.channels = 0;

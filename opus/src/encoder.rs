@@ -54,8 +54,23 @@ pub enum Application {
     LowDelay,
 }
 
+/// Signal-type hint for the encoder's mode decision (libopus `OPUS_SET_SIGNAL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// Let the encoder decide from the content.
+    Auto,
+    /// Speech.
+    Voice,
+    /// Music.
+    Music,
+}
+
 /// Encoder configuration. Construct with sensible defaults via [`EncoderConfig::new`] and override
 /// fields, or build directly.
+///
+/// The `vbr` / `vbr_constrained` / `complexity` / `signal` knobs steer the **libopus** backend
+/// (they are the searchable rate-distortion surface — see `examples/quality_search.rs`); the
+/// pure-Rust CELT backend is CBR-only and ignores them.
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
     /// Input sample rate. This milestone requires **48000** (CELT's native rate); other rates are
@@ -63,20 +78,27 @@ pub struct EncoderConfig {
     pub sample_rate: u32,
     /// Channel count: 1 (mono) or 2 (stereo).
     pub channels: u8,
-    /// Target **total** bitrate in bits/s (includes the TOC byte). The CBR budget is derived from
-    /// this and the frame duration.
+    /// Target bitrate in bits/s. With VBR this is the average target; with CBR it is exact.
     pub bitrate_bps: u32,
     /// Application intent (biases mode/bandwidth selection).
     pub application: Application,
     /// Frame duration in tenths of a millisecond — one of 25/50/100/200 (2.5/5/10/20 ms) for the
     /// CELT-only path (RFC 6716 §3.1 Table 2, configs 16–31).
     pub frame_ms_tenths: u16,
+    /// Variable bitrate (libopus): quality-consistent, size-variable. `true` = VBR (default).
+    pub vbr: bool,
+    /// Constrained VBR (libopus): VBR that respects a per-frame cap (a middle ground toward CBR).
+    pub vbr_constrained: bool,
+    /// Encoder complexity 0–10 (libopus): higher = better quality per bit, more CPU. Default 10.
+    pub complexity: u8,
+    /// Signal-type hint (libopus).
+    pub signal: Signal,
 }
 
 impl EncoderConfig {
-    /// A config with common defaults: 48 kHz, [`Application::Audio`], 20 ms frames, and a
-    /// bitrate scaled to the channel count (64 kbps mono / 96 kbps stereo — libopus-typical
-    /// transparent-ish music rates).
+    /// A config with common defaults: 48 kHz, [`Application::Audio`], 20 ms frames, VBR, complexity
+    /// 10, auto signal, and a bitrate scaled to the channel count (64 kbps mono / 96 kbps stereo —
+    /// libopus-typical transparent-ish music rates).
     #[must_use]
     pub fn new(channels: u8) -> Self {
         Self {
@@ -85,6 +107,10 @@ impl EncoderConfig {
             bitrate_bps: if channels >= 2 { 96_000 } else { 64_000 },
             application: Application::Audio,
             frame_ms_tenths: 200,
+            vbr: true,
+            vbr_constrained: false,
+            complexity: 10,
+            signal: Signal::Auto,
         }
     }
 }

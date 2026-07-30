@@ -71,12 +71,14 @@
 //! allocations) live in `OPUS_ENCODER_HANDOFF.md`.
 
 mod encoder;
+/// Safe wrappers over the statically-linked reference libopus (`libopus` feature). Public so
+/// tools (e.g. `examples/quality_search.rs`) can encode/decode directly, outside the element.
 #[cfg(feature = "libopus")]
-mod libopus;
+pub mod libopus;
 mod opusdec;
 mod opusenc;
 
-pub use encoder::{Application, EncoderConfig, OpusEncoder, OPUS_RATE};
+pub use encoder::{Application, EncoderConfig, OpusEncoder, Signal, OPUS_RATE};
 pub use opusdec::OpusDec;
 pub use opusenc::OpusEnc;
 

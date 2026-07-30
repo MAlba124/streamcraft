@@ -9,7 +9,7 @@ use std::os::raw::c_int;
 
 use libopus_sys as sys;
 
-use crate::encoder::{Application, EncoderConfig, OPUS_RATE};
+use crate::encoder::{Application, EncoderConfig, Signal, OPUS_RATE};
 
 /// Safe owner of a C `OpusEncoder`: interleaved 48 kHz `i16` frames in, Opus packets out.
 pub struct LibopusEncoder {
@@ -57,8 +57,20 @@ impl LibopusEncoder {
 
         let frame_samples = (cfg.sample_rate as usize * cfg.frame_ms_tenths as usize) / 10_000;
         let mut me = Self { st, channels, frame_samples, aligned: Vec::new() };
-        // CBR at the target bitrate (matches the pure-Rust backend's default rate control).
+        // The rate-distortion surface (see EncoderConfig). libopus defaults to VBR + high
+        // complexity; we set them explicitly so the config is authoritative and searchable.
         me.ctl_set(sys::OPUS_SET_BITRATE_REQUEST, cfg.bitrate_bps as i32);
+        me.ctl_set(sys::OPUS_SET_VBR_REQUEST, i32::from(cfg.vbr));
+        me.ctl_set(sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, i32::from(cfg.vbr_constrained));
+        me.ctl_set(sys::OPUS_SET_COMPLEXITY_REQUEST, i32::from(cfg.complexity.min(10)));
+        me.ctl_set(
+            sys::OPUS_SET_SIGNAL_REQUEST,
+            match cfg.signal {
+                Signal::Auto => sys::OPUS_AUTO,
+                Signal::Voice => sys::OPUS_SIGNAL_VOICE,
+                Signal::Music => sys::OPUS_SIGNAL_MUSIC,
+            },
+        );
         Ok(me)
     }
 
