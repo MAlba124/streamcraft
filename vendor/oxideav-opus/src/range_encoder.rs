@@ -320,6 +320,37 @@ impl RangeEncoder {
     /// gated on `tell()` against the same `size * 8` budget).
     #[must_use]
     pub fn finish_fixed(mut self, size: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        if self.finish_fixed_into(size, &mut out) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Reset to a freshly-initialized state (§5.1) while **retaining** the `buf` / `end_bytes`
+    /// heap capacity — so a persistent encoder reused across packets does no per-packet allocation
+    /// (Profluens patch, encode alloc-free: the range coder is the encoder's per-packet output
+    /// buffer; growing it from empty each packet was a large share of steady-state encode allocs).
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.end_bytes.clear();
+        self.rng = 1 << 31;
+        self.val = 0;
+        self.rem = -1;
+        self.ext = 0;
+        self.end_window = 0;
+        self.nend_bits = 0;
+        self.nbits_total = 33;
+        self.nbits_raw = 0;
+    }
+
+    /// Non-consuming [`Self::finish_fixed`]: finalize into exactly `size` bytes **appended** to
+    /// `out` (so a caller can push a TOC byte first, then the payload, into one reused buffer).
+    /// Mutates `self` into the finalized state; call [`Self::reset`] before encoding again.
+    /// Returns `false` (writing nothing) when the coded symbols cannot fit `size` bytes.
+    #[must_use]
+    pub fn finish_fixed_into(&mut self, size: usize, out: &mut Vec<u8>) -> bool {
         // Minimum number of terminating bits so the symbols decode
         // correctly regardless of what follows.
         let mut l: i32 = 32 - (32 - self.rng.leading_zeros()) as i32;
@@ -343,30 +374,34 @@ impl RangeEncoder {
         let n_range = self.buf.len();
         let n_raw = self.end_bytes.len();
         if n_range + n_raw > size {
-            return None;
+            return false;
         }
-        let mut out = vec![0u8; size];
-        out[..n_range].copy_from_slice(&self.buf);
+        let base = out.len();
+        out.resize(base + size, 0);
+        let dst = &mut out[base..base + size];
+        dst[..n_range].copy_from_slice(&self.buf);
         for (i, &b) in self.end_bytes.iter().enumerate() {
-            out[size - 1 - i] = b;
+            dst[size - 1 - i] = b;
         }
         // Remaining partial raw-bit window: OR into the next raw byte.
         if self.nend_bits > 0 {
             if n_raw >= size {
-                return None;
+                out.truncate(base);
+                return false;
             }
             let mut window = self.end_window;
             // If the raw bits share the last range byte, only the
             // range value's trailing free bits (`-l`) are usable.
             if n_range + n_raw >= size && (-l as u32) < self.nend_bits {
-                return None;
+                out.truncate(base);
+                return false;
             }
             if n_range + n_raw >= size {
                 window &= (1u32 << (-l)) - 1;
             }
-            out[size - n_raw - 1] |= window as u8;
+            dst[size - n_raw - 1] |= window as u8;
         }
-        Some(out)
+        true
     }
 
     /// Finalize the stream (§5.1.5, `ec_enc_done`) and return the packed

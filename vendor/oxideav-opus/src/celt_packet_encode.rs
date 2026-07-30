@@ -25,6 +25,9 @@ const MAX_FRAME_BYTES: usize = 1275;
 #[derive(Debug, Clone)]
 pub struct CeltEncoder {
     state: CeltEncoderState,
+    /// Persistent range coder, reset (capacity retained) per packet so a steady encode does no
+    /// per-packet output-buffer allocation (Profluens patch, encode alloc-free).
+    enc: RangeEncoder,
     bandwidth: Bandwidth,
     frame_tenths_ms: u16,
     stereo: bool,
@@ -64,6 +67,7 @@ impl CeltEncoder {
         let channels = if stereo { 2 } else { 1 };
         Ok(Self {
             state: CeltEncoderState::new(channels, n),
+            enc: RangeEncoder::new(),
             bandwidth,
             frame_tenths_ms,
             stereo,
@@ -87,6 +91,7 @@ impl CeltEncoder {
     /// Reset all carried state (stream start / §4.5.2).
     pub fn reset(&mut self) {
         self.state.reset();
+        self.enc.reset();
     }
 
     /// Encode one frame of interleaved 48 kHz PCM
@@ -100,6 +105,21 @@ impl CeltEncoder {
         pcm: &[i16],
         payload_bytes: usize,
     ) -> Result<(Vec<u8>, CeltFrameEncodeInfo), Error> {
+        let mut out = Vec::with_capacity(1 + payload_bytes);
+        let info = self.encode_packet_into(pcm, payload_bytes, &mut out)?;
+        Ok((out, info))
+    }
+
+    /// Allocation-free [`Self::encode_packet`]: write the `1 + payload_bytes`-byte code-0 packet
+    /// into `out` (cleared first). The persistent range coder is reset (capacity retained) and the
+    /// payload finalized straight into `out` after the TOC byte, so a steady encode drives no
+    /// per-packet output allocation (Profluens patch, encode alloc-free).
+    pub fn encode_packet_into(
+        &mut self,
+        pcm: &[i16],
+        payload_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<CeltFrameEncodeInfo, Error> {
         if pcm.len() != self.channels() * self.frame_samples() {
             return Err(Error::MalformedPacket);
         }
@@ -113,24 +133,23 @@ impl CeltEncoder {
             self.stereo,
             FrameCountCode::One,
         )?;
-        let mut enc = RangeEncoder::new();
+        self.enc.reset();
         let info = encode_celt_frame(
             &mut self.state,
-            &mut enc,
+            &mut self.enc,
             pcm,
             payload_bytes,
             0,
             self.end_band,
             self.lm,
         );
-        debug_assert!(enc.tell() as usize <= payload_bytes * 8, "budget bust");
-        let payload = enc
-            .finish_fixed(payload_bytes)
-            .ok_or(Error::MalformedPacket)?;
-        let mut packet = Vec::with_capacity(1 + payload_bytes);
-        packet.push(toc);
-        packet.extend_from_slice(&payload);
-        Ok((packet, info))
+        debug_assert!(self.enc.tell() as usize <= payload_bytes * 8, "budget bust");
+        out.clear();
+        out.push(toc);
+        if !self.enc.finish_fixed_into(payload_bytes, out) {
+            return Err(Error::MalformedPacket);
+        }
+        Ok(info)
     }
 }
 

@@ -67,3 +67,31 @@ capacity, logical length preserved) instead of reallocating.
 **0.031 allocs/packet (down from 3270, −99.999%)**; the residual is transition-only persistent-state
 resizes on the concealment path (PLC history on a mono↔stereo toggle + the rare redundant-frame
 path), which must stay on the global allocator. Conformance byte-identical throughout.
+
+## Encode alloc-free (CELT path) — 226 → 22 allocs/packet (−90%)
+
+The mirror of the decode work, for the wired **CELT-only encoder** (`OpusEncoder`/`OpusEnc` in
+`pf-opus`). `opus/examples/encode_alloc_check.rs` counts steady-state allocs/packet;
+`encode_alloc_profile.rs` is a backtrace-capturing allocator that ranks the hottest sites (the same
+method the decode work used). Baseline was **175/packet mono, 226 stereo**. Two output-preserving
+changes (round-trip + perceptual + ffmpeg/libopus oracle all **byte-identical** after):
+
+1. **PVQ search + quant scratch → stack arrays** (`celt_pvq_encode.rs`). `op_pvq_search`'s `iy`/`y`
+   and `alg_quant`'s `signs` were `vec![…]` per coded band — **~90% of all encode allocations**
+   (profiler: `op_pvq_search` 133/pkt + `alg_quant` 72/pkt). A band's PVQ dimension `N` is bounded
+   by `PVQ_V_N_MAX` = 352, so they are now fixed stack arrays sliced to `n` (zero heap; `alg_quant`
+   is a non-nested leaf, so no depth concern). This alone took 226 → ~26.
+2. **Persistent range coder** (`range_encoder.rs` + `celt_packet_encode.rs`). `CeltEncoder` now
+   holds one `RangeEncoder`, `reset()` (capacity retained) per packet instead of `RangeEncoder::new()`,
+   and finalizes via the new **`finish_fixed_into(&mut self, size, out)`** — non-consuming, appends
+   the payload straight into the caller's reused buffer after the TOC byte (`finish_fixed` now
+   delegates to it). Removes the per-packet output `Vec` + packet `Vec` + range-buffer growth.
+
+**Result.** **18 allocs/pkt mono, 22 stereo** (−90%). The residual tail is per-*frame* analysis
+transients across `celt_analysis` (`forward_mdct`, `normalise_bands`, `transient_analysis`),
+`celt_frame_encode`, `celt_energy_encode`, and `celt_laplace` — small counts each, not per-band.
+Reaching literal 0 needs the decode side's `DecodeBump` treatment (an `EncodeBump` arena reset once
+per packet at `encode_celt_frame`'s top, transients → `Vec<T, EncodeBump>`) or per-frame reused
+scratch on the persistent `CeltEncoderState`; best done with the RFC vectors on hand to re-verify
+bit-exactness. NB: two `silk_packet_encode` end-to-end tests fail on **pristine HEAD** (unrelated to
+this CELT work — the handoff's flagged unconfirmed SILK/hybrid encode coverage).

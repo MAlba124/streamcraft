@@ -23,6 +23,13 @@
 use crate::celt_pvq_v::{pvq_codebook_size, PvqVError};
 use crate::range_encoder::RangeEncoder;
 
+/// Upper bound on a band's PVQ dimension `N` (`PVQ_V_N_MAX` = 352, i.e. `CELT_MAX_BINS_PER_BAND`
+/// 176 with the stereo/time-split doubling). The PVQ search + quant are the hot encode leaves
+/// (~90% of per-packet encode allocations before this patch); since `N` is bounded, their working
+/// vectors are **stack arrays** of this size sliced to `n` — zero heap, and simpler than a reused
+/// thread-local (Profluens patch, encode alloc-free).
+const PVQ_MAX_N: usize = crate::celt_pvq_v::PVQ_V_N_MAX as usize;
+
 /// Errors returnable by [`encode_pvq_vector`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PvqEncodeError {
@@ -114,10 +121,14 @@ pub fn encode_pvq_vector(x: &[i32]) -> Result<(u32, u32), PvqEncodeError> {
 /// pre-places pulses when `k > n/2`, then a greedy loop places the
 /// remainder one at a time on the position maximizing
 /// `(xy + x[j])² / (yy + y[j])`.
-fn op_pvq_search(x: &mut [f64], k: i32) -> Vec<i32> {
+///
+/// The result vector is written into `iy` (length `n`, zeroed here); `y` is a working buffer of
+/// length `n` (also zeroed). Callers pass stack-array slices, so this touches no heap.
+fn op_pvq_search(x: &mut [f64], k: i32, iy: &mut [i32], y: &mut [f64]) {
     let n = x.len();
-    let mut iy = vec![0i32; n];
-    let mut y = vec![0.0f64; n];
+    debug_assert!(iy.len() == n && y.len() == n);
+    iy.fill(0);
+    y.fill(0.0);
     let mut pulses_left = k;
     let mut xy = 0.0f64;
     let mut yy = 0.0f64;
@@ -180,7 +191,6 @@ fn op_pvq_search(x: &mut [f64], k: i32) -> Vec<i32> {
         y[best_id] += 2.0;
         iy[best_id] += 1;
     }
-    iy
 }
 
 /// §4.3.4.2 PVQ encode of one leaf band (the listing's `alg_quant`
@@ -194,30 +204,38 @@ pub fn alg_quant(enc: &mut RangeEncoder, x: &mut [f64], k: i32, spread: u8, b: u
     debug_assert!(x.len() > 1, "alg_quant needs at least two dimensions");
     crate::celt_band_decode::exp_rotation(x, 1, b, k, spread);
 
-    // Strip the signs (a zero coordinate takes the negative sign, as
-    // in the listing; it never affects the codeword unless the search
-    // places a pulse there, and then either sign is a valid choice).
-    let mut signs = vec![false; x.len()];
-    for (v, s) in x.iter_mut().zip(signs.iter_mut()) {
+    let n = x.len();
+    debug_assert!(n <= PVQ_MAX_N, "band N exceeds the PVQ maximum");
+    // Bounded working vectors on the stack (see `PVQ_MAX_N`): signs + the search's `iy`/`y`, all
+    // sliced to `n` — zero heap on the hottest encode leaf.
+    let mut signs = [false; PVQ_MAX_N];
+    let mut iy = [0i32; PVQ_MAX_N];
+    let mut y = [0.0f64; PVQ_MAX_N];
+    let (signs, iy, y) = (&mut signs[..n], &mut iy[..n], &mut y[..n]);
+
+    // Strip the signs (a zero coordinate takes the negative sign, as in the listing; it never
+    // affects the codeword unless the search places a pulse there, and then either sign is a valid
+    // choice).
+    for (v, sg) in x.iter_mut().zip(signs.iter_mut()) {
         if *v > 0.0 {
-            *s = false;
+            *sg = false;
         } else {
-            *s = true;
+            *sg = true;
             *v = -*v;
         }
     }
 
-    let mut iy = op_pvq_search(x, k);
-    for (v, &s) in iy.iter_mut().zip(signs.iter()) {
-        if s {
+    op_pvq_search(x, k, iy, y);
+    for (v, &sg) in iy.iter_mut().zip(signs.iter()) {
+        if sg {
             *v = -*v;
         }
     }
-    let (index, kk) = encode_pvq_vector(&iy).expect("search preserves the L1 budget");
+    let (index, kk) = encode_pvq_vector(iy).expect("search preserves the L1 budget");
     debug_assert_eq!(kk, k as u32);
-    let ft = pvq_codebook_size(x.len() as u32, kk).expect("validated by encode_pvq_vector");
+    let ft = pvq_codebook_size(n as u32, kk).expect("validated by encode_pvq_vector");
     enc.enc_uint(index, ft);
-    crate::celt_band_decode::extract_collapse_mask(&iy, b)
+    crate::celt_band_decode::extract_collapse_mask(iy, b)
 }
 
 #[cfg(test)]
@@ -276,7 +294,9 @@ mod tests {
         // A smooth shape: the search must place exactly K pulses and
         // put the most pulses on the largest coordinate.
         let mut x: Vec<f64> = (0..16).map(|i| (1.0 + i as f64).recip()).collect();
-        let iy = op_pvq_search(&mut x, 20);
+        let mut iy = [0i32; 16];
+        let mut y = [0.0f64; 16];
+        op_pvq_search(&mut x, 20, &mut iy, &mut y);
         assert_eq!(iy.iter().map(|&v| v.unsigned_abs()).sum::<u32>(), 20);
         let maxpos = (0..16).max_by_key(|&i| iy[i]).unwrap();
         assert_eq!(maxpos, 0);
