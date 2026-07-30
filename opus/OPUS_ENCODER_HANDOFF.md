@@ -1,12 +1,38 @@
 # Opus encoder — handoff brief for the "transcode-to-Opus" milestone
 
-**Status (2026-07-30):** the Opus *decoder* is wired, conformant, and allocation-free (`OpusDec`,
-see `vendor/oxideav-opus/PROFLUENS-PATCHES.md`). The *encoder* is **not wired** — but it is **not
-broken either**. The confusion in older notes ("encoder is low-level building blocks only") is half
-right: the per-mode packet encoders are real and unit-tested, what's missing is the **top-level
-orchestration** that turns a config + PCM stream into Opus packets, plus wiring as an element.
+**Status (2026-07-30, updated):** the Opus *decoder* is wired, conformant, and allocation-free
+(`OpusDec`). The *encoder* is now **wired for CELT-only mode** — `OpusEncoder` (orchestrator) +
+`OpusEnc` (element), validated round-trip + perceptual + ffmpeg oracle. SILK-only and Hybrid modes
+are the remaining work; this doc is the brief for picking them up. Read it fully before touching
+code.
 
-This doc is the brief for an agent picking that up. Read it fully before touching code.
+## Milestone 1 — CELT-only: DONE ✅
+
+- **`opus/src/encoder.rs` — `OpusEncoder`**: the unified orchestrator (mode selection + bandwidth
+  selection + CBR rate control) driving `oxideav-opus`'s `CeltEncoder`. Mono + stereo, the four
+  CELT frame sizes, all CELT bandwidths, CBR. `EncoderConfig` + `Application` (Voip/Audio/LowDelay,
+  all → CELT-only for now; the mode-select fn is the hook SILK/Hybrid attach to). Input:
+  interleaved **48 kHz `i16`** (CELT-native; other rates resample upstream).
+- **`opus/src/opusenc.rs` — `OpusEnc` element**: `audio/raw` s16/48 kHz/1–2 ch sink →
+  one-`opus`-packet-per-buffer src. Reframes to full CELT frames, emits into `alloc_exact` pool
+  buffers, EOS zero-pads the tail. Registered in `lib.rs`; autoplugs into the mkv/mp4/ogg muxers
+  (they accept `opus`). No per-frame alloc on the pf-opus side (the CELT range coder still allocates
+  internally — the alloc-free follow-up, item 4 below).
+- **Validation** (`opus/examples/encode_roundtrip.rs` + `opus/tests/pipeline.rs`): round-trip
+  through our `OpusDec`, the perceptual NMR gate, and the **ffmpeg/libopus external oracle** on a
+  hand-muxed Ogg-Opus file — all PASS. Tones/sweeps −22 to −34 dB NMR (transparent). A full
+  `tonesrc → opusenc → opusdec → sink` scheduler test covers the element's caps negotiation +
+  reframing.
+
+**Why CELT-only first:** it takes 48 kHz `i16` directly (no encode-side resampler) and never
+touches the SILK excitation path, so the ⚠️ gotcha below stays **dormant** — the whole
+Milestone-1 deliverable ships without needing to touch the shared decoder struct.
+
+**Design note — the orchestrator lives in `pf-opus`, not the vendored crate.** The vendored
+`oxideav-opus` modules are all `pub`, so `OpusEncoder` builds on `CeltEncoder` / `Bandwidth` /
+`compose_packet` etc. without diverging the vendored snapshot further (keeps `PROFLUENS-PATCHES.md`
+minimal). SILK/Hybrid should follow suit: drive `SilkEncoderMono/Stereo` + `HybridEncoderMono` from
+`opus/src/encoder.rs`, adding `ModeImpl::Silk`/`ModeImpl::Hybrid` variants.
 
 ---
 
@@ -39,36 +65,37 @@ oracle yet.
 
 ---
 
-## What's actually missing — this is the work
+## What's left — the remaining work (SILK/Hybrid + polish)
 
-There is **no `OpusEncoder` type at all**. (`lib.rs`'s doc line "[`Encoder`] entry points still
-return `Error::NotImplemented`" is **stale** — it describes a scaffold that was replaced by the
-building blocks above; there is no `Encoder`/`OpusEncoder` struct to grep for.) The gaps, roughly in
-dependency order:
+Milestone 1 delivered the orchestrator + element for CELT-only (items 1, 4, 5, 7 of the original
+plan, and item 3 for CBR). The remaining work, roughly in dependency order:
 
-1. **A unified `OpusEncoder`** taking `(sample_rate, channels, target_bitrate, application)` and a
-   PCM stream, producing Opus packets. This is the orchestrator that ties everything below together.
-   Mirror the structure of libopus `opus_encoder.c` conceptually (clean-room — do NOT read its source;
-   see the rules section).
-2. **Mode selection** (SILK vs CELT vs Hybrid, per frame) driven by target bitrate + audio bandwidth
-   + signal type (speech vs music). RFC 6716 §2 Table 1 gives the bitrate/bandwidth → mode guidance.
-   A minimal first cut can hard-select a mode from an explicit "application" hint (VOIP → SILK,
-   AUDIO → CELT/Hybrid) before adding content analysis.
-3. **Bitrate / rate control.** The per-mode encoders take an explicit `payload_bytes` budget per
-   packet — nothing converts a target bitrate + frame duration into that budget, nor does CBR/VBR/
-   CVBR across packets (the bit-reservoir). Start with CBR (`payload_bytes = bitrate * frame_s / 8`),
-   then add the VBR-elected path (`encode_packet_elected` already exists for hybrid).
-4. **Config/TOC orchestration at the top.** Map `(mode, bandwidth, frame_size)` → the §3.1 32-config
-   TOC, and pack multi-frame packets (§3.2 code 1/2/3 via `packet_compose.rs`) when the frame
-   duration exceeds one internal frame.
-5. **Input convention.** SILK takes `&[f32]`, CELT/Hybrid take `&[i16]` — the unified encoder needs
-   one input type + conversion at the boundary. Decide and document one.
-6. **Encode-side resampling.** Input at an arbitrary rate → resample to the internal rates (SILK
-   8/12/16 kHz, CELT 48 kHz). The decode side has `silk_resampler.rs` (upsampler); the encode side
-   needs the *down*sampler. Check whether one already exists before writing it.
-7. **Wire it as a `pf-opus` element** (`OpusEnc`) in `opus/src/lib.rs` (only `OpusDec` is registered
-   today), following the `opusdec` element pattern (dynamic caps, pool buffers, no per-frame alloc).
-   Add it to autoplug/transcode paths. This is the actual "transcode-to-Opus" deliverable.
+1. **⚠️ Fix the `Excitation` generic-allocator gotcha FIRST** (see the section below). CELT-only
+   dodged it; SILK-only and Hybrid **construct `Excitation` on the encode path**, so without the fix
+   the first SILK/Hybrid encode session leaks into the 16 MiB decode bump arena → `AllocError`
+   panic. Scope confirmed this session: `Excitation` (and `SilkFrameDecoded` which holds it) must
+   become generic over the allocator (`= Global` default) — ~47 mentions across silk_decode.rs,
+   silk_decode_core.rs, silk_synthesis.rs, silk_packet_encode.rs, decoder.rs. The synthesis (the one
+   `.excitation.e_q23()` reader, `silk_decode_core::decode_core`) is **decode-only**, so encode
+   never reads the returned excitation's arena buffers — but it still *constructs* them, which is
+   the leak. Verify `alloc_check.rs` still reports 0 decode allocs after the refactor.
+2. **SILK-only mode.** Add `ModeImpl::Silk` driving `SilkEncoderMono`/`SilkEncoderStereo`
+   (`silk_encoder.rs`). Needs the **encode-side 48→8/12/16 kHz downsampler** (item 5) — SILK takes
+   internal-rate `&[f32]`, not 48 kHz `i16`. SILK has no per-packet rate control (quality-driven
+   quantizer); use `encode_packet_cbr` (pads to a target) and pick budgets with headroom.
+3. **Hybrid mode.** Add `ModeImpl::Hybrid` driving `HybridEncoderMono` — it carries its own
+   48→16 kHz decimator, so it takes 48 kHz `i16` like CELT (no external resampler), but only mono
+   exists today (`HybridEncoderMono`). Verify its + LBRR-FEC round-trip coverage (unconfirmed).
+4. **Real mode selection** (RFC 6716 §2 Table 1): bitrate + bandwidth + speech/music analysis →
+   SILK / Hybrid / CELT per frame, replacing the CELT-only `select_mode` in `encoder.rs`.
+5. **Encode-side downsampler** for SILK (48→8/12/16 kHz). Check `silk_resampler.rs` (it's the decode
+   *up*sampler) and the Hybrid module's private `Decimator48To16` before writing a new one.
+6. **VBR/CVBR rate control** (the bit reservoir) — CELT `encode_packet` already takes a per-packet
+   budget, and `HybridEncoderMono::encode_packet_elected` exists; add cross-packet VBR on top of the
+   CBR baseline in `cbr_payload_bytes`.
+7. **Multi-frame packets** (§3.2 code 1/2/3 via `packet_compose.rs`) for frame durations > one
+   internal frame (40/60 ms SILK packets), and the alloc-free follow-up (pool-back the CELT range
+   coder so `OpusEnc` does zero per-frame heap traffic, like the decoder's alloc_check trajectory).
 
 ---
 
@@ -101,6 +128,12 @@ struct is **shared with the encode path**:
 
 ## Validation plan (hold the encoder to the workspace's correctness bar)
 
+**Already wired for CELT-only** in `examples/encode_roundtrip.rs` — mirror it for SILK/Hybrid: gate
+each new mode on the same three checks below. (Note the pure-tone SNR alignment lesson: correlation
+alignment is phase-ambiguous on periodic signals, so a low tone-SNR next to a very negative NMR is a
+measurement artifact — brute-force the best-SNR offset and gate on the perceptual NMR, not raw SNR.)
+
+
 1. **Round-trip through our own `OpusDec`**: encode a signal, decode it back, measure SNR. Extend the
    existing per-module round-trip tests to a whole-encoder test.
 2. **External oracle** (the workspace rule — see the `external-player-validation` discipline): decode
@@ -125,7 +158,11 @@ struct is **shared with the encode path**:
 - **Reactor IO** if the element ever touches IO (`ctx.io()`, never std blocking).
 
 ## Quick file map
+- **Encoder (Milestone 1, CELT-only):** `opus/src/encoder.rs` (`OpusEncoder`/`EncoderConfig`/
+  `Application`), `opus/src/opusenc.rs` (`OpusEnc` element).
+- **Encoder validation:** `opus/examples/encode_roundtrip.rs` (round-trip + perceptual + ffmpeg
+  Ogg-Opus oracle), `opus/tests/pipeline.rs` (full-scheduler `tonesrc→opusenc→opusdec→sink`).
 - Decoder + patches: `vendor/oxideav-opus/PROFLUENS-PATCHES.md`, `opus/src/opusdec.rs`.
-- Conformance harness to mirror for the encoder: `opus/examples/conformance.rs`,
+- Decode conformance/alloc harnesses to mirror: `opus/examples/conformance.rs`,
   `opus/examples/alloc_check.rs`.
 - Encode building blocks: the `*_encode.rs` files + `silk_encoder.rs` + `packet_compose.rs` above.
