@@ -16,11 +16,18 @@ name = "pf_opus"
 # `OpusDec` (decode) stays pure-Rust either way (conformant + alloc-free).
 default = ["libopus"]
 libopus = ["dep:libopus-sys"]
+# `qa`: the transcode-QA metric ViSQOL (MOS-LQO) for the quality-targeting tools. Optional and off
+# by default — pulls the pure-Rust `visqol-rs` (Apache-2.0) + its deps (ndarray/rustfft/ffsvm),
+# which take ~20 s to compile. Without it, the tools use the fast in-tree NMR metric.
+qa = ["libopus", "dep:visqol-rs"]
 
 [dependencies]
 profluens-core = { path = "../core" }
 # Statically-linked reference libopus (vendored C, cc-built) — the default `OpusEnc` backend.
 libopus-sys = { path = "../libopus-sys", optional = true }
+# Pure-Rust ViSQOL v3 (MOS-LQO perceptual metric) for the `qa` feature; audio-mode SVR model is
+# bundled at models/visqol_audio_model.txt.
+visqol-rs = { version = "0.3.1", optional = true }
 # Pure-Rust Opus, the one sanctioned kind of plugin dependency (like oxideav-mp3 for
 # pf-mp3): no build.rs, no unsafe, MIT, RFC 6716/7845-annotated. The *published* 0.0.13
 # is an "orphan-rebuild scaffold" that decodes real Opus to silence/noise (see src/lib.rs
@@ -42,4 +49,9 @@ pf-flac = { path = "../flac" }
 # The quality-search tool drives the libopus wrappers directly (encode-many/decode-many).
 [[example]]
 name = "quality_search"
+required-features = ["libopus"]
+
+# FLAC→Opus demo CLI. NMR metric always; the ViSQOL metric compiles in with `--features qa`.
+[[example]]
+name = "transcode"
 required-features = ["libopus"]
