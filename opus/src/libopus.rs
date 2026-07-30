@@ -128,6 +128,111 @@ impl Drop for LibopusEncoder {
     }
 }
 
+/// Maximum samples per channel one Opus packet can decode to (120 ms @ 48 kHz — the §3.2.5 limit).
+const MAX_FRAME_SAMPLES: usize = 5760;
+
+/// Safe owner of a C `OpusDecoder`: Opus packets in, interleaved 48 kHz `i16` PCM out.
+///
+/// The output channel count is fixed when the decoder is created — from an `OpusHead` hint
+/// ([`Self::set_channels`]) when the container front-loads it, else auto-detected from the first
+/// packet's TOC. A fixed output width is what makes libopus transparently up/down-mix a mono-coded
+/// frame inside a stereo stream (the pure-Rust decoder reports per-packet channels instead).
+pub struct LibopusDecoder {
+    st: *mut sys::OpusDecoder,
+    channels: usize,
+    /// `OpusHead` channel hint (0 = none yet); used when the decoder is lazily created.
+    hint: usize,
+}
+
+// SAFETY: as for LibopusEncoder — the C decoder is owned solely here, accessed only through
+// `&mut self`, and the element runs on one scheduler thread at a time.
+unsafe impl Send for LibopusDecoder {}
+
+impl Default for LibopusDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LibopusDecoder {
+    pub fn new() -> Self {
+        Self { st: std::ptr::null_mut(), channels: 0, hint: 0 }
+    }
+
+    /// Fix the output channel count from an `OpusHead` (RFC 7845) before the first packet.
+    pub fn set_channels(&mut self, channels: usize) {
+        if self.st.is_null() && (1..=2).contains(&channels) {
+            self.hint = channels;
+        }
+    }
+
+    /// Decode one packet into `pcm` (interleaved `s16`, contents replaced); returns the output
+    /// channel count. `pcm`'s capacity is reused, so a steady decode does no allocation on this
+    /// side, and libopus itself is allocation-free on the hot path.
+    pub fn decode_packet_into(&mut self, packet: &[u8], pcm: &mut Vec<i16>) -> Result<u8, String> {
+        if self.st.is_null() {
+            let channels = if self.hint != 0 {
+                self.hint as c_int
+            } else if packet.is_empty() {
+                return Err("empty packet before channel count is known".into());
+            } else {
+                // SAFETY: `packet` is non-empty; the function only reads the TOC byte.
+                let ch = unsafe { sys::opus_packet_get_nb_channels(packet.as_ptr()) };
+                if ch < 1 {
+                    return Err(format!("opus_packet_get_nb_channels: {}", strerror(ch)));
+                }
+                ch
+            };
+            let mut err: c_int = 0;
+            // SAFETY: standard opus_decoder_create at Opus's fixed 48 kHz output rate.
+            let st = unsafe { sys::opus_decoder_create(48_000, channels, &mut err) };
+            if err != sys::OPUS_OK || st.is_null() {
+                return Err(format!("opus_decoder_create failed: {}", strerror(err)));
+            }
+            self.st = st;
+            self.channels = channels as usize;
+        }
+
+        pcm.clear();
+        pcm.reserve(self.channels * MAX_FRAME_SAMPLES);
+        // SAFETY: `pcm` has room for channels·MAX_FRAME_SAMPLES i16; opus_decode writes
+        // `channels · got` (got ≤ MAX_FRAME_SAMPLES) initialized samples and returns `got`.
+        let got = unsafe {
+            sys::opus_decode(
+                self.st,
+                packet.as_ptr(),
+                packet.len() as i32,
+                pcm.as_mut_ptr(),
+                MAX_FRAME_SAMPLES as c_int,
+                0,
+            )
+        };
+        if got < 0 {
+            return Err(format!("opus_decode: {}", strerror(got)));
+        }
+        // SAFETY: opus_decode wrote `channels · got` initialized i16 samples.
+        unsafe { pcm.set_len(self.channels * got as usize) };
+        Ok(self.channels as u8)
+    }
+
+    /// Reset carried inter-packet state (seek / stream restart).
+    pub fn reset(&mut self) {
+        if !self.st.is_null() {
+            // SAFETY: OPUS_RESET_STATE consumes no vararg.
+            unsafe { sys::opus_decoder_ctl(self.st, sys::OPUS_RESET_STATE) };
+        }
+    }
+}
+
+impl Drop for LibopusDecoder {
+    fn drop(&mut self) {
+        if !self.st.is_null() {
+            // SAFETY: `st` came from opus_decoder_create and is freed exactly once.
+            unsafe { sys::opus_decoder_destroy(self.st) };
+        }
+    }
+}
+
 /// The libopus message for an error code.
 fn strerror(code: c_int) -> String {
     // SAFETY: opus_strerror returns a static NUL-terminated string for any code.

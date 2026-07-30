@@ -50,14 +50,15 @@
 //! on. Tones/sweeps land at −22 to −34 dB NMR (transparent); the Ogg-Opus file decodes cleanly in
 //! ffmpeg/ffprobe. Run it with `cargo run -p pf-opus --example encode_roundtrip`.
 //!
-//! # Encode backend — libopus (default) or pure-Rust
+//! # Codec backend — libopus (default) or pure-Rust
 //!
-//! [`OpusEnc`] encodes through the **reference libopus** C encoder (statically linked via
-//! `libopus-sys`, the `libopus` feature — default): reference-grade quality and allocation-free on
-//! the hot path. `--no-default-features` swaps in the pure-Rust `OpusEncoder` (CELT-only) instead.
-//! [`OpusDec`] stays pure-Rust either way (conformant + alloc-free). Codecs are the sanctioned
-//! place for a C dependency in this workspace — quality/tuning that clean-room Rust can't match —
-//! kept behind the plugin boundary (the core never sees C).
+//! Both [`OpusEnc`] and [`OpusDec`] run through the **reference libopus** C codec (statically linked
+//! via `libopus-sys`, the `libopus` feature — default): reference-grade quality, allocation-free on
+//! the hot path. `--no-default-features` swaps in the pure-Rust `oxideav-opus` codec instead (the
+//! CELT-only `OpusEncoder` + the conformant pure-Rust decoder). Codecs are the sanctioned place for
+//! a C dependency in this workspace — quality/tuning that clean-room Rust can't match — kept behind
+//! the plugin boundary (the core never sees C). Each backend is selected by a small `EncBackend` /
+//! `DecBackend` trait so the element code is backend-agnostic.
 //!
 //! A full FLAC→Opus transcode measures **2.1 allocs/packet** on the libopus backend vs 20.1 on the
 //! pure-Rust one (`examples/transcode_alloc_check.rs`) — libopus contributes ~0, so the residual is

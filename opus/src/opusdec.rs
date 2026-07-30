@@ -1,7 +1,8 @@
-//! `opusdec` — the Opus (RFC 6716 / RFC 7845) decoder element, backed by the pure-Rust
-//! `oxideav-opus` (git master; see the crate's lib.rs history for why the published 0.0.13 is a
-//! non-decoding scaffold). One **Opus packet per input buffer** on the `opus` sink pad; decoded
-//! interleaved `s16` PCM at 48 kHz leaves on the `audio/raw` src pad.
+//! `opusdec` — the Opus (RFC 6716 / RFC 7845) decoder element. The decode backend is selected by
+//! the `libopus` feature (default): the reference **libopus** C decoder (`libopus-sys`), or the
+//! pure-Rust `oxideav-opus` decoder with `--no-default-features` — see the [`DecBackend`] trait.
+//! One **Opus packet per input buffer** on the `opus` sink pad; decoded interleaved `s16` PCM at
+//! 48 kHz leaves on the `audio/raw` src pad.
 //!
 //! The concrete `audio/raw` format (channels) is data-dependent, so the src pad is `dynamic` and
 //! the format is announced at runtime via [`Ctx::announce_format`] — from the `OpusHead` (RFC
@@ -13,7 +14,9 @@
 //! bounded pending carry, so a slow sink cannot make the decoder run ahead and balloon the pool.
 //! Opus is always 48 kHz on decode; sample-rate conversion is a downstream `audioresample`.
 
-use oxideav_opus::{apply_output_gain, OpusDecoder, OpusHead, OPUS_HEAD_MAGIC};
+// `OpusHead`/`OpusTags`/gain are RFC 7845 container metadata (not decode), so they stay pure-Rust
+// regardless of the decode backend.
+use oxideav_opus::{apply_output_gain, OpusHead, OPUS_HEAD_MAGIC};
 
 use profluens_core::batch::Inputs;
 use profluens_core::bus::BusMessage;
@@ -79,9 +82,58 @@ static DESC: ElementDesc = ElementDesc {
     make_default: Some(|| Box::new(OpusDec::new())),
 };
 
+/// The Opus decoder backend — selected at build time: the reference **libopus** C decoder
+/// (`libopus` feature, default) or the pure-Rust `oxideav-opus` decoder (`--no-default-features`).
+/// Both decode one packet into a reused `i16` buffer and report the output channel count.
+trait DecBackend: Send {
+    /// Fix the output channel count from an `OpusHead` hint (libopus creates a fixed-width decoder;
+    /// the pure-Rust decoder learns per-packet and ignores this).
+    fn set_channels(&mut self, channels: usize);
+    /// Decode one packet into `pcm` (interleaved `s16`, contents replaced); returns channel count.
+    fn decode_into(&mut self, packet: &[u8], pcm: &mut Vec<i16>) -> Result<u8, String>;
+    /// Reset carried inter-packet state (seek).
+    fn reset(&mut self);
+}
+
+#[cfg(feature = "libopus")]
+impl DecBackend for crate::libopus::LibopusDecoder {
+    fn set_channels(&mut self, channels: usize) {
+        crate::libopus::LibopusDecoder::set_channels(self, channels)
+    }
+    fn decode_into(&mut self, packet: &[u8], pcm: &mut Vec<i16>) -> Result<u8, String> {
+        crate::libopus::LibopusDecoder::decode_packet_into(self, packet, pcm)
+    }
+    fn reset(&mut self) {
+        crate::libopus::LibopusDecoder::reset(self)
+    }
+}
+
+#[cfg(not(feature = "libopus"))]
+impl DecBackend for oxideav_opus::OpusDecoder {
+    fn set_channels(&mut self, _channels: usize) {} // learns channels per packet
+    fn decode_into(&mut self, packet: &[u8], pcm: &mut Vec<i16>) -> Result<u8, String> {
+        oxideav_opus::OpusDecoder::decode_packet_into(self, packet, pcm).map_err(|e| format!("{e:?}"))
+    }
+    fn reset(&mut self) {
+        oxideav_opus::OpusDecoder::reset(self)
+    }
+}
+
+#[allow(clippy::disallowed_methods)] // one-time construction at registry/parse time
+fn make_decoder() -> Box<dyn DecBackend> {
+    #[cfg(feature = "libopus")]
+    {
+        Box::new(crate::libopus::LibopusDecoder::new())
+    }
+    #[cfg(not(feature = "libopus"))]
+    {
+        Box::new(oxideav_opus::OpusDecoder::new())
+    }
+}
+
 /// Decodes an Opus packet stream to interleaved 48 kHz `s16` PCM.
 pub struct OpusDec {
-    dec: OpusDecoder,
+    dec: Box<dyn DecBackend>,
     announced: bool,
     /// Channel count of the announced format (from `OpusHead` or the first decoded packet).
     channels: usize,
@@ -104,7 +156,7 @@ impl OpusDec {
     #[allow(clippy::disallowed_methods)] // one-time construction at registry/parse time
     pub fn new() -> Self {
         OpusDec {
-            dec: OpusDecoder::new(),
+            dec: make_decoder(),
             announced: false,
             channels: 0,
             preskip_remaining: 0,
@@ -171,13 +223,11 @@ impl OpusDec {
     /// `flacdec::pull_into` and `aacdec`'s reused `pending_pcm`). The RFC 7845 header/comment
     /// packets are handled by the caller.
     fn decode_audio(&mut self, ctx: &mut Ctx, packet: &[u8]) -> Result<(), Error> {
-        // `self.dec` and `self.pending` are disjoint fields — decode straight into the reused buf.
-        // The vendored oxideav-opus decode is allocation-free in steady state: a per-packet
-        // `DecodeBump` arena backs every transient (type-checked so it can never hold persistent
-        // state) plus a reused thread-local scratch for the hot PVQ leaf — see
-        // vendor/oxideav-opus/PROFLUENS-PATCHES.md. So this element drives zero per-packet heap
-        // traffic through the whole SILK/CELT decode graph.
-        let channels = match self.dec.decode_packet_into(packet, &mut self.pending) {
+        // Decode straight into the reused `pending` buffer (its capacity is retained across
+        // packets), so a steady decode drives no per-packet heap traffic on either backend: libopus
+        // is allocation-free on the hot path (C99 VLA scratch); the pure-Rust decoder uses a
+        // per-packet `DecodeBump` arena + a reused PVQ scratch (vendor/oxideav-opus/PROFLUENS-PATCHES.md).
+        let channels = match self.dec.decode_into(packet, &mut self.pending) {
             Ok(ch) => (ch as usize).max(1),
             // Per-packet error scope (spec: error handling): warn-drop a corrupt packet rather
             // than tearing down the stream; a following clean packet resumes decode.
@@ -187,7 +237,7 @@ impl OpusDec {
                     element,
                     error: Error::Element {
                         element,
-                        message: format!("opusdec: dropping undecodable packet: {e:?}"),
+                        message: format!("opusdec: dropping undecodable packet: {e}"),
                     },
                 });
                 self.pending.clear();
@@ -234,6 +284,9 @@ impl Element for OpusDec {
                 if let Ok(head) = OpusHead::parse(data) {
                     self.preskip_remaining = head.pre_skip as u32;
                     self.output_gain_q7_8 = head.output_gain_q7_8;
+                    // Fix the decoder's output width from the header (so a mono-coded frame in a
+                    // stereo stream still outputs stereo).
+                    self.dec.set_channels(head.channel_count as usize);
                     self.announce(ctx, head.channel_count as usize);
                 }
                 continue;

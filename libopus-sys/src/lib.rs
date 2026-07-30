@@ -89,6 +89,9 @@ extern "C" {
     pub fn opus_encoder_ctl(st: *mut OpusEncoder, request: c_int, ...) -> c_int;
     pub fn opus_encoder_destroy(st: *mut OpusEncoder);
 
+    /// Channel count (1 or 2) of an Opus packet, read from its TOC byte. Negative on a bad packet.
+    pub fn opus_packet_get_nb_channels(data: *const u8) -> c_int;
+
     // ---- Decoder ----
     pub fn opus_decoder_get_size(channels: c_int) -> c_int;
     pub fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int) -> *mut OpusDecoder;
