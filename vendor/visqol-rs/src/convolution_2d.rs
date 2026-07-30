@@ -75,29 +75,122 @@ where
     let f_c_c = fir_filter.ncols();
     let o_r_c = i_r_c - f_r_c + 1;
     let o_c_c = i_c_c - f_c_c + 1;
-    let filter_size = f_r_c * f_c_c;
 
     let flattened_filter = flatten_filter(fir_filter, arena);
 
     // Every (o_row, o_col) is written below, so the uninitialised arena matrix needs no fill.
     let mut out_matrix = arena_mat(arena, o_r_c, o_c_c);
+    let out_slice = out_matrix
+        .as_slice_mut()
+        .expect("arena_mat output is standard-layout contiguous");
+    conv2d_valid(
+        padded_flattened_matrix,
+        i_c_c,
+        flattened_filter,
+        f_r_c,
+        f_c_c,
+        o_r_c,
+        o_c_c,
+        out_slice,
+    );
+    out_matrix
+}
 
+/// Valid 2-D convolution core: `out[o_row][o_col] = Σ_taps padded[(f_row+o_row)*i_c_c + f_col+o_col]
+/// * filter[filter_size-1 - tap]`. Vectorised across output columns (4 per AVX2 instruction) with a
+/// scalar fallback. The per-output accumulation is the identical tap sequence in the identical order
+/// as the scalar form and uses no FMA contraction, so it is bit-for-bit identical.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_valid(
+    padded: &[f64],
+    i_c_c: usize,
+    filter: &[f64],
+    f_r_c: usize,
+    f_c_c: usize,
+    o_r_c: usize,
+    o_c_c: usize,
+    out: &mut [f64],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: gated on runtime AVX2 detection; the body is plain safe Rust (no intrinsics) —
+            // `target_feature` only lets the autovectoriser use 256-bit lanes.
+            unsafe {
+                conv2d_valid_avx2(padded, i_c_c, filter, f_r_c, f_c_c, o_r_c, o_c_c, out);
+            }
+            return;
+        }
+    }
+    conv2d_valid_kernel(padded, i_c_c, filter, f_r_c, f_c_c, o_r_c, o_c_c, out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn conv2d_valid_avx2(
+    padded: &[f64],
+    i_c_c: usize,
+    filter: &[f64],
+    f_r_c: usize,
+    f_c_c: usize,
+    o_r_c: usize,
+    o_c_c: usize,
+    out: &mut [f64],
+) {
+    conv2d_valid_kernel(padded, i_c_c, filter, f_r_c, f_c_c, o_r_c, o_c_c, out);
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn conv2d_valid_kernel(
+    padded: &[f64],
+    i_c_c: usize,
+    filter: &[f64],
+    f_r_c: usize,
+    f_c_c: usize,
+    o_r_c: usize,
+    o_c_c: usize,
+    out: &mut [f64],
+) {
+    let filter_size = f_r_c * f_c_c;
     for o_row in 0..o_r_c {
-        for o_col in 0..o_c_c {
-            let mut sum = 0.0f64;
+        let out_row = &mut out[o_row * o_c_c..o_row * o_c_c + o_c_c];
+        let mut o_col = 0;
+        // Four output columns at a time: `padded[idx..idx+4]` is four adjacent columns (row-major,
+        // stride 1) and the filter tap is a shared scalar, so the four MACs vectorise.
+        while o_col + 4 <= o_c_c {
+            let mut sum4 = [0.0f64; 4];
             let mut filter_index = filter_size - 1;
-
             for f_col in 0..f_c_c {
                 for f_row in 0..f_r_c {
-                    let idx = ((f_row + o_row) * i_c_c) + f_col + o_col;
-                    sum += padded_flattened_matrix[idx] * flattened_filter[filter_index];
+                    let idx = (f_row + o_row) * i_c_c + f_col + o_col;
+                    let fv = filter[filter_index];
+                    let p = &padded[idx..idx + 4];
+                    for k in 0..4 {
+                        sum4[k] += p[k] * fv;
+                    }
                     filter_index = filter_index.saturating_sub(1);
                 }
             }
-            out_matrix[(o_row, o_col)] = sum;
+            out_row[o_col..o_col + 4].copy_from_slice(&sum4);
+            o_col += 4;
+        }
+        // Remainder columns — identical scalar accumulation.
+        while o_col < o_c_c {
+            let mut sum = 0.0f64;
+            let mut filter_index = filter_size - 1;
+            for f_col in 0..f_c_c {
+                for f_row in 0..f_r_c {
+                    let idx = (f_row + o_row) * i_c_c + f_col + o_col;
+                    sum += padded[idx] * filter[filter_index];
+                    filter_index = filter_index.saturating_sub(1);
+                }
+            }
+            out_row[o_col] = sum;
+            o_col += 1;
         }
     }
-    out_matrix
 }
 
 /// Row-major flatten of the (Fortran-order) FIR filter into arena memory. Row-major via `[(i, j)]`
