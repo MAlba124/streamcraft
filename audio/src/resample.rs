@@ -68,8 +68,10 @@ pub struct PolyphaseFilter {
     pub m: usize,
     /// Taps per polyphase branch (the per-output multiply count).
     pub taps_per_phase: usize,
-    /// `L` branches × `taps_per_phase` coefficients, row-major (`phases[p][k]`).
-    phases: Vec<Vec<f32>>,
+    /// `L` branches × `taps_per_phase` coefficients, row-major in one contiguous buffer
+    /// (`phases[p * taps_per_phase + k]`). Flat (not `Vec<Vec>`) so `design` and `clone` are a
+    /// single allocation each, not `L`.
+    phases: Vec<f32>,
 }
 
 impl PolyphaseFilter {
@@ -121,10 +123,10 @@ impl PolyphaseFilter {
         // Scatter into `L` branches. Branch p, tap k := proto[p + k*L]; the innermost tap
         // (k=0, nearest the interpolation instant) comes first so it dots a most-recent-first
         // history window with no index arithmetic in the hot loop.
-        let mut phases = vec![vec![0f32; taps_per_phase]; l];
-        for (p, branch) in phases.iter_mut().enumerate() {
-            for (k, coeff) in branch.iter_mut().enumerate() {
-                *coeff = proto[p + k * l];
+        let mut phases = vec![0f32; taps_per_phase * l];
+        for p in 0..l {
+            for k in 0..taps_per_phase {
+                phases[p * taps_per_phase + k] = proto[p + k * l];
             }
         }
 
@@ -137,12 +139,12 @@ impl PolyphaseFilter {
     }
 
     /// The full designed prototype low-pass coefficients (branches re-interleaved), useful for
-    /// verifying the impulse response. `proto[p + k·L] == phases[p][k]`.
+    /// verifying the impulse response. `proto[p + k·L] == phases[p·taps_per_phase + k]`.
     pub fn prototype(&self) -> Vec<f32> {
         let mut proto = vec![0f32; self.prototype_len()];
-        for (p, branch) in self.phases.iter().enumerate() {
-            for (k, &c) in branch.iter().enumerate() {
-                proto[p + k * self.l] = c;
+        for p in 0..self.l {
+            for k in 0..self.taps_per_phase {
+                proto[p + k * self.l] = self.phases[p * self.taps_per_phase + k];
             }
         }
         proto
@@ -211,7 +213,7 @@ impl ChannelResampler {
         // Produce while the base index has `tpp` samples of history behind it (indices
         // `in_pos-(tpp-1)..=in_pos` all present). `in_pos` is an index into `history`.
         while self.in_pos < self.history.len() {
-            let branch = &self.filter.phases[self.phase];
+            let branch = &self.filter.phases[self.phase * tpp..self.phase * tpp + tpp];
             // Dot the branch against history[in_pos], history[in_pos-1], … (most-recent-first).
             let mut acc = 0f32;
             // `in_pos >= tpp-1` always holds here (seeded warm-up), so the window is in range.
@@ -303,7 +305,7 @@ mod tests {
         assert_eq!(f.l, 160);
         assert_eq!(f.m, 147);
         assert_eq!(f.taps_per_phase, 32); // 2 * half_taps
-        assert_eq!(f.phases.len(), 160);
+        assert_eq!(f.phases.len(), 32 * 160); // flat: taps_per_phase × L
         assert_eq!(f.prototype_len(), 32 * 160);
 
         // The prototype is a linear-phase (symmetric) windowed sinc.
