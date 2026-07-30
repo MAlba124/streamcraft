@@ -203,30 +203,39 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
         .map(|n| n.get())
         .unwrap_or(4)
         .min(grid.len().max(1));
-    let per = grid.len().div_ceil(threads);
+    // Work-queue rather than static `chunks(per)`: `chunks` splits N points into ceil(N/per)
+    // pieces, spawning fewer threads than cores when N < 2·cores (15 points ÷ per=2 = 8 threads on
+    // 12 cores) and load-imbalancing the tail. Instead spawn `threads` workers that each pull the
+    // next grid index from a shared atomic until the grid is drained — every core stays busy and
+    // the last, uneven items are picked up by whichever thread frees first.
+    let grid_ref = &grid;
+    let next = AtomicUsize::new(0);
     let counter = AtomicUsize::new(0);
 
     let t0 = Instant::now();
     let mut rows: Vec<(u32, f64, f64)> = std::thread::scope(|s| {
-        let handles: Vec<_> = grid
-            .chunks(per)
-            .map(|chunk| {
-                let counter = &counter;
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (next, counter) = (&next, &counter);
                 s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&k| {
-                            let (recon, actual) = enc_dec(pcm, orig, channels, k, cx);
-                            let q = match metric {
-                                Metric::Nmr => nmr(orig, &recon, channels),
-                                Metric::Visqol => {
-                                    let tag = counter.fetch_add(1, Ordering::Relaxed);
-                                    visqol_mos(orig, &recon, channels, tag)
-                                }
-                            };
-                            (k, actual, q)
-                        })
-                        .collect::<Vec<_>>()
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= grid_ref.len() {
+                            break;
+                        }
+                        let k = grid_ref[i];
+                        let (recon, actual) = enc_dec(pcm, orig, channels, k, cx);
+                        let q = match metric {
+                            Metric::Nmr => nmr(orig, &recon, channels),
+                            Metric::Visqol => {
+                                let tag = counter.fetch_add(1, Ordering::Relaxed);
+                                visqol_mos(orig, &recon, channels, tag)
+                            }
+                        };
+                        out.push((k, actual, q));
+                    }
+                    out
                 })
             })
             .collect();
