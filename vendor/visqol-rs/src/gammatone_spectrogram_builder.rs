@@ -10,6 +10,13 @@ use ndarray::{Array2, Axis};
 /// Produces a frequency domain representation from a time domain signal using a gammatone filterbank.
 pub struct GammatoneSpectrogramBuilder<const NUM_BANDS: usize> {
     filter_bank: GammatoneFilterbank<NUM_BANDS>,
+    /// Sample rate the filterbank coefficients are currently configured for. The gammatone
+    /// coefficients depend only on `(sample_rate, NUM_BANDS, min/max freq)`, so they are computed
+    /// once and reused — `make_filters` + `set_filter_coefficients` were ~27% of a quality search's
+    /// allocations, recomputed on *every* `build` (twice per patch in the fine realignment).
+    configured_rate: Option<u32>,
+    /// Cached sorted centre frequencies, cloned into each produced `Spectrogram`.
+    center_freqs: Vec<f64>,
 }
 
 impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<NUM_BANDS> {
@@ -26,15 +33,24 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
             sample_rate / 2
         };
 
-        // get gammatone coefficients
-        let (mut filter_coeffs, mut center_freqs) =
-            equivalent_rectangular_bandwidth::make_filters::<NUM_BANDS>(
-                sample_rate as usize,
-                self.filter_bank.min_freq,
-                max_freq as f64,
-            );
-        filter_coeffs.invert_axis(Axis(0));
-        self.filter_bank.set_filter_coefficients(&filter_coeffs);
+        // Gammatone coefficients depend only on the sample rate (plus the const band count and
+        // min/max freq), so compute + install them once and reuse across every build; only
+        // `reset_filter_conditions` (cheap in-place zeroing) has to run each time.
+        if self.configured_rate != Some(sample_rate) {
+            let (mut filter_coeffs, mut center_freqs) =
+                equivalent_rectangular_bandwidth::make_filters::<NUM_BANDS>(
+                    sample_rate as usize,
+                    self.filter_bank.min_freq,
+                    max_freq as f64,
+                );
+            filter_coeffs.invert_axis(Axis(0));
+            self.filter_bank.set_filter_coefficients(&filter_coeffs);
+            center_freqs.as_mut_slice().sort_by(|a, b| {
+                a.partial_cmp(b).expect("Failed to sort center frequencies!")
+            });
+            self.center_freqs = center_freqs;
+            self.configured_rate = Some(sample_rate);
+        }
         self.filter_bank.reset_filter_conditions();
 
         let hop_size = (window.size as f64 * window.overlap) as usize;
@@ -77,11 +93,7 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
             }
         }
 
-        center_freqs.as_mut_slice().sort_by(|a, b| {
-            a.partial_cmp(b)
-                .expect("Failed to sort center frequencies!")
-        });
-        Ok(Spectrogram::new(out_matrix, center_freqs))
+        Ok(Spectrogram::new(out_matrix, self.center_freqs.clone()))
     }
 }
 
@@ -90,7 +102,13 @@ impl<const NUM_BANDS: usize> GammatoneSpectrogramBuilder<NUM_BANDS> {
 
     /// Creates a new gammatone spectrogram builder with the given gammatone filterbank.
     /// If `use_speech_mode` is set to `true`, the maximum frequency is determined to be 8000 Hz.
-    pub fn new(filter_bank: GammatoneFilterbank<NUM_BANDS>) -> Self { Self { filter_bank } }
+    pub fn new(filter_bank: GammatoneFilterbank<NUM_BANDS>) -> Self {
+        Self {
+            filter_bank,
+            configured_rate: None,
+            center_freqs: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
