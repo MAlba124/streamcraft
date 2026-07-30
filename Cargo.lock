@@ -1873,8 +1873,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "visqol-rs"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a06e9b90763cfaeedada5a447ed019ebc3574b13d7b8b485c9e218500dd193b"
 dependencies = [
  "ffsvm",
  "hound",

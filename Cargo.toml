@@ -9,6 +9,9 @@ exclude = [
     # Vendored oxideav-opus git master + the decode_packet_into no-alloc patch
     # (vendor/oxideav-opus/PROFLUENS-PATCHES.md); a path dep from opus/Cargo.toml.
     "vendor/oxideav-opus",
+    # Vendored visqol-rs 0.3.1 + the fused-gammatone-cascade speedup
+    # (vendor/visqol-rs/PROFLUENS-PATCHES.md); path dep from opus/Cargo.toml under the `qa` feature.
+    "vendor/visqol-rs",
 ]
 members = [
     "core",

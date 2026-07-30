@@ -26,8 +26,9 @@ profluens-core = { path = "../core" }
 # Statically-linked reference libopus (vendored C, cc-built) — the default `OpusEnc` backend.
 libopus-sys = { path = "../libopus-sys", optional = true }
 # Pure-Rust ViSQOL v3 (MOS-LQO perceptual metric) for the `qa` feature; audio-mode SVR model is
-# bundled at models/visqol_audio_model.txt.
-visqol-rs = { version = "0.3.1", optional = true }
+# bundled at models/visqol_audio_model.txt. Vendored (vendor/visqol-rs/PROFLUENS-PATCHES.md) with a
+# fused-gammatone-cascade speedup — bit-identical output, no per-pass allocations.
+visqol-rs = { path = "../vendor/visqol-rs", optional = true }
 # Pure-Rust Opus, the one sanctioned kind of plugin dependency (like oxideav-mp3 for
 # pf-mp3): no build.rs, no unsafe, MIT, RFC 6716/7845-annotated. The *published* 0.0.13
 # is an "orphan-rebuild scaffold" that decodes real Opus to silence/noise (see src/lib.rs
