@@ -68,12 +68,18 @@ fn main() {
         i += 2;
     }
 
-    // 1. Decode the FLAC to 48 kHz s16 (pure-Rust decode + resample if needed).
-    let (pcm, channels) = decode_flac_48k(input);
+    // 1. Decode the FLAC to 48 kHz s16 (pure-Rust decode + resample if needed) and read its tags.
+    let (pcm, channels, comments) = decode_flac_48k(input);
     let orig = to_i16(&pcm);
     let secs = orig.len() as f64 / channels as f64 / RATE as f64;
     let in_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
-    println!("in:  {input}  {channels}ch {secs:.1}s  {} KiB FLAC", in_size / 1024);
+    let art = comments.iter().any(|c| c.starts_with("METADATA_BLOCK_PICTURE="));
+    println!(
+        "in:  {input}  {channels}ch {secs:.1}s  {} KiB FLAC  ({} tags{})",
+        in_size / 1024,
+        comments.len(),
+        if art { " + art" } else { "" },
+    );
 
     // 2. Pick the bitrate: recommend (knee of the curve), quality target search, or fixed.
     if recommend_mode {
@@ -85,7 +91,7 @@ fn main() {
     // 3. Encode + mux to Ogg-Opus.
     let t0 = Instant::now();
     let packets = encode_all(&pcm, channels, bitrate, complexity);
-    write_ogg_opus(output, channels, &packets);
+    write_ogg_opus(output, channels, &packets, &comments);
     let out_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     println!(
         "out: {output}  {:.1} kbps  {} KiB Opus  ({:.0}% of source)  encoded {:.2?}",
@@ -101,8 +107,9 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 /// Decode a FLAC file to interleaved 48 kHz `s16` bytes (first 1–2 channels), resampling if needed.
-fn decode_flac_48k(path: &str) -> (Vec<u8>, usize) {
+fn decode_flac_48k(path: &str) -> (Vec<u8>, usize, Vec<String>) {
     let bytes = std::fs::read(path).unwrap_or_else(|e| die(&format!("read {path}: {e}")));
+    let comments = flac_comments(&bytes); // tags from the same bytes, before decoding
     let dec = FlacDecoder::decode(&bytes).unwrap_or_else(|e| die(&format!("decode FLAC: {e:?}")));
     let total_ch = dec.info.channels as usize;
     let out_ch = total_ch.min(2);
@@ -138,7 +145,7 @@ fn decode_flac_48k(path: &str) -> (Vec<u8>, usize) {
             pcm.extend_from_slice(&s.to_le_bytes());
         }
     }
-    (pcm, out_ch)
+    (pcm, out_ch, comments)
 }
 
 // ---------------------------------------------------------------------------
@@ -408,13 +415,13 @@ fn ensure_model() {
 // Ogg-Opus mux (RFC 7845) + small helpers
 // ---------------------------------------------------------------------------
 
-fn write_ogg_opus(path: &str, channels: usize, packets: &[Vec<u8>]) {
+fn write_ogg_opus(path: &str, channels: usize, packets: &[Vec<u8>], comments: &[String]) {
     const PRE_SKIP: u64 = 120;
     let mut w = OggWriter::new(0x5C0F_0007);
     let mut out = Vec::new();
     w.write_packet(&mut out, &opus_head(channels), 0).unwrap();
     w.flush(&mut out);
-    w.write_packet(&mut out, &opus_tags(), 0).unwrap();
+    w.write_packet(&mut out, &opus_tags(comments), 0).unwrap();
     w.flush(&mut out);
     for (k, p) in packets.iter().enumerate() {
         let granule = (k as u64 + 1) * FRAME_SAMPLES as u64 + PRE_SKIP;
@@ -436,14 +443,91 @@ fn opus_head(channels: usize) -> Vec<u8> {
     h
 }
 
-fn opus_tags() -> Vec<u8> {
+/// Build the `OpusTags` comment header (RFC 7845 §5.2), carrying `comments` forward as Vorbis
+/// comments. The user comments (`KEY=value`, and `METADATA_BLOCK_PICTURE=<base64>` for art) use the
+/// exact same wire format as FLAC's `VORBIS_COMMENT`, so forwarding is a straight copy. The vendor
+/// string identifies *this* encoder, so it stays ours (the FLAC vendor is not carried).
+fn opus_tags(comments: &[String]) -> Vec<u8> {
     let vendor = b"streamcraft-transcode";
     let mut t = Vec::new();
     t.extend_from_slice(b"OpusTags");
     t.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
     t.extend_from_slice(vendor);
-    t.extend_from_slice(&0u32.to_le_bytes());
+    t.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for c in comments {
+        let b = c.as_bytes();
+        t.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        t.extend_from_slice(b);
+    }
     t
+}
+
+/// Walk a FLAC file's metadata-block chain and return its tags as Vorbis-comment strings: every
+/// `VORBIS_COMMENT` user comment verbatim, plus each `PICTURE` block base64-encoded as a
+/// `METADATA_BLOCK_PICTURE=…` comment (the standard way album art rides in Opus/Vorbis). Malformed or
+/// truncated metadata just stops the walk — tags are best-effort, never fatal.
+fn flac_comments(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if bytes.len() < 4 || &bytes[0..4] != b"fLaC" {
+        return out;
+    }
+    // Each block: 1 header byte [last:1 | type:7], 3-byte big-endian length, then the block body.
+    let mut pos = 4;
+    while pos + 4 <= bytes.len() {
+        let header = bytes[pos];
+        let last = header & 0x80 != 0;
+        let block_type = header & 0x7f;
+        let len = u32::from_be_bytes([0, bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let start = pos + 4;
+        let Some(block) = bytes.get(start..start + len) else { break };
+        match block_type {
+            4 => out.extend(parse_vorbis_comment(block)), // VORBIS_COMMENT
+            6 => out.push(format!("METADATA_BLOCK_PICTURE={}", base64_encode(block))), // PICTURE
+            _ => {}
+        }
+        pos = start + len;
+        if last {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse a FLAC `VORBIS_COMMENT` block body into its user comment strings (§8.6): a
+/// little-endian-length-prefixed vendor string (skipped — see [`opus_tags`]), then a count and that
+/// many length-prefixed UTF-8 `KEY=value` strings.
+fn parse_vorbis_comment(block: &[u8]) -> Vec<String> {
+    let le = |b: &[u8], p: usize| b.get(p..p + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize);
+    let mut p = 0;
+    let Some(vendor_len) = le(block, p) else { return Vec::new() };
+    p += 4 + vendor_len;
+    let Some(count) = le(block, p) else { return Vec::new() };
+    p += 4;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let Some(clen) = le(block, p) else { break };
+        p += 4;
+        let Some(s) = block.get(p..p + clen) else { break };
+        p += clen;
+        if let Ok(s) = std::str::from_utf8(s) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
+/// Standard base64 (RFC 4648, padded, no line breaks) — for the `METADATA_BLOCK_PICTURE` comment.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn to_i16(bytes: &[u8]) -> Vec<i16> {
