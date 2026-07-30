@@ -1,6 +1,6 @@
 use crate::convolution_2d::{binop_into, map_into, perform_valid_2d_conv_with_boundary};
 use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
-use ndarray::{arr2, Array1, Array2, ArrayViewMut2, Axis};
+use ndarray::{arr2, Array1, Array2, ArrayBase, ArrayViewMut2, Axis, Data, Ix2};
 use profluens_core::memory::Arena;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
@@ -38,12 +38,16 @@ impl NeurogramSimiliarityIndexMeasure {
     /// The per-element ops and their order are unchanged, so the map is bit-identical.
     ///
     /// [`arena_mat`]: crate::convolution_2d::arena_mat
-    fn compute_sim_map<'a>(
+    fn compute_sim_map<'a, Sr, Sd>(
         &self,
-        ref_patch: &Array2<f64>,
-        deg_patch: &Array2<f64>,
+        ref_patch: &ArrayBase<Sr, Ix2>,
+        deg_patch: &ArrayBase<Sd, Ix2>,
         arena: &'a Arena,
-    ) -> ArrayViewMut2<'a, f64> {
+    ) -> ArrayViewMut2<'a, f64>
+    where
+        Sr: Data<Elem = f64>,
+        Sd: Data<Elem = f64>,
+    {
         let window = &self.window;
 
         let k = [0.01, 0.03];
@@ -104,6 +108,37 @@ impl NeurogramSimiliarityIndexMeasure {
             binop_into(arena, &structure_numerator, &structure_denominator, |a, b| a / b);
         binop_into(arena, &intensity, &structure, |a, b| a * b)
     }
+
+    /// Just the scalar similarity — the only field the O(patches × window) alignment slide loop
+    /// consumes. Allocation-free: the `sim_map` scratch is arena, and the per-band `Array1`s + three
+    /// result `Vec`s of the full measure are skipped entirely. Generic over both patches' storage so
+    /// the slide loop can pass a zero-copy `ArrayView2` slice of the degraded spectrogram rather than
+    /// an owned patch copy. The score is the grand mean of `sim_map` computed as
+    /// `mean_axis(Axis(1)).mean()` — per-band (row) means then the mean of those — reproduced with
+    /// the identical left-to-right sums and identical two divisions, so it is bit-identical to
+    /// `measure_patch_similarity(..).similarity` (asserted in the tests).
+    pub fn measure_similarity_score<Sr, Sd>(
+        &self,
+        ref_patch: &ArrayBase<Sr, Ix2>,
+        deg_patch: &ArrayBase<Sd, Ix2>,
+        arena: &Arena,
+    ) -> f64
+    where
+        Sr: Data<Elem = f64>,
+        Sd: Data<Elem = f64>,
+    {
+        let sim_map = self.compute_sim_map(ref_patch, deg_patch, arena);
+        let (nrows, ncols) = sim_map.dim();
+        let ncols_f = ncols as f64;
+        // `sim_map.row(i).sum()` sums the contiguous row left-to-right, exactly as
+        // `sum_axis(Axis(1))[i]` does; dividing by `ncols` matches `mean_axis`. Accumulating those
+        // row means in order and dividing by `nrows` matches the subsequent `Array1::mean`.
+        let mut acc = 0.0;
+        for i in 0..nrows {
+            acc += sim_map.row(i).sum() / ncols_f;
+        }
+        acc / nrows as f64
+    }
 }
 
 impl Default for NeurogramSimiliarityIndexMeasure {
@@ -146,31 +181,6 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
             freq_band_deg_energy.to_vec(),
             mean_freq_band_means,
         )
-    }
-
-    /// Just the scalar similarity — the only field the O(patches × window) alignment slide loop
-    /// consumes. Allocation-free: the `sim_map` scratch is arena, and the per-band `Array1`s +
-    /// three result `Vec`s of the full measure are skipped entirely. The score is the grand mean of
-    /// `sim_map` computed as `mean_axis(Axis(1)).mean()` — per-band (row) means, then the mean of
-    /// those — reproduced with the identical left-to-right sums and the identical two divisions, so
-    /// it is bit-identical to `measure_patch_similarity(..).similarity` (asserted in the tests).
-    fn measure_similarity_score(
-        &self,
-        ref_patch: &mut ndarray::Array2<f64>,
-        deg_patch: &mut ndarray::Array2<f64>,
-        arena: &Arena,
-    ) -> f64 {
-        let sim_map = self.compute_sim_map(&*ref_patch, &*deg_patch, arena);
-        let (nrows, ncols) = sim_map.dim();
-        let ncols_f = ncols as f64;
-        // `sim_map.row(i).sum()` sums the contiguous row left-to-right, exactly as
-        // `sum_axis(Axis(1))[i]` does; dividing by `ncols` matches `mean_axis`. Accumulating those
-        // row means in order and dividing by `nrows` matches the subsequent `Array1::mean`.
-        let mut acc = 0.0;
-        for i in 0..nrows {
-            acc += sim_map.row(i).sum() / ncols_f;
-        }
-        acc / nrows as f64
     }
 }
 
@@ -242,8 +252,12 @@ mod tests {
         .unwrap();
 
         let full = sim.measure_patch_similarity(&mut r.clone(), &mut d.clone(), &arena);
-        let score = sim.measure_similarity_score(&mut r.clone(), &mut d.clone(), &arena);
+        let score = sim.measure_similarity_score(&r, &d, &arena);
+        // ...and a zero-copy view of the degraded patch must give the identical score (this is the
+        // path the slide loop takes).
+        let score_view = sim.measure_similarity_score(&r, &d.slice(ndarray::s![.., ..]), &arena);
 
         assert_eq!(score, full.similarity, "scalar path must equal full .similarity bit-for-bit");
+        assert_eq!(score, score_view, "view and owned degraded patch must score identically");
     }
 }

@@ -60,22 +60,14 @@ impl ComparisonPatchesSelector {
             vec![vec![0.0f64; spectrogram_data.ncols()]; ref_patch_indices.len()];
         let mut backtrace = vec![vec![0usize; spectrogram_data.ncols()]; ref_patch_indices.len()];
 
-        let mut deg_patches = Vec::<Array2<f64>>::with_capacity(spectrogram_data.ncols());
-
-        for slide_offset in 0..spectrogram_data.ncols() {
-            deg_patches.push(Self::build_degraded_patch(
-                spectrogram_data,
-                slide_offset,
-                slide_offset + ref_patches[0].ncols(),
-            ));
-        }
-
-        // Attempt to get a good alignment with backtracking.
+        // Attempt to get a good alignment with backtracking. The degraded candidate patch at each
+        // slide offset is a (usually zero-copy) window into `spectrogram_data`, built on demand
+        // inside the slide loop — the old pre-built `Vec<Array2>` of every column `to_owned`ed the
+        // whole spectrogram ~ncols times (the largest remaining allocator, ~210K/song).
         for (index, ref_patch) in ref_patches.iter_mut().enumerate() {
             self.find_most_optimal_deg_patch(
                 spectrogram_data,
                 ref_patch,
-                &mut deg_patches,
                 &mut cumulative_similarity_dp,
                 &mut backtrace,
                 ref_patch_indices,
@@ -163,7 +155,6 @@ impl ComparisonPatchesSelector {
         &self,
         spectrogram_data: &Array2<f64>,
         ref_patch: &mut Array2<f64>,
-        deg_patches: &mut [Array2<f64>],
         cumulative_similarity_dp: &mut [Vec<f64>],
         backtrace: &mut [Vec<usize>],
         ref_patch_indices: &[usize],
@@ -172,6 +163,7 @@ impl ComparisonPatchesSelector {
         arena: &mut Arena,
     ) {
         let ref_frame_index = ref_patch_indices[patch_index];
+        let patch_width = ref_patch.ncols();
 
         let mut sim_similarity: f64;
 
@@ -193,12 +185,22 @@ impl ComparisonPatchesSelector {
             // was carried into the DP table), so reclaim the arena — this is the hot
             // O(patches × window) loop, so it dominates the allocation win.
             arena.reset();
-            let deg_patch = &mut deg_patches[slide_offset as usize];
             // Scalar-only: this loop uses nothing but the score, so skip the full measure's per-band
-            // result `Vec`s entirely — with the arena scratch, the whole loop is allocation-free.
-            sim_similarity = self
-                .sim_comparator
-                .measure_similarity_score(ref_patch, deg_patch, &*arena);
+            // result `Vec`s. The degraded candidate patch `[start, end)` is a zero-copy view into the
+            // spectrogram in the common case; only the last few offsets (which spill past the end and
+            // need zero-padding) allocate an owned patch. With the arena scratch the loop is
+            // allocation-free apart from those tail patches.
+            let start = slide_offset as usize;
+            let end = start + patch_width;
+            sim_similarity = if end <= spectrogram_data.ncols() {
+                let deg_view = spectrogram_data.slice(s![.., start..end]);
+                self.sim_comparator
+                    .measure_similarity_score(&*ref_patch, &deg_view, &*arena)
+            } else {
+                let deg_patch = Self::build_degraded_patch(spectrogram_data, start, end);
+                self.sim_comparator
+                    .measure_similarity_score(&*ref_patch, &deg_patch, &*arena)
+            };
             let mut past_slide_offset = -1;
             let mut highest_sim = f64::MIN;
 
