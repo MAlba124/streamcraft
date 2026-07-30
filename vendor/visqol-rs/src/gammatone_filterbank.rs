@@ -79,8 +79,16 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
     /// compatibility.
     #[inline(always)]
     pub fn apply_filter(&mut self, input_signal: &[f64]) -> ndarray::Array2<f64> {
-        let n = input_signal.len();
-        let mut output = ndarray::Array2::<f64>::zeros((NUM_BANDS, n));
+        let mut output = ndarray::Array2::<f64>::zeros((NUM_BANDS, input_signal.len()));
+        self.apply_filter_into(input_signal, &mut output);
+        output
+    }
+
+    /// Like [`apply_filter`](Self::apply_filter) but writes into a caller-provided
+    /// `(NUM_BANDS, input_signal.len())` buffer, so the spectrogram builder reuses a single
+    /// allocation across every frame instead of allocating a fresh `Array2` per frame (~45K/song,
+    /// the bulk of ViSQOL's allocation byte-churn). Each output row is fully overwritten.
+    pub fn apply_filter_into(&mut self, input_signal: &[f64], output: &mut ndarray::Array2<f64>) {
         for band in 0..NUM_BANDS {
             let g = self.filter_coeff_gain[band];
             // Section numerators (`a`) — stage 1 scaled by 1/gain; the shared `a0`/`a2` and the
@@ -126,7 +134,6 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
             self.filter_conditions_3[band] = z3;
             self.filter_conditions_4[band] = z4;
         }
-        output
     }
 }
 

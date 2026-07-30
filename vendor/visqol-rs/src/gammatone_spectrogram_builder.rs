@@ -48,6 +48,10 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
 
         let num_cols = 1 + ((time_domain_signal.len() - window.size) / hop_size);
         let mut out_matrix = Array2::<f64>::zeros((NUM_BANDS, num_cols));
+        let window_size_f = window.size as f64;
+        // Reused across every frame: `apply_filter` used to mint a fresh (NUM_BANDS × window_size)
+        // `Array2` (~1 MB) per frame — thousands per spectrogram, the bulk of ViSQOL's byte churn.
+        let mut filtered_signal = Array2::<f64>::zeros((NUM_BANDS, window.size));
 
         for (index, frame) in time_domain_signal
             .windows(window.size)
@@ -56,24 +60,20 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
             .enumerate()
         {
             self.filter_bank.reset_filter_conditions();
-            let mut filtered_signal = self.filter_bank.apply_filter(
+            self.filter_bank.apply_filter_into(
                 frame
                     .as_slice()
                     .expect("Failed to convert audio frame to slice"),
+                &mut filtered_signal,
             );
 
-            filtered_signal.map_inplace(|e| *e = *e * *e);
-
-            let mut row_means = filtered_signal
-                .mean_axis(Axis(1))
-                .expect("Failed to compute means for gammatone spectrogram!");
-
-            row_means.map_inplace(|e| {
-                *e = e.sqrt();
-            });
-
-            for j in 0..row_means.to_vec().len() {
-                out_matrix[(j, index)] = row_means[j];
+            // Per-band RMS straight into the output column. Bit-identical to the previous
+            // square-in-place → `mean_axis(Axis(1))` → `sqrt` (same left-to-right Σe² over the
+            // contiguous row, same `/window`, same `sqrt`) but with no per-frame `mean_axis`/
+            // `to_vec` allocations.
+            for band in 0..NUM_BANDS {
+                let sum_sq: f64 = filtered_signal.row(band).iter().map(|&e| e * e).sum();
+                out_matrix[(band, index)] = (sum_sq / window_size_f).sqrt();
             }
         }
 
