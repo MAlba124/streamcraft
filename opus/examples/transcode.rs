@@ -90,8 +90,7 @@ fn main() {
 
     // 3. Encode + mux to Ogg-Opus.
     let t0 = Instant::now();
-    let packets = encode_all(&pcm, channels, bitrate, complexity);
-    write_ogg_opus(output, channels, &packets, &comments);
+    encode_and_write_ogg_opus(output, &pcm, channels, bitrate, complexity, &comments);
     let out_size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     println!(
         "out: {output}  {:.1} kbps  {} KiB Opus  ({:.0}% of source)  encoded {:.2?}",
@@ -151,22 +150,6 @@ fn decode_flac_48k(path: &str) -> (Vec<u8>, usize, Vec<String>) {
 // ---------------------------------------------------------------------------
 // Encode / decode
 // ---------------------------------------------------------------------------
-
-fn encode_all(pcm: &[u8], channels: usize, bitrate: u32, complexity: u8) -> Vec<Vec<u8>> {
-    let cfg = EncoderConfig { bitrate_bps: bitrate, complexity, ..EncoderConfig::new(channels as u8) };
-    let mut enc = LibopusEncoder::new(cfg).expect("libopus encoder");
-    let fb = enc.frame_bytes();
-    let mut packets = Vec::new();
-    let mut pkt = Vec::new();
-    let mut frame = vec![0u8; fb];
-    for chunk in pcm.chunks(fb) {
-        frame[..chunk.len()].copy_from_slice(chunk);
-        frame[chunk.len()..].fill(0); // zero-pad a trailing partial frame
-        enc.encode(&frame, &mut pkt).expect("encode");
-        packets.push(pkt.clone());
-    }
-    packets
-}
 
 /// Encode at `bitrate`, decode back, return `(reconstruction_i16, actual_kbps)`.
 fn enc_dec(pcm: &[u8], orig: &[i16], channels: usize, bitrate: u32, complexity: u8) -> (Vec<i16>, f64) {
@@ -415,17 +398,40 @@ fn ensure_model() {
 // Ogg-Opus mux (RFC 7845) + small helpers
 // ---------------------------------------------------------------------------
 
-fn write_ogg_opus(path: &str, channels: usize, packets: &[Vec<u8>], comments: &[String]) {
+/// Encode `pcm` to Opus at `bitrate` and mux straight to an Ogg-Opus file (RFC 7845), writing each
+/// packet to the Ogg stream the moment it's produced — no intermediate `Vec<Vec<u8>>` of cloned
+/// packets (that per-packet clone was ~90% of the whole transcode's allocations). `comments` become
+/// the `OpusTags` header. Byte-identical output to the collect-then-write form.
+fn encode_and_write_ogg_opus(
+    path: &str,
+    pcm: &[u8],
+    channels: usize,
+    bitrate: u32,
+    complexity: u8,
+    comments: &[String],
+) {
     const PRE_SKIP: u64 = 120;
+    let cfg = EncoderConfig { bitrate_bps: bitrate, complexity, ..EncoderConfig::new(channels as u8) };
+    let mut enc = LibopusEncoder::new(cfg).expect("libopus encoder");
+    let fb = enc.frame_bytes();
+
     let mut w = OggWriter::new(0x5C0F_0007);
     let mut out = Vec::new();
     w.write_packet(&mut out, &opus_head(channels), 0).unwrap();
     w.flush(&mut out);
     w.write_packet(&mut out, &opus_tags(comments), 0).unwrap();
     w.flush(&mut out);
-    for (k, p) in packets.iter().enumerate() {
-        let granule = (k as u64 + 1) * FRAME_SAMPLES as u64 + PRE_SKIP;
-        w.write_packet(&mut out, p, granule).unwrap();
+
+    let mut pkt = Vec::new();
+    let mut frame = vec![0u8; fb];
+    let mut k = 0u64;
+    for chunk in pcm.chunks(fb) {
+        frame[..chunk.len()].copy_from_slice(chunk);
+        frame[chunk.len()..].fill(0); // zero-pad a trailing partial frame
+        enc.encode(&frame, &mut pkt).expect("encode");
+        let granule = (k + 1) * FRAME_SAMPLES as u64 + PRE_SKIP;
+        w.write_packet(&mut out, &pkt, granule).unwrap();
+        k += 1;
     }
     w.finish(&mut out);
     std::fs::write(path, &out).unwrap_or_else(|e| die(&format!("write {path}: {e}")));
