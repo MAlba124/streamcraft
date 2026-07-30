@@ -18,6 +18,7 @@
 
 #![allow(clippy::disallowed_methods, clippy::chunks_exact_to_as_chunks)] // one-shot CLI
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use pf_flac::FlacDecoder;
@@ -186,48 +187,82 @@ fn enc_dec(pcm: &[u8], orig: &[i16], channels: usize, bitrate: u32, complexity: 
 // ---------------------------------------------------------------------------
 
 fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64, cx: u8) -> u32 {
-    println!("\n  rate-distortion sweep (NMR, fast):");
-    for &k in &[32u32, 48, 64, 96, 128, 192] {
-        let (recon, actual) = enc_dec(pcm, orig, channels, k * 1000, cx);
-        println!("   {k:>4}k → {actual:>5.1}k   NMR {:>7.2} dB", nmr(orig, &recon, channels));
+    #[cfg(feature = "qa")]
+    if metric == Metric::Visqol {
+        ensure_model(); // write the model once, before the parallel section
     }
+
+    // Each bitrate probe (encode → decode → score) is independent, so evaluate a whole grid in
+    // parallel across cores — replacing a sequential binary search. Denser for cheap NMR, coarser
+    // for the ~100× slower ViSQOL. A `tag` per ViSQOL call keeps its temp WAV paths thread-unique.
+    let grid: Vec<u32> = match metric {
+        Metric::Nmr => (24..=256).step_by(8).map(|k| k * 1000).collect(),
+        Metric::Visqol => (32..=256).step_by(16).map(|k| k * 1000).collect(),
+    };
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(grid.len().max(1));
+    let per = grid.len().div_ceil(threads);
+    let counter = AtomicUsize::new(0);
+
+    let t0 = Instant::now();
+    let mut rows: Vec<(u32, f64, f64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = grid
+            .chunks(per)
+            .map(|chunk| {
+                let counter = &counter;
+                s.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&k| {
+                            let (recon, actual) = enc_dec(pcm, orig, channels, k, cx);
+                            let q = match metric {
+                                Metric::Nmr => nmr(orig, &recon, channels),
+                                Metric::Visqol => {
+                                    let tag = counter.fetch_add(1, Ordering::Relaxed);
+                                    visqol_mos(orig, &recon, channels, tag)
+                                }
+                            };
+                            (k, actual, q)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    rows.sort_by_key(|r| r.0);
 
     let label = if metric == Metric::Visqol { "MOS" } else { "NMR" };
     let meets = |q: f64| match metric {
         Metric::Nmr => q <= target,
         Metric::Visqol => q >= target,
     };
-    let eval = |k: u32| -> (f64, f64) {
-        let (recon, actual) = enc_dec(pcm, orig, channels, k, cx);
-        let q = match metric {
-            Metric::Nmr => nmr(orig, &recon, channels),
-            Metric::Visqol => visqol_mos(orig, &recon, channels),
-        };
-        (q, actual)
-    };
-
-    println!("\n  binary-searching {label} ≥/≤ {target:.1}:");
-    let (mut lo, mut hi) = (24_000u32, 256_000u32);
-    let (qhi, ahi) = eval(hi);
-    if !meets(qhi) {
-        println!("   target not reachable ≤256k ({label} {qhi:.2}); using 256k");
-        return hi;
+    println!(
+        "\n  rate-distortion sweep — {} points over {threads} threads in {:.1?}:",
+        rows.len(),
+        t0.elapsed(),
+    );
+    for &(k, actual, q) in &rows {
+        println!(
+            "   {:>4}k → {actual:>5.1}k   {label} {q:>7.2}  {}",
+            k / 1000,
+            if meets(q) { "✓" } else { "" },
+        );
     }
-    let (mut best, mut best_actual) = (hi, ahi);
-    while hi - lo > 8_000 {
-        let mid = (lo + hi) / 2 / 1000 * 1000;
-        let (q, actual) = eval(mid);
-        println!("   probe {:>4}k → {actual:>5.1}k   {label} {q:>7.2}", mid / 1000);
-        if meets(q) {
-            best = mid;
-            best_actual = actual;
-            hi = mid;
-        } else {
-            lo = mid;
+    // Lowest grid bitrate meeting the target (rows are ascending).
+    match rows.iter().find(|&&(_, _, q)| meets(q)) {
+        Some(&(k, a, q)) => {
+            println!("→ chosen: {}k target / {a:.1}k actual ({label} {q:.2})\n", k / 1000);
+            k
+        }
+        None => {
+            let last = *rows.last().expect("non-empty grid");
+            println!("→ target not reached in range; using {}k\n", last.0 / 1000);
+            last.0
         }
     }
-    println!("→ chosen: {}k target / {best_actual:.1}k actual\n", best / 1000);
-    best
 }
 
 // ---------------------------------------------------------------------------
@@ -248,9 +283,10 @@ fn nmr(reference: &[i16], test: &[i16], channels: usize) -> f64 {
 }
 
 /// ViSQOL MOS-LQO (1–5), audio mode. Mono, first ~30 s (ViSQOL is slow + aligns internally, so no
-/// pre-alignment needed). Higher = better.
+/// pre-alignment needed). `tag` makes the temp WAV paths thread-unique for the parallel sweep.
+/// Higher = better.
 #[cfg(feature = "qa")]
-fn visqol_mos(reference: &[i16], test: &[i16], channels: usize) -> f64 {
+fn visqol_mos(reference: &[i16], test: &[i16], channels: usize, tag: usize) -> f64 {
     use profluens_audio::format::{AudioFormat, SampleFormat};
     use visqol_rs::constants::{DEFAULT_WINDOW_SIZE, NUM_BANDS_AUDIO};
     use visqol_rs::variant::Variant;
@@ -258,32 +294,33 @@ fn visqol_mos(reference: &[i16], test: &[i16], channels: usize) -> f64 {
 
     let cap = RATE as usize * 30;
     let fmt = AudioFormat::new(RATE, 1, SampleFormat::S16);
-    let ref_wav = profluens_audio::wav::write_pcm_wav(&fmt, &i16_bytes(&ch0(reference, channels, cap)));
-    let deg_wav = profluens_audio::wav::write_pcm_wav(&fmt, &i16_bytes(&ch0(test, channels, cap)));
-    let (rp, dp) = ("/tmp/sc_vq_ref.wav", "/tmp/sc_vq_deg.wav");
-    std::fs::write(rp, &ref_wav).expect("write ref wav");
-    std::fs::write(dp, &deg_wav).expect("write deg wav");
+    let (rp, dp) = (format!("/tmp/sc_vq_ref_{tag}.wav"), format!("/tmp/sc_vq_deg_{tag}.wav"));
+    std::fs::write(&rp, profluens_audio::wav::write_pcm_wav(&fmt, &i16_bytes(&ch0(reference, channels, cap))))
+        .expect("write ref wav");
+    std::fs::write(&dp, profluens_audio::wav::write_pcm_wav(&fmt, &i16_bytes(&ch0(test, channels, cap))))
+        .expect("write deg wav");
 
     let mut v = VisqolManager::<NUM_BANDS_AUDIO>::new(
-        Variant::Fullband { model_path: model_path() },
+        Variant::Fullband { model_path: MODEL_PATH.to_string() },
         DEFAULT_WINDOW_SIZE,
     );
-    v.run(rp, dp).map(|r| r.moslqo).unwrap_or(1.0)
+    v.run(&rp, &dp).map(|r| r.moslqo).unwrap_or(1.0)
 }
 
 #[cfg(not(feature = "qa"))]
-fn visqol_mos(_: &[i16], _: &[i16], _: usize) -> f64 {
+fn visqol_mos(_: &[i16], _: &[i16], _: usize, _tag: usize) -> f64 {
     unreachable!("ViSQOL requires --features qa")
 }
 
-/// Write the bundled ViSQOL audio SVR model to a temp path once (visqol-rs takes a file path).
+/// Bundled ViSQOL audio SVR model, spilled to this path once (visqol-rs takes a file path).
 #[cfg(feature = "qa")]
-fn model_path() -> String {
-    let p = "/tmp/sc_visqol_audio_model.txt";
-    if !std::path::Path::new(p).exists() {
-        std::fs::write(p, include_str!("../models/visqol_audio_model.txt")).expect("write model");
+const MODEL_PATH: &str = "/tmp/sc_visqol_audio_model.txt";
+
+#[cfg(feature = "qa")]
+fn ensure_model() {
+    if !std::path::Path::new(MODEL_PATH).exists() {
+        std::fs::write(MODEL_PATH, include_str!("../models/visqol_audio_model.txt")).expect("write model");
     }
-    p.to_string()
 }
 
 // ---------------------------------------------------------------------------
