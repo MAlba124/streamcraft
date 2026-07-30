@@ -45,7 +45,120 @@ pub enum Event {
     Patch { offset: u64, data: Memory },
 }
 
-/// Interned-key → value pairs, plus a blob reference for cover art. TODO(step 5).
+/// Stream/container metadata carried in-band by [`Event::Tags`] and mirrored to the application as
+/// [`BusMessage::Tags`](crate::bus::BusMessage::Tags) — profluens' analogue of a GStreamer
+/// `GstTagList` (a sticky tag event travelling downstream *and* a tag message on the bus). A
+/// demuxer/parser fills one from its header (Vorbis comments, an ID3/iTunes atom, a Matroska
+/// `Tags` element) and emits it; a muxer consumes it to write its own container's tag encoding; a
+/// player reads it off the bus for "now playing" / cover art.
+///
+/// Text tags use the Vorbis-comment field-name vocabulary, uppercased (`TITLE`, `ARTIST`, `ALBUM`,
+/// `DATE`, `TRACKNUMBER`, …), and a key may repeat (two `ARTIST`s — kept in order). Pictures (cover
+/// art) hold their bytes zero-copy in [`Memory`], so forwarding art through the graph never copies
+/// it.
+#[derive(Clone, Default)]
 pub struct TagList {
-    _priv: (),
+    text: Vec<(Box<str>, Box<str>)>,
+    pictures: Vec<Picture>,
+}
+
+/// An attached picture (cover art): its MIME type and the image bytes, held zero-copy.
+#[derive(Clone)]
+pub struct Picture {
+    pub mime: Box<str>,
+    pub data: Memory,
+}
+
+impl TagList {
+    /// An empty tag list.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// No text tags and no pictures.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.pictures.is_empty()
+    }
+
+    /// Number of text tags plus pictures.
+    pub fn len(&self) -> usize {
+        self.text.len() + self.pictures.len()
+    }
+
+    /// Append a text tag; `key` is normalised to its uppercase Vorbis-comment field name.
+    // One-time: a demuxer/parser builds a `TagList` once per stream (spec: allocation discipline —
+    // header parsing is the sanctioned one-time-allocation exception), never in the per-frame path.
+    #[allow(clippy::disallowed_methods)]
+    pub fn add(&mut self, key: &str, value: &str) -> &mut Self {
+        self.text.push((key.to_ascii_uppercase().into(), value.into()));
+        self
+    }
+
+    /// Append an attached picture (cover art), keeping the image bytes zero-copy.
+    #[allow(clippy::disallowed_methods)] // one-time — see `add`
+    pub fn add_picture(&mut self, mime: &str, data: Memory) -> &mut Self {
+        self.pictures.push(Picture { mime: mime.into(), data });
+        self
+    }
+
+    /// First value for `key` (case-insensitive), if present.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.text.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| &**v)
+    }
+
+    /// All `(key, value)` text tags, in insertion order (a key may repeat).
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.text.iter().map(|(k, v)| (&**k, &**v))
+    }
+
+    /// The attached pictures (cover art).
+    pub fn pictures(&self) -> &[Picture] {
+        &self.pictures
+    }
+
+    /// Fold `other`'s tags into `self` — a later parsing stage refining an earlier stage's tags.
+    pub fn merge(&mut self, other: TagList) {
+        self.text.extend(other.text);
+        self.pictures.extend(other.pictures);
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::TagList;
+
+    #[test]
+    fn text_tags_add_get_iter() {
+        let mut t = TagList::new();
+        assert!(t.is_empty());
+        t.add("title", "Enough")
+            .add("Artist", "Fred again..")
+            .add("ARTIST", "Brian Eno");
+
+        // Keys are uppercased and looked up case-insensitively; `get` returns the first value.
+        assert_eq!(t.get("TITLE"), Some("Enough"));
+        assert_eq!(t.get("title"), Some("Enough"));
+        assert_eq!(t.get("artist"), Some("Fred again.."));
+        assert_eq!(t.get("album"), None);
+
+        // Repeated keys are kept in order.
+        let all: Vec<_> = t.iter().collect();
+        assert_eq!(
+            all,
+            vec![("TITLE", "Enough"), ("ARTIST", "Fred again.."), ("ARTIST", "Brian Eno")]
+        );
+        assert_eq!(t.len(), 3);
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn merge_appends() {
+        let mut a = TagList::new();
+        a.add("title", "A");
+        let mut b = TagList::new();
+        b.add("genre", "Ambient");
+        a.merge(b);
+        assert_eq!(a.get("TITLE"), Some("A"));
+        assert_eq!(a.get("GENRE"), Some("Ambient"));
+    }
 }
