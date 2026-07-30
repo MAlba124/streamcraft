@@ -44,9 +44,11 @@ mod encoder;
 mod flacdec;
 mod flacenc;
 mod oggflac;
+pub mod tags;
 
 pub use bitstream::{crc16, crc8, BitReader, BitWriter, ReadError};
 pub use decoder::{DecodeError, DecodedFrame, FlacDecoder, StreamDecoder, StreamInfo};
+pub use tags::FlacTags;
 pub use encoder::{EncodeError, FlacEncoder, SampleFormat};
 pub use flacdec::FlacDec;
 pub use flacenc::FlacEnc;

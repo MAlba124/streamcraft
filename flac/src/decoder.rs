@@ -61,6 +61,8 @@ pub struct FlacDecoder {
     pub info: StreamInfo,
     /// Decoded interchannel samples, interleaved: `[s0c0, s0c1, ..., s1c0, ...]`.
     pub samples: Vec<i64>,
+    /// Tags parsed from the metadata blocks (Vorbis comments + pictures); empty if none.
+    pub tags: crate::tags::FlacTags,
 }
 
 impl FlacDecoder {
@@ -78,6 +80,8 @@ impl FlacDecoder {
         }
 
         let info = Self::read_metadata(&mut r)?;
+        // Tags are parsed from the (byte-aligned) metadata blocks directly, off the bit-decode path.
+        let tags = crate::tags::parse(data);
 
         let mut samples: Vec<i64> = Vec::new();
         let mut scratch = Scratch::default();
@@ -88,7 +92,7 @@ impl FlacDecoder {
             Self::read_frame(&mut r, data, &info, &mut samples, &mut scratch)?;
             r.align(); // frames are byte-aligned (§9.3 footer padding)
         }
-        Ok(Self { info, samples })
+        Ok(Self { info, samples, tags })
     }
 
     /// Read the metadata block chain and return the STREAMINFO (§8.1, §8.2). Non-
@@ -258,6 +262,8 @@ pub struct StreamDecoder {
     /// Decode cursor within `buf`; bytes before it are consumed and periodically dropped.
     pos: usize,
     info: Option<StreamInfo>,
+    /// Tags parsed from the metadata blocks alongside the header (empty until then / if none).
+    tags: crate::tags::FlacTags,
     scratch: Scratch,
     /// After a byte-domain seek the buffer starts mid-frame; [`pull_into`](Self::pull_into)
     /// then scans for the next frame boundary before decoding (spec: flush/seek — resync).
@@ -272,6 +278,12 @@ impl StreamDecoder {
     /// The stream header, available once enough bytes have been pushed to parse it.
     pub fn info(&self) -> Option<&StreamInfo> {
         self.info.as_ref()
+    }
+
+    /// Tags (Vorbis comments + pictures) parsed alongside the header — populated by the same
+    /// [`try_header`](Self::try_header) call that fills [`info`](Self::info); empty until then.
+    pub fn tags(&self) -> &crate::tags::FlacTags {
+        &self.tags
     }
 
     /// Append freshly-received bytes to the decode buffer.
@@ -378,7 +390,7 @@ impl StreamDecoder {
     /// Parse the `fLaC` marker and metadata chain once enough bytes are buffered. Returns
     /// `Ok(false)` (need more) if the header is still truncated.
     fn try_header(&mut self) -> Result<bool, DecodeError> {
-        let (info, used) = {
+        let (info, tags, used) = {
             let slice = &self.buf[self.pos..];
             let mut r = BitReader::new(slice);
             let magic = match r.read_bits(32) {
@@ -389,12 +401,15 @@ impl StreamDecoder {
                 return Err(DecodeError::BadMagic);
             }
             match FlacDecoder::read_metadata(&mut r) {
-                Ok(info) => (info, (r.bit_pos() / 8) as usize),
+                // The header is now fully buffered, so the byte-aligned tag blocks are too — parse
+                // them off the same slice (independent of the bit-decode cursor).
+                Ok(info) => (info, crate::tags::parse(slice), (r.bit_pos() / 8) as usize),
                 Err(DecodeError::UnexpectedEof) => return Ok(false), // metadata truncated
                 Err(e) => return Err(e),
             }
         };
         self.info = Some(info);
+        self.tags = tags;
         self.pos += used;
         self.compact();
         Ok(true)
@@ -842,6 +857,54 @@ mod tests {
             got,
             baseline[baseline.len() - got.len()..],
             "resynced tail is bit-exact with the baseline from that boundary"
+        );
+    }
+
+    #[test]
+    fn stream_decoder_captures_vorbis_comments() {
+        use crate::encoder::{FlacEncoder, SampleFormat};
+        const BLOCK: usize = 512;
+        let (mut enc, mut header) =
+            FlacEncoder::new_streaming(44100, 2, SampleFormat::S16, BLOCK as u32).unwrap();
+
+        // Splice a VORBIS_COMMENT after STREAMINFO: clear STREAMINFO's last-metadata-block flag,
+        // then append the comment block with the flag set — a valid FLAC metadata chain.
+        header[4] &= 0x7f;
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(b"ref");
+        let comments = ["TITLE=Set Theory", "ARTIST=Carbon Based Lifeforms"];
+        body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            body.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            body.extend_from_slice(c.as_bytes());
+        }
+        header.push(0x80 | 4); // last-block, VORBIS_COMMENT
+        header.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        header.extend_from_slice(&body);
+
+        // A couple of real frames so the header is fully buffered before decoding.
+        let mut stream = header;
+        for f in 0..2usize {
+            let mut pcm = Vec::new();
+            for i in 0..BLOCK {
+                let s = (8000.0 * ((f * BLOCK + i) as f64 * 0.03).sin()) as i16;
+                pcm.extend_from_slice(&s.to_le_bytes());
+                pcm.extend_from_slice(&s.to_le_bytes());
+            }
+            enc.encode_interleaved(&pcm, &mut stream).unwrap();
+        }
+
+        let mut dec = StreamDecoder::new();
+        dec.push(&stream);
+        dec.pull().expect("decodes").expect("a frame is present");
+        assert!(dec.info().is_some(), "header parsed");
+        assert_eq!(
+            dec.tags().comments,
+            vec![
+                ("TITLE".to_string(), "Set Theory".to_string()),
+                ("ARTIST".to_string(), "Carbon Based Lifeforms".to_string()),
+            ]
         );
     }
 

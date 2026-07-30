@@ -45,6 +45,28 @@ fn encode_stream(pcm: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Like [`encode_stream`], but splices a `VORBIS_COMMENT` metadata block after STREAMINFO — a
+/// valid FLAC tag chain (`fLaC` + STREAMINFO(not-last) + VORBIS_COMMENT(last) + frames).
+fn encode_stream_with_tags(pcm: &[u8], comments: &[&str]) -> Vec<u8> {
+    let (mut enc, mut header) =
+        FlacEncoder::new_streaming(RATE, CHANNELS, SampleFormat::S16, 4096).expect("enc");
+    header[4] &= 0x7f; // clear STREAMINFO's last-metadata-block flag
+    let mut body = Vec::new();
+    body.extend_from_slice(&3u32.to_le_bytes());
+    body.extend_from_slice(b"ref"); // vendor string
+    body.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for c in comments {
+        body.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        body.extend_from_slice(c.as_bytes());
+    }
+    header.push(0x80 | 4); // last-block | VORBIS_COMMENT
+    header.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    header.extend_from_slice(&body);
+    let mut out = header;
+    enc.encode_interleaved(pcm, &mut out).expect("encode");
+    out
+}
+
 /// Reassemble a run of little-endian s16 PCM bytes into a flat `i64` sample vector.
 fn samples_from_bytes(bytes: &[u8]) -> Vec<i64> {
     bytes
@@ -104,4 +126,37 @@ fn flacdec_announces_format_and_decodes_pcm() {
     assert_eq!(oracle.info.sample_rate, RATE);
     assert_eq!(oracle.info.channels, CHANNELS);
     assert_eq!(got, oracle.samples, "harness path matches the standalone decoder");
+}
+
+/// The parser element surfaces the FLAC's Vorbis comments to the application as a `BusMessage::Tags`
+/// — the out-of-band half of the GStreamer-style tag flow (the in-band `Event::Tags` travels
+/// downstream to a muxer). Emitted once, when the header is decoded.
+#[test]
+fn flacdec_posts_tags_to_the_bus() {
+    use profluens_core::bus::BusMessage;
+
+    let (pcm, _) = gen_s16(4_000);
+    let flac = encode_stream_with_tags(&pcm, &["TITLE=Set Theory", "ARTIST=Carbon Based Lifeforms"]);
+
+    let mut h = Harness::new(pf_flac::FlacDec::new());
+    for chunk in flac.chunks(700) {
+        let buf = h.alloc(chunk);
+        h.push("sink", buf).expect("flacdec process");
+        while h.pull("src").is_some() {} // drain decoded PCM
+    }
+    for _ in h.eos().expect("eos flush") {}
+
+    let tag_lists: Vec<_> = h
+        .bus_messages()
+        .into_iter()
+        .filter_map(|m| match m {
+            BusMessage::Tags { tags, .. } => Some(tags),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tag_lists.len(), 1, "tags posted exactly once");
+    let tags = &tag_lists[0];
+    assert_eq!(tags.get("TITLE"), Some("Set Theory"));
+    assert_eq!(tags.get("ARTIST"), Some("Carbon Based Lifeforms"));
+    assert_eq!(tags.get("artist"), Some("Carbon Based Lifeforms"), "lookup is case-insensitive");
 }

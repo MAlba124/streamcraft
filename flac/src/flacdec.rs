@@ -16,8 +16,9 @@ use profluens_core::ctx::Ctx;
 use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
+use profluens_core::bus::BusMessage;
 use profluens_core::error::Error;
-use profluens_core::event::Event;
+use profluens_core::event::{Event, TagList};
 use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
 use profluens_core::id::PadId;
 use profluens_core::time::Timestamp;
@@ -182,8 +183,36 @@ impl FlacDec {
                 (F_SAMPLE, ValueDesc::Id(sample_name(info.bits_per_sample))),
             ],
         );
+        self.emit_tags(ctx);
         self.announced = true;
         Ok(())
+    }
+
+    /// Emit the stream's metadata tags once, GStreamer-style: an in-band [`Event::Tags`] travelling
+    /// downstream (a muxer writes them into its container) **and** a [`BusMessage::Tags`] for the
+    /// application (a player's "now playing" / cover art). No-op if the file carried no tags.
+    fn emit_tags(&mut self, ctx: &mut Ctx) {
+        // One-time clone of the parsed tags (header path) so the borrow of `self.dec` is released
+        // before we touch `ctx` for the picture buffers below.
+        let ft = self.dec.tags().clone();
+        if ft.is_empty() {
+            return;
+        }
+        let mut tags = TagList::new();
+        for (key, value) in &ft.comments {
+            tags.add(key, value);
+        }
+        // Cover art: copy each picture's bytes into a one-time buffer (a large image heap-allocates
+        // via `alloc_exact`). The `TagList` clone below is a refcount bump, not a copy.
+        for (mime, data) in &ft.pictures {
+            let mut buf = ctx.alloc_exact(PadId(1), data.len());
+            buf.memory.as_mut_full()[..data.len()].copy_from_slice(data);
+            buf.memory.set_len(data.len());
+            tags.add_picture(mime, buf.memory.clone());
+        }
+        let element = ctx.element();
+        ctx.push_event(PadId(1), Event::Tags(tags.clone()));
+        ctx.post(BusMessage::Tags { element, tags });
     }
 }
 
