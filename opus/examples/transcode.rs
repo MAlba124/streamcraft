@@ -200,6 +200,17 @@ fn enc_dec(pcm: &[u8], orig: &[i16], channels: usize, bitrate: u32, complexity: 
 // Quality search (hybrid: NMR sweep for the curve, chosen metric for the target)
 // ---------------------------------------------------------------------------
 
+/// A `[███░░░] done/total` progress bar string for the live search readout.
+fn progress_line(done: usize, total: usize) -> String {
+    const W: usize = 24;
+    let filled = if total == 0 { W } else { (done * W / total).min(W) };
+    let bar: String = std::iter::repeat('█')
+        .take(filled)
+        .chain(std::iter::repeat('░').take(W - filled))
+        .collect();
+    format!("[{bar}] {done}/{total}")
+}
+
 fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64, cx: u8) -> u32 {
     #[cfg(feature = "qa")]
     if metric == Metric::Visqol {
@@ -208,7 +219,7 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
 
     // Each bitrate probe (encode → decode → score) is independent, so evaluate a whole grid in
     // parallel across cores — replacing a sequential binary search. Denser for cheap NMR, coarser
-    // for the ~100× slower ViSQOL. A `tag` per ViSQOL call keeps its temp WAV paths thread-unique.
+    // for the ~100× slower ViSQOL.
     let grid: Vec<u32> = match metric {
         Metric::Nmr => (24..=256).step_by(8).map(|k| k * 1000).collect(),
         Metric::Visqol => (32..=256).step_by(16).map(|k| k * 1000).collect(),
@@ -224,13 +235,16 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
     // the last, uneven items are picked up by whichever thread frees first.
     let grid_ref = &grid;
     let next = AtomicUsize::new(0);
-    let counter = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let total = grid.len();
+    eprint!("  scoring {}", progress_line(0, total));
+    let _ = std::io::Write::flush(&mut std::io::stderr());
 
     let t0 = Instant::now();
     let mut rows: Vec<(u32, f64, f64)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
-                let (next, counter) = (&next, &counter);
+                let (next, done) = (&next, &done);
                 s.spawn(move || {
                     let mut out = Vec::new();
                     loop {
@@ -242,11 +256,13 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
                         let (recon, actual) = enc_dec(pcm, orig, channels, k, cx);
                         let q = match metric {
                             Metric::Nmr => nmr(orig, &recon, channels),
-                            Metric::Visqol => {
-                                let tag = counter.fetch_add(1, Ordering::Relaxed);
-                                visqol_mos(orig, &recon, channels, tag)
-                            }
+                            Metric::Visqol => visqol_mos(orig, &recon, channels),
                         };
+                        // Live progress: points complete out of order across threads, so just count
+                        // finished ones. eprint! locks stderr, so concurrent updates don't interleave.
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprint!("\r  scoring {}", progress_line(d, total));
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
                         out.push((k, actual, q));
                     }
                     out
@@ -255,6 +271,7 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
+    eprintln!(); // end the progress line
     rows.sort_by_key(|r| r.0);
 
     let label = if metric == Metric::Visqol { "MOS" } else { "NMR" };
@@ -306,36 +323,48 @@ fn nmr(reference: &[i16], test: &[i16], channels: usize) -> f64 {
 }
 
 /// ViSQOL MOS-LQO (1–5), audio mode. Mono, first ~30 s (ViSQOL is slow + aligns internally, so no
-/// pre-alignment needed). `tag` makes the temp WAV paths thread-unique for the parallel sweep.
-/// Higher = better.
+/// pre-alignment needed). Higher = better.
+///
+/// The audio is passed to ViSQOL **in memory** (`compute_results`) — no temp files. ViSQOL's `run()`
+/// only takes file paths (it's a CLI port upstream), so the tool used to write a WAV per comparison
+/// and have ViSQOL read it back: blocking disk I/O on `/tmp` across every search thread. The signals
+/// are built here exactly as `load_as_mono` would (channel 0, i16→f64 as `x / 32767`), so the score
+/// is identical.
 #[cfg(feature = "qa")]
-fn visqol_mos(reference: &[i16], test: &[i16], channels: usize, tag: usize) -> f64 {
-    use profluens_audio::format::{AudioFormat, SampleFormat};
+fn visqol_mos(reference: &[i16], test: &[i16], channels: usize) -> f64 {
+    use visqol_rs::audio_signal::AudioSignal;
     use visqol_rs::constants::{DEFAULT_WINDOW_SIZE, NUM_BANDS_AUDIO};
     use visqol_rs::variant::Variant;
     use visqol_rs::visqol_manager::VisqolManager;
 
     let cap = RATE as usize * 30;
-    let fmt = AudioFormat::new(RATE, 1, SampleFormat::S16);
-    let (rp, dp) = (format!("/tmp/sc_vq_ref_{tag}.wav"), format!("/tmp/sc_vq_deg_{tag}.wav"));
-    std::fs::write(&rp, profluens_audio::wav::write_pcm_wav(&fmt, &i16_bytes(&ch0(reference, channels, cap))))
-        .expect("write ref wav");
-    std::fs::write(&dp, profluens_audio::wav::write_pcm_wav(&fmt, &i16_bytes(&ch0(test, channels, cap))))
-        .expect("write deg wav");
+    let to_signal = |pcm: &[i16]| {
+        let samples: Vec<f64> = pcm
+            .iter()
+            .step_by(channels)
+            .take(cap)
+            .map(|&x| x as f64 / 32767.0)
+            .collect();
+        AudioSignal::new(&samples, RATE)
+    };
+    let mut ref_sig = to_signal(reference);
+    let mut deg_sig = to_signal(test);
 
     let mut v = VisqolManager::<NUM_BANDS_AUDIO>::new(
         Variant::Fullband { model_path: MODEL_PATH.to_string() },
         DEFAULT_WINDOW_SIZE,
     );
     // Profluens owns the bump arena; ViSQOL borrows it for the per-patch NSIM/convolution scratch
-    // (reset between patches inside `run`). One arena per call — each parallel-search thread has
-    // its own (`Arena` is `!Sync`); its chunks are reused across every patch of this comparison.
+    // (reset between patches). One arena per call — each parallel-search thread has its own
+    // (`Arena` is `!Sync`); its chunks are reused across every patch of this comparison.
     let mut arena = profluens_core::memory::Arena::default();
-    v.run(&rp, &dp, &mut arena).map(|r| r.moslqo).unwrap_or(1.0)
+    v.compute_results(&mut ref_sig, &mut deg_sig, &mut arena)
+        .map(|r| r.moslqo)
+        .unwrap_or(1.0)
 }
 
 #[cfg(not(feature = "qa"))]
-fn visqol_mos(_: &[i16], _: &[i16], _: usize, _tag: usize) -> f64 {
+fn visqol_mos(_: &[i16], _: &[i16], _: usize) -> f64 {
     unreachable!("ViSQOL requires --features qa")
 }
 
@@ -394,14 +423,6 @@ fn opus_tags() -> Vec<u8> {
 
 fn ch0(interleaved: &[i16], channels: usize, cap: usize) -> Vec<i16> {
     interleaved.iter().step_by(channels).take(cap).copied().collect()
-}
-#[cfg(feature = "qa")]
-fn i16_bytes(v: &[i16]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(v.len() * 2);
-    for &s in v {
-        b.extend_from_slice(&s.to_le_bytes());
-    }
-    b
 }
 fn to_i16(bytes: &[u8]) -> Vec<i16> {
     bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()

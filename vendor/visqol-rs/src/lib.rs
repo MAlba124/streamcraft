@@ -30,7 +30,7 @@
 
 mod alignment;
 mod analysis_window;
-mod audio_signal;
+pub mod audio_signal;
 pub mod audio_utils;
 mod comparison_patches_selector;
 pub mod constants;

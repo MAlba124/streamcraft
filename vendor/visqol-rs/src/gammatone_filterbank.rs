@@ -77,7 +77,12 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
     /// operations are the identical ops in the identical order, so the output is bit-for-bit the
     /// same (this profiled at ~53% of a ViSQOL run). `filter_signal` (below) is kept unused for API
     /// compatibility.
+    ///
+    /// `build` now uses [`filter_frame_energy_into`](Self::filter_frame_energy_into) directly, so
+    /// `apply_filter` / `apply_filter_into` remain only as the reference the bit-exact energy test
+    /// checks against — hence `allow(dead_code)`.
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn apply_filter(&mut self, input_signal: &[f64]) -> ndarray::Array2<f64> {
         let mut output = ndarray::Array2::<f64>::zeros((NUM_BANDS, input_signal.len()));
         self.apply_filter_into(input_signal, &mut output);
@@ -88,6 +93,7 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
     /// `(NUM_BANDS, input_signal.len())` buffer, so the spectrogram builder reuses a single
     /// allocation across every frame instead of allocating a fresh `Array2` per frame (~45K/song,
     /// the bulk of ViSQOL's allocation byte-churn). Each output row is fully overwritten.
+    #[allow(dead_code)]
     pub fn apply_filter_into(&mut self, input_signal: &[f64], output: &mut ndarray::Array2<f64>) {
         for band in 0..NUM_BANDS {
             let g = self.filter_coeff_gain[band];
