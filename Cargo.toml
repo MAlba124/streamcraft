@@ -43,6 +43,7 @@ members = [
     "ac3",
     "avi",
     "mpeg4p2",
+    "libopus-sys",
 ]
 
 [workspace.package]
