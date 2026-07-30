@@ -1,4 +1,3 @@
-use crate::audio_utils;
 use crate::math_utils;
 use num::complex::Complex64;
 use num::Zero;
@@ -15,6 +14,12 @@ thread_local! {
     /// was ~38K plan-building allocations/song in the alignment path. Thread-local (not a global
     /// mutex) so the parallel search threads never contend.
     static PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::<f64>::new());
+    /// Per-thread reusable rustfft out-of-place scratch buffer.
+    static FFT_SCRATCH: RefCell<Vec<Complex64>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread reusable complex I/O buffer (the real→complex staging / inverse output). The FFT
+    /// is called per patch during alignment (~42% of a quality search's allocations went to the
+    /// per-call `vec![Complex64; …]`s these replace); the buffers only grow.
+    static FFT_CBUF: RefCell<Vec<Complex64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Wrapper around the `rustfft` library to perform basic fft operations.
@@ -46,28 +51,27 @@ impl FftManager {
         freq_channel: &mut [Complex64],
     ) {
         let real_to_complex = PLANNER.with(|p| p.borrow_mut().plan_fft_forward(self.fft_size));
-        if time_channel.len() == self.fft_size {
-            let mut complex_time_domain =
-                audio_utils::float_vec_to_real_valued_complex_vec(time_channel);
-            let mut scratch_buffer =
-                vec![Complex64::zero(); real_to_complex.get_outofplace_scratch_len()];
-            real_to_complex.process_outofplace_with_scratch(
-                &mut complex_time_domain[..],
-                freq_channel,
-                &mut scratch_buffer[..],
-            );
-        } else {
+        if time_channel.len() != self.fft_size {
             time_channel.resize(self.fft_size, 0.0f64);
-            let mut complex_time_domain =
-                audio_utils::float_vec_to_real_valued_complex_vec(time_channel);
-            let mut scratch_buffer =
-                vec![Complex64::zero(); real_to_complex.get_outofplace_scratch_len()];
-            real_to_complex.process_outofplace_with_scratch(
-                &mut complex_time_domain[..],
-                &mut freq_channel[..],
-                &mut scratch_buffer[..],
-            );
         }
+        // Reused thread-local buffers rather than a fresh `Vec` per transform. `complex_time_domain`
+        // stages `time_channel` as real-valued complex (`re = x, im = 0` — the exact
+        // `float_vec_to_real_valued_complex_vec`); the scratch is sized by the plan.
+        FFT_CBUF.with(|cb| {
+            let mut complex_time_domain = cb.borrow_mut();
+            complex_time_domain.clear();
+            complex_time_domain.extend(time_channel.iter().map(|&x| Complex64::new(x, 0.0)));
+            FFT_SCRATCH.with(|sb| {
+                let mut scratch_buffer = sb.borrow_mut();
+                scratch_buffer.clear();
+                scratch_buffer.resize(real_to_complex.get_outofplace_scratch_len(), Complex64::zero());
+                real_to_complex.process_outofplace_with_scratch(
+                    &mut complex_time_domain[..],
+                    freq_channel,
+                    &mut scratch_buffer[..],
+                );
+            });
+        });
     }
 
     /// Zero-pads `freq_channel` if necessary, transforms its contents into the time domain and stores it in `time_channel`
@@ -78,28 +82,27 @@ impl FftManager {
     ) {
         let complex_to_real = PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(self.fft_size));
 
-        if time_channel.len() == self.fft_size {
-            let mut scratch_buffer =
-                vec![Complex64::zero(); complex_to_real.get_outofplace_scratch_len()];
-            let mut complex_td = audio_utils::float_vec_to_real_valued_complex_vec(time_channel);
-            complex_to_real.process_outofplace_with_scratch(
-                freq_channel,
-                &mut complex_td[..],
-                &mut scratch_buffer[..],
-            );
-            *time_channel = audio_utils::real_valued_complex_vec_to_float_vec(&complex_td);
-        } else {
-            let mut scratch_buffer =
-                vec![Complex64::zero(); complex_to_real.get_outofplace_scratch_len()];
-            time_channel.resize(self.fft_size, f64::zero());
-            let mut complex_td = audio_utils::float_vec_to_real_valued_complex_vec(time_channel);
-            complex_to_real.process_outofplace_with_scratch(
-                freq_channel,
-                &mut complex_td[..],
-                &mut scratch_buffer[..],
-            );
-            *time_channel = audio_utils::real_valued_complex_vec_to_float_vec(&complex_td);
-        }
+        // `complex_td` is the inverse transform's *output* — `process_outofplace` overwrites it, so
+        // its previous contents are irrelevant and it only needs to be `fft_size` long. Reuse
+        // thread-local buffers, then write the real parts back into `time_channel` in place (the
+        // original allocated a fresh scratch, a fresh complex buffer, and a fresh output `Vec`).
+        FFT_CBUF.with(|cb| {
+            let mut complex_td = cb.borrow_mut();
+            complex_td.clear();
+            complex_td.resize(self.fft_size, Complex64::zero());
+            FFT_SCRATCH.with(|sb| {
+                let mut scratch_buffer = sb.borrow_mut();
+                scratch_buffer.clear();
+                scratch_buffer.resize(complex_to_real.get_outofplace_scratch_len(), Complex64::zero());
+                complex_to_real.process_outofplace_with_scratch(
+                    freq_channel,
+                    &mut complex_td[..],
+                    &mut scratch_buffer[..],
+                );
+            });
+            time_channel.clear();
+            time_channel.extend(complex_td.iter().map(|c| c.re));
+        });
     }
 
     /// Multiplies each element in `time_channel` by `self.inverse_fft_scale`
