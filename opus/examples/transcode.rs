@@ -128,7 +128,9 @@ fn decode_flac_48k(path: &str) -> (Vec<u8>, usize, Vec<String>) {
             .iter()
             .map(|lane| {
                 let mut r = ChannelResampler::new(filter.clone());
-                let mut out = Vec::new();
+                // Pre-size to the resampled length (≈ len·RATE/in_rate) so `process` grows once.
+                let mut out =
+                    Vec::with_capacity(lane.len() * RATE as usize / in_rate as usize + 1);
                 r.process(lane, &mut out);
                 out
             })

@@ -83,7 +83,10 @@ impl FlacDecoder {
         // Tags are parsed from the (byte-aligned) metadata blocks directly, off the bit-decode path.
         let tags = crate::tags::parse(data);
 
-        let mut samples: Vec<i64> = Vec::new();
+        // Pre-size the output from STREAMINFO's total sample count (0 = unknown → grows on demand),
+        // so a whole-file decode grows its buffer once instead of log₂(N) times.
+        let cap = (info.total_samples as usize).saturating_mul(info.channels as usize);
+        let mut samples: Vec<i64> = Vec::with_capacity(cap);
         let mut scratch = Scratch::default();
         // Frames follow until the input is exhausted (§9). A fixed-block-size stream
         // has no explicit frame count; we stop when fewer than a sync code's worth of
