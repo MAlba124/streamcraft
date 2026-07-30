@@ -37,12 +37,25 @@ enum Metric {
     Visqol,
 }
 
+impl Metric {
+    /// Does quality `q` meet `target`? NMR is a distortion (lower is better), MOS a quality
+    /// (higher is better).
+    fn meets(self, q: f64, target: f64) -> bool {
+        match self {
+            Metric::Nmr => q <= target,
+            Metric::Visqol => q >= target,
+        }
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 3 {
         eprintln!(
-            "usage: transcode <in.flac> <out.opus> [--bitrate K | --target Q --metric nmr|visqol] \
-             [--complexity C]"
+            "usage: transcode <in.flac> <out.opus> [--bitrate K | --target Q | --recommend] \
+             [--metric nmr|visqol] [--complexity C]\n\
+             \n  --recommend   sweep the bitrate grid and report the knee of the quality curve\n\
+             \x20               (best quality-per-bit), then encode at it"
         );
         std::process::exit(2);
     }
@@ -51,13 +64,21 @@ fn main() {
     let mut target: Option<f64> = None;
     let mut metric = Metric::Nmr;
     let mut complexity = 10u8;
+    let mut recommend_mode = false;
     let mut i = 3;
-    while i + 1 < a.len() {
-        match a[i].as_str() {
-            "--bitrate" => bitrate = a[i + 1].parse::<u32>().unwrap_or(96) * 1000,
-            "--target" => target = a[i + 1].parse().ok(),
-            "--metric" => metric = if a[i + 1] == "visqol" { Metric::Visqol } else { Metric::Nmr },
-            "--complexity" => complexity = a[i + 1].parse().unwrap_or(10).min(10),
+    while i < a.len() {
+        let opt = a[i].as_str();
+        if opt == "--recommend" {
+            recommend_mode = true;
+            i += 1;
+            continue;
+        }
+        let val = a.get(i + 1).map(String::as_str);
+        match opt {
+            "--bitrate" => bitrate = val.and_then(|s| s.parse::<u32>().ok()).unwrap_or(96) * 1000,
+            "--target" => target = val.and_then(|s| s.parse().ok()),
+            "--metric" => metric = if val == Some("visqol") { Metric::Visqol } else { Metric::Nmr },
+            "--complexity" => complexity = val.and_then(|s| s.parse().ok()).unwrap_or(10).min(10),
             x => {
                 eprintln!("unknown option {x}");
                 std::process::exit(2);
@@ -81,8 +102,10 @@ fn main() {
     let in_size = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
     println!("in:  {input}  {channels}ch {secs:.1}s  {} KiB FLAC", in_size / 1024);
 
-    // 2. Pick the bitrate: quality search or fixed.
-    if let Some(t) = target {
+    // 2. Pick the bitrate: recommend (knee of the curve), quality target search, or fixed.
+    if recommend_mode {
+        bitrate = recommend(&pcm, &orig, channels, metric, complexity);
+    } else if let Some(t) = target {
         bitrate = search(&pcm, &orig, channels, metric, t, complexity);
     }
 
@@ -211,15 +234,23 @@ fn progress_line(done: usize, total: usize) -> String {
     format!("[{bar}] {done}/{total}")
 }
 
-fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64, cx: u8) -> u32 {
+/// Evaluate the whole bitrate grid in parallel (encode → decode → score) with a live progress bar.
+/// Returns the `(target_bitrate, actual_kbps, quality)` rows ascending, the thread count, and the
+/// wall time — shared by the `--target` search and the `--recommend` analysis.
+fn sweep(
+    pcm: &[u8],
+    orig: &[i16],
+    channels: usize,
+    metric: Metric,
+    cx: u8,
+) -> (Vec<(u32, f64, f64)>, usize, std::time::Duration) {
     #[cfg(feature = "qa")]
     if metric == Metric::Visqol {
         ensure_model(); // write the model once, before the parallel section
     }
 
     // Each bitrate probe (encode → decode → score) is independent, so evaluate a whole grid in
-    // parallel across cores — replacing a sequential binary search. Denser for cheap NMR, coarser
-    // for the ~100× slower ViSQOL.
+    // parallel across cores. Denser for cheap NMR, coarser for the ~100× slower ViSQOL.
     let grid: Vec<u32> = match metric {
         Metric::Nmr => (24..=256).step_by(8).map(|k| k * 1000).collect(),
         Metric::Visqol => (32..=256).step_by(16).map(|k| k * 1000).collect(),
@@ -228,11 +259,9 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
         .map(|n| n.get())
         .unwrap_or(4)
         .min(grid.len().max(1));
-    // Work-queue rather than static `chunks(per)`: `chunks` splits N points into ceil(N/per)
-    // pieces, spawning fewer threads than cores when N < 2·cores (15 points ÷ per=2 = 8 threads on
-    // 12 cores) and load-imbalancing the tail. Instead spawn `threads` workers that each pull the
-    // next grid index from a shared atomic until the grid is drained — every core stays busy and
-    // the last, uneven items are picked up by whichever thread frees first.
+    // Work-queue: spawn `threads` workers that each pull the next grid index from a shared atomic
+    // until the grid is drained — every core stays busy and the uneven tail is picked up by whoever
+    // frees first (beats a static `chunks`, which under-subscribes when N < 2·cores).
     let grid_ref = &grid;
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
@@ -273,26 +302,35 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
     });
     eprintln!(); // end the progress line
     rows.sort_by_key(|r| r.0);
+    (rows, threads, t0.elapsed())
+}
 
+/// Print the rate-distortion table; `target` (if set) marks the meeting rows with `✓`.
+fn print_sweep_table(
+    rows: &[(u32, f64, f64)],
+    metric: Metric,
+    threads: usize,
+    dt: std::time::Duration,
+    target: Option<f64>,
+) {
     let label = if metric == Metric::Visqol { "MOS" } else { "NMR" };
-    let meets = |q: f64| match metric {
-        Metric::Nmr => q <= target,
-        Metric::Visqol => q >= target,
-    };
     println!(
-        "\n  rate-distortion sweep — {} points over {threads} threads in {:.1?}:",
+        "\n  rate-distortion sweep — {} points over {threads} threads in {dt:.1?}:",
         rows.len(),
-        t0.elapsed(),
     );
-    for &(k, actual, q) in &rows {
-        println!(
-            "   {:>4}k → {actual:>5.1}k   {label} {q:>7.2}  {}",
-            k / 1000,
-            if meets(q) { "✓" } else { "" },
-        );
+    for &(k, actual, q) in rows {
+        let mark = if target.is_some_and(|t| metric.meets(q, t)) { "✓" } else { "" };
+        println!("   {:>4}k → {actual:>5.1}k   {label} {q:>7.2}  {mark}", k / 1000);
     }
+}
+
+/// `--target`: lowest grid bitrate meeting the quality target (or the top of the range).
+fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64, cx: u8) -> u32 {
+    let (rows, threads, dt) = sweep(pcm, orig, channels, metric, cx);
+    let label = if metric == Metric::Visqol { "MOS" } else { "NMR" };
+    print_sweep_table(&rows, metric, threads, dt, Some(target));
     // Lowest grid bitrate meeting the target (rows are ascending).
-    match rows.iter().find(|&&(_, _, q)| meets(q)) {
+    match rows.iter().find(|&&(_, _, q)| metric.meets(q, target)) {
         Some(&(k, a, q)) => {
             println!("→ chosen: {}k target / {a:.1}k actual ({label} {q:.2})\n", k / 1000);
             k
@@ -303,6 +341,58 @@ fn search(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, target: f64
             last.0
         }
     }
+}
+
+/// `--recommend`: sweep the grid, then report the knee of the quality/bitrate curve — the best
+/// quality-per-bit point, beyond which extra bits buy little — plus the ceiling reached. Returns the
+/// knee bitrate (which the file is then encoded at).
+fn recommend(pcm: &[u8], orig: &[i16], channels: usize, metric: Metric, cx: u8) -> u32 {
+    let (rows, threads, dt) = sweep(pcm, orig, channels, metric, cx);
+    let label = if metric == Metric::Visqol { "MOS" } else { "NMR" };
+    print_sweep_table(&rows, metric, threads, dt, None);
+
+    // "Goodness" increases with quality: MOS as-is (higher = better), NMR negated (lower dB = better).
+    let good = |q: f64| if metric == Metric::Visqol { q } else { -q };
+    let n = rows.len();
+
+    // Knee = the point furthest above the straight line joining the cheapest and most expensive
+    // points — the classic elbow/Kneedle heuristic, i.e. where the curve stops climbing steeply.
+    let (x0, x1) = (rows[0].0 as f64, rows[n - 1].0 as f64);
+    let (g0, g1) = (good(rows[0].2), good(rows[n - 1].2));
+    let mut knee = 0usize;
+    let mut best = f64::NEG_INFINITY;
+    for (i, &(k, _, q)) in rows.iter().enumerate() {
+        let t = if x1 > x0 { (k as f64 - x0) / (x1 - x0) } else { 0.0 };
+        let chord = g0 + (g1 - g0) * t; // the chord's goodness at this bitrate
+        let dist = good(q) - chord; // vertical gap above the chord
+        if dist > best {
+            best = dist;
+            knee = i;
+        }
+    }
+
+    let (kk, ka, kq) = rows[knee];
+    let (ck, ca, cq) = rows[n - 1]; // ceiling = highest bitrate tried
+    println!("recommendation:");
+    println!(
+        "  {:<11}→  {:>4}k  ({ka:.1}k actual, {label} {kq:.2})   best quality per bit",
+        "sweet spot",
+        kk / 1000,
+    );
+    if ck > kk {
+        println!(
+            "  {:<11}→  {:>4}k  ({ca:.1}k actual, {label} {cq:.2})   +{}k more buys {:.2} {label}",
+            "ceiling",
+            ck / 1000,
+            (ck - kk) / 1000,
+            (cq - kq).abs(),
+        );
+    }
+    println!(
+        "→ recommended: --bitrate {} --complexity {cx}  (encoding at this now)\n",
+        kk / 1000,
+    );
+    kk
 }
 
 // ---------------------------------------------------------------------------
