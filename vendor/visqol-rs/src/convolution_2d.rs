@@ -6,7 +6,16 @@ pub fn perform_valid_2d_conv_with_boundary(
     input_matrix: &mut Array2<f64>,
 ) -> Array2<f64> {
     let padded_matrix = add_matrix_boundary(input_matrix);
-    let padded_flattened_matrix = flatten_matrix(&padded_matrix);
+    // `padded_matrix` is produced by `copy_matrix_within_padding` as a default C-order
+    // (standard-layout, row-major) `Array2`, and the convolution below indexes it as
+    // `row * ncols + col` — so its backing store already *is* the exact row-major flattening
+    // this needs. Borrow it zero-copy instead of allocating + copying a fresh `Vec` per call.
+    // (Profiled with heaptrack: this per-conv `flatten_matrix(&padded_matrix)` was ~51% of all
+    // ViSQOL allocations — a `Vec::new()` grown one element at a time, once per 2-D convolution
+    // inside the per-patch NSIM loop.)
+    let padded_flattened_matrix = padded_matrix
+        .as_slice()
+        .expect("padded matrix is standard-layout (row-major) contiguous");
 
     let i_r_c = padded_matrix.nrows();
     let i_c_c = padded_matrix.ncols();
@@ -39,7 +48,10 @@ pub fn perform_valid_2d_conv_with_boundary(
 }
 
 fn flatten_matrix(input_matrix: &Array2<f64>) -> Vec<f64> {
-    let mut res = Vec::<f64>::new();
+    // Row-major flatten via `[(i, j)]` indexing — independent of the array's memory layout, so
+    // this is *not* equivalent to `as_slice` for the Fortran-order FIR filter. Pre-size to avoid
+    // the element-at-a-time `grow_one` reallocation storm (~10% of ViSQOL allocations).
+    let mut res = Vec::<f64>::with_capacity(input_matrix.nrows() * input_matrix.ncols());
     for i in 0..input_matrix.nrows() {
         for j in 0..input_matrix.ncols() {
             res.push(input_matrix[(i, j)]);

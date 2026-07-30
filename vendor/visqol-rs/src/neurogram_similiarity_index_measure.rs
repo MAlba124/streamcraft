@@ -49,8 +49,11 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
         let deg_mu_squared = &mu_deg * &mu_deg;
         let mu_r_mu_d = &mu_ref * &mu_deg;
 
-        let mut ref_neuro_sq = ref_patch.clone() * ref_patch.clone();
-        let mut deg_neuro_sq = deg_patch.clone() * deg_patch.clone();
+        // Element-wise square by reference: `&x * &x` allocates the single result array,
+        // whereas `x.clone() * x.clone()` allocated two full-array clones first (the conv fn
+        // borrows these `&mut` but does not mutate them, so the reference product is identical).
+        let mut ref_neuro_sq = &*ref_patch * &*ref_patch;
+        let mut deg_neuro_sq = &*deg_patch * &*deg_patch;
 
         // Compute sigmas
         let conv2_ref_neuro_squared =
@@ -61,7 +64,7 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
             perform_valid_2d_conv_with_boundary(&window, &mut deg_neuro_sq);
         let sigma_deg_squared = &conv2_deg_neuro_squared - &deg_mu_squared;
 
-        let mut ref_neuro_deg = ref_patch.clone() * deg_patch.clone();
+        let mut ref_neuro_deg = &*ref_patch * &*deg_patch;
         let conv2_ref_neuro_deg = perform_valid_2d_conv_with_boundary(&window, &mut ref_neuro_deg);
 
         let sigma_r_d = &conv2_ref_neuro_deg - &mu_r_mu_d;
