@@ -59,11 +59,11 @@ version = "0.4.17"
 [dependencies.ndarray]
 version = "0.16.1"
 
-[dependencies.ndarray-linalg]
-version = "0.17.0"
-
-[dependencies.ndarray-stats]
-version = "0.6.0"
+# Profluens' bump-allocator arena (memory::Arena) — passed into the NSIM/convolution hot loop so
+# the per-patch scratch matrices are carved from reusable arena memory instead of the heap. Vendored
+# path dep (this crate is excluded from the workspace); see PROFLUENS-PATCHES.md.
+[dependencies.profluens-core]
+path = "../../core"
 
 [dependencies.num]
 version = "0.4.0"

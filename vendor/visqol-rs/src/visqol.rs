@@ -7,6 +7,7 @@ use crate::{
     spectrogram_builder::SpectrogramBuilder,
 };
 use ndarray::Array1;
+use profluens_core::memory::Arena;
 use std::error::Error;
 
 /// Perform a comparison on two audio signals. Their similarity is calculated
@@ -21,6 +22,7 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
     selector: &ComparisonPatchesSelector,
     sim_to_qual_mapper: &dyn SimilarityToQualityMapper,
     search_window: usize,
+    arena: &mut Arena,
 ) -> Result<SimilarityResult, Box<dyn Error>> {
     /////////////////// Stage 1: Preprocessing ///////////////////
     let deg_signal_scaled =
@@ -48,6 +50,7 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
         &deg_spectrogram.data,
         frame_duration,
         search_window as i32,
+        arena,
     )?;
     // Realign the patches in time domain subsignals that start at the coarse
     // patch times.
@@ -58,6 +61,7 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
         &deg_signal_scaled,
         spect_builder,
         window,
+        arena,
     )?;
     sim_match_info = realign_result;
 

@@ -1,5 +1,19 @@
 use ndarray::Array1;
-use ndarray_stats::QuantileExt;
+
+/// Maximum of an `f64` iterator. Replaces `ndarray_stats::QuantileExt::max` so the crate can
+/// drop `ndarray-stats` *and* `ndarray-linalg` (the latter was a declared-but-unused dep that
+/// drags in a BLAS/LAPACK backend visqol never calls). `None` on an empty iterator — matching
+/// the `Result::Err` that every call site already `.expect`s. Inputs here are finite dB
+/// magnitudes (no NaN), so `f64::max`/`f64::min` are exact.
+pub fn max_of<'a>(iter: impl Iterator<Item = &'a f64>) -> Option<f64> {
+    iter.copied().reduce(f64::max)
+}
+
+/// Minimum of an `f64` iterator — see [`max_of`].
+pub fn min_of<'a>(iter: impl Iterator<Item = &'a f64>) -> Option<f64> {
+    iter.copied().reduce(f64::min)
+}
+
 pub fn normalize_signal(signal: &Array1<f64>) -> Array1<f64> {
     let normalized_mat = signal.clone();
     let max = get_max(signal);
@@ -29,7 +43,9 @@ pub fn normalize_int16_to_double(input: &[i16]) -> Vec<f64> {
 }
 
 /// Returns the maximum of an `ndarray::Array1<f64>`
-fn get_max(mat: &Array1<f64>) -> f64 { *mat.max().expect("Failed to compute maximum of matrix!") }
+fn get_max(mat: &Array1<f64>) -> f64 {
+    max_of(mat.iter()).expect("Failed to compute maximum of matrix!")
+}
 
 #[cfg(test)]
 mod tests {

@@ -12,6 +12,7 @@ use crate::{
     visqol_error::VisqolError,
 };
 use ndarray::{concatenate, s, Array1, Array2, Axis};
+use profluens_core::memory::Arena;
 pub struct ComparisonPatchesSelector {
     sim_comparator: NeurogramSimiliarityIndexMeasure,
 }
@@ -27,6 +28,7 @@ impl ComparisonPatchesSelector {
         spectrogram_data: &Array2<f64>,
         frame_duration: f64,
         search_window_radius: i32,
+        arena: &mut Arena,
     ) -> Result<Vec<PatchSimilarityResult>, VisqolError> {
         let num_frames_per_patch = ref_patches[0].ncols();
         let num_frames_in_deg_spectro = spectrogram_data.ncols();
@@ -79,6 +81,7 @@ impl ComparisonPatchesSelector {
                 ref_patch_indices,
                 index,
                 search_window,
+                arena,
             );
         }
         let mut max_similarity_score = f64::MIN;
@@ -111,6 +114,9 @@ impl ComparisonPatchesSelector {
 
         let mut patch_index: i32 = (num_patches - 1) as i32;
         while patch_index >= 0 {
+            // Per-patch reset: the previous iteration's NSIM scratch is dead (its result is the
+            // owned `PatchSimilarityResult` now in `best_deg_patches`), so reclaim the arena.
+            arena.reset();
             // This sets the reference and degraded patch start and end times.
             let mut ref_patch = ref_patches[patch_index as usize].clone();
 
@@ -122,7 +128,7 @@ impl ComparisonPatchesSelector {
 
             best_deg_patches[patch_index as usize] = self
                 .sim_comparator
-                .measure_patch_similarity(&mut ref_patch, &mut deg_patch);
+                .measure_patch_similarity(&mut ref_patch, &mut deg_patch, &*arena);
 
             // This condition is true only if no matching patch was found for the given
             // reference patch. In this case, the matched patch is essentially set to
@@ -163,6 +169,7 @@ impl ComparisonPatchesSelector {
         ref_patch_indices: &[usize],
         patch_index: usize,
         search_window: i32,
+        arena: &mut Arena,
     ) {
         let ref_frame_index = ref_patch_indices[patch_index];
 
@@ -182,10 +189,14 @@ impl ComparisonPatchesSelector {
 
                 break;
             }
+            // Per-candidate reset: the previous slide's NSIM scratch is dead (only the owned
+            // `sim_result.similarity` was carried into the DP table), so reclaim the arena — this
+            // is the hot O(patches × window) loop, so it dominates the allocation win.
+            arena.reset();
             let deg_patch = &mut deg_patches[slide_offset as usize];
             sim_result = self
                 .sim_comparator
-                .measure_patch_similarity(ref_patch, deg_patch);
+                .measure_patch_similarity(ref_patch, deg_patch, &*arena);
             let mut past_slide_offset = -1;
             let mut highest_sim = f64::MIN;
 
@@ -324,11 +335,15 @@ impl ComparisonPatchesSelector {
         deg_signal: &AudioSignal,
         spect_builder: &mut GammatoneSpectrogramBuilder<NUM_BANDS>,
         analysis_window: &AnalysisWindow,
+        arena: &mut Arena,
     ) -> Result<Vec<PatchSimilarityResult>, Box<dyn Error>> {
         // Case: The patches are already matched.  Iterate over each pair.
         let mut realigned_results = Vec::<PatchSimilarityResult>::with_capacity(sim_results.len());
         realigned_results.resize(sim_results.len(), PatchSimilarityResult::default());
         for (i, result) in sim_results.iter_mut().enumerate() {
+            // Per-patch reset: the previous iteration's NSIM scratch is dead (its result is owned
+            // in `realigned_results`), so reclaim the arena before this patch's comparison.
+            arena.reset();
             if result.deg_patch_start_time == result.deg_patch_end_time
                 && result.deg_patch_start_time == 0.0
             {
@@ -368,9 +383,11 @@ impl ComparisonPatchesSelector {
             );
             // 5. Update the similarity result with the new patch.
 
-            let mut new_sim_result = self
-                .sim_comparator
-                .measure_patch_similarity(&mut ref_spectrogram.data, &mut deg_spectrogram.data);
+            let mut new_sim_result = self.sim_comparator.measure_patch_similarity(
+                &mut ref_spectrogram.data,
+                &mut deg_spectrogram.data,
+                &*arena,
+            );
             // Compare to the old result and take the max.
             if new_sim_result.similarity < result.similarity {
                 realigned_results[i] = result.clone();
@@ -479,6 +496,7 @@ mod tests {
                 &deg_matrix,
                 frame_duration,
                 search_window,
+                &mut profluens_core::memory::Arena::default(),
             )
             .unwrap();
 
@@ -513,6 +531,7 @@ mod tests {
                 &deg_matrix,
                 frame_duration,
                 search_window,
+                &mut profluens_core::memory::Arena::default(),
             )
             .unwrap();
 
@@ -553,6 +572,7 @@ mod tests {
                 &deg_matrix,
                 frame_duration,
                 search_window,
+                &mut profluens_core::memory::Arena::default(),
             )
             .unwrap();
         assert_eq!(res[0].deg_patch_start_time, 6.0);
@@ -603,6 +623,7 @@ mod tests {
                 &deg_matrix,
                 frame_duration,
                 search_window,
+                &mut profluens_core::memory::Arena::default(),
             )
             .unwrap();
 

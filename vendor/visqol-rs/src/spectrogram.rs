@@ -1,5 +1,5 @@
+use crate::math_utils::{max_of, min_of};
 use ndarray::{Array2, Axis};
-use ndarray_stats::QuantileExt;
 
 /// Contains the spectral representation of audio data
 pub struct Spectrogram {
@@ -33,10 +33,7 @@ impl Spectrogram {
 
     /// Returns the minimum value of the spectrogram
     pub fn get_minimum(&self) -> f64 {
-        *self
-            .data
-            .min()
-            .expect("Failed to compute minimum for spectrogram")
+        min_of(self.data.iter()).expect("Failed to compute minimum for spectrogram")
     }
 
     /// Elementwise subtraction of the spectrogram
@@ -54,13 +51,11 @@ impl Spectrogram {
         for index in 0..min_columns {
             let our_frame = &mut self.data.index_axis_mut(Axis(1), index);
             let other_frame = &mut other.data.index_axis_mut(Axis(1), index);
-            let our_max = our_frame
-                .max()
-                .expect("Failed to raise level for spectrogram!");
-            let other_max = other_frame
-                .max()
-                .expect("Failed to raise level for spectrogram!");
-            let any_max = our_max.max(*other_max);
+            let our_max =
+                max_of(our_frame.iter()).expect("Failed to raise level for spectrogram!");
+            let other_max =
+                max_of(other_frame.iter()).expect("Failed to raise level for spectrogram!");
+            let any_max = our_max.max(other_max);
             let floor_db = any_max - noise_threshold;
             our_frame.mapv_inplace(|element| floor_db.max(element));
             other_frame.mapv_inplace(|element| floor_db.max(element));

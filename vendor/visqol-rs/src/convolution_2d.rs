@@ -1,18 +1,70 @@
-use ndarray::{Array2, ShapeBuilder};
+use ndarray::{Array2, ArrayBase, ArrayViewMut2, Data, Ix2, Zip};
+use profluens_core::memory::Arena;
+use std::mem::{align_of, size_of};
 
-/// Computes the convolution of `input_matrix` with `fir_filter`
-pub fn perform_valid_2d_conv_with_boundary(
+/// Carve an uninitialised `r × c` row-major `f64` matrix from the bump `arena` as a mutable view.
+/// The backing bytes are reused arena memory (contents unspecified), so **every element must be
+/// written (or the whole view `fill`ed) before it is read**. Zero heap traffic on the steady-state
+/// path — the arena reuses its chunks across [`Arena::reset`], which the per-patch NSIM loop does.
+pub(crate) fn arena_mat(arena: &Arena, r: usize, c: usize) -> ArrayViewMut2<'_, f64> {
+    let n = r * c;
+    let bytes = arena.alloc(n * size_of::<f64>(), align_of::<f64>());
+    // SAFETY: `bytes` is exactly `n * size_of::<f64>()` bytes, `align_of::<f64>()`-aligned; every
+    // bit pattern is a valid (possibly-NaN) `f64`, and callers write every element before use.
+    let data = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f64>(), n) };
+    ArrayViewMut2::from_shape((r, c), data).expect("arena_mat: slice length matches r*c")
+}
+
+/// `out[i] = op(a[i], b[i])` into a fresh arena matrix — the allocation-free analogue of ndarray's
+/// `&a <op> &b` (which mints a heap `Array2` per call). `a` and `b` may be any storage (owned,
+/// arena view, …) and must share `a`'s shape. Same per-element op in the same order as the
+/// operator form, so the result is bit-identical.
+pub(crate) fn binop_into<'a, S1, S2>(
+    arena: &'a Arena,
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+    op: impl Fn(f64, f64) -> f64,
+) -> ArrayViewMut2<'a, f64>
+where
+    S1: Data<Elem = f64>,
+    S2: Data<Elem = f64>,
+{
+    let (r, c) = a.dim();
+    let mut out = arena_mat(arena, r, c);
+    Zip::from(&mut out).and(a).and(b).for_each(|o, &x, &y| *o = op(x, y));
+    out
+}
+
+/// `out[i] = op(a[i])` into a fresh arena matrix — the arena analogue of `a.mapv(op)` / `&a <op> s`.
+pub(crate) fn map_into<'a, S>(
+    arena: &'a Arena,
+    a: &ArrayBase<S, Ix2>,
+    op: impl Fn(f64) -> f64,
+) -> ArrayViewMut2<'a, f64>
+where
+    S: Data<Elem = f64>,
+{
+    let (r, c) = a.dim();
+    let mut out = arena_mat(arena, r, c);
+    Zip::from(&mut out).and(a).for_each(|o, &x| *o = op(x));
+    out
+}
+
+/// Computes the convolution of `input_matrix` with `fir_filter`, writing the result into a fresh
+/// arena matrix (was: a heap `Array2` per call). `input_matrix` is generic over storage so a conv
+/// result (an arena view) can feed straight into the next conv without copying to an owned array.
+pub fn perform_valid_2d_conv_with_boundary<'a, S>(
     fir_filter: &Array2<f64>,
-    input_matrix: &mut Array2<f64>,
-) -> Array2<f64> {
-    let padded_matrix = add_matrix_boundary(input_matrix);
-    // `padded_matrix` is produced by `copy_matrix_within_padding` as a default C-order
-    // (standard-layout, row-major) `Array2`, and the convolution below indexes it as
-    // `row * ncols + col` — so its backing store already *is* the exact row-major flattening
-    // this needs. Borrow it zero-copy instead of allocating + copying a fresh `Vec` per call.
-    // (Profiled with heaptrack: this per-conv `flatten_matrix(&padded_matrix)` was ~51% of all
-    // ViSQOL allocations — a `Vec::new()` grown one element at a time, once per 2-D convolution
-    // inside the per-patch NSIM loop.)
+    input_matrix: &ArrayBase<S, Ix2>,
+    arena: &'a Arena,
+) -> ArrayViewMut2<'a, f64>
+where
+    S: Data<Elem = f64>,
+{
+    let padded_matrix = add_matrix_boundary(input_matrix, arena);
+    // `padded_matrix` is an `arena_mat` — standard-layout row-major — and the convolution indexes
+    // it as `row*ncols + col`, so its backing slice is exactly the flattening this wants
+    // (borrowed zero-copy, not rebuilt).
     let padded_flattened_matrix = padded_matrix
         .as_slice()
         .expect("padded matrix is standard-layout (row-major) contiguous");
@@ -25,9 +77,10 @@ pub fn perform_valid_2d_conv_with_boundary(
     let o_c_c = i_c_c - f_c_c + 1;
     let filter_size = f_r_c * f_c_c;
 
-    let flattened_filter = flatten_matrix(fir_filter);
+    let flattened_filter = flatten_filter(fir_filter, arena);
 
-    let mut out_matrix = Array2::<f64>::zeros((o_r_c, o_c_c).f());
+    // Every (o_row, o_col) is written below, so the uninitialised arena matrix needs no fill.
+    let mut out_matrix = arena_mat(arena, o_r_c, o_c_c);
 
     for o_row in 0..o_r_c {
         for o_col in 0..o_c_c {
@@ -47,22 +100,34 @@ pub fn perform_valid_2d_conv_with_boundary(
     out_matrix
 }
 
-fn flatten_matrix(input_matrix: &Array2<f64>) -> Vec<f64> {
-    // Row-major flatten via `[(i, j)]` indexing — independent of the array's memory layout, so
-    // this is *not* equivalent to `as_slice` for the Fortran-order FIR filter. Pre-size to avoid
-    // the element-at-a-time `grow_one` reallocation storm (~10% of ViSQOL allocations).
-    let mut res = Vec::<f64>::with_capacity(input_matrix.nrows() * input_matrix.ncols());
-    for i in 0..input_matrix.nrows() {
-        for j in 0..input_matrix.ncols() {
-            res.push(input_matrix[(i, j)]);
+/// Row-major flatten of the (Fortran-order) FIR filter into arena memory. Row-major via `[(i, j)]`
+/// indexing — independent of the array's layout, matching the convolution's reverse indexing (so
+/// it is deliberately *not* `as_slice`, which would give the filter's Fortran memory order).
+fn flatten_filter<'a>(input_matrix: &Array2<f64>, arena: &'a Arena) -> &'a mut [f64] {
+    let (r, c) = (input_matrix.nrows(), input_matrix.ncols());
+    let bytes = arena.alloc(r * c * size_of::<f64>(), align_of::<f64>());
+    // SAFETY: as in `arena_mat`; every element is written just below before any read.
+    let out = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f64>(), r * c) };
+    let mut k = 0;
+    for i in 0..r {
+        for j in 0..c {
+            out[k] = input_matrix[(i, j)];
+            k += 1;
         }
     }
-    res
+    out
 }
 
-/// Compute zero-padded matrix and fill zero-padded boundaries with the adjacent non-zero rows and columns
-pub fn add_matrix_boundary(input_matrix: &mut Array2<f64>) -> Array2<f64> {
-    let mut output_matrix = copy_matrix_within_padding(input_matrix, 1, 1, 1, 1);
+/// Compute zero-padded matrix (in the arena) and fill zero-padded boundaries with the adjacent
+/// non-zero rows and columns.
+pub fn add_matrix_boundary<'a, S>(
+    input_matrix: &ArrayBase<S, Ix2>,
+    arena: &'a Arena,
+) -> ArrayViewMut2<'a, f64>
+where
+    S: Data<Elem = f64>,
+{
+    let mut output_matrix = copy_matrix_within_padding(input_matrix, 1, 1, 1, 1, arena);
 
     for i in 0..output_matrix.ncols() {
         output_matrix.row_mut(0)[i] = output_matrix.row(1)[i];
@@ -78,18 +143,27 @@ pub fn add_matrix_boundary(input_matrix: &mut Array2<f64>) -> Array2<f64> {
     output_matrix
 }
 
-/// Returns a copy of `input matrix` which is zero-padded by the specified amounts.
-pub fn copy_matrix_within_padding(
-    input_matrix: &Array2<f64>,
+/// Returns a copy of `input_matrix` (in the arena) which is zero-padded by the specified amounts.
+pub fn copy_matrix_within_padding<'a, S>(
+    input_matrix: &ArrayBase<S, Ix2>,
     row_prepad_amount: usize,
     row_postpad_amount: usize,
     col_prepad_amount: usize,
     col_postpad_amount: usize,
-) -> Array2<f64> {
-    let mut output_matrix = Array2::<f64>::zeros((
+    arena: &'a Arena,
+) -> ArrayViewMut2<'a, f64>
+where
+    S: Data<Elem = f64>,
+{
+    let mut output_matrix = arena_mat(
+        arena,
         row_prepad_amount + input_matrix.nrows() + row_postpad_amount,
         col_prepad_amount + input_matrix.ncols() + col_postpad_amount,
-    ));
+    );
+    // Arena memory is uninitialised; the original allocated `Array2::zeros`, and `add_matrix_boundary`
+    // reads the padding ring (as 0) before overwriting it — so zero the whole matrix first to stay
+    // bit-identical.
+    output_matrix.fill(0.0);
 
     for row_i in 0..input_matrix.nrows() {
         for col_i in 0..input_matrix.ncols() {
@@ -103,11 +177,13 @@ pub fn copy_matrix_within_padding(
 #[cfg(test)]
 mod tests {
     use ndarray::{Array, Array2, ShapeBuilder};
+    use profluens_core::memory::Arena;
 
     use super::*;
 
     #[test]
     fn convolve_with_window() {
+        let arena = Arena::default();
         let w = vec![
             0.0113033910173052,
             0.0838251475442633,
@@ -126,9 +202,9 @@ mod tests {
             43.6190, 41.0119, 40.4244, 41.5932, 43.6027, 42.6204, 43.0624, 42.2610, 42.4725,
             43.4258, 42.9079,
         ];
-        let mut matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
+        let matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
 
-        let result = perform_valid_2d_conv_with_boundary(&window, &mut matrix);
+        let result = perform_valid_2d_conv_with_boundary(&window, &matrix, &arena);
 
         let r = vec![
             40.6634, 42.8407, 40.6395, 41.0129, 41.5407, 42.4677, 44.2760, 44.2031, 41.2263,
@@ -147,13 +223,14 @@ mod tests {
 
     #[test]
     fn perform_padding() {
+        let arena = Arena::default();
         let m = vec![
             40.0392, 43.3409, 39.5270, 41.1731, 41.3591, 42.6852, 45.2083, 45.7769, 39.9689,
             43.6190, 41.0119, 40.4244, 41.5932, 43.6027, 42.6204, 43.0624, 42.2610, 42.4725,
             43.4258, 42.9079,
         ];
-        let mut matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
-        let result = add_matrix_boundary(&mut matrix);
+        let matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
+        let result = add_matrix_boundary(&matrix, &arena);
 
         let mut r = Vec::new();
         for i in 0..result.dim().0 {
@@ -175,13 +252,14 @@ mod tests {
 
     #[test]
     fn copy_with_zeros() {
+        let arena = Arena::default();
         let m = vec![
             40.0392, 43.3409, 39.5270, 41.1731, 41.3591, 42.6852, 45.2083, 45.7769, 39.9689,
             43.6190, 41.0119, 40.4244, 41.5932, 43.6027, 42.6204, 43.0624, 42.2610, 42.4725,
             43.4258, 42.9079,
         ];
         let matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
-        let result = copy_matrix_within_padding(&matrix, 1, 1, 1, 1);
+        let result = copy_matrix_within_padding(&matrix, 1, 1, 1, 1, &arena);
 
         let er = vec![
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 40.0392, 42.6852, 41.0119, 43.0624, 0.0, 0.0,

@@ -2,7 +2,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```no_run
 //! use visqol_rs::constants::{DEFAULT_WINDOW_SIZE, NUM_BANDS_SPEECH};
 //! use visqol_rs::variant::Variant;
 //! use visqol_rs::*;
@@ -15,9 +15,11 @@
 //! };
 //! let mut visqol =
 //!     visqol_manager::VisqolManager::<NUM_BANDS_SPEECH>::new(variant, DEFAULT_WINDOW_SIZE);
+//! // Caller-owned bump arena for the per-patch NSIM scratch (reset between patches internally).
+//! let mut arena = profluens_core::memory::Arena::default();
 //!
 //! let similarity_result = visqol
-//!     .run(path_to_reference_file, path_to_degraded_file)
+//!     .run(path_to_reference_file, path_to_degraded_file, &mut arena)
 //!     .unwrap();
 //!
 //! println!(

@@ -1,3 +1,4 @@
+use profluens_core::memory::Arena;
 use std::error::Error;
 
 use crate::{
@@ -72,19 +73,21 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
         &mut self,
         ref_signal_path: &str,
         deg_signal_path: &str,
+        arena: &mut Arena,
     ) -> Result<SimilarityResult, Box<dyn Error>> {
         let mut ref_signal = audio_utils::load_as_mono(ref_signal_path)?;
         let mut deg_signal = audio_utils::load_as_mono(deg_signal_path)?;
 
         Self::validate_input_audio(&ref_signal, &deg_signal)?;
 
-        self.compute_results(&mut ref_signal, &mut deg_signal)
+        self.compute_results(&mut ref_signal, &mut deg_signal, arena)
     }
 
     pub fn compute_results(
         &mut self,
         ref_signal: &mut AudioSignal,
         deg_signal: &mut AudioSignal,
+        arena: &mut Arena,
     ) -> Result<SimilarityResult, Box<dyn Error>> {
         let (mut deg_signal, _) = alignment::globally_align(ref_signal, deg_signal)
             .ok_or(VisqolError::FailedToAlignSignals)?;
@@ -104,6 +107,7 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
             &self.patch_selector,
             self.sim_to_quality_mapper.as_mut(),
             self.search_window,
+            arena,
         )
     }
 

@@ -1,4 +1,5 @@
 use ndarray::Array2 as ImagePatch;
+use profluens_core::memory::Arena;
 use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 /// Bundles similarity information of a single patch.
@@ -64,5 +65,6 @@ pub trait PatchSimilarityComparator {
         &self,
         ref_patch: &mut ImagePatch<f64>,
         deg_patch: &mut ImagePatch<f64>,
+        arena: &Arena,
     ) -> PatchSimilarityResult;
 }

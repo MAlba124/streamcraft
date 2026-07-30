@@ -304,7 +304,11 @@ fn visqol_mos(reference: &[i16], test: &[i16], channels: usize, tag: usize) -> f
         Variant::Fullband { model_path: MODEL_PATH.to_string() },
         DEFAULT_WINDOW_SIZE,
     );
-    v.run(&rp, &dp).map(|r| r.moslqo).unwrap_or(1.0)
+    // Profluens owns the bump arena; ViSQOL borrows it for the per-patch NSIM/convolution scratch
+    // (reset between patches inside `run`). One arena per call — each parallel-search thread has
+    // its own (`Arena` is `!Sync`); its chunks are reused across every patch of this comparison.
+    let mut arena = profluens_core::memory::Arena::default();
+    v.run(&rp, &dp, &mut arena).map(|r| r.moslqo).unwrap_or(1.0)
 }
 
 #[cfg(not(feature = "qa"))]

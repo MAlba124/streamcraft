@@ -1,6 +1,7 @@
-use crate::convolution_2d::perform_valid_2d_conv_with_boundary;
+use crate::convolution_2d::{binop_into, map_into, perform_valid_2d_conv_with_boundary};
 use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
 use ndarray::{arr2, Array1, Axis};
+use profluens_core::memory::Arena;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
 /// patch similarity comparator. NSIM is a distance metric, adapted from the
@@ -26,10 +27,19 @@ impl Default for NeurogramSimiliarityIndexMeasure {
 
 impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
     /// Computes the NSIM between `ref_patch` and `deg_patch` and returns the mean and standard deviation of each frequency band, the energy of the degraded patch and the similarity score.
+    ///
+    /// Every intermediate matrix is carved from the caller-owned bump `arena` (see [`arena_mat`]
+    /// et al.) rather than the heap: the per-op `&a * &b` result arrays of the original — the top
+    /// allocator after the flatten fix — become writes into reused arena memory. The caller
+    /// [`Arena::reset`]s between patches, so this loop is allocation-free in steady state, and the
+    /// per-element ops are unchanged so the score is bit-identical.
+    ///
+    /// [`arena_mat`]: crate::convolution_2d::arena_mat
     fn measure_patch_similarity(
         &self,
         ref_patch: &mut ndarray::Array2<f64>,
         deg_patch: &mut ndarray::Array2<f64>,
+        arena: &Arena,
     ) -> PatchSimilarityResult {
         let window = arr2(&[
             [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
@@ -42,42 +52,45 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
         let c3 = (k[1] * self.intensity_range).powf(2.0) / 2.0;
 
         // Compute mu
-        let mu_ref = perform_valid_2d_conv_with_boundary(&window, ref_patch);
-        let mu_deg = perform_valid_2d_conv_with_boundary(&window, deg_patch);
+        let mu_ref = perform_valid_2d_conv_with_boundary(&window, &*ref_patch, arena);
+        let mu_deg = perform_valid_2d_conv_with_boundary(&window, &*deg_patch, arena);
 
-        let ref_mu_squared = &mu_ref * &mu_ref;
-        let deg_mu_squared = &mu_deg * &mu_deg;
-        let mu_r_mu_d = &mu_ref * &mu_deg;
+        let ref_mu_squared = binop_into(arena, &mu_ref, &mu_ref, |a, b| a * b);
+        let deg_mu_squared = binop_into(arena, &mu_deg, &mu_deg, |a, b| a * b);
+        let mu_r_mu_d = binop_into(arena, &mu_ref, &mu_deg, |a, b| a * b);
 
-        // Element-wise square by reference: `&x * &x` allocates the single result array,
-        // whereas `x.clone() * x.clone()` allocated two full-array clones first (the conv fn
-        // borrows these `&mut` but does not mutate them, so the reference product is identical).
-        let mut ref_neuro_sq = &*ref_patch * &*ref_patch;
-        let mut deg_neuro_sq = &*deg_patch * &*deg_patch;
+        let ref_neuro_sq = binop_into(arena, &*ref_patch, &*ref_patch, |a, b| a * b);
+        let deg_neuro_sq = binop_into(arena, &*deg_patch, &*deg_patch, |a, b| a * b);
 
         // Compute sigmas
         let conv2_ref_neuro_squared =
-            perform_valid_2d_conv_with_boundary(&window, &mut ref_neuro_sq);
-        let sigma_ref_squared = &conv2_ref_neuro_squared - &ref_mu_squared;
+            perform_valid_2d_conv_with_boundary(&window, &ref_neuro_sq, arena);
+        let sigma_ref_squared =
+            binop_into(arena, &conv2_ref_neuro_squared, &ref_mu_squared, |a, b| a - b);
 
         let conv2_deg_neuro_squared =
-            perform_valid_2d_conv_with_boundary(&window, &mut deg_neuro_sq);
-        let sigma_deg_squared = &conv2_deg_neuro_squared - &deg_mu_squared;
+            perform_valid_2d_conv_with_boundary(&window, &deg_neuro_sq, arena);
+        let sigma_deg_squared =
+            binop_into(arena, &conv2_deg_neuro_squared, &deg_mu_squared, |a, b| a - b);
 
-        let mut ref_neuro_deg = &*ref_patch * &*deg_patch;
-        let conv2_ref_neuro_deg = perform_valid_2d_conv_with_boundary(&window, &mut ref_neuro_deg);
+        let ref_neuro_deg = binop_into(arena, &*ref_patch, &*deg_patch, |a, b| a * b);
+        let conv2_ref_neuro_deg =
+            perform_valid_2d_conv_with_boundary(&window, &ref_neuro_deg, arena);
 
-        let sigma_r_d = &conv2_ref_neuro_deg - &mu_r_mu_d;
+        let sigma_r_d = binop_into(arena, &conv2_ref_neuro_deg, &mu_r_mu_d, |a, b| a - b);
 
-        // Compute intensity
-        let intensity_numerator = &mu_r_mu_d * 2.0 + c1;
-        let intensity_denominator = &ref_mu_squared + &deg_mu_squared + c1;
+        // Compute intensity: `&mu_r_mu_d * 2.0 + c1` and `&ref_mu_squared + &deg_mu_squared + c1`
+        let intensity_numerator = map_into(arena, &mu_r_mu_d, |x| x * 2.0 + c1);
+        let intensity_denominator =
+            binop_into(arena, &ref_mu_squared, &deg_mu_squared, |a, b| a + b + c1);
 
-        let intensity = &intensity_numerator / &intensity_denominator;
+        let intensity =
+            binop_into(arena, &intensity_numerator, &intensity_denominator, |a, b| a / b);
 
         // Compute structure
-        let structure_numerator = &sigma_r_d + c3;
-        let mut structure_denominator = &sigma_ref_squared * &sigma_deg_squared;
+        let structure_numerator = map_into(arena, &sigma_r_d, |x| x + c3);
+        let mut structure_denominator =
+            binop_into(arena, &sigma_ref_squared, &sigma_deg_squared, |a, b| a * b);
 
         // Avoid nans
         structure_denominator.map_inplace(|element| {
@@ -88,8 +101,9 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
             }
         });
 
-        let structure = &structure_numerator / &structure_denominator;
-        let sim_map = &intensity * &structure;
+        let structure =
+            binop_into(arena, &structure_numerator, &structure_denominator, |a, b| a / b);
+        let sim_map = binop_into(arena, &intensity, &structure, |a, b| a * b);
 
         let freq_band_deg_energy: Array1<f64> = deg_patch
             .mean_axis(Axis(1))
@@ -116,11 +130,13 @@ mod tests {
 
     use approx::assert_abs_diff_eq;
     use ndarray::Array2;
+    use profluens_core::memory::Arena;
 
     use super::*;
 
     #[test]
     fn test_neurogram_measure() {
+        let arena = Arena::default();
         let ref_patch = vec![1.0, 0.0, 0.0];
         let mut ref_patch_mat = Array2::from_shape_vec((3, 1), ref_patch).unwrap();
         let deg_patch = vec![0.0, 0.0, 0.0];
@@ -129,8 +145,11 @@ mod tests {
 
         let sim_comparator = NeurogramSimiliarityIndexMeasure::default();
 
-        let result =
-            sim_comparator.measure_patch_similarity(&mut ref_patch_mat, &mut deg_patch_mat);
+        let result = sim_comparator.measure_patch_similarity(
+            &mut ref_patch_mat,
+            &mut deg_patch_mat,
+            &arena,
+        );
 
         assert_abs_diff_eq!(
             result.freq_band_means[0],
