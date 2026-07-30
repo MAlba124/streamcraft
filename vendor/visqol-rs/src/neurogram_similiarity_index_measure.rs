@@ -1,6 +1,6 @@
 use crate::convolution_2d::{binop_into, map_into, perform_valid_2d_conv_with_boundary};
 use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
-use ndarray::{arr2, Array1, Axis};
+use ndarray::{arr2, Array1, Array2, ArrayViewMut2, Axis};
 use profluens_core::memory::Arena;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
@@ -10,72 +10,71 @@ use profluens_core::memory::Arena;
 /// spectrograms.
 pub struct NeurogramSimiliarityIndexMeasure {
     intensity_range: f64,
+    /// The fixed 3×3 NSIM smoothing window (a Gaussian-ish kernel), built once. It was previously
+    /// `arr2`-allocated on *every* `compute_sim_map` call — in the hot alignment slide loop that was
+    /// the single largest remaining allocator (~1.7M heap `Array2`s per song).
+    window: Array2<f64>,
+}
+
+/// The fixed NSIM 3×3 smoothing window.
+fn nsim_window() -> Array2<f64> {
+    arr2(&[
+        [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
+        [0.0838251475442633, 0.619485845753726, 0.0838251475442633],
+        [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
+    ])
 }
 
 #[allow(unused)]
 impl NeurogramSimiliarityIndexMeasure {
-    pub fn new(intensity_range: f64) -> Self { Self { intensity_range } }
-}
-
-impl Default for NeurogramSimiliarityIndexMeasure {
-    fn default() -> Self {
-        Self {
-            intensity_range: 1.0,
-        }
+    pub fn new(intensity_range: f64) -> Self {
+        Self { intensity_range, window: nsim_window() }
     }
-}
 
-impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
-    /// Computes the NSIM between `ref_patch` and `deg_patch` and returns the mean and standard deviation of each frequency band, the energy of the degraded patch and the similarity score.
-    ///
-    /// Every intermediate matrix is carved from the caller-owned bump `arena` (see [`arena_mat`]
-    /// et al.) rather than the heap: the per-op `&a * &b` result arrays of the original — the top
-    /// allocator after the flatten fix — become writes into reused arena memory. The caller
-    /// [`Arena::reset`]s between patches, so this loop is allocation-free in steady state, and the
-    /// per-element ops are unchanged so the score is bit-identical.
+    /// Shared NSIM core: compute the per-element similarity map into the `arena`. Both entry points
+    /// need this — only the final per-band reduction differs. Every intermediate matrix is carved
+    /// from the caller-owned bump arena (see [`arena_mat`] et al.) rather than the heap: the per-op
+    /// `&a * &b` result arrays become writes into reused arena memory, so this is allocation-free.
+    /// The per-element ops and their order are unchanged, so the map is bit-identical.
     ///
     /// [`arena_mat`]: crate::convolution_2d::arena_mat
-    fn measure_patch_similarity(
+    fn compute_sim_map<'a>(
         &self,
-        ref_patch: &mut ndarray::Array2<f64>,
-        deg_patch: &mut ndarray::Array2<f64>,
-        arena: &Arena,
-    ) -> PatchSimilarityResult {
-        let window = arr2(&[
-            [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
-            [0.0838251475442633, 0.619485845753726, 0.0838251475442633],
-            [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
-        ]);
+        ref_patch: &Array2<f64>,
+        deg_patch: &Array2<f64>,
+        arena: &'a Arena,
+    ) -> ArrayViewMut2<'a, f64> {
+        let window = &self.window;
 
         let k = [0.01, 0.03];
         let c1 = (k[0] * self.intensity_range).powf(2.0);
         let c3 = (k[1] * self.intensity_range).powf(2.0) / 2.0;
 
         // Compute mu
-        let mu_ref = perform_valid_2d_conv_with_boundary(&window, &*ref_patch, arena);
-        let mu_deg = perform_valid_2d_conv_with_boundary(&window, &*deg_patch, arena);
+        let mu_ref = perform_valid_2d_conv_with_boundary(window, ref_patch, arena);
+        let mu_deg = perform_valid_2d_conv_with_boundary(window, deg_patch, arena);
 
         let ref_mu_squared = binop_into(arena, &mu_ref, &mu_ref, |a, b| a * b);
         let deg_mu_squared = binop_into(arena, &mu_deg, &mu_deg, |a, b| a * b);
         let mu_r_mu_d = binop_into(arena, &mu_ref, &mu_deg, |a, b| a * b);
 
-        let ref_neuro_sq = binop_into(arena, &*ref_patch, &*ref_patch, |a, b| a * b);
-        let deg_neuro_sq = binop_into(arena, &*deg_patch, &*deg_patch, |a, b| a * b);
+        let ref_neuro_sq = binop_into(arena, ref_patch, ref_patch, |a, b| a * b);
+        let deg_neuro_sq = binop_into(arena, deg_patch, deg_patch, |a, b| a * b);
 
         // Compute sigmas
         let conv2_ref_neuro_squared =
-            perform_valid_2d_conv_with_boundary(&window, &ref_neuro_sq, arena);
+            perform_valid_2d_conv_with_boundary(window, &ref_neuro_sq, arena);
         let sigma_ref_squared =
             binop_into(arena, &conv2_ref_neuro_squared, &ref_mu_squared, |a, b| a - b);
 
         let conv2_deg_neuro_squared =
-            perform_valid_2d_conv_with_boundary(&window, &deg_neuro_sq, arena);
+            perform_valid_2d_conv_with_boundary(window, &deg_neuro_sq, arena);
         let sigma_deg_squared =
             binop_into(arena, &conv2_deg_neuro_squared, &deg_mu_squared, |a, b| a - b);
 
-        let ref_neuro_deg = binop_into(arena, &*ref_patch, &*deg_patch, |a, b| a * b);
+        let ref_neuro_deg = binop_into(arena, ref_patch, deg_patch, |a, b| a * b);
         let conv2_ref_neuro_deg =
-            perform_valid_2d_conv_with_boundary(&window, &ref_neuro_deg, arena);
+            perform_valid_2d_conv_with_boundary(window, &ref_neuro_deg, arena);
 
         let sigma_r_d = binop_into(arena, &conv2_ref_neuro_deg, &mu_r_mu_d, |a, b| a - b);
 
@@ -103,7 +102,32 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
 
         let structure =
             binop_into(arena, &structure_numerator, &structure_denominator, |a, b| a / b);
-        let sim_map = binop_into(arena, &intensity, &structure, |a, b| a * b);
+        binop_into(arena, &intensity, &structure, |a, b| a * b)
+    }
+}
+
+impl Default for NeurogramSimiliarityIndexMeasure {
+    fn default() -> Self {
+        Self {
+            intensity_range: 1.0,
+            window: nsim_window(),
+        }
+    }
+}
+
+impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
+    /// Full NSIM: the mean and standard deviation of each frequency band, the energy of the
+    /// degraded patch, and the scalar similarity. Called O(patches) times (the backtrace + fine
+    /// realignment), so its three per-band result `Vec`s are a negligible allocation; the hot
+    /// alignment slide loop uses [`measure_similarity_score`](Self::measure_similarity_score)
+    /// instead, which needs none of them.
+    fn measure_patch_similarity(
+        &self,
+        ref_patch: &mut ndarray::Array2<f64>,
+        deg_patch: &mut ndarray::Array2<f64>,
+        arena: &Arena,
+    ) -> PatchSimilarityResult {
+        let sim_map = self.compute_sim_map(&*ref_patch, &*deg_patch, arena);
 
         let freq_band_deg_energy: Array1<f64> = deg_patch
             .mean_axis(Axis(1))
@@ -122,6 +146,31 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
             freq_band_deg_energy.to_vec(),
             mean_freq_band_means,
         )
+    }
+
+    /// Just the scalar similarity — the only field the O(patches × window) alignment slide loop
+    /// consumes. Allocation-free: the `sim_map` scratch is arena, and the per-band `Array1`s +
+    /// three result `Vec`s of the full measure are skipped entirely. The score is the grand mean of
+    /// `sim_map` computed as `mean_axis(Axis(1)).mean()` — per-band (row) means, then the mean of
+    /// those — reproduced with the identical left-to-right sums and the identical two divisions, so
+    /// it is bit-identical to `measure_patch_similarity(..).similarity` (asserted in the tests).
+    fn measure_similarity_score(
+        &self,
+        ref_patch: &mut ndarray::Array2<f64>,
+        deg_patch: &mut ndarray::Array2<f64>,
+        arena: &Arena,
+    ) -> f64 {
+        let sim_map = self.compute_sim_map(&*ref_patch, &*deg_patch, arena);
+        let (nrows, ncols) = sim_map.dim();
+        let ncols_f = ncols as f64;
+        // `sim_map.row(i).sum()` sums the contiguous row left-to-right, exactly as
+        // `sum_axis(Axis(1))[i]` does; dividing by `ncols` matches `mean_axis`. Accumulating those
+        // row means in order and dividing by `nrows` matches the subsequent `Array1::mean`.
+        let mut acc = 0.0;
+        for i in 0..nrows {
+            acc += sim_map.row(i).sum() / ncols_f;
+        }
+        acc / nrows as f64
     }
 }
 
@@ -166,5 +215,35 @@ mod tests {
             expected_result[2],
             epsilon = 0.0001
         );
+    }
+
+    /// The zero-alloc scalar path must be *bit-exactly* the full measure's `.similarity`, since the
+    /// alignment DP compares these scores against each other and a stored cumulative sum.
+    #[test]
+    fn score_matches_full_similarity_bit_exact() {
+        let arena = Arena::default();
+        let sim = NeurogramSimiliarityIndexMeasure::default();
+        // A non-trivial multi-band, multi-frame pair (so per-band means genuinely differ).
+        let r = Array2::from_shape_vec(
+            (4, 5),
+            vec![
+                0.9, 0.2, 0.5, 0.7, 0.1, 0.4, 0.8, 0.3, 0.6, 0.05, 0.55, 0.15, 0.95, 0.35, 0.75,
+                0.25, 0.65, 0.45, 0.85, 0.02,
+            ],
+        )
+        .unwrap();
+        let d = Array2::from_shape_vec(
+            (4, 5),
+            vec![
+                0.8, 0.25, 0.55, 0.6, 0.15, 0.35, 0.7, 0.4, 0.5, 0.1, 0.6, 0.2, 0.9, 0.3, 0.8, 0.3,
+                0.6, 0.5, 0.8, 0.05,
+            ],
+        )
+        .unwrap();
+
+        let full = sim.measure_patch_similarity(&mut r.clone(), &mut d.clone(), &arena);
+        let score = sim.measure_similarity_score(&mut r.clone(), &mut d.clone(), &arena);
+
+        assert_eq!(score, full.similarity, "scalar path must equal full .similarity bit-for-bit");
     }
 }

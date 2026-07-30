@@ -173,7 +173,7 @@ impl ComparisonPatchesSelector {
     ) {
         let ref_frame_index = ref_patch_indices[patch_index];
 
-        let mut sim_result;
+        let mut sim_similarity: f64;
 
         let mut slide_offset = ref_frame_index as i32 - search_window;
         while slide_offset <= ref_frame_index as i32 + search_window {
@@ -189,14 +189,16 @@ impl ComparisonPatchesSelector {
 
                 break;
             }
-            // Per-candidate reset: the previous slide's NSIM scratch is dead (only the owned
-            // `sim_result.similarity` was carried into the DP table), so reclaim the arena — this
-            // is the hot O(patches × window) loop, so it dominates the allocation win.
+            // Per-candidate reset: the previous slide's NSIM scratch is dead (only the scalar score
+            // was carried into the DP table), so reclaim the arena — this is the hot
+            // O(patches × window) loop, so it dominates the allocation win.
             arena.reset();
             let deg_patch = &mut deg_patches[slide_offset as usize];
-            sim_result = self
+            // Scalar-only: this loop uses nothing but the score, so skip the full measure's per-band
+            // result `Vec`s entirely — with the arena scratch, the whole loop is allocation-free.
+            sim_similarity = self
                 .sim_comparator
-                .measure_patch_similarity(ref_patch, deg_patch, &*arena);
+                .measure_similarity_score(ref_patch, deg_patch, &*arena);
             let mut past_slide_offset = -1;
             let mut highest_sim = f64::MIN;
 
@@ -229,7 +231,7 @@ impl ComparisonPatchesSelector {
                     back_offset -= 1;
                 }
 
-                sim_result.similarity += highest_sim;
+                sim_similarity += highest_sim;
 
                 // If the current reference patch experienced a packet loss, then the
                 // cumulative similarity score till the previous patch might be more and
@@ -237,14 +239,14 @@ impl ComparisonPatchesSelector {
                 // in the degraded window.
 
                 if cumulative_similarity_dp[patch_index - 1][slide_offset as usize]
-                    > sim_result.similarity
+                    > sim_similarity
                 {
-                    sim_result.similarity =
+                    sim_similarity =
                         cumulative_similarity_dp[patch_index - 1][slide_offset as usize];
                     past_slide_offset = slide_offset;
                 }
             }
-            cumulative_similarity_dp[patch_index][slide_offset as usize] = sim_result.similarity;
+            cumulative_similarity_dp[patch_index][slide_offset as usize] = sim_similarity;
             backtrace[patch_index][slide_offset as usize] = past_slide_offset as usize;
             slide_offset += 1;
         }

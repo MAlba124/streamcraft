@@ -67,4 +67,14 @@ pub trait PatchSimilarityComparator {
         deg_patch: &mut ImagePatch<f64>,
         arena: &Arena,
     ) -> PatchSimilarityResult;
+
+    /// Just the scalar similarity score — the only field the O(patches × window) alignment slide
+    /// loop uses. Zero heap allocation (all scratch is arena; the per-band result `Vec`s of the
+    /// full measure are skipped). Bit-identical to `measure_patch_similarity(..).similarity`.
+    fn measure_similarity_score(
+        &self,
+        ref_patch: &mut ImagePatch<f64>,
+        deg_patch: &mut ImagePatch<f64>,
+        arena: &Arena,
+    ) -> f64;
 }
