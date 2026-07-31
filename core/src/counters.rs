@@ -201,6 +201,12 @@ pub struct TapHandle {
     /// Signed ns of the current run's base time; [`crate::time::BASE_UNSET`] until
     /// the first `run()`. Signed: a seek rebase can push it negative.
     base: Arc<AtomicI64>,
+    /// The run's buffer pools, for [`pool`](Self::pool) — a live read of slot occupancy and
+    /// recycling health. Cheap: each `Pool` is an `Arc` handle and `stats()` is six relaxed loads.
+    /// Empty until `run()` builds them.
+    pools: Arc<std::sync::Mutex<Vec<crate::memory::Pool>>>,
+    /// The pause/idle transport, for [`scheduler`](Self::scheduler).
+    idle: Arc<crate::pipeline::PauseShared>,
 }
 
 impl TapHandle {
@@ -208,8 +214,41 @@ impl TapHandle {
         entries: Vec<(&'static str, Arc<ElementCounters>)>,
         clock: Arc<std::sync::Mutex<Arc<dyn Clock>>>,
         base: Arc<AtomicI64>,
+        pools: Arc<std::sync::Mutex<Vec<crate::memory::Pool>>>,
+        idle: Arc<crate::pipeline::PauseShared>,
     ) -> Self {
-        Self { entries: entries.into(), clock, base }
+        Self { entries: entries.into(), clock, base, pools, idle }
+    }
+
+    /// Buffer-pool health, live (spec: Debuggability).
+    ///
+    /// `slot_allocations` flat across a run is the zero-steady-state-allocation goal met;
+    /// climbing means the pool is missing and heap-allocating. `outstanding` against `max_slots`
+    /// is the backpressure headroom — sitting at the cap is why a producer's `try_alloc` is
+    /// returning `None`. `high_water` is what the run actually needed, i.e. how to size `--pool`.
+    /// Summed across the run's pools when per-element slot overrides created more than one:
+    /// counters add, `high_water` and `outstanding` add (they are concurrent occupancies), and
+    /// `max_slots` adds to keep `outstanding / max_slots` readable as overall headroom.
+    pub fn pool(&self) -> crate::memory::PoolStats {
+        let pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        pools.iter().fold(crate::memory::PoolStats::default(), |mut acc, p| {
+            let s = p.stats();
+            acc.slot_allocations += s.slot_allocations;
+            acc.acquires += s.acquires;
+            acc.recycles += s.recycles;
+            acc.high_water += s.high_water;
+            acc.outstanding += s.outstanding;
+            acc.max_slots = acc.max_slots.saturating_add(s.max_slots);
+            acc
+        })
+    }
+
+    /// Scheduler idle accounting, live (spec: Debuggability) — see
+    /// [`SchedulerStats`](crate::pipeline::SchedulerStats). `tick_expiries` near zero means every
+    /// wake was published; a large fraction means work is being made available without announcing
+    /// it, and the pipeline is stepping at the 10 ms backstop rather than at the data rate.
+    pub fn scheduler(&self) -> crate::pipeline::SchedulerStats {
+        self.idle.scheduler_stats()
     }
 
     /// The number of elements this handle observes.

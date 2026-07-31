@@ -106,7 +106,7 @@ pub struct StopHandle {
 /// park at their pass gate after `Event::Paused` is delivered, and a sink whose
 /// clock wait expires mid-pause blocks in `ctx.wait_until` until resume — then
 /// re-derives its deadline from the shifted base.
-pub(crate) struct PauseShared {
+pub struct PauseShared {
     /// Lock-free mirror of `inner.paused` for the per-pass / per-render fast checks
     /// (one relaxed load); the mutex is only taken when it reads `true` or on
     /// transitions.
@@ -136,6 +136,34 @@ pub(crate) struct PauseShared {
     /// (two lock-free atomics) whenever nobody is parked, which is the common
     /// streaming state.
     idle_waiters: AtomicU32,
+    /// Scheduler idle accounting (spec: Debuggability). Three relaxed counters on the *parking*
+    /// path only — never on the per-buffer path — so they are always on: a group that is about to
+    /// sleep for 10 ms can afford a clock read and three increments. See [`SchedulerStats`].
+    parks: AtomicU64,
+    park_tick_expiries: AtomicU64,
+    parked_ns: AtomicU64,
+}
+
+/// What the scheduler did while it was *not* working — the cheap counterpart to the per-element
+/// latency histograms (spec: Debuggability).
+///
+/// `tick_expiries` is the number that matters. A park normally ends because someone published work
+/// via `bump_idle`; one that instead runs out the 10 ms backstop means the wake was never
+/// published, so the pipeline advanced at the tick rate rather than at the data rate. A healthy run
+/// has `tick_expiries` near zero. If it is a large fraction of `parks`, some path is making work
+/// available without announcing it, and `parked_ns` against wall time says what that cost.
+///
+/// This is the instrument that was missing: two transport defects fixed in `d95b53d`, and an AC-3
+/// pipeline found spending 90% of its wall time asleep, were all invisible to the existing
+/// per-element histograms and took an strace to find.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerStats {
+    /// Times a group parked with nothing to do.
+    pub parks: u64,
+    /// Parks that ended on the backstop tick rather than on a published wake.
+    pub tick_expiries: u64,
+    /// Total wall time groups spent parked, summed across groups.
+    pub parked_ns: u64,
 }
 
 struct PauseInner {
@@ -162,6 +190,9 @@ impl PauseShared {
             stop,
             idle_epoch: AtomicU64::new(0),
             idle_waiters: AtomicU32::new(0),
+            parks: AtomicU64::new(0),
+            park_tick_expiries: AtomicU64::new(0),
+            parked_ns: AtomicU64::new(0),
         })
     }
 
@@ -215,12 +246,30 @@ impl PauseShared {
         self.idle_waiters.fetch_add(1, Ordering::SeqCst);
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if self.idle_epoch.load(Ordering::SeqCst) == epoch && !self.stop.load(Ordering::Acquire) {
-            let _ = self
+            // Accounting sits on the sleeping path only: a group about to wait 10 ms can afford a
+            // clock read and three relaxed adds, and `tick_expiries` is what makes a missed wake
+            // visible without a profiler (see `SchedulerStats`).
+            let at = std::time::Instant::now();
+            let (_guard, wait) = self
                 .cond
                 .wait_timeout(guard, std::time::Duration::from_millis(10))
                 .unwrap_or_else(|e| e.into_inner());
+            self.parks.fetch_add(1, Ordering::Relaxed);
+            self.parked_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if wait.timed_out() {
+                self.park_tick_expiries.fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.idle_waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Read the idle accounting (cumulative across this pipeline's lifetime).
+    pub fn scheduler_stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            parks: self.parks.load(Ordering::Relaxed),
+            tick_expiries: self.park_tick_expiries.load(Ordering::Relaxed),
+            parked_ns: self.parked_ns.load(Ordering::Relaxed),
+        }
     }
 
     /// The hot-path check: one relaxed load while playing.
@@ -584,6 +633,11 @@ pub struct Pipeline {
     /// `run()` still reads the run's actual timeline (run() replaces the default
     /// with a sink-provided device clock).
     clock_shared: Arc<Mutex<Arc<dyn Clock>>>,
+    /// The run's distinct buffer pools, published for [`TapHandle::pool`]. Like the clock, these
+    /// are built inside `run()` — after an observer may already hold a tap — so they arrive
+    /// through a shared cell rather than a field. Plural because per-element slot overrides make
+    /// their own recycling domains.
+    pools_shared: Arc<Mutex<Vec<Pool>>>,
     /// Verbosity rank for build-phase pipeline diagnostics (add/link/negotiation/
     /// clock/groups — spec: Debuggability, "framework internals log too"), from
     /// `PROFLUENS_DEBUG` under the pseudo-target `pipeline` (or the bare global
@@ -675,6 +729,7 @@ impl Pipeline {
             log_queue_cap: 1024,
             clock: Arc::clone(&default_clock),
             clock_shared: Arc::new(Mutex::new(default_clock)),
+            pools_shared: Arc::new(Mutex::new(Vec::new())),
             build_log_rank,
             clock_explicit: false,
             base_shared: Arc::clone(&base_shared),
@@ -1300,6 +1355,7 @@ impl Pipeline {
                 None => pool.clone(),
             })
             .collect();
+        *self.pools_shared.lock().unwrap_or_else(|e| e.into_inner()) = distinct_pools.clone();
         let credits = self.credits;
         let factory: ReactorFactory = self
             .reactor_factory
@@ -1936,6 +1992,8 @@ impl Pipeline {
                 .collect(),
             Arc::clone(&self.clock_shared),
             Arc::clone(&self.base_shared),
+            Arc::clone(&self.pools_shared),
+            Arc::clone(&self.pause),
         )
     }
 

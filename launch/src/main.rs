@@ -21,6 +21,10 @@
 //!
 //! `launch` switches:
 //! * `--counters`      — after the run, print each element's `CounterSnapshot`.
+//! * `--health`        — after the run, print buffer-pool and scheduler-idle health: whether the
+//!                       pool reached a steady state, how much slot headroom was left, and whether
+//!                       the scheduler was woken by published work or fell back on its backstop
+//!                       tick. Costs nothing to collect, so it works on any pipeline unprompted.
 //! * `--log LEVEL`     — enable stderr logging up to LEVEL (error/warn/info/debug/trace).
 //! * `--no-progress`   — suppress the live progress line (auto-off when stderr isn't a tty).
 //! * `--pool SIZExN`   — size the buffer pool: `SIZE` bytes per slot, `N` slots (e.g.
@@ -87,6 +91,10 @@ struct Options {
     launch: String,
     dump_dot: bool,
     counters: bool,
+    /// `--health`: print buffer-pool and scheduler-idle health after the run. Always cheap — the
+    /// counters behind it are relaxed adds on the pool and on the scheduler's *parking* path, never
+    /// on the per-buffer path — so unlike `--trace` it needs nothing enabled up front.
+    health: bool,
     /// `--trace`: enable latency tracing and print per-element histograms after the
     /// run (p50/p90/p99/max of process time, ring residency, sink wait overshoot).
     trace: bool,
@@ -117,6 +125,7 @@ fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
         "launch" | "dot" => {
             let dump_dot = sub == "dot";
             let mut counters = false;
+    let mut health = false;
             let mut trace = false;
             let mut log = None;
             let mut no_progress = false;
@@ -129,6 +138,7 @@ fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
                 }
                 match arg.as_str() {
                     "--counters" => counters = true,
+            "--health" => health = true,
                     "--trace" => trace = true,
                     "--no-progress" => no_progress = true,
                     "--log" => {
@@ -157,6 +167,7 @@ fn parse_args(args: Vec<String>) -> Result<Cmd, String> {
                 launch: words.join(" "),
                 dump_dot,
                 counters,
+                health,
                 trace,
                 log,
                 no_progress,
@@ -218,6 +229,7 @@ fn usage() -> String {
      \n\
      launch switches:\n\
      \x20 --counters        print each element's counters after the run\n\
+\x20 --health          pool + scheduler idle health after the run (always cheap)\n\
 \x20 --trace           latency tracing: per-element p50/p99/max after the run\n\
 \x20 (interactive)     while running on a tty: 'p'⏎ pause/resume, 'q'⏎ stop\n\
      \x20 --log LEVEL       log to stderr up to LEVEL (error/warn/info/debug/trace)\n\
@@ -350,6 +362,9 @@ fn main() -> ExitCode {
     if opts.counters {
         print_counters(&tap, &ids);
     }
+    if opts.health {
+        print_health(&tap);
+    }
     if opts.trace {
         print_latency(&tap, &ids);
     }
@@ -453,6 +468,51 @@ fn fmt_size(bytes: u64) -> String {
 /// Print each element's counters after the run (spec: Debuggability — per-element
 /// counters). Reads through the [`TapHandle`](profluens_core::counters::TapHandle),
 /// the zero-streaming-cost stats pull.
+/// Buffer-pool and scheduler-idle health — the two questions a profiler would otherwise be needed
+/// for: "did this pipeline settle into recycling memory, and was it ever asleep when it should have
+/// been working?"
+///
+/// `slot_allocations` flat against `acquires` is the zero-steady-state-allocation goal met; a large
+/// ratio means the pool is missing and falling back to the heap. `outstanding` against `max_slots`
+/// is the backpressure headroom, and `high_water` is what the run actually needed — i.e. how to size
+/// `--pool`. On the scheduler side `tick expiries` is the number to read: a park normally ends
+/// because work was published, so expiries near zero is healthy, while a large fraction means some
+/// path made work available without announcing it and the pipeline stepped at the 10 ms backstop
+/// rather than at the data rate.
+fn print_health(tap: &profluens_core::counters::TapHandle) {
+    let pool = tap.pool();
+    let sched = tap.scheduler();
+    println!("pool:");
+    println!(
+        "  slots {:>10} outstanding  {:>10} high water  {:>10} capacity",
+        pool.outstanding, pool.high_water, pool.max_slots
+    );
+    let reuse = if pool.acquires > 0 {
+        100.0 * (1.0 - pool.slot_allocations as f64 / pool.acquires as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "  {:>10} acquires  {:>10} recycles  {:>10} heap allocations ({reuse:.1}% reused)",
+        pool.acquires, pool.recycles, pool.slot_allocations
+    );
+    println!("scheduler:");
+    let expiry_pct =
+        if sched.parks > 0 { 100.0 * sched.tick_expiries as f64 / sched.parks as f64 } else { 0.0 };
+    println!(
+        "  {:>10} parks  {:>10} tick expiries ({expiry_pct:.1}%)  {:>10.3}s parked",
+        sched.parks,
+        sched.tick_expiries,
+        sched.parked_ns as f64 / 1e9
+    );
+    if expiry_pct > 25.0 && sched.parks > 20 {
+        println!(
+            "  note: most parks ended on the backstop tick, not on published work — the pipeline \
+             was stepping at the tick rate rather than the data rate."
+        );
+    }
+}
+
 fn print_counters(tap: &profluens_core::counters::TapHandle, ids: &[profluens_core::id::ElementId]) {
     println!("counters:");
     for &id in ids {
