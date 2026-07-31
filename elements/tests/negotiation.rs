@@ -24,6 +24,7 @@ use profluens_core::format::{
 use profluens_core::id::PadId;
 use profluens_core::pipeline::Pipeline;
 use profluens_core::time::Timestamp;
+use profluens_elements::flow::Queue;
 
 const ZERO_LAT: LatencyDesc = LatencyDesc {
     min: Timestamp::ZERO,
@@ -231,6 +232,178 @@ impl Element for TextSink {
         Ok(())
     }
     fn stop(&mut self, _ctx: &mut Ctx) {}
+}
+
+// --- A source pinned to 44.1k/s16 — the *other* side of a wildcard transport. ------
+
+static PIN_FIELDS: [FieldDesc; 2] = [
+    FieldDesc { field: "rate", allowed: ConstraintDesc::Eq(ValueDesc::Int(44100)), preferred: None },
+    FieldDesc {
+        field: "sample",
+        allowed: ConstraintDesc::Eq(ValueDesc::Id("s16")),
+        preferred: None,
+    },
+];
+static PIN_OFFERS: [OfferDesc; 1] = [OfferDesc { family: "audio/raw", fields: &PIN_FIELDS }];
+static PIN_PADS: [PadDesc; 1] = [PadDesc {
+    name: "src",
+    direction: Direction::Src,
+    offers: &PIN_OFFERS,
+    dynamic: false,
+    validate: None,
+}];
+static PIN_DESC: ElementDesc = ElementDesc {
+    name: "pinned44k",
+    pads: &PIN_PADS,
+    props: &[],
+    sched: SchedHint::Active,
+    inputs: InputPolicy::None,
+    latency: ZERO_LAT,
+    make_default: None,
+};
+
+#[derive(Default)]
+struct PinnedSrc;
+
+impl Element for PinnedSrc {
+    fn desc(&self) -> &'static ElementDesc {
+        &PIN_DESC
+    }
+    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+        Ok(())
+    }
+    fn process(&mut self, _ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
+        Ok(Flow::Eos)
+    }
+    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+        Ok(())
+    }
+    fn stop(&mut self, _ctx: &mut Ctx) {}
+}
+
+// --- A flexible sink: 44.1k or 48k, prefers 48k. ----------------------------------
+
+static FLEX_RATES: [ValueDesc; 2] = [ValueDesc::Int(44100), ValueDesc::Int(48000)];
+static FLEX_FIELDS: [FieldDesc; 2] = [
+    FieldDesc {
+        field: "rate",
+        allowed: ConstraintDesc::Set(&FLEX_RATES),
+        preferred: Some(ValueDesc::Int(48000)),
+    },
+    FieldDesc {
+        field: "sample",
+        allowed: ConstraintDesc::Eq(ValueDesc::Id("s16")),
+        preferred: None,
+    },
+];
+static FLEX_OFFERS: [OfferDesc; 1] = [OfferDesc { family: "audio/raw", fields: &FLEX_FIELDS }];
+static FLEX_PADS: [PadDesc; 1] = [PadDesc {
+    name: "sink",
+    direction: Direction::Sink,
+    offers: &FLEX_OFFERS,
+    dynamic: false,
+    validate: None,
+}];
+static FLEX_DESC: ElementDesc = ElementDesc {
+    name: "flexsink",
+    pads: &FLEX_PADS,
+    props: &[],
+    sched: SchedHint::Active,
+    inputs: InputPolicy::Single,
+    latency: ZERO_LAT,
+    make_default: None,
+};
+
+#[derive(Default)]
+struct FlexSink;
+
+impl Element for FlexSink {
+    fn desc(&self) -> &'static ElementDesc {
+        &FLEX_DESC
+    }
+    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+        Ok(())
+    }
+    fn process(&mut self, _ctx: &mut Ctx, _inputs: Inputs<'_>) -> Result<Flow, Error> {
+        Ok(Flow::Ok)
+    }
+    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+        Ok(())
+    }
+    fn stop(&mut self, _ctx: &mut Ctx) {}
+}
+
+/// A wildcard transport must not let two pads that could never link directly link
+/// *through* it (spec: Formats — the wildcard adopts the peer's family, it does not
+/// launder a contradiction). `pinned44k ! queue ! audiotestsink(48k)` fails directly, so
+/// it must fail through the queue too: a `queue` copies buffers verbatim, so 44.1 kHz
+/// samples arriving at a pad whose negotiated format says 48 kHz is silent corruption —
+/// wrong pitch and duration, with every element downstream believing the wrong rate.
+#[test]
+fn wildcard_transport_cannot_launder_a_contradiction() {
+    // The direct link is rejected — that is the behaviour the indirection must preserve.
+    {
+        let mut p = Pipeline::new();
+        let src = p.add(PinnedSrc);
+        let snk = p.add(AudioSink { seen: Arc::new(Mutex::new(None)) });
+        assert!(p.link((src, "src"), (snk, "sink")).is_err(), "44.1k src vs 48k sink");
+    }
+
+    let seen = Arc::new(Mutex::new(None));
+    let mut p = Pipeline::new();
+    let src = p.add(PinnedSrc);
+    let q = p.add(Queue::new());
+    let snk = p.add(AudioSink { seen: Arc::clone(&seen) });
+
+    let a = p.link((src, "src"), (q, "sink")).expect("wildcard adopts the src's 44.1k");
+    // The queue's *other* pad is now bound to 44.1k by the first link; a 48k-only sink
+    // shares no format with it.
+    let b = p.link((q, "src"), (snk, "sink"));
+
+    let rate = p.field_id("rate").expect("rate field seen");
+    match b {
+        Ok(b) => {
+            let up = p.negotiated(a).expect("upstream edge fixed").get(rate);
+            let down = p.negotiated(b).expect("downstream edge fixed").get(rate);
+            panic!(
+                "queue laundered a contradiction: it carries {up:?} in and claims {down:?} out, \
+                 yet copies buffers verbatim"
+            );
+        }
+        Err(e) => {
+            // The message has to name the *reason*, or it is baffling: the queue's own pad
+            // offers a wildcard, which by construction matches everything.
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("other wildcard pad"),
+                "error should explain the transport is already bound, got: {msg}"
+            );
+        }
+    }
+}
+
+/// The binding propagates *through* the transport: a flexible peer downstream of a bound
+/// `queue` must take the format the queue is already carrying, not its own preference.
+/// This is the half that a "just reject contradictions" check would miss — the sink here
+/// prefers 48 kHz and would happily have fixated there.
+#[test]
+fn wildcard_transport_propagates_its_bound_format() {
+    let mut p = Pipeline::new();
+    let src = p.add(PinnedSrc); // 44.1k only
+    let q = p.add(Queue::new());
+    let snk = p.add(FlexSink); // 44.1k or 48k, prefers 48k
+
+    let a = p.link((src, "src"), (q, "sink")).expect("queue adopts 44.1k");
+    let b = p.link((q, "src"), (snk, "sink")).expect("flexible sink accepts 44.1k");
+
+    let rate = p.field_id("rate").expect("rate field seen");
+    assert_eq!(p.negotiated(a).unwrap().get(rate), Some(Value::Int(44100)), "upstream edge");
+    assert_eq!(
+        p.negotiated(b).unwrap().get(rate),
+        Some(Value::Int(44100)),
+        "the queue carries 44.1k through — the sink's 48k preference must not win, since the \
+         queue does not resample"
+    );
 }
 
 #[test]

@@ -263,6 +263,34 @@ impl OfferDesc {
     }
 }
 
+impl FormatOffer {
+    /// The offer that admits **exactly** `fixed` and nothing else: its family, every field
+    /// it fixes pinned with [`Constraint::Eq`].
+    ///
+    /// Used to re-express a format a *pure wildcard transport* is already carrying as an
+    /// offer, so the transport's remaining pads negotiate through the ordinary
+    /// [`intersect`] path instead of adopting a second, contradictory format (spec:
+    /// Formats — a wildcard adopts the peer's family, it does not launder a
+    /// contradiction). Leaks its field table exactly as [`OfferDesc::lower`] does, and for
+    /// the same reason: the count is bounded by the graph, not the stream.
+    pub fn pinned_to(fixed: &FixedFormat) -> FormatOffer {
+        let lowered: Vec<FieldConstraint> = fixed
+            .fields()
+            .iter()
+            .map(|(field, v)| FieldConstraint {
+                field: *field,
+                allowed: Constraint::Eq(*v),
+                preferred: Some(*v),
+            })
+            .collect();
+        FormatOffer {
+            family: fixed.family,
+            fields: Box::leak(lowered.into_boxed_slice()),
+            wildcard: false,
+        }
+    }
+}
+
 /// The solve's per-edge output: flat POD, memcmp-comparable, cheap to copy into
 /// batch/edge metadata. Up to 16 fixed fields inline (spill-to-blob is TODO).
 #[derive(Clone)]

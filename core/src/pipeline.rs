@@ -21,7 +21,9 @@ use crate::ctx::{Ctx, SeekState};
 use crate::element::{Direction, Element, ElementDesc, Flow, SchedHint, Template};
 use crate::error::Error;
 use crate::event::Event;
-use crate::format::{negotiate, FieldConstraint, FixedFormat, OfferDesc, Value, Vocabulary};
+use crate::format::{
+    negotiate, FieldConstraint, FixedFormat, FormatOffer, OfferDesc, Value, Vocabulary,
+};
 use crate::id::{ElementId, FieldId, FormatId, GroupId, Interner, LinkId, PadId, ValueId};
 use crate::io::{Reactor, ReactorFactory, SyncReactor};
 use crate::log::{log_channel, Level, LevelFilter, Log, LogDrain};
@@ -979,20 +981,32 @@ impl Pipeline {
         // field/value names once, here), then intersect. Offer menus are `'static`
         // (static pads *and* dynamic ones, whose `add_pad` menu is `&'static`), so the
         // borrows survive the two `&mut self` lowering passes.
+        // A pure wildcard transport (queue, tee) already carrying a format on one of its
+        // wildcard pads offers *that format* here, not a fresh wildcard — see
+        // `transport_binding`. Computed before lowering: these formats are already interned.
+        let src_bound = self.transport_binding(src.0, src_pad);
+        let sink_bound = self.transport_binding(sink.0, sink_pad);
+
         let src_offers_desc = self
             .pad_offers(src.0, src_pad)
             .ok_or(Error::Todo("link: no offers for src pad"))?;
-        let src_offers: Vec<_> = src_offers_desc
-            .iter()
-            .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
-            .collect();
+        let src_offers: Vec<_> = match &src_bound {
+            Some(f) => vec![FormatOffer::pinned_to(f)],
+            None => src_offers_desc
+                .iter()
+                .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
+                .collect(),
+        };
         let sink_offers_desc = self
             .pad_offers(sink.0, sink_pad)
             .ok_or(Error::Todo("link: no offers for sink pad"))?;
-        let sink_offers: Vec<_> = sink_offers_desc
-            .iter()
-            .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
-            .collect();
+        let sink_offers: Vec<_> = match &sink_bound {
+            Some(f) => vec![FormatOffer::pinned_to(f)],
+            None => sink_offers_desc
+                .iter()
+                .map(|o| o.lower(&mut self.formats, &mut self.fields, &mut self.values))
+                .collect(),
+        };
 
         self.plog(
             Level::Debug,
@@ -1015,12 +1029,31 @@ impl Pipeline {
                 Level::Debug,
                 format_args!("link FAILED {sn}.{sp} -> {dn}.{dp}: no common format"),
             );
-            Error::Resource(format!(
+            let base = format!(
                 "link: no common format between {sn}.{sp} and {dn}.{dp} \
                  (offers {:?} vs {:?}) — negotiation failed",
                 self.families(&src_offers),
                 self.families(&sink_offers),
-            ))
+            );
+            // Name the transport binding when one is in play: "no common format" is
+            // baffling for a pad whose own offer is a wildcard, which by construction
+            // matches everything. The reason it did not is that the element's other pad
+            // already fixed the format.
+            Error::Resource(match (&src_bound, &sink_bound) {
+                (Some(f), _) => format!(
+                    "{base} — {sn} already carries {} on its other wildcard pad (a pure \
+                     transport hands buffers on unchanged, so it cannot also offer {dp}'s \
+                     format)",
+                    self.format_display(f)
+                ),
+                (_, Some(f)) => format!(
+                    "{base} — {dn} already carries {} on its other wildcard pad (a pure \
+                     transport hands buffers on unchanged, so it cannot also offer {sp}'s \
+                     format)",
+                    self.format_display(f)
+                ),
+                _ => base,
+            })
         })?;
 
         self.plog(
@@ -1043,6 +1076,44 @@ impl Pipeline {
             format,
         });
         Ok(id)
+    }
+
+    /// Whether pad `pad` on `el` offers a wildcard — i.e. adopts its peer's family
+    /// (spec: Formats).
+    fn pad_is_wildcard(&self, el: ElementId, pad: usize) -> bool {
+        self.pad_offers(el, pad).is_some_and(|o| o.iter().any(|o| o.is_wildcard()))
+    }
+
+    /// The format an already-linked **sibling wildcard pad** on `el` is carrying, if any.
+    ///
+    /// An element with more than one wildcard pad is a *pure transport* — `queue` and `tee`
+    /// are the two, and both hand buffers on verbatim. So a format fixed on one of their
+    /// wildcard pads is fixed on all of them, and the remaining links must negotiate against
+    /// it rather than adopt a second, contradictory one. Without this, `src(44100) ! queue !
+    /// sink(48000)` linked happily with 44.1 kHz on the queue's input edge and 48 kHz on its
+    /// output edge: a pair of pads that could never link directly, laundered through a
+    /// transport that does not resample. Downstream then believed the wrong rate — wrong
+    /// pitch, wrong duration, no error anywhere.
+    ///
+    /// Returns `None` when the sibling edge carries the interned wildcard family itself
+    /// (two wildcards linked to each other before either met a concrete peer): that format
+    /// fixes nothing, so there is nothing to propagate. Such a pair stays unconstrained —
+    /// link-time negotiation is a forward pass and does not re-fixate a settled edge. In
+    /// practice the chain still binds, because linking `src ! queue1` first pins `queue1`,
+    /// which pins `queue2` in turn.
+    fn transport_binding(&self, el: ElementId, pad: usize) -> Option<FixedFormat> {
+        if !self.pad_is_wildcard(el, pad) {
+            return None;
+        }
+        let any_family = self.formats.get(crate::format::WILDCARD).map(FormatId);
+        self.edges
+            .iter()
+            .find(|e| {
+                (e.src == el && e.src_pad != pad && self.pad_is_wildcard(el, e.src_pad))
+                    || (e.sink == el && e.sink_pad != pad && self.pad_is_wildcard(el, e.sink_pad))
+            })
+            .filter(|e| Some(e.format.family) != any_family)
+            .map(|e| e.format.clone())
     }
 
     /// Verify a named pad exists on an element with the expected direction, returning its
