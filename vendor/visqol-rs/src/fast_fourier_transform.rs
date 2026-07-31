@@ -52,6 +52,10 @@ fn inverse_1d_real<'a>(
 }
 
 /// Performs an inverse fast fourier transform on `input_signal` using `fft_manager` and returns the real-valued signal in the time domain.
+///
+/// Only the reference Hilbert path uses the complex form (see [`crate::envelope`]); the production
+/// paths take [`inverse_1d_conj_sym`], whose real output these zero-imaginary values just wrap.
+#[cfg(test)]
 pub fn inverse_1d<'a>(
     fft_manager: &mut FftManager,
     input_signal: &mut [Complex64],

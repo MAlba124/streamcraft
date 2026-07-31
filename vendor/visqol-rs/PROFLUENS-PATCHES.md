@@ -219,3 +219,45 @@ after every individual change, and identical bit patterns at four degradation le
 `transcode --target 4.5` search produces a **byte-identical** `.opus` (`769f03f8…`) and the same 15-point
 rate-distortion table. In-crate tests: **37 pass**, the same 11 fail as on pristine 0.3.1 (they load
 `test_data/*.wav`, which 0.3.1 `exclude`s from the package).
+
+## The envelope's Hilbert transform was a no-op — `envelope.rs`
+
+**Why.** A `perf` profile of one comparison put ~13% of cycles in `rustfft`. Reading the call chain
+to see whether a real-input transform was worth it turned up something better: two of the three FFTs
+were computing the identity.
+
+**The finding.** `calculate_upper_env` is written as an analytic-signal envelope — zero the negative
+frequencies, double the positive ones, inverse-transform, take `.norm()`. But
+`fast_fourier_transform::inverse_1d` keeps only the **real** part of the inverse transform and leaves
+the imaginary part at zero, so the `.norm()` reduces to `|re|` — and the real part of the analytic
+signal is the input itself. The imaginary part, the Hilbert transform that would make this an
+envelope, is discarded. (Upstream 0.3.1 says so in a comment: *"This makes very little sense but oh
+well…"*.) The whole two-FFT round trip therefore computes `|2·(x − mean) − 1e-6| + mean`.
+
+Measured on `fixtures/out/audio.wav`: the FFT formulation and that closed form agree to **3.3e-16
+absolute, 1.3e-15 relative** — pure round-trip rounding.
+
+**The change.** `calculate_upper_env` is the closed form, a single pass with no transform, no scratch
+arena and no `FftManager`. The FFT formulation stays as `calculate_upper_env_via_hilbert` under
+`#[cfg(test)]`, the executable reference; `matches_hilbert_reference` asserts both that the envelopes
+agree (< 1e-14) and that `calculate_best_lag` picks the identical lag from them — the envelope's only
+consumer is that lag. `globally_align_into` loses two of its three phases, so its scratch arena now
+sizes for the cross-correlation alone.
+
+**Result.** MOS-LQO **bit-identical across a nine-point 6–96 kbps degradation sweep**, and
+`transcode --target 4.5` still emits a byte-identical `.opus`. Wall time for two 30 s comparisons
+**7.0–7.9 s → 5.9–7.3 s**; maxrss **497 → 429 MiB** (the 2 M-point rustfft plan's twiddle tables are
+never built). The 15-point parallel search drops 1.4 s → 1.1 s. In-crate tests 38 pass (the same 11
+`test_data`-loading failures as pristine 0.3.1).
+
+**Caveat, and why the reference is kept.** This is bit-identical *by measurement*, not by
+construction: the envelope differs from the old one at the 1e-16 level, and it feeds an integer
+arg-max, which is insensitive to that unless two lag candidates tie to within 1e-15. If `inverse_1d`
+is ever fixed to carry the imaginary part — which is what reference ViSQOL intends — this fast path
+becomes wrong and `calculate_upper_env_via_hilbert` must take over. The doc comment says so at the
+call site.
+
+**Profile after** (perf, self time): gammatone filterbank 36.5%, NSIM convolution 27.6% (kernel +
+padding), `rustfft` 9%, ndarray `Zip`/`map_inplace` 11.5%. A real-input (r2c/c2r) cross-correlation
+would take roughly half the remaining 9% and shrink the scratch chunk from `40·F` to ~`24·F` bytes,
+but needs a new dependency and is genuinely not bit-identical — held.

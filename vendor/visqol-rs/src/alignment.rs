@@ -47,9 +47,8 @@ pub fn align_and_truncate_into(
 /// be the same length.
 ///
 /// The two envelopes must both be live for the cross-correlation, so they are carved from `out`;
-/// everything else is transform scratch, carved from `scratch` and reclaimed between the three
-/// phases. (`scratch` is reset here, not by the caller, so the reset discipline lives next to the
-/// allocations it reclaims.)
+/// the cross-correlation's own transform buffers go in `scratch`, which is reset here (rather than
+/// by the caller) so the reset discipline lives next to the allocations it reclaims.
 pub fn globally_align_into(
     ref_samples: &[f64],
     deg_samples: &[f64],
@@ -58,26 +57,21 @@ pub fn globally_align_into(
     out: &Arena,
     scratch: &mut Arena,
 ) -> Option<f64> {
-    // A bump arena reuses chunks across `reset` only while the *next* phase's allocations still fit
-    // the chunks it already holds — and the cross-correlation's buffers are about twice the
-    // envelope's, so the three phases below would otherwise each grow their own set (~360 MiB of
-    // chunks for a 30 s clip, where the largest single phase needs ~230). Force one chunk sized for
-    // that largest phase up front by carving and immediately dropping it; every phase then fits in
-    // it and the resets genuinely recycle. Purely a sizing hint: if it is short the arena just grows.
-    //
-    // The dominating phase is the cross-correlation — two `fft_points`-long complex spectra (the
-    // product overwrites one of them) plus one real output, i.e. `2*16 + 8` bytes per point.
+    // Size `scratch`'s first chunk for the whole cross-correlation up front, by carving and
+    // immediately dropping it: a bump arena only reuses a chunk across `reset` while the next use
+    // still fits it, so without the hint successive comparisons would each grow a fresh set. The
+    // cross-correlation needs two `fft_points`-long complex spectra (the product overwrites one of
+    // them) plus one real output — `2*16 + 8` bytes per point. Purely a sizing hint: if it is short
+    // the arena just grows.
     let longest = ref_samples.len().max(deg_samples.len()).max(1);
     let hint = 40 * crate::math_utils::next_pow_two(2 * longest - 1);
     scratch.reset();
     let _ = scratch.alloc(hint, align_of::<num::complex::Complex64>());
 
-    scratch.reset();
-    let ref_upper_env = envelope::calculate_upper_env(ref_samples, out, &*scratch)?;
-    scratch.reset();
-    let deg_upper_env = envelope::calculate_upper_env(deg_samples, out, &*scratch)?;
-    scratch.reset();
+    let ref_upper_env = envelope::calculate_upper_env(ref_samples, out)?;
+    let deg_upper_env = envelope::calculate_upper_env(deg_samples, out)?;
 
+    scratch.reset();
     let best_lag = xcorr::calculate_best_lag(ref_upper_env, deg_upper_env, &*scratch)?;
 
     out_deg.clear();
