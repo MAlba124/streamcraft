@@ -2711,8 +2711,20 @@ fn run_group(
         .collect();
 
     // Start each element; hand any file it registered to this group's reactor.
+    //
+    // A failure part-way through must still stop the elements that already started. The `?` used
+    // to return straight out of `run_group`, past the reverse stop loop at the end, so elements
+    // `0..k` that had opened a device or an fd in `start()` never saw `stop()` and leaked it —
+    // while `element.rs` promises authors that "start/stop/drop run exactly once, in order" and
+    // that they "can't get it wrong", so nobody writes a `Drop` guard. Unwind in reverse, the same
+    // order the normal teardown uses.
     for i in 0..m {
-        elements[i].start(&mut ctxs[i])?;
+        if let Err(e) = elements[i].start(&mut ctxs[i]) {
+            for j in (0..i).rev() {
+                elements[j].stop(&mut ctxs[j]);
+            }
+            return Err(e);
+        }
         if let Some(f) = ctxs[i].take_registration() {
             reactor.set_file(ids[i], f);
         }
