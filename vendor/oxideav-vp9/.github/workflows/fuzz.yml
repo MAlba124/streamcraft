@@ -1,0 +1,30 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The reusable
+# workflow auto-discovers targets from fuzz/fuzz_targets/*.rs and splits
+# the 30-minute budget across them:
+#
+#   * frame_header — panic-surface fuzz for the §6.2 uncompressed-
+#     header walker plus the frame-walk that hangs off it (§6.3
+#     compressed-header slice + §6.4 tile-size prefix chain).
+#   * compressed_header — panic-surface fuzz for the §6.3 intra and
+#     inter compressed-header walkers over the §9.2 Boolean decoder,
+#     with a leading control byte steering the caller-supplied flags.
+#
+# No oracle harnesses — arbitrary bytes in, "no panic / no overflow /
+# no OOM" out; Err is a correct answer for garbage input. Seed corpus
+# entries (corpus/*/seed-*) are derived from the crate's synthetic
+# test vectors and tracked in git; fuzz-grown corpus persists across
+# runs via the workflow's actions/cache step.
+
+on:
+  schedule:
+    - cron: "37 6 * * *"   # daily 06:37 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

@@ -770,8 +770,6 @@ version = "0.2.6"
 [[package]]
 name = "oxideav-vp9"
 version = "0.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "118175e8415f482b83723cbb84e95343b97681806d2d0cee63531bf077615b22"
 dependencies = [
  "oxideav-core",
 ]
@@ -860,6 +858,7 @@ dependencies = [
  "pf-flac",
  "pf-vp8",
  "profluens-core",
+ "profluens-elements",
 ]
 
 [[package]]
@@ -898,6 +897,7 @@ name = "pf-ogg"
 version = "0.1.0"
 dependencies = [
  "profluens-core",
+ "profluens-elements",
 ]
 
 [[package]]

@@ -39,6 +39,13 @@ use pf_vp9::Vp9Dec;
 /// as its raw coded payload (IVF container stripped). ~1 KB.
 const KEYFRAME: &[u8] = include_bytes!("fixtures/keyframe_64x48.vp9");
 
+/// A real **1280x720** VP9 keyframe, generated the same way. 720 = 22*32 + 16, so the
+/// bottom superblock row carries transform blocks that legally overhang the frame —
+/// the case that made upstream `oxideav-vp9` 0.0.12 panic in `intra.rs` (`Plane::set`,
+/// "index out of bounds: the len is 921600 but the index is 921600"). Fixed by the
+/// vendored store clamp; see `vendor/oxideav-vp9/PROFLUENS-PATCHES.md`. ~28 KB.
+const KEYFRAME_720P: &[u8] = include_bytes!("fixtures/keyframe_1280x720.vp9");
+
 const W: i64 = 64;
 const H: i64 = 48;
 /// One frame per 33 ms — a stand-in container timestamp grid.
@@ -226,7 +233,19 @@ fn reference_decode(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
 }
 
 fn run_pipeline(frames: Vec<Vec<u8>>) -> (Pipeline, Arc<Mutex<Recorded>>) {
+    run_pipeline_with_pool(frames, None)
+}
+
+/// `slot_size`: `Some(n)` raises the pool slot size — a 720p I420 frame is 1.32 MB and
+/// the default 128 KB slot cannot hold it.
+fn run_pipeline_with_pool(
+    frames: Vec<Vec<u8>>,
+    slot_size: Option<usize>,
+) -> (Pipeline, Arc<Mutex<Recorded>>) {
     let mut p = Pipeline::new();
+    if let Some(n) = slot_size {
+        p.set_pool(n, 4);
+    }
     let (sink, recorded) = PlaneRecordSink::new();
     let src = p.add(FrameSrc::new(frames));
     let dec = p.add(Vp9Dec::new());
@@ -428,6 +447,131 @@ fn flush_start_drops_the_pending_carry_and_no_stale_frame_leaks() {
     let ht = h.vocabulary().field_id("height").unwrap();
     assert_eq!(ann.get(w), Some(Value::Int(W)));
     assert_eq!(ann.get(ht), Some(Value::Int(H)));
+}
+
+// ---- frame-edge regression (vendor/oxideav-vp9/PROFLUENS-PATCHES.md) ------------
+
+/// §6.4.21 `residual( )` admits a transform block on its **top-left corner only**
+/// (`if ( startX < maxx && startY < maxy )`), so a block anchored on the last in-range
+/// row legally overhangs the frame; the §8.5.1 / §8.6.2 store steps are written against
+/// an unbounded `CurrFrame`. Upstream 0.0.12 allocated `CurrFrame` at exactly
+/// `(MiCols*8) x (MiRows*8)` and panicked on the overhang — **every 1280x720 frame**,
+/// plus 1920x1080 / 640x360 / 320x240. This is the regression guard: 720p must decode.
+#[test]
+fn decodes_720p_whose_height_is_not_a_multiple_of_32() {
+    const W720: i64 = 1280;
+    const H720: i64 = 720;
+    let reference = reference_decode(&[KEYFRAME_720P.to_vec()]);
+    assert_eq!(reference.len(), 1, "the 720p keyframe decodes via the library");
+    assert_eq!(reference[0].len(), (W720 * H720 * 3 / 2) as usize, "I420 720p");
+
+    let (_p, recorded) =
+        run_pipeline_with_pool(vec![KEYFRAME_720P.to_vec()], Some(reference[0].len()));
+    let rec = recorded.lock().unwrap();
+    assert_eq!(rec.frames.len(), 1, "the 720p keyframe was emitted");
+    assert_eq!(rec.frames[0].1, reference[0], "720p planes byte-identical to the reference");
+    let (w, h, pf) = rec.format.clone().expect("format announced");
+    assert_eq!((w, h), (W720, H720));
+    assert_eq!(pf, "i420");
+}
+
+/// The clamp must not perturb the interior. This pins the committed 64x48 fixture's
+/// decode to the digest it produced **before** the vendored patch — an unaffected size
+/// (no transform block overhangs its plane), so any change here means the store clamp
+/// leaked into in-range samples.
+#[test]
+fn unaffected_size_decode_is_byte_identical_to_the_pre_patch_digest() {
+    let d = decode_intra_frame(KEYFRAME).expect("64x48 decodes").to_planar_bytes();
+    assert_eq!(d.len(), 4608, "64x48 I420");
+    // FNV-1a 64, computed from the unpatched oxideav-vp9 0.0.12 decode.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in &d {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    assert_eq!(
+        hash, 0xbb01_7b0b_7af9_dd2e,
+        "64x48 decode changed — the frame-edge store clamp perturbed in-range samples"
+    );
+}
+
+/// ffmpeg oracle over the frame-edge sizes: decoding must be byte-exact against
+/// ffmpeg's own VP9 decoder, not merely panic-free. Covers both overhang directions —
+/// `height % 32 != 0` (which panicked upstream) and `width % 32 != 0` (which silently
+/// wrapped the overhang into the next plane row, corrupting visible samples).
+/// Skips cleanly when ffmpeg is unavailable or lacks a VP9 encoder.
+#[test]
+fn frame_edge_sizes_decode_byte_exactly_against_ffmpeg() {
+    // (w, h): the first two exercise the horizontal overhang alone, the next three the
+    // vertical one, then both at once, then a control with neither.
+    let sizes: &[(u32, u32)] =
+        &[(200, 128), (360, 640), (1280, 720), (640, 360), (1920, 1080), (360, 240), (640, 480)];
+    for &(w, h) in sizes {
+        let Some((frames, oracle)) = ffmpeg_vp9_keyframes_and_decode(w, h) else {
+            eprintln!("ffmpeg (with libvpx-vp9) not available; skipping oracle test");
+            return;
+        };
+        let frame_len = (w * h) as usize * 3 / 2;
+        assert_eq!(oracle.len(), frames.len() * frame_len, "{w}x{h}: ffmpeg raw size");
+        for (i, coded) in frames.iter().enumerate() {
+            let got = decode_intra_frame(coded)
+                .unwrap_or_else(|e| panic!("{w}x{h} frame {i} failed to decode: {e}"))
+                .to_planar_bytes();
+            let want = &oracle[i * frame_len..(i + 1) * frame_len];
+            assert!(
+                got == want,
+                "{w}x{h} frame {i}: decode differs from ffmpeg's VP9 decoder \
+                 (w%32={}, h%32={})",
+                w % 32,
+                h % 32
+            );
+        }
+    }
+}
+
+/// Encode `width x height` `testsrc2` as keyframe-only VP9 and return both the coded
+/// frames and **ffmpeg's own decode** of them (packed I420, all frames concatenated) —
+/// the oracle for [`frame_edge_sizes_decode_byte_exactly_against_ffmpeg`].
+fn ffmpeg_vp9_keyframes_and_decode(width: u32, height: u32) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let ivf = dir.join(format!("pf_vp9_edge_{width}x{height}_{pid}.ivf"));
+    let raw = dir.join(format!("pf_vp9_edge_{width}x{height}_{pid}.yuv"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&ivf);
+        let _ = std::fs::remove_file(&raw);
+    };
+    let encoded = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc2=size={width}x{height}:rate=1:duration=2"))
+        .args([
+            "-frames:v", "2", "-c:v", "libvpx-vp9", "-crf", "40", "-b:v", "0",
+            "-g", "1", "-pix_fmt", "yuv420p", "-f", "ivf",
+        ])
+        .arg(&ivf)
+        .status()
+        .ok()
+        .is_some_and(|s| s.success());
+    if !encoded {
+        cleanup();
+        return None;
+    }
+    let decoded = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(&ivf)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&raw)
+        .status()
+        .ok()
+        .is_some_and(|s| s.success());
+    if !decoded {
+        cleanup();
+        return None;
+    }
+    let frames = demux_ivf(&std::fs::read(&ivf).ok()?);
+    let oracle = std::fs::read(&raw).ok()?;
+    cleanup();
+    Some((frames, oracle))
 }
 
 /// Encode `width x height` `testsrc2` as keyframe-only VP9 (`-g 1`) into IVF via
