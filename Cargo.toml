@@ -45,6 +45,7 @@ members = [
     "nvr",
     "text",
     "play",
+    "engine",
     "player-ui",
     "ac3",
     "avi",

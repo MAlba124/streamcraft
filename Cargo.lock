@@ -956,6 +956,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-player-engine"
+version = "0.1.0"
+dependencies = [
+ "pf-flac",
+ "pf-pipewire",
+ "pf-play",
+ "profluens-core",
+ "profluens-elements",
+]
+
+[[package]]
 name = "pf-present"
 version = "0.1.0"
 dependencies = [
