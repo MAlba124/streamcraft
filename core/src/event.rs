@@ -5,7 +5,7 @@
 //! delivers through the same `event()` door at the same batch-boundary safe point.
 
 use crate::format::{FixedFormat, Value};
-use crate::memory::Memory;
+use crate::memory::{Memory, Pool};
 use crate::time::Timestamp;
 
 pub enum Event {
@@ -123,9 +123,73 @@ impl TagList {
     }
 }
 
+/// The **streaming** face of [`TagList`]: a metadata parser (Vorbis comments, ID3, an iTunes atom, a
+/// Matroska `Tags` element) pushes entries into a sink as it decodes them, instead of building an
+/// owned list it may not need. A caller that *does* want the owned list drives the parser with
+/// [`TagListSink`]; one that only wants to print, count or forward a subset supplies its own sink
+/// and never materialises a `TagList` at all.
+///
+/// `key` is the same canonical vocabulary `TagList` stores: the Vorbis-comment field name,
+/// uppercase (`TITLE`, `ARTIST`, `ALBUM`, `TRACKNUMBER`, `DISCNUMBER`,
+/// `REPLAYGAIN_TRACK_GAIN`, …), so a sink may match on it directly. Parsers of other tag
+/// dialects map into it before calling (an ID3 `TPE1` arrives as `ARTIST`).
+///
+/// **Every `&str` and `&[u8]` argument is borrowed for the call only** — typically a window into
+/// the parser's transient read buffer or a scratch arena, both reused before the next entry. A sink
+/// that retains anything past the call must copy it (that is precisely what `TagListSink::picture`
+/// does). Parsers call these once per parsed entry, in file order, and a key may repeat.
+pub trait TagSink {
+    /// A text tag, e.g. `("TITLE", "Enough")`.
+    fn text(&mut self, key: &str, value: &str);
+
+    /// An attached picture (cover art): its MIME type and the encoded image bytes.
+    fn picture(&mut self, mime: &str, data: &[u8]);
+}
+
+/// The [`TagSink`] that materialises an owned [`TagList`] — what a demuxer/parser element uses when
+/// it is going to emit [`Event::Tags`].
+///
+/// Text goes straight to [`TagList::add`]. Pictures are the reason this needs a [`Pool`]: their
+/// bytes are borrowed from the parser's read buffer, so they are copied into pool memory, and a
+/// cover image is large enough that the copy should come from the pipeline's allocator rather than
+/// the heap (spec: Memory — a large image takes `acquire_exact`'s right-sized fallback, so it never
+/// pins a slot).
+pub struct TagListSink<'p> {
+    pool: &'p Pool,
+    tags: TagList,
+}
+
+impl<'p> TagListSink<'p> {
+    /// An empty sink drawing picture buffers from `pool`.
+    pub fn new(pool: &'p Pool) -> Self {
+        Self { pool, tags: TagList::new() }
+    }
+
+    /// The tags accumulated so far, ready for [`Event::Tags`].
+    pub fn finish(self) -> TagList {
+        self.tags
+    }
+}
+
+impl TagSink for TagListSink<'_> {
+    fn text(&mut self, key: &str, value: &str) {
+        self.tags.add(key, value);
+    }
+
+    fn picture(&mut self, mime: &str, data: &[u8]) {
+        let mut mem = self.pool.acquire_exact(data.len());
+        // A recycled buffer arrives holding stale bytes and its capacity may exceed the request, so
+        // write the exact prefix and trim to it — the `[..n]`-then-`set_len(n)` idiom.
+        mem.as_mut_full()[..data.len()].copy_from_slice(data);
+        mem.set_len(data.len());
+        self.tags.add_picture(mime, mem);
+    }
+}
+
 #[cfg(test)]
 mod tag_tests {
-    use super::TagList;
+    use super::{TagList, TagListSink, TagSink};
+    use crate::memory::Pool;
 
     #[test]
     fn text_tags_add_get_iter() {
@@ -160,5 +224,29 @@ mod tag_tests {
         a.merge(b);
         assert_eq!(a.get("TITLE"), Some("A"));
         assert_eq!(a.get("GENRE"), Some("Ambient"));
+    }
+
+    #[test]
+    fn tag_list_sink_materialises_text_and_pictures() {
+        let pool = Pool::bounded(64, 4);
+        let art = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+
+        let mut sink = TagListSink::new(&pool);
+        sink.text("TITLE", "Enough");
+        sink.text("artist", "Fred again..");
+        sink.picture("image/jpeg", &art);
+        let tags = sink.finish();
+
+        assert_eq!(tags.get("TITLE"), Some("Enough"));
+        // `text` goes through `TagList::add`, so the key is uppercased on the way in.
+        assert_eq!(tags.get("ARTIST"), Some("Fred again.."));
+        assert_eq!(tags.pictures().len(), 1);
+
+        // The picture's bytes were copied into pool memory and trimmed to the input length — the
+        // buffer's capacity may be larger, so `data()` must still be exactly what was pushed.
+        let pic = &tags.pictures()[0];
+        assert_eq!(&*pic.mime, "image/jpeg");
+        assert_eq!(pic.data.len(), art.len());
+        assert_eq!(pic.data.data(), &art);
     }
 }
