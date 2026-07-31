@@ -117,6 +117,137 @@ enum Phase {
 /// The default TimestampScale when Info omits it (Matroska `basics`: 1_000_000 ns/tick).
 const DEFAULT_TIMESTAMP_SCALE: u64 = 1_000_000;
 
+/// Smallest pooled payload capacity, as a shift: 64 B. Anything shorter rounds up to it —
+/// below that the per-buffer bookkeeping costs more than the bytes saved.
+const CLASS_MIN_SHIFT: u32 = 6;
+/// Largest pooled payload capacity, as a shift: 64 MiB. A single frame longer than this is
+/// pathological (a whole Cluster would have to be bigger still); it gets an exact-size
+/// allocation and is dropped rather than pooled, so one freak frame cannot pin 64 MiB.
+const CLASS_MAX_SHIFT: u32 = 26;
+/// Quarter-octave size classes from [`CLASS_MIN_SHIFT`] to [`CLASS_MAX_SHIFT`] inclusive:
+/// 4 steps per power of two, so a class is at most 25 % larger than the frame it serves.
+const CLASSES: usize = ((CLASS_MAX_SHIFT - CLASS_MIN_SHIFT) * 4 + 1) as usize;
+
+/// Floor on the payload free-list's byte budget (see [`MatroskaReader::free_budget`]): a
+/// consumer feeding tiny chunks still gets a pool big enough to be worth having.
+const MIN_FREE_BYTES: usize = 256 << 10;
+/// Hard ceiling on the payload free-list's byte budget — the reader's entire steady-state
+/// payload retention, whatever the stream does. Only reachable by a consumer that already
+/// held that much in flight at once (see [`FreePool`]); it exists so an adversarial
+/// multi-hundred-MiB Cluster cannot turn the pool into a memory bomb.
+const MAX_FREE_BYTES: usize = 32 << 20;
+
+/// The recycled frame-payload buffers, bucketed by capacity size class.
+///
+/// ## Why classes, and why a byte budget
+/// One [`MatroskaReader::push`] decodes *everything* the pushed bytes contain before the
+/// consumer drains a single frame, so the number of payload buffers in flight at once is
+/// "one push's worth of frames" — thousands for a multi-MiB read, not the dozens an
+/// intuitive small cap suggests. A free-list capped by *count* is therefore blown through on
+/// the first push and every frame past the cap allocates; capping by *retained bytes* tracks
+/// the thing that actually matters (memory) and lets the list hold as many buffers as the
+/// stream's frame sizes imply.
+///
+/// The buffers only ever enter this pool by having been handed out and given back, so the
+/// pool self-limits to the consumer's own high-water mark: it can only reach a size the
+/// consumer already had simultaneously live. The budget
+/// ([`free_budget`](MatroskaReader::free_budget)) is the point past which we stop *retaining*
+/// that, and is the reader's entire steady-state payload footprint.
+///
+/// Bucketing keeps `take` O(1). The demux interleaves small (audio) and large (video
+/// keyframe) frames through one pool, so a flat list needs a linear best-fit scan to avoid
+/// handing a large frame a small buffer — which is fine over 64 entries and quadratic over
+/// several thousand. Quantizing capacity to quarter-octave classes makes "the smallest
+/// buffer that fits" a bucket index instead of a search, and makes capacities *repeat*: a
+/// buffer allocated at a class size is recycled into that same class forever (a
+/// `clear` + `extend_from_slice` within capacity never reallocates), so the pool converges
+/// on exactly the multiset of sizes the stream uses.
+struct FreePool {
+    /// One LIFO stack per size class; class `i` holds buffers of capacity `class_size(i)`.
+    class: [Vec<Vec<u8>>; CLASSES],
+    /// Total retained capacity across every class, bounded by the caller's `budget`.
+    bytes: usize,
+}
+
+/// Round `n` up to the next quarter-octave size class (`{4,5,6,7}/4 × 2^k`), the capacity a
+/// pooled buffer serving an `n`-byte frame is given. Never less than `1 << CLASS_MIN_SHIFT`.
+/// Anything past the pooled range is returned unrounded — the caller ([`FreePool::take`])
+/// hands those an exact-size allocation, and rounding a near-`usize::MAX` length (which a
+/// malformed block could ask for) would overflow rather than answer.
+fn class_size(n: usize) -> usize {
+    let min = 1usize << CLASS_MIN_SHIFT;
+    if n <= min {
+        return min;
+    }
+    if n > 1usize << CLASS_MAX_SHIFT {
+        return n;
+    }
+    // `ilog2` is the octave; a quarter of it is the rounding step, so the result is one of
+    // 4,5,6,7 (or 8 = the next octave's 4) steps — at most 25 % over `n`.
+    let step = 1usize << (n.ilog2() - 2);
+    n.div_ceil(step) * step
+}
+
+/// The bucket for a capacity: the class it can *serve*, i.e. rounded **down** to a
+/// quarter-octave. For a capacity that is itself a [`class_size`] (every buffer the pool
+/// allocates) that is its own class; for a `Vec` that reached the pool another way it floors,
+/// never rounds up — rounding up would promise room the buffer does not have. `cap` must be
+/// within `1 << CLASS_MIN_SHIFT ..= 1 << CLASS_MAX_SHIFT`, which both callers check.
+fn class_index(cap: usize) -> usize {
+    let k = cap.ilog2();
+    // `cap >> (k - 2)` is 4..=7 for any `cap` in `[2^k, 2^(k+1))`.
+    let quarter = (cap >> (k - 2)) - 4;
+    ((k - CLASS_MIN_SHIFT) * 4) as usize + quarter
+}
+
+impl FreePool {
+    // COLD: one-time construction of the empty per-class stacks; `Vec::new` does not allocate.
+    #[allow(clippy::disallowed_methods)]
+    const fn new() -> Self {
+        Self { class: [const { Vec::new() }; CLASSES], bytes: 0 }
+    }
+
+    /// Take a payload buffer with room for `needed` bytes, so the caller's
+    /// `extend_from_slice` never reallocates. Pops the exact class first, then the (at most
+    /// four, i.e. ≤ 2× oversized) classes above it, so a momentarily-empty class reuses a
+    /// near-fit instead of allocating; only a real miss allocates, and it allocates *at the
+    /// class size* so the buffer lands back in its own bucket on recycle.
+    // The one `Vec::with_capacity` here is the cold miss path: a size the stream has not shown
+    // before, or a pool that has not warmed. Steady state is a `pop`.
+    #[allow(clippy::disallowed_methods)]
+    fn take(&mut self, needed: usize) -> Vec<u8> {
+        let size = class_size(needed);
+        if size > (1usize << CLASS_MAX_SHIFT) {
+            return Vec::with_capacity(needed); // unpooled freak frame; dropped on recycle
+        }
+        let first = class_index(size);
+        for c in first..(first + 5).min(CLASSES) {
+            if let Some(b) = self.class[c].pop() {
+                self.bytes -= b.capacity();
+                return b;
+            }
+        }
+        Vec::with_capacity(size)
+    }
+
+    /// Give a drained frame's buffer back. Dropped (freed) once the pool has `budget` bytes of
+    /// capacity retained, or if the buffer is outside the pooled size range.
+    fn put(&mut self, buf: Vec<u8>, budget: usize) {
+        let cap = buf.capacity();
+        if !((1usize << CLASS_MIN_SHIFT)..=(1usize << CLASS_MAX_SHIFT)).contains(&cap)
+            || self.bytes + cap > budget
+        {
+            return;
+        }
+        // Every buffer the pool handed out already has a class-sized capacity (`take`
+        // allocates at the class size and `clear` + `extend` within capacity never grows it),
+        // so this is its own class; a `Vec` that reached us another way floors to the class it
+        // can actually serve.
+        self.bytes += cap;
+        self.class[class_index(cap)].push(buf);
+    }
+}
+
 /// Incremental Matroska structure reader. Feed bytes with [`push`](Self::push); read the
 /// discovered [`tracks`](Self::tracks) once [`tracks_ready`](Self::tracks_ready); drain
 /// decoded [`Frame`]s with [`next_frame`](Self::next_frame). See the module docs for the
@@ -149,9 +280,10 @@ pub struct MatroskaReader {
     /// Recycled frame-payload buffers (profluens patch). [`push_frame`] draws a `Vec<u8>`
     /// from here instead of allocating; a consumer hands each drained frame's buffer back via
     /// [`recycle`](Self::recycle) once done with it, so steady-state framing allocates nothing.
-    /// Bounded, so a stalled consumer cannot grow it without limit. Empty for consumers that
-    /// don't recycle (probing, tests) — they simply keep allocating, which is still correct.
-    free: Vec<Vec<u8>>,
+    /// Bounded by retained bytes ([`free_budget`](Self::free_budget)), so a stalled consumer
+    /// cannot grow it without limit. Empty for consumers that don't recycle (probing, tests)
+    /// — they simply keep allocating, which is still correct.
+    free: FreePool,
     /// Reused scratch for a laced block's per-frame sizes: `decode_block` clears and refills
     /// this in place so a laced block (audio packing) allocates nothing per block. Unlaced
     /// blocks (the common video/one-frame-per-block case) never touch it.
@@ -180,20 +312,35 @@ impl MatroskaReader {
             duration_ns: None,
             cluster_base_tick: 0,
             pending: VecDeque::new(),
-            free: Vec::new(),
+            free: FreePool::new(),
             lace_sizes: Vec::new(),
         }
     }
 
     /// Hand a drained frame's payload buffer back for reuse by a later [`push_frame`], so
     /// steady-state framing allocates nothing (profluens patch). Bounded — buffers past the
-    /// cap are dropped. Recycling is optional: a consumer that never calls this just keeps
-    /// allocating fresh buffers, with identical output.
+    /// pool's byte budget ([`free_budget`](Self::free_budget)) are dropped. Recycling is
+    /// optional: a consumer that never calls this just keeps allocating fresh buffers, with
+    /// identical output.
     pub fn recycle(&mut self, buf: Vec<u8>) {
-        const MAX_FREE: usize = 64;
-        if self.free.len() < MAX_FREE {
-            self.free.push(buf);
-        }
+        self.free.put(buf, self.free_budget());
+    }
+
+    /// How many bytes of payload capacity the recycle pool may retain: **the reader's own
+    /// input-buffer capacity**, clamped to [`MIN_FREE_BYTES`]..=[`MAX_FREE_BYTES`].
+    ///
+    /// That is the proportionate axis rather than a flat constant. One [`push`](Self::push)
+    /// decodes every frame the pushed bytes contain before the consumer drains any, so the
+    /// payload buffers alive at once are exactly the frames carved out of what `buf` holds —
+    /// which is at most one push plus one partial Cluster, and is what `buf.capacity()`
+    /// converges to (it is a high-water mark: [`compact`](Self::compact) drains bytes, never
+    /// capacity). So the rule is "the pool never retains more payload than the reader is
+    /// already buffering of the stream itself": a player feeding 128 KiB pool slots keeps a
+    /// few hundred KiB, a tool feeding 8 MiB chunks keeps ~8 MiB, and neither pays a
+    /// per-frame allocation. The clamp keeps a tiny-chunk consumer's pool usable and caps
+    /// the worst case at [`MAX_FREE_BYTES`].
+    fn free_budget(&self) -> usize {
+        self.buf.capacity().clamp(MIN_FREE_BYTES, MAX_FREE_BYTES)
     }
 
     /// The TimestampScale in ns/tick this stream declared (or the default until Info is read).
@@ -460,7 +607,13 @@ impl MatroskaReader {
     pub fn resync_streaming(&mut self) {
         self.buf.clear();
         self.pos = 0;
-        self.pending.clear();
+        // The pre-seek frames are discarded, but their payload buffers are not: hand them to
+        // the recycle pool instead of freeing them, so a scrubbing consumer does not re-warm
+        // the pool (and pay a per-frame allocation again) after every seek.
+        let budget = self.free_budget();
+        while let Some(frame) = self.pending.pop_front() {
+            self.free.put(frame.data, budget);
+        }
         self.cluster_base_tick = 0;
         // Only resync from a resumable point if discovery already completed; if a seek somehow
         // arrives before the Tracks are known, stay in Discovering (the source will resend the
@@ -661,7 +814,7 @@ fn decode_block_group(
     cluster_base_tick: i64,
     scale: u64,
     out: &mut VecDeque<Frame>,
-    free: &mut Vec<Vec<u8>>,
+    free: &mut FreePool,
     lace_buf: &mut Vec<usize>,
 ) -> Result<(), ReadError> {
     let mut at = 0;
@@ -703,7 +856,7 @@ fn decode_simple_block(
     cluster_base_tick: i64,
     scale: u64,
     out: &mut VecDeque<Frame>,
-    free: &mut Vec<Vec<u8>>,
+    free: &mut FreePool,
     lace_buf: &mut Vec<usize>,
 ) -> Result<(), ReadError> {
     let (_track, _rel, flags, _start) = parse_block_header(data)?;
@@ -727,7 +880,7 @@ fn decode_block(
     scale: u64,
     duration_ns: Option<u64>,
     out: &mut VecDeque<Frame>,
-    free: &mut Vec<Vec<u8>>,
+    free: &mut FreePool,
     lace_buf: &mut Vec<usize>,
 ) -> Result<(), ReadError> {
     let (track, rel_ts, flags, frames_start) = parse_block_header(data)?;
@@ -784,39 +937,19 @@ fn block_pts_ns(cluster_base_tick: i64, rel_ts: i16, scale: u64) -> u64 {
     abs_tick.saturating_mul(scale)
 }
 
-/// Take a recycled payload buffer that already has room for `needed` bytes, so the caller's
-/// `extend_from_slice` never reallocates. The demux interleaves small (audio) and large
-/// (video-keyframe) frames through one free-list, so a plain LIFO `pop()` hands a large frame a
-/// small buffer and forces a grow every time; picking a buffer that already fits — else the
-/// largest one (it grows once, then stays large and is recycled) — makes the steady state
-/// realloc-free. Linear over a bounded (`MAX_FREE` = 64) list, so cheap.
-// The `Vec::new()` fallback is an empty (zero-heap) buffer, hit only before the free-list has
-// warmed; the actual copy allocation is the caller's `extend_from_slice`, which reuses a
-// recycled buffer in steady state.
-#[allow(clippy::disallowed_methods)]
-fn take_fit(free: &mut Vec<Vec<u8>>, needed: usize) -> Vec<u8> {
-    if let Some(i) = free.iter().position(|b| b.capacity() >= needed) {
-        return free.swap_remove(i);
-    }
-    match free.iter().enumerate().max_by_key(|(_, b)| b.capacity()) {
-        Some((i, _)) => free.swap_remove(i),
-        None => Vec::new(),
-    }
-}
-
 /// Queue one decoded frame, copying its bytes out of the shared buffer window into a payload
 /// buffer drawn from `free` (a recycled buffer when the consumer returns them via
 /// [`MatroskaReader::recycle`], else a fresh allocation).
 fn push_frame(
     out: &mut VecDeque<Frame>,
-    free: &mut Vec<Vec<u8>>,
+    free: &mut FreePool,
     track: u64,
     pts_ns: u64,
     duration_ns: Option<u64>,
     keyframe: bool,
     data: &[u8],
 ) {
-    let mut buf = take_fit(free, data.len());
+    let mut buf = free.take(data.len());
     buf.clear();
     buf.extend_from_slice(data);
     out.push_back(Frame {
@@ -1163,6 +1296,68 @@ fn read_float(data: &[u8]) -> Result<f64, ReadError> {
 mod tests {
     use super::*;
     use crate::writer::{MatroskaWriter, TrackConfig};
+
+    /// The payload pool's class arithmetic is the one place a bug would silently hand out a
+    /// buffer too small for its frame (a realloc, not a corruption — but the whole point of
+    /// the pool is that it never happens). Pin the two invariants that matter: a class is
+    /// always ≥ the request and never more than 25 % over it, and `class_index` round-trips
+    /// every class size back to a distinct in-range bucket.
+    #[test]
+    fn payload_size_classes_fit_and_round_trip() {
+        let mut seen = std::collections::BTreeMap::new();
+        // Every size up to 8 KiB, then a sparse sweep to the top of the pooled range.
+        let sizes = (0usize..=8192).chain((13..CLASS_MAX_SHIFT).flat_map(|k| {
+            let b = 1usize << k;
+            [b, b + 1, b + b / 3, b + b / 2, b + b - 1]
+        }));
+        for n in sizes {
+            let size = class_size(n);
+            assert!(size >= n.max(1 << CLASS_MIN_SHIFT), "class {size} too small for {n}");
+            assert!(
+                n <= 1 << CLASS_MIN_SHIFT || size * 4 <= n * 5,
+                "class {size} more than 25% over {n}"
+            );
+            let idx = class_index(size);
+            assert!(idx < CLASSES, "index {idx} out of range for class {size} (n={n})");
+            // The index identifies the class: same size ⇒ same bucket, and no two distinct
+            // class sizes share one — that is what makes a bucket's buffers interchangeable.
+            let prev = seen.insert(idx, size);
+            assert!(prev.is_none_or(|p| p == size), "two class sizes share bucket {idx}");
+        }
+        // A buffer allocated at a class size must land back in its own bucket on recycle —
+        // that is what makes the pool converge instead of fragmenting.
+        let mut pool = FreePool::new();
+        for size in seen.values() {
+            let b = pool.take(*size);
+            assert!(b.capacity() >= *size);
+            pool.put(b, usize::MAX);
+        }
+        for size in seen.values() {
+            let b = pool.take(*size);
+            assert_eq!(b.capacity(), *size, "recycled buffer changed class");
+        }
+    }
+
+    /// The pool is bounded by *retained bytes*, not by a buffer count: past the budget a
+    /// recycled buffer is dropped rather than held.
+    #[test]
+    fn payload_pool_honours_its_byte_budget() {
+        let mut pool = FreePool::new();
+        let budget = 4096;
+        for _ in 0..100 {
+            let mut b = pool.take(1000);
+            b.extend_from_slice(&[0u8; 1000]);
+            pool.put(b, budget);
+        }
+        assert!(pool.bytes <= budget, "retained {} bytes over budget {budget}", pool.bytes);
+        // …and a zero budget retains nothing at all (still correct, just always allocating).
+        let mut pool = FreePool::new();
+        for _ in 0..10 {
+            let b = pool.take(1000);
+            pool.put(b, 0);
+        }
+        assert_eq!(pool.bytes, 0);
+    }
 
     /// Build a minimal single-track MKV stream with the writer for the reader to consume.
     fn build_single(frames: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {

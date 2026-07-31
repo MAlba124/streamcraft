@@ -27,3 +27,7 @@ pf-flac = { path = "../flac" }
 # does not depend on pf-mkv), mirroring vp8/tests/vp8dec.rs.
 pf-vp8 = { path = "../vp8" }
 oxideav-vp8 = { version = "0.2", default-features = false }
+# Only for `examples/read_alloc_check.rs`: the `filesrc` that drives the demuxer through the
+# real scheduler, so the allocation audit measures the pipeline read path and not just the
+# standalone reader. No cycle: profluens-elements depends on core only.
+profluens-elements = { path = "../elements" }
