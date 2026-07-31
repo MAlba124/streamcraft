@@ -340,3 +340,17 @@ to invent or hide a win of this size. Compare builds **interleaved** (`for i in 
 and read `cycles:u`, not wall time; `instructions:u` is deterministic to 8 significant figures and is
 the better signal when the two disagree. A sequential before/after measurement of the previous round
 reported −12.7% cycles where the interleaved figure is −2.3%.
+
+**A negative result worth not repeating.** The row copy shows up as `__memmove_avx_unaligned_erms`
+at ~2.8% of cycles — five convolutions per NSIM call, ~15 M `memcpy` calls of ~160 bytes. Replacing
+the whole-row `copy_from_slice` with constant-size `[f64; 4]` chunk copies (so it stays inline vector
+moves instead of a libc call) measured as **no change**: +1.1% instructions, cycles within noise
+(2 of 5 paired runs favoured it). glibc's small-copy path is already good enough here — that 2.8% is
+the copy itself, not call overhead. Reverted.
+
+**Where the remaining time goes** (perf, self time): gammatone filterbank 38.8%, convolution kernel
+22.3%, `rustfft` 9.6%, the fused NSIM passes 6.0%, everything else below 4%. The convolution is now
+instruction-lean (−20%) but latency/bandwidth bound, so more would take restructuring — e.g. reading
+the input with clamped indices instead of materialising the padded matrix. The gammatone is bounded
+by the metric itself: ViSQOL's 75%-overlapped frames each filter from zero state, so every sample is
+filtered four times, and that is not removable without changing scores.
