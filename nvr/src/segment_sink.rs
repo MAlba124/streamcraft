@@ -116,6 +116,12 @@ pub struct SegmentStats {
     pub segments_closed: u64,
     pub frames_written: u64,
     pub bytes_written: u64,
+    /// AUs dropped waiting for a decodable entry point. Rises at join, then
+    /// stops; a counter that keeps rising is a camera sending no IDRs — i.e. a
+    /// camera that is *silently recording nothing*.
+    pub aus_skipped: u64,
+    /// Media-clock discontinuities that cut a segment.
+    pub discontinuities: u64,
 }
 
 pub struct MkvSegmentSink {
@@ -144,6 +150,8 @@ pub struct MkvSegmentSink {
     /// AUs dropped while waiting for the opening IDR (normal at join) or for
     /// parameter sets (a stream problem if it persists).
     skipped: u64,
+    /// Backward media-clock steps that cut a segment.
+    discontinuities: u64,
 }
 
 impl MkvSegmentSink {
@@ -167,6 +175,7 @@ impl MkvSegmentSink {
             scratch: Pool::new(1),
             stats: Default::default(),
             skipped: 0,
+            discontinuities: 0,
         };
         for nal in sprop {
             s.stash_param_set(nal);
@@ -328,7 +337,10 @@ impl MkvSegmentSink {
         }
         // Duration: last frame's start plus one nominal frame (the mean delta —
         // the true last-frame duration is unknowable from timestamps alone).
-        let span = seg.last_pts - seg.base_pts;
+        // `last_pts` is `pts.max(last_pts)` from `base_pts` up, so this cannot
+        // go negative today; saturating keeps it that way if that ever changes
+        // (a wrap here writes a nonsense Duration into an otherwise fine file).
+        let span = seg.last_pts.saturating_sub(seg.base_pts);
         let mean_delta = span / seg.frames.saturating_sub(1).max(1);
         let sh = seg.writer.finalize_scatter(&mut seg.out);
         let dur = seg.writer.duration_patch(span + mean_delta);
@@ -408,14 +420,56 @@ impl MkvSegmentSink {
                 // Wait for a decodable entry point.
                 if !(keyframe && self.sps.is_some() && self.pps.is_some()) {
                     self.skipped += 1;
+                    // Mirrored so a supervisor can see "this camera is
+                    // delivering AUs but no entry point" — otherwise the sink
+                    // writes nothing, forever, in complete silence.
+                    self.stats.lock().unwrap().aus_skipped = self.skipped;
                     return Ok(());
                 }
                 self.open_segment(ctx, pts)?;
             }
             Some(seg) => {
-                if keyframe && pts.saturating_sub(seg.base_pts) >= self.segment_ns {
-                    // Boundary: this AU opens the NEXT segment once the current
-                    // one has fully drained and finalized.
+                // A *backward* media-clock step ends the segment. The block
+                // timestamp is `pts - base_pts` on `u64`, so a camera NTP
+                // correction, an RTP timestamp restart under an unchanged SSRC,
+                // or an `rtpsession` re-anchor after a source restart wraps it
+                // into a ~584-year Cluster timestamp — a file ffprobe still
+                // reports a plausible Duration for while every seek lands
+                // nowhere. Worse, the rotation test below is `saturating_sub`,
+                // so the segment would then never rotate again: one file grows
+                // until the disk fills. Cutting rebases the next file on the
+                // new clock. `reopen` re-enters `handle_au` with no segment
+                // open, so this AU starts the next file if it is a decodable
+                // entry point and otherwise the sink idles to the next IDR,
+                // exactly as it does at startup.
+                //
+                // A forward jump needs no case of its own: at a keyframe the
+                // ordinary boundary test already cuts (a jump past
+                // `last_pts + segment_ns` implies `pts - base_pts >=
+                // segment_ns`), and cutting at a *non*-keyframe would throw
+                // away a GOP every frame on a sub-0.1 fps camera.
+                let backwards = pts < seg.base_pts;
+                let boundary = keyframe && pts.saturating_sub(seg.base_pts) >= self.segment_ns;
+                if boundary || backwards {
+                    if backwards {
+                        self.discontinuities += 1;
+                        self.stats.lock().unwrap().discontinuities = self.discontinuities;
+                        let element = ctx.element();
+                        ctx.post(profluens_core::bus::BusMessage::Warning {
+                            element,
+                            error: Error::Element {
+                                element,
+                                message: format!(
+                                    "mkvsegmentsink: backward media-clock step \
+                                     (pts {pts} ns, segment base {} ns, last {} ns) — \
+                                     cutting the segment",
+                                    seg.base_pts, seg.last_pts
+                                ),
+                            },
+                        });
+                    }
+                    // This AU opens the NEXT segment once the current one has
+                    // fully drained and finalized.
                     self.carry = Some(buf);
                     self.phase = Phase::Finalizing { reopen: true };
                     return self.drive_finalize(ctx);
@@ -441,8 +495,11 @@ impl MkvSegmentSink {
         let seg = self.seg.as_mut().expect("segment open");
         seg.last_pts = pts.max(seg.last_pts);
         seg.frames += 1;
+        // `saturating_sub`, belt to the discontinuity cut's braces: a decode-order
+        // reorder (B-frames) may legitimately sit a frame or two below the base,
+        // and no arithmetic here may ever wrap into a 584-year Cluster.
         seg.writer
-            .write_frame_scatter(&mut seg.out, 1, pts - seg.base_pts, mem, keyframe)
+            .write_frame_scatter(&mut seg.out, 1, pts.saturating_sub(seg.base_pts), mem, keyframe)
             .map_err(|e| Error::Resource(format!("mkvsegmentsink: frame: {e:?}")))?;
         self.submit_pieces(ctx);
         Ok(())

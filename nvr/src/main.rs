@@ -291,13 +291,20 @@ fn main() {
                         prev[i] = (c.buffers_in, c.buffers_out);
                     }
                 }
-                let (mut segs, mut mb) = (0u64, 0u64);
+                let (mut segs, mut mb, mut skip, mut disc) = (0u64, 0u64, 0u64, 0u64);
                 for h in &seg_stats {
                     let s = h.lock().unwrap();
                     segs += s.segments_closed;
                     mb += s.bytes_written >> 20;
+                    skip += s.aus_skipped;
+                    disc += s.discontinuities;
                 }
-                line.push_str(&format!(" segments={segs} written={mb}MiB"));
+                // `skipped` rising steadily = a camera delivering AUs with no
+                // decodable entry point, i.e. recording nothing; `disc` =
+                // media-clock steps that cut a segment. Both were invisible.
+                line.push_str(&format!(
+                    " segments={segs} written={mb}MiB skipped={skip} disc={disc}"
+                ));
                 eprintln!("{line}");
             }
         });
@@ -342,12 +349,16 @@ fn main() {
         total.segments_closed += s.segments_closed;
         total.frames_written += s.frames_written;
         total.bytes_written += s.bytes_written;
+        total.aus_skipped += s.aus_skipped;
+        total.discontinuities += s.discontinuities;
     }
     println!(
-        "done: {} segments, {} frames, {:.1} MiB",
+        "done: {} segments, {} frames, {:.1} MiB, {} AUs skipped, {} clock discontinuities",
         total.segments_closed,
         total.frames_written,
-        total.bytes_written as f64 / (1024.0 * 1024.0)
+        total.bytes_written as f64 / (1024.0 * 1024.0),
+        total.aus_skipped,
+        total.discontinuities,
     );
     if let Err(e) = result {
         eprintln!("pipeline error: {e:?}");
