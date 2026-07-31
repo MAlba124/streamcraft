@@ -11,6 +11,7 @@
 //! (`core/src/pipeline.rs` — the flush/seek arm). The seek target is computed from the file's
 //! own Cues via `parse_seek_head` + `parse_cues`, so it lands on a real keyframe Cluster.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pf_mkv::ebml::{self, id};
@@ -52,6 +53,12 @@ static SRC_DESC: ElementDesc = ElementDesc {
     make_default: None,
 };
 
+/// Ceiling on the gated spin below, so a demuxer that *cannot* produce `pre_seek_gate` buffers
+/// from the pre-trigger bytes fails the test's own assertion (with the recorded shape) instead
+/// of hanging the suite forever. Reached only when something is genuinely broken: the wait is
+/// normally over in a handful of turns.
+const PRE_SEEK_SPIN_LIMIT: u32 = 100_000;
+
 struct SeekSrc {
     data: Vec<u8>,
     chunk: usize,
@@ -60,6 +67,20 @@ struct SeekSrc {
     seek_byte: usize,
     seek: SeekHandle,
     seeked: bool,
+    /// Sink buffers that must have been *recorded* before the seek is published — zero to seek
+    /// the moment the trigger byte is reached.
+    ///
+    /// Reaching `trigger_byte` only means the bytes were **pushed**; the demuxer downstream may
+    /// not have run yet, and a flush discards whatever is still in flight (the batch carries the
+    /// pre-seek generation stamp and the consumer drops it). So a test that asserts anything
+    /// about *pre-seek* output is otherwise asserting a scheduling coin-flip — which is exactly
+    /// how `seek_reemits_codec_head` came to fail ~1 run in 12, recording only the post-seek
+    /// `[HEAD, frame@40ms]` and no pre-seek pair at all. Gating on the sink's own count makes the
+    /// pre-seek phase a fact rather than a race.
+    pre_seek_gate: usize,
+    /// Buffers recorded by [`RecSink`], published after each `process`.
+    seen: Arc<AtomicUsize>,
+    spins: u32,
 }
 
 impl Element for SeekSrc {
@@ -74,6 +95,16 @@ impl Element for SeekSrc {
         // this call, so no post-seek bytes leak ahead of the FlushStart the scheduler is about
         // to deliver (it observes the generation bump at the next group-loop boundary).
         if !self.seeked && self.pos >= self.trigger_byte {
+            // Let the pre-seek bytes come out the far end before flushing them away. Pushing
+            // nothing while we wait also keeps post-trigger bytes from reaching the demuxer
+            // early — an overshooting final chunk could otherwise carry a whole small Cluster
+            // across the trigger and have its frame emitted *before* the seek.
+            if self.seen.load(Ordering::Acquire) < self.pre_seek_gate
+                && self.spins < PRE_SEEK_SPIN_LIMIT
+            {
+                self.spins += 1;
+                return Ok(Flow::Ok);
+            }
             self.seek.seek(self.seek_byte as u64, profluens_core::time::Timestamp::ZERO);
             self.pos = self.seek_byte;
             self.seeked = true;
@@ -87,7 +118,14 @@ impl Element for SeekSrc {
             None => return Ok(Flow::Ok),
         };
         let cap = buf.memory.capacity();
-        let n = self.chunk.min(cap).min(self.data.len() - self.pos);
+        // While a gate is armed, stop exactly at the trigger rather than overshooting into the
+        // next Cluster (see `pre_seek_gate`). Ungated runs stream as before, byte for byte.
+        let limit = if self.pre_seek_gate > 0 && !self.seeked {
+            self.trigger_byte.min(self.data.len())
+        } else {
+            self.data.len()
+        };
+        let n = self.chunk.min(cap).min(limit.saturating_sub(self.pos));
         buf.memory.as_mut_full()[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
         buf.memory.set_len(n);
         ctx.out(PadId(0)).push(buf);
@@ -131,6 +169,8 @@ struct Recorded {
 
 struct RecSink {
     rec: Arc<Mutex<Recorded>>,
+    /// Published buffer count, for [`SeekSrc::pre_seek_gate`].
+    seen: Arc<AtomicUsize>,
 }
 
 impl Element for RecSink {
@@ -150,6 +190,9 @@ impl Element for RecSink {
                 buf.flags.contains(BufferFlags::DELTA),
             ));
         }
+        // Release-store *after* the push, so a source that observes the count knows the buffers
+        // are in `rec` — not merely in flight.
+        self.seen.store(rec.bufs.len(), Ordering::Release);
         Ok(Flow::Ok)
     }
     fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
@@ -194,9 +237,22 @@ fn seek_index(stream: &[u8]) -> Vec<(u64, u64)> {
 /// Run `seeksrc(stream, seek at `seek_byte` once past `trigger_byte`) ! mkvdemux ! recsink`
 /// and return the sink's record. One track → one src pad → one sink.
 fn run_seek(stream: Vec<u8>, chunk: usize, trigger_byte: usize, seek_byte: usize) -> Recorded {
+    run_seek_gated(stream, chunk, trigger_byte, seek_byte, 0)
+}
+
+/// As [`run_seek`], but the source withholds the seek until the sink has recorded
+/// `pre_seek_gate` buffers — see [`SeekSrc::pre_seek_gate`]. `0` reproduces `run_seek` exactly.
+fn run_seek_gated(
+    stream: Vec<u8>,
+    chunk: usize,
+    trigger_byte: usize,
+    seek_byte: usize,
+    pre_seek_gate: usize,
+) -> Recorded {
     let header = header_prefix(&stream);
     let mut p = Pipeline::new();
     let seek = p.seek_handle();
+    let seen = Arc::new(AtomicUsize::new(0));
     let src = p.add(SeekSrc {
         data: stream,
         chunk,
@@ -205,6 +261,9 @@ fn run_seek(stream: Vec<u8>, chunk: usize, trigger_byte: usize, seek_byte: usize
         seek_byte,
         seek,
         seeked: false,
+        pre_seek_gate,
+        seen: Arc::clone(&seen),
+        spins: 0,
     });
     let demux = p.add(MkvDemux::new(header));
     p.link((src, "src"), (demux, "sink")).expect("src -> demux");
@@ -213,7 +272,7 @@ fn run_seek(stream: Vec<u8>, chunk: usize, trigger_byte: usize, seek_byte: usize
     assert_eq!(added.len(), 1, "one video track → one src pad");
 
     let rec = Arc::new(Mutex::new(Recorded::default()));
-    let sink = p.add(RecSink { rec: Arc::clone(&rec) });
+    let sink = p.add(RecSink { rec: Arc::clone(&rec), seen });
     p.link((added[0].element, &added[0].name), (sink, "sink")).expect("pad -> sink");
 
     p.run().expect("run");
@@ -360,18 +419,33 @@ fn seek_reemits_codec_head() {
 
     let index = seek_index(&stream);
     let (_t, seek_byte) = index[1]; // the 40 ms cluster
-    let trigger = index[0].1 as usize;
-    let rec = run_seek(stream, 40, trigger, seek_byte as usize);
+    // Stream *all* of the 0 ms cluster — i.e. stop at the 40 ms cluster's first byte — and wait
+    // for its head + frame to reach the sink before seeking. Triggering at `index[0].1` instead
+    // (the 0 ms cluster's *start*) published the seek before that cluster had even been pushed,
+    // so there was no pre-seek output to re-emit anything after and the count below was a race.
+    let trigger = seek_byte as usize;
+    let rec = run_seek_gated(stream, 40, trigger, seek_byte as usize, 2);
 
-    // The head must appear at least twice: once before the first (pre-seek) frame, once after
-    // the seek before the 40 ms frame. Count exact-head buffers.
+    // The head appears exactly twice: once before the pre-seek frame, once after the seek
+    // before the 40 ms frame. Count exact-head buffers.
+    let shape: Vec<String> = rec
+        .bufs
+        .iter()
+        .map(|b| if b.0 == head { "HEAD".into() } else { format!("{:?}@{:?}", b.0, b.1) })
+        .collect();
     let head_count = rec.bufs.iter().filter(|b| b.0 == head).count();
-    assert!(head_count >= 2, "codec head re-emitted after the seek (saw {head_count})");
+    assert!(head_count >= 2, "codec head re-emitted after the seek (saw {head_count}) {shape:?}");
+    // The pre-seek pair really did stream — otherwise "re-emitted" would be vacuous.
+    let pre = rec.bufs.iter().position(|b| b.0 == vec![0x11, 0x22]).expect("pre-seek 0 ms frame");
+    assert!(pre > 0 && rec.bufs[pre - 1].0 == head, "head precedes the pre-seek frame {shape:?}");
     // The 40 ms frame is present, bit-exact, immediately preceded by a head buffer.
     let frame_at = rec
         .bufs
         .iter()
         .position(|b| b.1 == Some(40_000_000) && b.0 == vec![0x33, 0x44, 0x55])
         .expect("40 ms frame present");
-    assert!(frame_at > 0 && rec.bufs[frame_at - 1].0 == head, "head precedes the post-seek frame");
+    assert!(
+        frame_at > 0 && rec.bufs[frame_at - 1].0 == head,
+        "head precedes the post-seek frame {shape:?}"
+    );
 }
