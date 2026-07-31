@@ -63,6 +63,8 @@ use profluens_core::error::Error;
 use profluens_core::event::Event;
 use profluens_core::format::OfferDesc;
 use profluens_core::id::PadId;
+use profluens_core::log;
+use profluens_core::log::Level;
 use profluens_core::time::Timestamp;
 use profluens_video::format::PixelFormat;
 use profluens_video::frame::VideoFrameMut;
@@ -154,7 +156,7 @@ static DESC: ElementDesc = ElementDesc {
 };
 
 /// A cue held in the overlay's timeline: its interval and the plain text to draw.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RingCue {
     start: Timestamp,
     end: Timestamp,
@@ -171,6 +173,27 @@ struct BitmapCue {
     ds: pgs::DisplaySet,
 }
 
+/// The rasterised caption currently on screen, kept across frames.
+///
+/// A cue is on screen for seconds — 50-75 frames at 25 fps — and its pixels do not change in
+/// that time, so re-rasterising per frame is pure waste (it also allocated a fresh ~25 KB
+/// coverage bitmap every frame). The cache is keyed by exactly what the rasterisation depends
+/// on: the concatenated active-cue text and the baked font size. `key_scratch` is the reused
+/// buffer the per-frame key is built into, so the compare costs no allocation either.
+#[derive(Default)]
+struct CaptionCache {
+    /// The active cues' text, newline-separated — the key the bitmaps were built from.
+    key: String,
+    /// Scratch the next frame's key is assembled into before comparing (reused, never freed).
+    key_scratch: String,
+    /// The baked font size (px) the bitmaps were rasterised at.
+    size_px: f32,
+    /// Line-box height for that size — the vertical stacking advance.
+    line_h: usize,
+    /// One A8 coverage bitmap per *physical* line (a multi-line cue contributes several).
+    lines: Vec<font::Bitmap>,
+}
+
 /// Burns active subtitle cues onto decoded video frames, bottom-centre. See the module docs.
 pub struct SubtitleOverlay {
     /// Time-sorted (by `start`) ring of received cues; evicted once well behind the video PTS.
@@ -179,6 +202,11 @@ pub struct SubtitleOverlay {
     bitmap: Option<BitmapCue>,
     /// The negotiated video format forwarded downstream once (announced on first frame).
     announced: bool,
+    /// Whether the "cues arrived but the video geometry is unreadable" warning has been logged
+    /// (once per stream — see `process`).
+    warned_no_geom: bool,
+    /// The rasterised caption, reused while the active cue set does not change.
+    caption: CaptionCache,
     /// Frames composited / passed through (health counters, mirroring the mosaic's).
     pub emitted: u64,
     pub with_caption: u64,
@@ -200,6 +228,8 @@ impl SubtitleOverlay {
             cues: Vec::new(),
             bitmap: None,
             announced: false,
+            warned_no_geom: false,
+            caption: CaptionCache::default(),
             emitted: 0,
             with_caption: 0,
             with_bitmap: 0,
@@ -226,7 +256,22 @@ impl SubtitleOverlay {
         // Insert sorted by start (cues usually arrive in order, so this is O(1) amortised at
         // the tail; a stray out-of-order cue costs one shift).
         let at = self.cues.partition_point(|c| c.start <= cue.start);
+        // Drop an exact re-send. Cues with an equal start sort adjacently, so the scan is over
+        // that run only. Without this a demuxer that replays a Block — a seek landing before a
+        // cue that is still in the ring, a looping source — stacks the *same* line twice on
+        // screen (`active_text` returns both) instead of showing it once.
+        if self.cues[..at].iter().rev().take_while(|c| c.start == cue.start).any(|c| *c == cue) {
+            return;
+        }
         self.cues.insert(at, cue);
+    }
+
+    /// Drop the whole cue timeline — the flush/seek reset (see `Element::event`).
+    fn flush(&mut self) {
+        self.cues.clear();
+        self.bitmap = None;
+        self.caption.key.clear();
+        self.caption.lines.clear();
     }
 
     /// Evict cues whose end is more than [`EVICT_SLACK_NS`] behind `now` — they can never be
@@ -237,13 +282,57 @@ impl SubtitleOverlay {
         self.cues.retain(|c| c.end.nanos().map(|e| e > cutoff).unwrap_or(true));
     }
 
-    /// The text of every cue active at `pts`, in start order — the lines to stack on the frame.
+    /// The text of every cue active at `pts`, in start order.
+    #[cfg(test)]
     fn active_text(&self, pts: Timestamp) -> Vec<&str> {
         self.cues
             .iter()
             .filter(|c| pts >= c.start && pts < c.end)
             .map(|c| c.text.as_str())
             .collect()
+    }
+
+    /// Bring [`CaptionCache`] up to date for presentation time `pts` on a `frame_h`-tall frame,
+    /// and report whether anything is on screen.
+    ///
+    /// The active cues' text is assembled into a **reused** buffer and compared against the key
+    /// the cached bitmaps were built from; only a genuine change (a cue starting, one expiring,
+    /// a resolution change) re-rasterises. On an unchanged cue — the overwhelming majority of
+    /// frames, since a cue lives 50-75 frames at 25 fps — this allocates nothing and does no
+    /// glyph work at all.
+    ///
+    /// Each **physical** line becomes its own bitmap. Cue text keeps the newlines the parsers
+    /// preserve (`\n` from SubRip/WebVTT, `\N` from ASS), and rasterising a string containing
+    /// `\n` as a single line drew the font's replacement box rather than breaking the line — a
+    /// two-line caption came out as `line one□line two` on one row.
+    fn refresh_caption(&mut self, pts: Timestamp, frame_h: usize) -> bool {
+        let px = (frame_h as f32 * TEXT_HEIGHT_FRAC).max(8.0);
+        let size = font::size_nearest(px);
+        // Build this frame's key into the scratch buffer (moved out so `self.cues` can be read
+        // while it is written; moved back below — no allocation in the steady state).
+        let mut key = std::mem::take(&mut self.caption.key_scratch);
+        key.clear();
+        for c in self.cues.iter().filter(|c| pts >= c.start && pts < c.end) {
+            if !key.is_empty() {
+                key.push('\n');
+            }
+            key.push_str(&c.text);
+        }
+        if key != self.caption.key || self.caption.size_px != size.px {
+            self.caption.lines.clear();
+            for line in key.split('\n') {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                self.caption.lines.push(font::rasterize_line(size, line));
+            }
+            self.caption.key.clear();
+            self.caption.key.push_str(&key);
+            self.caption.size_px = size.px;
+            self.caption.line_h = font::line_height(size);
+        }
+        self.caption.key_scratch = key;
+        !self.caption.lines.is_empty()
     }
 
     /// Ingest one `subtitle/bitmap` buffer (a decoded PGS Display Set: RGBA + geometry, PTS +
@@ -296,6 +385,8 @@ impl Element for SubtitleOverlay {
         self.cues.clear();
         self.bitmap = None;
         self.announced = false;
+        self.warned_no_geom = false;
+        self.caption = CaptionCache::default();
         self.emitted = 0;
         self.with_caption = 0;
         self.with_bitmap = 0;
@@ -340,18 +431,36 @@ impl Element for SubtitleOverlay {
 
             // Resolve the frame geometry once (both paths write onto the same planes).
             let geom = negotiated_video(ctx);
+            // Without geometry there is nothing to blit onto, and the element degrades to a
+            // silent passthrough — the exact shape of "my subtitles just don't show up". Say so
+            // once: it happens whenever the video sink's caps carry no width/height/pixfmt (a
+            // pure transport upstream that does not `forward_format`, e.g. `tee`) or the pixel
+            // format is not 4:2:0.
+            if geom.is_none() && !self.warned_no_geom && (!self.cues.is_empty() || self.bitmap.is_some())
+            {
+                self.warned_no_geom = true;
+                log!(
+                    &*ctx,
+                    Level::Warn,
+                    "no_video_geometry",
+                    detail = "video sink caps carry no usable width/height/pixfmt — \
+                              subtitles cannot be composited and frames pass through unchanged",
+                );
+            }
 
             // --- text path: stack the active cues' lines bottom-centre ---
-            let lines = self.active_text(buf.pts);
-            if !lines.is_empty() {
-                if let Some((w, h, pixfmt)) = geom {
+            // `refresh_caption` re-rasterises only when the on-screen text actually changed, so
+            // the steady state (the same cue for the next 50 frames) is a string compare.
+            if let Some((w, h, pixfmt)) = geom {
+                if self.refresh_caption(buf.pts, h as usize) {
                     let need = profluens_video::geometry::frame_size(pixfmt, w, h);
+                    let line_h = self.caption.line_h;
                     let data = buf.memory.as_mut_full();
                     if data.len() >= need {
                         if let Some(mut frame) =
                             VideoFrameMut::new(&mut data[..need], w, h, pixfmt)
                         {
-                            draw_caption(&mut frame, &lines);
+                            draw_caption(&mut frame, &self.caption.lines, line_h);
                             self.with_caption += 1;
                         }
                     }
@@ -390,7 +499,16 @@ impl Element for SubtitleOverlay {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    /// A flush (the scheduler's out-of-band seek signal, delivered at a batch boundary — spec:
+    /// flush/seek) drops the whole cue timeline: after a seek the demuxer replays subtitle
+    /// Blocks from the new position, and a ring still holding the pre-seek cues both stacks
+    /// duplicates of any cue that is re-sent and keeps showing cues from the old playhead. Every
+    /// other stateful element in the tree resets here (`h264dec`, `aacdec`, `avidemux`, …); the
+    /// overlay was the exception.
+    fn event(&mut self, _ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::FlushStart) {
+            self.flush();
+        }
         Ok(())
     }
 
@@ -438,25 +556,21 @@ const OUTLINE_LUMA: u8 = 16;
 /// the underlying picture's colour.
 const NEUTRAL_CHROMA: u8 = 128;
 
-/// Draw `lines` bottom-centre onto `frame`: rasterise each line to A8 coverage, stack them
-/// upward from a bottom margin, and alpha-over white-on-dark-outline luma + neutral chroma.
-fn draw_caption(frame: &mut VideoFrameMut<'_>, lines: &[&str]) {
+/// Draw pre-rasterised `lines` (A8 coverage, one per physical line, top line first) bottom-centre
+/// onto `frame`, stacking upward from a bottom margin with alpha-over white-on-dark-outline luma
+/// + neutral chroma. `line_h` is the stacking advance for the size they were rasterised at.
+///
+/// Rasterisation is the caller's ([`SubtitleOverlay::refresh_caption`]) so an unchanged caption
+/// is not re-rendered on every frame.
+fn draw_caption(frame: &mut VideoFrameMut<'_>, lines: &[font::Bitmap], line_h: usize) {
     let (fw, fh) = (frame.width() as usize, frame.height() as usize);
-    if fw == 0 || fh == 0 {
-        return;
-    }
-    // Baked size nearest the target text height.
-    let px = (fh as f32 * TEXT_HEIGHT_FRAC).max(8.0);
-    let size = font::size_nearest(px);
-    let line_h = font::line_height(size);
-    if line_h == 0 {
+    if fw == 0 || fh == 0 || line_h == 0 {
         return;
     }
     // Bottom margin ~ half a line; lines stack upward from there.
     let margin = line_h / 2 + 2;
     let n = lines.len();
-    for (i, line) in lines.iter().enumerate() {
-        let bm = font::rasterize_line(size, line);
+    for (i, bm) in lines.iter().enumerate() {
         if bm.w == 0 || bm.h == 0 {
             continue;
         }
@@ -467,7 +581,7 @@ fn draw_caption(frame: &mut VideoFrameMut<'_>, lines: &[&str]) {
         let lines_from_bottom = n - 1 - i;
         let y_bottom = fh.saturating_sub(margin + lines_from_bottom * line_h);
         let y0 = y_bottom.saturating_sub(bm.h);
-        blit_coverage(frame, &bm, x0, y0);
+        blit_coverage(frame, bm, x0, y0);
     }
 }
 
@@ -534,18 +648,23 @@ fn blit_coverage(frame: &mut VideoFrameMut<'_>, bm: &font::Bitmap, x0: usize, y0
     }
 
     // --- chroma: pull toward neutral under the (dilated) text so it reads white -----------
-    // Chroma is half-resolution (4:2:0): a luma pixel (x, y) maps to chroma (x/2, y/2).
+    // Chroma is half-resolution (4:2:0): a luma pixel (x, y) maps to chroma (x/2, y/2). Only
+    // the chroma cells the caption's (dilated) box can reach are visited — scanning the whole
+    // plane made a one-line caption cost O(frame area) instead of O(caption area), which is
+    // ~97% of this function's time at 1080p. The per-cell guards below are unchanged, so the
+    // painted result is byte-identical; only the iteration bounds shrink.
+    let (cx0, cx1, cy0, cy1) = chroma_box(x0, y0, bm.w, bm.h, fw, fh);
     match pixfmt {
         PixelFormat::I420 => {
             for plane in 1..=2 {
                 if let Some((c_plane, c_stride)) = frame.plane_mut(plane) {
-                    paint_chroma_i420(c_plane, c_stride, bm, x0, y0, fw, fh);
+                    paint_chroma_i420(c_plane, c_stride, bm, x0, y0, (cx0, cx1, cy0, cy1));
                 }
             }
         }
         PixelFormat::Nv12 => {
             if let Some((c_plane, c_stride)) = frame.plane_mut(1) {
-                paint_chroma_nv12(c_plane, c_stride, bm, x0, y0, fw, fh);
+                paint_chroma_nv12(c_plane, c_stride, bm, x0, y0, (cx0, cx1, cy0, cy1));
             }
         }
         // Non-4:2:0 formats are refused upstream (negotiated_video); unreachable here.
@@ -553,22 +672,44 @@ fn blit_coverage(frame: &mut VideoFrameMut<'_>, bm: &font::Bitmap, x0: usize, y0
     }
 }
 
+/// The half-open chroma-cell range `(cx0, cx1, cy0, cy1)` a coverage bitmap of `bw × bh` placed
+/// at luma `(x0, y0)` can possibly touch, clamped to the frame's chroma plane (`fw × fh` luma).
+///
+/// A chroma cell `(cx, cy)` reads luma `2cx..2cx+2` and each of those is further **dilated by
+/// one** pixel by [`chroma_coverage`], so the reachable luma span is `[x0-2, x0+bw+2)`; halving
+/// and rounding outward gives the cell span. Deliberately one cell generous on each side — the
+/// per-cell coverage test still decides what is painted, so a slightly wide box costs a handful
+/// of zero-coverage probes and can never clip the caption.
+fn chroma_box(
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+    fw: usize,
+    fh: usize,
+) -> (usize, usize, usize, usize) {
+    let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
+    let cx0 = x0.saturating_sub(2) / 2;
+    let cy0 = y0.saturating_sub(2) / 2;
+    let cx1 = (x0 + bw + 2).div_ceil(2).saturating_add(1).min(cw);
+    let cy1 = (y0 + bh + 2).div_ceil(2).saturating_add(1).min(ch);
+    (cx0.min(cx1), cx1, cy0.min(cy1), cy1)
+}
+
 /// Chroma neutralisation for an I420 plane (Cb or Cr): a covered chroma cell is pulled toward
-/// 128 by the max coverage of its four covering luma pixels.
-#[allow(clippy::too_many_arguments)]
+/// 128 by the max coverage of its four covering luma pixels. `bounds` is the caption's chroma
+/// cell box from [`chroma_box`] — outside it the coverage is zero by construction.
 fn paint_chroma_i420(
     plane: &mut [u8],
     stride: usize,
     bm: &font::Bitmap,
     x0: usize,
     y0: usize,
-    fw: usize,
-    fh: usize,
+    bounds: (usize, usize, usize, usize),
 ) {
-    let cw = fw.div_ceil(2);
-    let ch = fh.div_ceil(2);
-    for cy in 0..ch {
-        for cx in 0..cw {
+    let (cx0, cx1, cy0, cy1) = bounds;
+    for cy in cy0..cy1 {
+        for cx in cx0..cx1 {
             let a = chroma_coverage(bm, x0, y0, cx, cy);
             if a == 0 {
                 continue;
@@ -582,20 +723,18 @@ fn paint_chroma_i420(
 }
 
 /// Chroma neutralisation for an NV12 interleaved plane (Cb, Cr pairs per chroma column).
-#[allow(clippy::too_many_arguments)]
+/// `bounds` is the caption's chroma cell box from [`chroma_box`].
 fn paint_chroma_nv12(
     plane: &mut [u8],
     stride: usize,
     bm: &font::Bitmap,
     x0: usize,
     y0: usize,
-    fw: usize,
-    fh: usize,
+    bounds: (usize, usize, usize, usize),
 ) {
-    let cw = fw.div_ceil(2);
-    let ch = fh.div_ceil(2);
-    for cy in 0..ch {
-        for cx in 0..cw {
+    let (cx0, cx1, cy0, cy1) = bounds;
+    for cy in cy0..cy1 {
+        for cx in cx0..cx1 {
             let a = chroma_coverage(bm, x0, y0, cx, cy);
             if a == 0 {
                 continue;
@@ -737,6 +876,25 @@ fn draw_bitmap(frame: &mut VideoFrameMut<'_>, ds: &pgs::DisplaySet) -> bool {
     drew
 }
 
+/// The half-open chroma-cell range a bitmap caption occupying luma `[dst_x0, dst_x0+dst_w) ×
+/// [dst_y0, dst_y0+dst_h)` can touch, clamped to the frame's chroma plane. A chroma cell
+/// `(cx, cy)` samples luma `(2cx, 2cy)` only, so the span is a plain halving rounded outward.
+fn bitmap_chroma_box(
+    dst_x0: usize,
+    dst_y0: usize,
+    dst_w: usize,
+    dst_h: usize,
+    fw: usize,
+    fh: usize,
+) -> (usize, usize, usize, usize) {
+    let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
+    let cx0 = (dst_x0 / 2).min(cw);
+    let cy0 = (dst_y0 / 2).min(ch);
+    let cx1 = (dst_x0 + dst_w).div_ceil(2).min(cw);
+    let cy1 = (dst_y0 + dst_h).div_ceil(2).min(ch);
+    (cx0.min(cx1), cx1, cy0.min(cy1), cy1)
+}
+
 /// Composite the caption's chroma onto an I420 frame (separate Cb/Cr planes). A chroma cell at
 /// `(cx, cy)` covers luma `(2cx, 2cy)`; we sample that destination pixel's source colour/alpha.
 #[allow(clippy::too_many_arguments)]
@@ -749,13 +907,14 @@ fn blit_bitmap_chroma_i420(
     sample: &impl Fn(usize, usize) -> Option<[u8; 4]>,
 ) {
     let (fw, fh) = (frame.width() as usize, frame.height() as usize);
-    let cw = fw.div_ceil(2);
-    let ch = fh.div_ceil(2);
+    // Only the chroma cells the caption rectangle covers (see `chroma_box`) — the per-cell
+    // guards below are unchanged, so this is a pure iteration-bound shrink.
+    let (cx0, cx1, cy0, cy1) = bitmap_chroma_box(dst_x0, dst_y0, dst_w, dst_h, fw, fh);
     for plane in 1..=2 {
         let is_cr = plane == 2;
         if let Some((c_plane, c_stride)) = frame.plane_mut(plane) {
-            for cy in 0..ch {
-                for cx in 0..cw {
+            for cy in cy0..cy1 {
+                for cx in cx0..cx1 {
                     // The luma pixel this chroma cell covers (top-left of the 2×2).
                     let (lx, ly) = (2 * cx, 2 * cy);
                     if lx < dst_x0 || ly < dst_y0 {
@@ -792,11 +951,10 @@ fn blit_bitmap_chroma_nv12(
     sample: &impl Fn(usize, usize) -> Option<[u8; 4]>,
 ) {
     let (fw, fh) = (frame.width() as usize, frame.height() as usize);
-    let cw = fw.div_ceil(2);
-    let ch = fh.div_ceil(2);
+    let (cx0, cx1, cy0, cy1) = bitmap_chroma_box(dst_x0, dst_y0, dst_w, dst_h, fw, fh);
     if let Some((c_plane, c_stride)) = frame.plane_mut(1) {
-        for cy in 0..ch {
-            for cx in 0..cw {
+        for cy in cy0..cy1 {
+            for cx in cx0..cx1 {
                 let (lx, ly) = (2 * cx, 2 * cy);
                 if lx < dst_x0 || ly < dst_y0 {
                     continue;
@@ -854,6 +1012,15 @@ fn clamp_u8(v: f32) -> u8 {
 mod tests {
     use super::*;
     use profluens_video::geometry::frame_size;
+
+    /// Rasterise `lines` the way `refresh_caption` does, for the blit tests.
+    fn raster(frame_h: u32, lines: &[&str]) -> (Vec<font::Bitmap>, usize) {
+        let size = font::size_nearest((frame_h as f32 * TEXT_HEIGHT_FRAC).max(8.0));
+        (
+            lines.iter().map(|l| font::rasterize_line(size, l)).collect(),
+            font::line_height(size),
+        )
+    }
 
     fn overlay_with_cue(text: &str, start_ns: u64, dur_ns: u64) -> SubtitleOverlay {
         let mut o = SubtitleOverlay::new();
@@ -913,7 +1080,8 @@ mod tests {
         let baseline = buf.clone();
         {
             let mut frame = VideoFrameMut::new(&mut buf, w, h, PixelFormat::I420).unwrap();
-            draw_caption(&mut frame, &["Hello, subtitles!"]);
+            let (bms, lh) = raster(h, &["Hello, subtitles!"]);
+            draw_caption(&mut frame, &bms, lh);
         }
         assert_ne!(buf, baseline, "drawing a caption changes the frame");
 
@@ -941,7 +1109,8 @@ mod tests {
         let baseline = buf.clone();
         {
             let mut frame = VideoFrameMut::new(&mut buf, w, h, PixelFormat::Nv12).unwrap();
-            draw_caption(&mut frame, &["NV12 caption"]);
+            let (bms, lh) = raster(h, &["NV12 caption"]);
+            draw_caption(&mut frame, &bms, lh);
         }
         assert_ne!(buf, baseline, "NV12 caption is drawn (luma + interleaved chroma)");
         // Luma changed (white glyph + dark outline).
@@ -1065,5 +1234,337 @@ mod tests {
         // A clear (empty bitmap) erases it immediately.
         o.push_bitmap(pgs::DisplaySet::clear(100, 100), Timestamp::from_nanos(1_600_000_000), Timestamp::NONE);
         assert!(o.active_bitmap(Timestamp::from_nanos(1_500_000_000)).is_none(), "cleared");
+    }
+
+    // ---- the chroma bounding box (a pure iteration-bound shrink) ----
+
+    /// The bounded chroma pass must paint **byte-for-byte** what the old whole-plane scan
+    /// painted, for **both** 4:2:0 layouts. Reference implementations: visit every chroma cell
+    /// in the frame, exactly as `paint_chroma_*` used to.
+    ///
+    /// The placement sweep is exhaustive over small frames of every width/height parity, with
+    /// the caption walked past all four edges and entirely off-frame — that is where a bounds
+    /// error would hide. `chroma_box` is deliberately a cell or two generous, so a shrunken
+    /// box (the failure that would clip a caption) is what this is guarding.
+    #[test]
+    fn bounded_chroma_matches_a_whole_plane_scan() {
+        fn reference_i420(plane: &mut [u8], stride: usize, bm: &font::Bitmap, x0: usize, y0: usize, fw: usize, fh: usize) {
+            for cy in 0..fh.div_ceil(2) {
+                for cx in 0..fw.div_ceil(2) {
+                    let a = chroma_coverage(bm, x0, y0, cx, cy);
+                    if a == 0 {
+                        continue;
+                    }
+                    let idx = cy * stride + cx;
+                    if idx < plane.len() {
+                        plane[idx] = over(plane[idx], NEUTRAL_CHROMA, a);
+                    }
+                }
+            }
+        }
+        fn reference_nv12(plane: &mut [u8], stride: usize, bm: &font::Bitmap, x0: usize, y0: usize, fw: usize, fh: usize) {
+            for cy in 0..fh.div_ceil(2) {
+                for cx in 0..fw.div_ceil(2) {
+                    let a = chroma_coverage(bm, x0, y0, cx, cy);
+                    if a == 0 {
+                        continue;
+                    }
+                    let idx = cy * stride + cx * 2;
+                    if idx + 1 < plane.len() {
+                        plane[idx] = over(plane[idx], NEUTRAL_CHROMA, a);
+                        plane[idx + 1] = over(plane[idx + 1], NEUTRAL_CHROMA, a);
+                    }
+                }
+            }
+        }
+
+        let s = font::size_nearest(14.0);
+        let mut checked = 0usize;
+        for text in ["Wg|_", "i", "The quick brown fox"] {
+            let bm = font::rasterize_line(s, text);
+            // Every width/height parity combination, swept exhaustively past all four edges.
+            for &(fw, fh) in &[(24usize, 20usize), (25, 21), (26, 20), (25, 22)] {
+                let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
+                for y0 in 0..fh + 4 {
+                    for x0 in 0..fw + 4 {
+                        let bounds = chroma_box(x0, y0, bm.w, bm.h, fw, fh);
+                        let mut got = vec![90u8; cw * ch];
+                        let mut want = got.clone();
+                        paint_chroma_i420(&mut got, cw, &bm, x0, y0, bounds);
+                        reference_i420(&mut want, cw, &bm, x0, y0, fw, fh);
+                        assert_eq!(
+                            got, want,
+                            "I420 bounded chroma differs from the whole-plane scan at frame \
+                             {fw}x{fh} caption ({x0},{y0}) size {}x{}",
+                            bm.w, bm.h
+                        );
+                        let mut got = vec![90u8; cw * 2 * ch];
+                        let mut want = got.clone();
+                        paint_chroma_nv12(&mut got, cw * 2, &bm, x0, y0, bounds);
+                        reference_nv12(&mut want, cw * 2, &bm, x0, y0, fw, fh);
+                        assert_eq!(
+                            got, want,
+                            "NV12 bounded chroma differs from the whole-plane scan at frame \
+                             {fw}x{fh} caption ({x0},{y0}) size {}x{}",
+                            bm.w, bm.h
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 3000, "the sweep should be broad, got {checked} placements");
+
+        // A large frame at the edge placements, plus the proof that the box really is a
+        // shrink: it must not cover the whole plane for a caption occupying a small part.
+        let bm = font::rasterize_line(s, "Wg|_");
+        for &(fw, fh) in &[(64usize, 48usize), (65, 49), (320, 180)] {
+            for &(x0, y0) in &[
+                (0usize, 0usize),
+                (1, 1),
+                (3, 5),
+                (fw / 2, fh / 2),
+                (fw.saturating_sub(2), fh.saturating_sub(2)),
+                (fw + 10, fh + 10), // entirely off-frame
+            ] {
+                let cw = fw.div_ceil(2);
+                let ch = fh.div_ceil(2);
+                let mut got = vec![90u8; cw * ch];
+                let mut want = got.clone();
+                let bounds = chroma_box(x0, y0, bm.w, bm.h, fw, fh);
+                paint_chroma_i420(&mut got, cw, &bm, x0, y0, bounds);
+                reference_i420(&mut want, cw, &bm, x0, y0, fw, fh);
+                assert_eq!(
+                    got, want,
+                    "bounded chroma differs from the whole-plane scan at frame {fw}x{fh} \
+                     caption ({x0},{y0}) size {}x{}",
+                    bm.w, bm.h
+                );
+                if fw >= 320 && x0 < fw {
+                    let (cx0, cx1, cy0, cy1) = bounds;
+                    assert!(
+                        (cx1 - cx0) * (cy1 - cy0) < cw * ch,
+                        "the caption box should be smaller than the whole chroma plane"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same, for the PGS bitmap path's chroma pass.
+    #[test]
+    fn bounded_bitmap_chroma_matches_a_whole_plane_scan() {
+        let (w, h) = (128u32, 96u32);
+        // A 20x10 semi-transparent coloured caption near the bottom-right.
+        let ds = pgs::DisplaySet {
+            rgba: (0..20 * 10 * 4).map(|i| (i % 251) as u8).collect(),
+            width: 20,
+            height: 10,
+            x: 100,
+            y: 80,
+            video_width: w,
+            video_height: h,
+        };
+        let mut got = vec![70u8; frame_size(PixelFormat::I420, w, h)];
+        let mut want = got.clone();
+        {
+            let mut f = VideoFrameMut::new(&mut got, w, h, PixelFormat::I420).unwrap();
+            assert!(draw_bitmap(&mut f, &ds));
+        }
+        // Reference: the luma pass is shared, so replay it, then scan every chroma cell.
+        {
+            let mut f = VideoFrameMut::new(&mut want, w, h, PixelFormat::I420).unwrap();
+            let (fw, fh) = (w as usize, h as usize);
+            let (ref_w, ref_h) = (fw, fh);
+            let dst_x0 = ds.x as usize * fw / ref_w;
+            let dst_y0 = ds.y as usize * fh / ref_h;
+            let dst_w = (ds.width as usize * fw).div_ceil(ref_w);
+            let dst_h = (ds.height as usize * fh).div_ceil(ref_h);
+            let sample = |dx: usize, dy: usize| -> Option<[u8; 4]> {
+                let sx = dx * ds.width as usize / dst_w;
+                let sy = dy * ds.height as usize / dst_h;
+                let si = (sy * ds.width as usize + sx) * 4;
+                ds.rgba.get(si..si + 4).map(|p| [p[0], p[1], p[2], p[3]])
+            };
+            if let Some((y_plane, y_stride)) = f.plane_mut(0) {
+                for dy in 0..dst_h {
+                    let py = dst_y0 + dy;
+                    if py >= fh {
+                        break;
+                    }
+                    for dx in 0..dst_w {
+                        let px = dst_x0 + dx;
+                        if px >= fw {
+                            break;
+                        }
+                        let Some([r, g, b, a]) = sample(dx, dy) else { continue };
+                        if a == 0 {
+                            continue;
+                        }
+                        let (yv, _, _) = rgb_to_ycbcr_bt709(r, g, b);
+                        let idx = py * y_stride + px;
+                        if idx < y_plane.len() {
+                            y_plane[idx] = over(y_plane[idx], yv, a);
+                        }
+                    }
+                }
+            }
+            for plane in 1..=2 {
+                let is_cr = plane == 2;
+                if let Some((c_plane, c_stride)) = f.plane_mut(plane) {
+                    for cy in 0..fh.div_ceil(2) {
+                        for cx in 0..fw.div_ceil(2) {
+                            let (lx, ly) = (2 * cx, 2 * cy);
+                            if lx < dst_x0 || ly < dst_y0 {
+                                continue;
+                            }
+                            let (dx, dy) = (lx - dst_x0, ly - dst_y0);
+                            if dx >= dst_w || dy >= dst_h {
+                                continue;
+                            }
+                            let Some([r, g, b, a]) = sample(dx, dy) else { continue };
+                            if a == 0 {
+                                continue;
+                            }
+                            let (_, cb, cr) = rgb_to_ycbcr_bt709(r, g, b);
+                            let c = if is_cr { cr } else { cb };
+                            let idx = cy * c_stride + cx;
+                            if idx < c_plane.len() {
+                                c_plane[idx] = over(c_plane[idx], c, a);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(got, want, "bounded bitmap chroma differs from the whole-plane scan");
+    }
+
+    // ---- flush / seek ----
+
+    /// A flush (seek) drops the cue timeline. Without this the ring keeps the pre-seek cues:
+    /// they are all in the *future* of the new playhead, so `evict_stale` never removes them,
+    /// and playing forward shows them again alongside the re-sent copies.
+    #[test]
+    fn flush_clears_the_cue_timeline() {
+        let mut o = SubtitleOverlay::new();
+        for i in 0..10u64 {
+            o.push_cue(format!("cue {i}"), Timestamp::from_nanos(i * 1_000_000_000), Timestamp::from_nanos(900_000_000));
+        }
+        o.push_bitmap(
+            pgs::DisplaySet { rgba: vec![255; 4], width: 1, height: 1, x: 0, y: 0, video_width: 8, video_height: 8 },
+            Timestamp::from_nanos(0),
+            Timestamp::from_nanos(1_000_000_000),
+        );
+        assert_eq!(o.cues.len(), 10);
+        assert!(o.bitmap.is_some());
+        o.flush();
+        assert!(o.cues.is_empty(), "seek drops the stale cue ring");
+        assert!(o.bitmap.is_none(), "seek drops the stale bitmap caption");
+    }
+
+    /// A cue re-sent verbatim (a seek landing before a cue still in the ring, a looping source)
+    /// must not stack on screen twice.
+    #[test]
+    fn a_resent_cue_is_not_shown_twice() {
+        let mut o = SubtitleOverlay::new();
+        let (t, d) = (Timestamp::from_nanos(1_000_000_000), Timestamp::from_nanos(2_000_000_000));
+        o.push_cue("Hello".into(), t, d);
+        o.push_cue("Hello".into(), t, d);
+        assert_eq!(o.cues.len(), 1, "the identical re-send is dropped");
+        assert_eq!(o.active_text(Timestamp::from_nanos(1_500_000_000)), vec!["Hello"]);
+        // Distinct cues at the same start still both show (two speakers on screen at once).
+        o.push_cue("- Who's there?".into(), t, d);
+        assert_eq!(o.active_text(Timestamp::from_nanos(1_500_000_000)).len(), 2);
+    }
+
+    // ---- the caption cache ----
+
+    /// A cue whose text contains a newline (every multi-line SubRip/WebVTT cue, and every ASS
+    /// cue with `\N`) must become **two stacked bitmaps**. Rasterising the whole string as one
+    /// line rendered the `\n` as the font's replacement box: `line one[]line two` on one row.
+    #[test]
+    fn a_multi_line_cue_becomes_two_stacked_lines() {
+        let mut o = SubtitleOverlay::new();
+        o.push_cue(
+            "line one\nline two".into(),
+            Timestamp::from_nanos(0),
+            Timestamp::from_nanos(1_000_000_000),
+        );
+        assert!(o.refresh_caption(Timestamp::from_nanos(0), 360));
+        assert_eq!(o.caption.lines.len(), 2, "one coverage bitmap per physical line");
+        assert_eq!(o.caption.lines[0].h, o.caption.lines[1].h, "same line box height");
+
+        // And they land on different rows of the frame.
+        let (w, h) = (320u32, 180u32);
+        let mut buf = vec![128u8; frame_size(PixelFormat::I420, w, h)];
+        {
+            let mut f = VideoFrameMut::new(&mut buf, w, h, PixelFormat::I420).unwrap();
+            draw_caption(&mut f, &o.caption.lines, o.caption.line_h);
+        }
+        let ys = w as usize;
+        let painted: Vec<usize> = (0..h as usize)
+            .filter(|&y| buf[y * ys..(y + 1) * ys].iter().any(|&p| p != 128))
+            .collect();
+        let (first, last) = (painted[0], *painted.last().unwrap());
+        assert!(
+            last - first >= o.caption.line_h,
+            "the two lines stack at least a line height apart (rows {first}..={last}, line_h {})",
+            o.caption.line_h
+        );
+    }
+
+    /// The baked atlas tops out at 32 px, so `size_nearest` saturates: every frame taller than
+    /// ~384 px gets the *same* 32 px text however large the picture is. At 1080p the target
+    /// height is 90 px and the caption is drawn at 32 — about a third of the intended size, and
+    /// small enough to be hard to read at a normal viewing distance. Recorded here as a known
+    /// limitation of the v1 "no scaling, snap to a baked size" model rather than a silent one.
+    #[test]
+    fn caption_size_saturates_on_tall_frames() {
+        let target_720 = 720.0 * TEXT_HEIGHT_FRAC;
+        let target_1080 = 1080.0 * TEXT_HEIGHT_FRAC;
+        let s720 = font::size_nearest(target_720);
+        let s1080 = font::size_nearest(target_1080);
+        assert_eq!(s720.px, s1080.px, "720p and 1080p both clamp to the largest baked size");
+        assert!(
+            s1080.px < target_1080 / 2.0,
+            "the drawn size ({}) is less than half the intended {target_1080} px",
+            s1080.px
+        );
+    }
+
+    /// The render-on-change gate: an unchanged cue reuses its bitmaps across frames, and a
+    /// changed one re-rasterises. Identity is the coverage buffer's address — a re-render
+    /// allocates a fresh `Vec`.
+    #[test]
+    fn an_unchanged_caption_is_not_re_rasterised() {
+        let mut o = SubtitleOverlay::new();
+        o.push_cue("Steady".into(), Timestamp::from_nanos(0), Timestamp::from_nanos(2_000_000_000));
+        assert!(o.refresh_caption(Timestamp::from_nanos(0), 360));
+        let first = o.caption.lines[0].cov.as_ptr();
+        for f in 1..50u64 {
+            assert!(o.refresh_caption(Timestamp::from_nanos(f * 40_000_000), 360));
+            assert_eq!(
+                o.caption.lines[0].cov.as_ptr(),
+                first,
+                "frame {f} re-rasterised an unchanged caption"
+            );
+        }
+        // A second cue coming on screen invalidates the cache.
+        o.push_cue(
+            "Different".into(),
+            Timestamp::from_nanos(1_000_000_000),
+            Timestamp::from_nanos(1_000_000_000),
+        );
+        assert!(o.refresh_caption(Timestamp::from_nanos(1_000_000_000), 360));
+        assert_eq!(o.caption.lines.len(), 2, "both cues are on screen now");
+        // So does a resolution change. (NB 360 and 1080 would *not* differ: the atlas tops out
+        // at 32 px, so every frame taller than ~384 px snaps to the same baked size — see the
+        // `caption_size_saturates_on_tall_frames` test.)
+        let before = o.caption.size_px;
+        assert!(o.refresh_caption(Timestamp::from_nanos(1_000_000_000), 120));
+        assert_ne!(o.caption.size_px, before, "a shorter frame picks a different baked size");
+        // And an expired cue empties it.
+        assert!(!o.refresh_caption(Timestamp::from_nanos(9_000_000_000), 120));
     }
 }
