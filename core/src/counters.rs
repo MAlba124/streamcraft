@@ -363,7 +363,16 @@ mod tests {
             vec![("testsrc", Arc::clone(&counters))],
             Arc::new(std::sync::Mutex::new(Arc::new(clock.clone()) as Arc<dyn Clock>)),
             Arc::clone(&base),
+            // No run, so no pools and an idle transport — `pool()` reads all-zero and
+            // `scheduler()` reports no parks, which is what a pre-run tap should say.
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            crate::pipeline::PauseShared::new(
+                Arc::clone(&base),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
         );
+        assert_eq!(tap.pool(), crate::memory::PoolStats::default(), "no run: no pools");
+        assert_eq!(tap.scheduler().parks, 0, "no run: nothing has parked");
 
         assert!(tap.now().is_none(), "no run yet — no running time");
         assert_eq!(tap.element_name(ElementId(0)), Some("testsrc"));

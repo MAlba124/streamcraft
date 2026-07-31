@@ -125,12 +125,18 @@ impl Pool {
         Some(mem)
     }
 
-    /// Acquire a buffer of at least `n` usable bytes: a pooled slot when `n` fits and
-    /// one is free, otherwise an **exactly-`n`** heap allocation. The right-sized
+    /// Acquire a buffer of at least `n` usable bytes: a pooled slot when `n` fits and one is
+    /// free, otherwise a **size-classed** small buffer (see [`small_free`](Self::small_free)) or,
+    /// above the classes' reach, an exactly-`n` heap allocation. The right-sized
     /// fallback is the point (spec: Memory — pool negotiation is future work): with
     /// one pipeline-wide slot size, a cold/tail path emitting a 15 KB demuxed sample
     /// must not pay a multi-MiB slot per buffer — that turned a movie transcode into
     /// gigabytes. Every heap fallback still shows in `PoolStats::slot_allocations`.
+    ///
+    /// Two consequences of the size classes, both shared with the slot path and neither a problem
+    /// for the `[..n]`-then-`set_len(n)` idiom every caller uses: [`Memory::capacity`] may exceed
+    /// `n` (it is the class size), and a recycled buffer arrives holding **the previous user's
+    /// bytes**, not zeros — write before you read.
     /// Hot paths should prefer `try_acquire` + backpressure; this is for bounded
     /// flushes (an EOS drain) where yielding is not an option.
     ///
@@ -431,7 +437,24 @@ impl Memory {
             // design — only a mutator downstream of a tee/slice pays it. A dead pool
             // (all handles dropped mid-flight) degrades to an unpooled backing.
             let mut fresh = match inner.pool.upgrade() {
-                Some(p) => Pool { inner: p }.acquire_exact(inner.buf.len()),
+                Some(p) => {
+                    let pool = Pool { inner: p };
+                    let want = inner.buf.len();
+                    // Replace a small-class backing **in kind**. `acquire_exact(want)` would round
+                    // `want` up again, and once the rounded size reaches `slot_size / 4` it takes
+                    // the *slot* branch — so copying a 600-byte packet could consume a whole pool
+                    // slot and count against `outstanding`. That is precisely the starvation this
+                    // path must never cause (see `acquire_exact`), and with the 128 KiB default
+                    // pool it was reachable for any request in 16..32 KiB — ordinary compressed
+                    // video access units. A pool-linked backing smaller than a slot is by
+                    // construction a small-class box, so it round-trips through `small_free`.
+                    let small = if want < pool.inner.slot_size {
+                        pool.small_free(want)
+                    } else {
+                        None
+                    };
+                    small.unwrap_or_else(|| pool.acquire_exact(want))
+                }
                 None => Memory {
                     inner: Some(Arc::new(MemoryInner {
                         buf: vec![0u8; inner.buf.len()].into_boxed_slice(),
@@ -982,6 +1005,31 @@ mod tests {
         let slots: Vec<Memory> = (0..4).map(|_| pool.try_acquire().expect("slot free")).collect();
         assert!(pool.try_acquire().is_none(), "cap still enforced");
         drop(slots);
+    }
+
+    /// Copy-on-write of a *small* buffer must not consume a pool slot.
+    ///
+    /// The CoW path re-requests by the existing **backing** size, and the size classes round that
+    /// up — so once the rounded size reached `slot_size / 4`, `acquire_exact` took the slot branch
+    /// and charged `outstanding`. With the 128 KiB default pool that was reachable for any request
+    /// in 16..32 KiB, i.e. ordinary compressed access units, and eight tee'd 600-byte packets could
+    /// pin every slot of a 4 KiB pool — the exact starvation the small path exists to avoid.
+    #[test]
+    fn copy_on_write_of_a_small_buffer_does_not_take_a_slot() {
+        let pool = Pool::bounded(4096, 4);
+        let mut shared = Vec::new();
+        for _ in 0..8 {
+            // 600 B rounds to a 1024 B class — which is exactly `slot_size / 4`.
+            let mut m = pool.acquire_exact(600);
+            m.set_len(600);
+            let tee = m.clone(); // a second view: the next mutation must copy
+            m.as_mut_full()[0] = 0xAB; // CoW happens here
+            shared.push((m, tee));
+        }
+        assert_eq!(pool.stats().outstanding, 0, "small CoW must not charge the slot budget");
+        assert_eq!(pool.free_slots(), 4, "every slot still available to a real client");
+        let slots: Vec<Memory> = (0..4).map(|_| pool.try_acquire().expect("slot free")).collect();
+        assert_eq!(slots.len(), 4);
     }
 
     /// Distinct size classes do not feed each other, and a buffer is never handed out smaller than

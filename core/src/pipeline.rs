@@ -177,7 +177,7 @@ struct PauseInner {
 }
 
 impl PauseShared {
-    fn new(base: Arc<AtomicI64>, stop: Arc<AtomicBool>) -> Arc<Self> {
+    pub(crate) fn new(base: Arc<AtomicI64>, stop: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             hint: AtomicBool::new(false),
             inner: Mutex::new(PauseInner {

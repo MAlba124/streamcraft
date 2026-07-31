@@ -505,9 +505,10 @@ impl Ctx {
         self.pool.stats()
     }
 
-    /// Allocate a buffer of at least `n` usable bytes: a pooled slot when one is free
-    /// and large enough, else an exactly-`n` heap allocation (never a slot-sized
-    /// over-allocation — see [`Pool::acquire_exact`]). For bounded cold paths (an EOS
+    /// Allocate a buffer of at least `n` usable bytes: a pooled slot when one is free and large
+    /// enough, else a size-classed small buffer (never a slot-sized over-allocation — see
+    /// [`Pool::acquire_exact`], which also documents that the capacity may exceed `n` and that the
+    /// bytes are not zeroed). For bounded cold paths (an EOS
     /// flush emitting the tail of a stream); steady-state producers use
     /// [`try_alloc`](Self::try_alloc) + backpressure instead.
     pub fn alloc_exact(&mut self, _pad: PadId, n: usize) -> Buffer {
