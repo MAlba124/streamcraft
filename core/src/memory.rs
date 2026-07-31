@@ -941,6 +941,49 @@ mod tests {
         assert_eq!(pool.free_slots(), 4, "every slot still available");
     }
 
+    /// Retention is genuinely capped: a burst far larger than the cap must not be kept.
+    ///
+    /// Holding 1000 small buffers live and dropping them all can only bank `SMALL_FREE_PER_CLASS`
+    /// of them; the next burst must therefore allocate the rest afresh. Without the cap the pool
+    /// would quietly retain the whole high-water mark of every transient spike.
+    #[test]
+    fn small_free_lists_do_not_retain_beyond_cap() {
+        let pool = Pool::new(64 * 1024);
+        let burst: Vec<Memory> = (0..1000).map(|_| pool.acquire_exact(212)).collect();
+        let after_burst = pool.stats().slot_allocations;
+        assert_eq!(after_burst, 1000, "all live at once, so all had to be allocated");
+        drop(burst);
+
+        let second: Vec<Memory> = (0..1000).map(|_| pool.acquire_exact(212)).collect();
+        let reused = 1000 - (pool.stats().slot_allocations - after_burst);
+        assert_eq!(reused, SMALL_FREE_PER_CLASS as u64, "only the capped free list is reused");
+        drop(second);
+    }
+
+    /// Concurrent small-buffer traffic must not corrupt the slot budget it deliberately stays out
+    /// of: `outstanding` has to come back to zero and every slot must still be acquirable.
+    #[test]
+    fn concurrent_small_buffers_leave_the_slot_budget_alone() {
+        let pool = Pool::bounded(64 * 1024, 4);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let pool = pool.clone();
+                s.spawn(move || {
+                    for i in 0..2000 {
+                        let n = [40usize, 212, 1000, 5000][i % 4];
+                        let mut m = pool.acquire_exact(n);
+                        assert!(m.capacity() >= n);
+                        m.set_len(n);
+                    }
+                });
+            }
+        });
+        assert_eq!(pool.stats().outstanding, 0, "slot budget untouched by small traffic");
+        let slots: Vec<Memory> = (0..4).map(|_| pool.try_acquire().expect("slot free")).collect();
+        assert!(pool.try_acquire().is_none(), "cap still enforced");
+        drop(slots);
+    }
+
     /// Distinct size classes do not feed each other, and a buffer is never handed out smaller than
     /// asked for.
     #[test]
