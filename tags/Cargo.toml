@@ -1,0 +1,55 @@
+[package]
+name = "pf-tags"
+description = "Parallel, zero-copy tag/metadata scanner for profluens: many files at once through the reactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_tags"
+
+[[example]]
+name = "pftags"
+path = "examples/pftags.rs"
+
+[[example]]
+name = "scan_alloc_check"
+path = "examples/scan_alloc_check.rs"
+
+[[example]]
+name = "bench_scan"
+path = "examples/bench_scan.rs"
+
+[dependencies]
+# The substrate: the reactor submit/complete contract, the buffer pool, the scratch
+# arena, and the `TagSink`/`TagList` tag vocabulary. Nothing else — a tag scanner that
+# pulls in decoders would defeat its own purpose.
+profluens-core = { path = "../core" }
+# The format parsers, reused rather than re-written — each is already this workspace's
+# reference reader for its specification, and a second implementation living in the scanner
+# would be one that silently drifts:
+#   pf-flac  RFC 9639 §8.2/§8.6/§8.8 metadata blocks (`tags::parse_into`, `tags::stream_info`)
+#   pf-mp3   ID3v2/ID3v1/APEv2 (`id3`) and the no-decode Xing/VBRI duration probe (`props`)
+#   pf-mkv   the SeekHead-driven metadata locator and the Tags/Attachments readers (`tags`)
+#   pf-mp4   the `moov` locator and the iTunes `ilst` reader (`ilst`)
+#   pf-ogg   page framing (`page`), the Opus/Vorbis identification headers (`ident`), the
+#            shared Vorbis-comment block (`comment`) and the last-granule scan (`duration`)
+# All five are metadata-only entry points: no decoder is constructed and no pipeline type is
+# touched, so linking them costs the scanner parsing code, not a decode graph. (pf-mp4 already
+# depended on pf-mkv for its NAL reframer, so naming it here adds no new crate to the build.)
+pf-flac = { path = "../flac" }
+pf-mkv = { path = "../mkv" }
+pf-mp3 = { path = "../mp3" }
+pf-mp4 = { path = "../mp4" }
+pf-ogg = { path = "../ogg" }
+# Only for the io_uring reactor backend (Linux), behind the matching feature. The
+# default build reaches for `SyncReactor` in core and links nothing extra.
+profluens-elements = { path = "../elements", optional = true }
+
+[features]
+default = []
+# Scan through the hand-rolled io_uring reactor (`profluens_elements::io::IoUringReactor`)
+# instead of core's `SyncReactor`. Falls back to `SyncReactor` when the ring cannot be set
+# up (old kernel, `io_uring_setup` blocked by seccomp), so enabling it is never fatal.
+io-uring = ["dep:profluens-elements", "profluens-elements/io-uring"]

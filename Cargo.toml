@@ -50,6 +50,7 @@ members = [
     "avi",
     "mpeg4p2",
     "libopus-sys",
+    "tags",
 ]
 
 [workspace.package]

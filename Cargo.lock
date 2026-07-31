@@ -1005,6 +1005,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-tags"
+version = "0.1.0"
+dependencies = [
+ "pf-flac",
+ "pf-mkv",
+ "pf-mp3",
+ "pf-mp4",
+ "pf-ogg",
+ "profluens-core",
+ "profluens-elements",
+]
+
+[[package]]
 name = "pf-text"
 version = "0.1.0"
 dependencies = [
