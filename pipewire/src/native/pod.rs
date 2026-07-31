@@ -95,7 +95,7 @@ impl<'a> PodBuilder<'a> {
     /// Pad the buffer up to the next 8-byte boundary (POD bodies are 8-aligned on the wire).
     #[inline]
     fn pad8(&mut self) {
-        while self.buf.len() % 8 != 0 {
+        while !self.buf.len().is_multiple_of(8) {
             self.buf.push(0);
         }
     }

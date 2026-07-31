@@ -259,9 +259,9 @@ impl Consumer {
     }
 
     /// Bytes currently available to pull. Used by tests to reassemble without trusting the
-    /// silence padding; the RT callback itself just calls [`pull`](Self::pull).
-    #[cfg(test)]
-    fn available(&self) -> usize {
+    /// silence padding, and by the capture backend to render only real audio; the RT callback
+    /// itself just calls [`pull`](Self::pull).
+    pub(crate) fn available(&self) -> usize {
         self.inner.len()
     }
 
@@ -287,6 +287,21 @@ impl Producer {
     /// Mark the ring closed (shutdown). Idempotent.
     pub fn close(&self) {
         self.inner.close();
+    }
+
+    /// Bytes currently buffered ahead of the consumer — the backlog still to be played. Used
+    /// by [`AudioOutHandle::attach`](crate::out::AudioOutHandle) to place a new position epoch
+    /// *behind* the previous track's in-flight tail.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the ring has been closed from the other end (the device thread exited, or the
+    /// `AudioOut` this producer was attached to was dropped). This is how an attached sink
+    /// tells "my output went away" — a hard error — from "a seek aborted my write", which
+    /// [`push_interruptible`](Self::push_interruptible) also reports as `false`.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
     }
 }
 
@@ -515,6 +530,8 @@ mod tests {
             // Reassemble the whole stream. `pull` zero-pads on underrun, so we can't trust
             // padding bytes; instead we track our own position and use `try_take` — pull a
             // scratch buffer, then only accept the bytes the ring actually held this round.
+            // Test-only reassembly buffer, sized once — not a hot-path allocation.
+            #[allow(clippy::disallowed_methods)]
             let mut received: Vec<u8> = Vec::with_capacity(N);
             let mut scratch = [0u8; 37]; // not a divisor of ring size or any chunk
             while received.len() < N {

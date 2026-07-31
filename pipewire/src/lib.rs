@@ -7,11 +7,21 @@
 //! PipeWire, configuring itself from the runtime `audio/raw` format a decoder announces
 //! (spec: Formats — dynamic caps) and pacing the graph by backpressure.
 //!
+//! [`AudioOut`] is the **application-owned** audio output the gapless design is built on
+//! (spec: gapless.md, Phase 2): one device, one ring, one clock, outliving any individual
+//! pipeline. A sink built with [`PipeWireAudioSink::with_output`] attaches to it, streams,
+//! and detaches at EOS *without draining*, so the next track's audio queues behind the tail
+//! still in flight and the boundary is sample-continuous. The single-owner constructor is
+//! untouched and remains the default for every non-gapless pipeline.
+//!
 //! [`native`] is the from-scratch native-protocol client (no libpipewire) that will replace
 //! the `libpipewire` binding below — see its module docs for the migration plan.
 
 pub mod native;
+pub mod out;
+mod pw_backend;
 mod ring;
 mod sink;
 
-pub use sink::{AudioControl, PipeWireAudioSink};
+pub use out::{AudioOut, AudioOutConfig, AudioOutHandle, CanonicalFormat, SampleFormat};
+pub use sink::{AudioControl, AudioDeviceClock, PipeWireAudioSink};
