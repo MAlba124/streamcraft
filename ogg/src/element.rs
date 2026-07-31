@@ -346,12 +346,31 @@ impl Element for OggDemux {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // On EOS, tell the reader no more bytes are coming and flush every packet a
-        // just-closed page completed. `finish` drops only unparsable trailing garbage; a
-        // clean stream ends on a page boundary with nothing left.
-        if matches!(event, Event::Eos) {
-            self.reader.finish();
-            self.flush(ctx);
+        match event {
+            // Seek (spec: flush/seek). Everything this element holds is pre-seek: bytes the
+            // source has already jumped past but that are still queued inside the reader (a
+            // whole source chunk can be, since `drive` parses only to its look-ahead), the
+            // per-serial reassembly, and any over-slot packet parked on pool exhaustion.
+            // Emitting them after the flush would play a burst of pre-seek audio; the reader
+            // then resyncs the post-seek bytes to the next `OggS` page boundary on its own
+            // (RFC 3533 §6 — see [`OggReader::reset`]).
+            //
+            // The locked serial is *kept*: it names the logical bitstream being played, and
+            // a seek moves within that stream rather than to a different one. Re-locking on
+            // whatever serial happened to land first would let a grouped file switch streams
+            // mid-playback.
+            Event::FlushStart => {
+                self.reader.reset();
+                self.pending = None;
+            }
+            // On EOS, tell the reader no more bytes are coming and flush every packet a
+            // just-closed page completed. `finish` drops only unparsable trailing garbage; a
+            // clean stream ends on a page boundary with nothing left.
+            Event::Eos => {
+                self.reader.finish();
+                self.flush(ctx);
+            }
+            _ => {}
         }
         Ok(())
     }

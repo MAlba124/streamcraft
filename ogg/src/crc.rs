@@ -16,8 +16,10 @@
 //! wrong answer, so this is the single spot that must match the wire format exactly —
 //! it is known-answer tested against a hand-built page in `tests`.
 //!
-//! Pure safe Rust: a 256-entry lookup table built at first use, then a byte-wise
-//! update. No `unsafe`, no dependency.
+//! Pure safe Rust: lookup tables built at first use, then a slicing-by-8 update with a
+//! byte-at-a-time tail (see [`SLICES`]). No `unsafe`, no dependency. Every table is derived
+//! from the one bit-at-a-time definition in [`Table::build`], so the whole file still rests on
+//! a single transcription of the polynomial.
 
 /// Ogg CRC-32 generator polynomial (§6): x^32 + x^26 + x^23 + x^22 + x^16 + x^12 +
 /// x^11 + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 + x^1 + x^0.
@@ -29,11 +31,25 @@ const POLY: u32 = 0x04C1_1DB7;
 /// A `const` array would work too, but a `const fn` builder needs a loop; this stays
 /// a plain runtime table behind a `OnceLock` so the code reads as the textbook
 /// bit-at-a-time definition (the thing that is easy to check against the spec).
-struct Table([u32; 256]);
+struct Table([[u32; 256]; SLICES]);
+
+/// How many bytes the sliced inner loop folds per iteration.
+///
+/// Slicing-by-N (Kounavis & Berry, *"Novel Table Lookup-Based Algorithms for High-Performance
+/// CRC Generation"*, IEEE Transactions on Computers 57(11), 2008 — the technique Intel's
+/// `crc32` reference and zlib's `crc32_z` both use): table `k` holds the CRC contribution of a
+/// byte that is `k` positions from the end of the block, so `N` bytes can be folded with `N`
+/// independent table lookups that the processor issues in parallel, instead of `N` dependent
+/// ones each waiting on the previous byte's register update. `TABLE[0]` is exactly the
+/// classic byte-at-a-time table, and the tail loop still uses it.
+///
+/// Eight is the usual sweet spot: the eight loads are independent, and the two `u32` block
+/// reads that feed them are a single aligned `u64` on any real input.
+const SLICES: usize = 8;
 
 impl Table {
     fn build() -> Self {
-        let mut table = [0u32; 256];
+        let mut table = [[0u32; 256]; SLICES];
         let mut i = 0usize;
         while i < 256 {
             // Seed the top byte of the 32-bit register with the index, then divide by
@@ -48,14 +64,27 @@ impl Table {
                 };
                 bit += 1;
             }
-            table[i] = crc;
+            table[0][i] = crc;
             i += 1;
+        }
+        // Each higher table is the previous one pushed through one more byte position: the
+        // CRC of "this byte, then a zero byte". Derived from `table[0]` rather than written
+        // out, so the whole structure still rests on the one bit-at-a-time definition above.
+        let mut s = 1usize;
+        while s < SLICES {
+            let mut j = 0usize;
+            while j < 256 {
+                let prev = table[s - 1][j];
+                table[s][j] = (prev << 8) ^ table[0][(prev >> 24) as usize];
+                j += 1;
+            }
+            s += 1;
         }
         Self(table)
     }
 }
 
-fn table() -> &'static [u32; 256] {
+fn table() -> &'static [[u32; 256]; SLICES] {
     use std::sync::OnceLock;
     static TABLE: OnceLock<Table> = OnceLock::new();
     &TABLE.get_or_init(Table::build).0
@@ -78,11 +107,31 @@ impl Crc32 {
     pub fn update(&mut self, data: &[u8]) {
         let table = table();
         let mut crc = self.state;
-        for &byte in data {
+
+        // Eight bytes per iteration through the sliced tables (see [`SLICES`]). The register
+        // is consumed by the first four bytes and takes no further part, so all eight lookups
+        // depend only on the loaded bytes and issue in parallel — the byte-at-a-time loop's
+        // one-lookup-per-cycle dependency chain is what this removes.
+        let (blocks, rest) = data.as_chunks::<SLICES>();
+        for c in blocks {
+            let a = u32::from_be_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
+            let b = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
+            crc = table[7][(a >> 24) as u8 as usize]
+                ^ table[6][(a >> 16) as u8 as usize]
+                ^ table[5][(a >> 8) as u8 as usize]
+                ^ table[4][a as u8 as usize]
+                ^ table[3][(b >> 24) as u8 as usize]
+                ^ table[2][(b >> 16) as u8 as usize]
+                ^ table[1][(b >> 8) as u8 as usize]
+                ^ table[0][b as u8 as usize];
+        }
+
+        // The 0..8-byte tail, and every short call (an Ogg header is 27 bytes), byte at a time.
+        for &byte in rest {
             // MSB-first: XOR the incoming byte with the top byte of the register,
             // index the table with that, and shift the register up by a byte.
             let idx = ((crc >> 24) as u8 ^ byte) as usize;
-            crc = (crc << 8) ^ table[idx];
+            crc = (crc << 8) ^ table[0][idx];
         }
         self.state = crc;
     }
@@ -142,6 +191,27 @@ mod tests {
         }
     }
 
+    /// Slicing-by-8 must agree with the plain byte-at-a-time loop at **every** length, not
+    /// just the multiples of 8 the fast path handles: lengths 0..8 skip the sliced loop
+    /// entirely, and everything else exercises a different remainder. A CRC that is right on
+    /// aligned buffers and wrong on a 43-byte page would pass every other test in this file.
+    #[test]
+    fn sliced_matches_byte_at_a_time_at_every_length() {
+        fn byte_at_a_time(data: &[u8]) -> u32 {
+            let t = table();
+            let mut crc = 0u32;
+            for &b in data {
+                crc = (crc << 8) ^ t[0][((crc >> 24) as u8 ^ b) as usize];
+            }
+            crc
+        }
+        let data: Vec<u8> =
+            (0..600u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for len in 0..data.len() {
+            assert_eq!(crc32(&data[..len]), byte_at_a_time(&data[..len]), "len={len}");
+        }
+    }
+
     #[test]
     fn incremental_equals_oneshot() {
         // Splitting the input at an arbitrary point must not change the result.
@@ -171,7 +241,7 @@ mod tests {
         // 0x00 stays 0 (no polynomial fold), while 0x80 and 0xFF drive the top-bit fold
         // path. `table_step_matches_bitwise` already proved the table itself correct.
         assert_eq!(crc32(&[0x00]), 0);
-        assert_eq!(crc32(&[0x80]), table()[0x80]);
-        assert_eq!(crc32(&[0xFF]), table()[0xFF]);
+        assert_eq!(crc32(&[0x80]), table()[0][0x80]);
+        assert_eq!(crc32(&[0xFF]), table()[0][0xFF]);
     }
 }

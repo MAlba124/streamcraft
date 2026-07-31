@@ -26,6 +26,19 @@
 //!   lacing values (including the trailing zero for multiples of 255, and nil packets),
 //!   splits over-long packets across pages via 255-lacing continuation, and stamps
 //!   incrementing sequence numbers, granule positions, and bos/eos flags ([`writer`]).
+//! - [`parse_comment_body`] / [`parse_opus_tags`] / [`parse_vorbis_comments`] — the Vorbis
+//!   comment block Vorbis, Opus and FLAC share, parsed into a
+//!   [`TagSink`](profluens_core::event::TagSink) with zero heap allocation: values borrow
+//!   the input and cover art is base64-decoded into the caller's scratch arena
+//!   ([`comment`]).
+//! - [`parse_opus_head`] / [`parse_vorbis_ident`] — the codec identification headers on the
+//!   bos page (channels, rate, pre-skip) ([`ident`]).
+//! - [`last_granule`] / [`opus_duration_ns`] / [`vorbis_duration_ns`] — stream duration from
+//!   a backwards scan of the file's tail ([`duration`]).
+//!
+//! Those last three modules are what a **standalone tag scanner** needs: a bos page, a
+//! comment packet and a ~64 KiB tail read give title/artist/cover-art, channels/rate and
+//! duration without instantiating a pipeline or linking a codec.
 //!
 //! ## Reader/writer support
 //! - **Multiplexed streams** (concurrent multiplexing / "grouping", §4): reader keys
@@ -57,13 +70,22 @@
 
 #![deny(unsafe_code)]
 
+pub mod comment;
 pub mod crc;
+pub mod duration;
 pub mod element;
+pub mod ident;
 pub mod page;
 pub mod reader;
 pub mod writer;
 
+pub use comment::{parse_comment_body, parse_opus_tags, parse_vorbis_comments};
 pub use crc::{crc32, Crc32};
+pub use duration::{last_granule, opus_duration_ns, vorbis_duration_ns, OPUS_GRANULE_RATE};
+pub use ident::{
+    parse_opus_head, parse_speex_head, parse_vorbis_ident, OpusHead, SpeexHead, VorbisIdent,
+    SPEEX_MAGIC,
+};
 pub use element::{OggDemux, OggMux, DEFAULT_SERIAL};
 
 use profluens_core::element::Element;

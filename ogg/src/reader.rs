@@ -183,6 +183,33 @@ impl OggReader {
         leftover
     }
 
+    /// Discard every byte and every packet fragment currently held, so the next
+    /// [`push`](Self::push) starts from a clean slate — the **seek/flush** entry point
+    /// (spec: flush/seek).
+    ///
+    /// A byte-seek drops the source on an arbitrary offset, and everything already inside
+    /// the reader is from *before* that jump: input bytes parsed-but-not-yet-consumed,
+    /// packets queued behind the look-ahead, and per-serial fragments of a packet nothing
+    /// after the jump continues. Carrying them across the seek would emit pre-seek audio
+    /// after the flush and splice a stale fragment onto the first CONTINUED page found past
+    /// the landing byte. Dropping them is also what makes the landing *work*: with the
+    /// cursor empty, [`drive`](Self::drive) scans the post-seek bytes for the next `OggS`
+    /// capture pattern and CRC-verifies each candidate before trusting it — RFC 3533 §6, the
+    /// capture pattern is there so a decoder "can regain synchronisation after parsing a
+    /// corrupted stream", and landing mid-page is the same problem in a friendlier disguise.
+    ///
+    /// The recycled-buffer free list is deliberately *kept*: it holds capacity, not stream
+    /// state, and re-growing it after every seek would allocate for nothing. Queued packets
+    /// hand their buffers back to it on the way out.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.pos = 0;
+        self.streams.clear();
+        while let Some(p) = self.ready.pop_front() {
+            self.recycle(p.data);
+        }
+    }
+
     /// Pull the next ready packet, or `None` if none is currently assembled. Resumes the
     /// page parse when the queue runs dry, so a bounded look-ahead is invisible to callers:
     /// draining in a loop yields exactly the packets an unbounded parse would have.
