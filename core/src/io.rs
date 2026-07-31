@@ -676,7 +676,7 @@ mod tests {
             want: IoResult,
         }
         let cases = [
-            Case { name: "full", send: Some(b"profluens body"), want: IoResult::Ok(16) },
+            Case { name: "full", send: Some(b"profluens body"), want: IoResult::Ok(14) },
             Case { name: "short", send: Some(b"hi"), want: IoResult::Ok(2) },
             Case { name: "early-eof", send: None, want: IoResult::Ok(0) },
         ];
