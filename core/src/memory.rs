@@ -18,6 +18,24 @@ use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+/// Smallest small-buffer size class (64 B), as a shift, and how many power-of-two classes sit
+/// above it — 64 B … 32 KiB. Below 64 B a buffer is rounded up; above the top class it is not
+/// worth bucketing and [`Pool::acquire_exact`] falls back to a plain exact-size heap box.
+const SMALL_MIN_SHIFT: u32 = 6;
+const SMALL_CLASSES: usize = 10;
+
+/// Free small buffers retained per size class. The classes together retain at most
+/// `32 * (64 + 128 + … + 32768)` ≈ 2 MiB per pool, and in practice far less: small buffers in
+/// flight are bounded by ring capacities (a few tens), so the buckets sit near that depth.
+const SMALL_FREE_PER_CLASS: usize = 32;
+
+/// The size class serving `n` bytes, as `(index, class size)`. `None` above the classes' reach.
+fn small_class(n: usize) -> Option<(usize, usize)> {
+    let size = n.max(1 << SMALL_MIN_SHIFT).next_power_of_two();
+    let class = size.trailing_zeros().saturating_sub(SMALL_MIN_SHIFT) as usize;
+    (class < SMALL_CLASSES).then_some((class, size))
+}
+
 /// A fixed-slot-size buffer pool. Cheap to clone (an `Arc` handle); every clone
 /// shares the same free-list and counters.
 pub struct Pool {
@@ -33,6 +51,9 @@ struct PoolInner {
     /// remux's 1.2M allocations. Entries hold `pool: Weak`, so this list creates no
     /// refcount cycle with the pool that owns it.
     free: Mutex<Vec<Arc<MemoryInner>>>,
+    /// Free lists for buffers too small to warrant a slot, one per size class — see
+    /// [`Pool::small_free`]. Separate from `free` because these are *not* part of the slot budget.
+    small: Mutex<[Vec<Arc<MemoryInner>>; SMALL_CLASSES]>,
     slot_allocations: AtomicU64, // boxes ever heap-allocated (misses)
     acquires: AtomicU64,
     recycles: AtomicU64,
@@ -57,6 +78,7 @@ impl Pool {
                 slot_size,
                 max_slots,
                 free: Mutex::new(Vec::new()),
+                small: Mutex::new(std::array::from_fn(|_| Vec::new())),
                 slot_allocations: AtomicU64::new(0),
                 acquires: AtomicU64::new(0),
                 recycles: AtomicU64::new(0),
@@ -108,10 +130,12 @@ impl Pool {
     /// fallback is the point (spec: Memory — pool negotiation is future work): with
     /// one pipeline-wide slot size, a cold/tail path emitting a 15 KB demuxed sample
     /// must not pay a multi-MiB slot per buffer — that turned a movie transcode into
-    /// gigabytes. Odd-sized boxes recycle to nothing (`recycle` keeps only slot-sized
-    /// ones), and every heap fallback still shows in `PoolStats::slot_allocations`.
+    /// gigabytes. Every heap fallback still shows in `PoolStats::slot_allocations`.
     /// Hot paths should prefer `try_acquire` + backpressure; this is for bounded
     /// flushes (an EOS drain) where yielding is not an option.
+    ///
+    /// Buffers below the slot threshold are served from a **size-classed free list** rather than a
+    /// fresh box every time — see [`small_free`](Self::small_free).
     pub fn acquire_exact(&self, n: usize) -> Memory {
         // A pooled slot serves an exact request only when the request meaningfully
         // fills it (n ≥ slot_size/4). Handing a whole multi-MiB slot to a tiny
@@ -120,7 +144,8 @@ impl Pool {
         // the decoder's carried picture could then never allocate its output (and
         // by design it stops consuming input until it emits), and the demux group
         // won the race for every slot the sink freed. Small requests take the
-        // exactly-n heap path instead: freed on drop, never competing with frames.
+        // size-classed small path instead: recycled among themselves, never competing
+        // with frames.
         // (Spec: Memory — per-link pools are the real fix for slot-size mismatch.)
         if n <= self.inner.slot_size && n >= self.inner.slot_size / 4 {
             if let Some(m) = self.try_acquire() {
@@ -136,8 +161,37 @@ impl Pool {
         // slots free* (it stops consuming input until it emits — deadlock). Heap
         // buffers are bounded by ring capacities; only slot-backed memory is the
         // pool's to budget. `slot_allocations` still records the heap alloc.
+        if let Some(small) = self.small_free(n) {
+            return small;
+        }
         self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
         Memory::from_heap(vec![0u8; n.max(1)].into_boxed_slice())
+    }
+
+    /// Recycle small buffers too, in power-of-two size classes from 64 B up.
+    ///
+    /// [`acquire_exact`](Self::acquire_exact)'s heap fallback is correct not to take a slot, but it
+    /// was also unpooled: a compressed-audio encoder emitting ~200-byte packets paid a fresh box
+    /// *and* a fresh `Arc<MemoryInner>` for every one — measured as exactly 2 of the 2.1
+    /// allocations per packet in a whole FLAC→Opus pipeline, i.e. all of its steady-state
+    /// allocation. Class-sized boxes recycle to these buckets instead, so the second packet onwards
+    /// reuses the whole `Arc` — the same trick the slot free-list already plays, applied to the
+    /// buffers too small for a slot.
+    ///
+    /// They stay **unlinked from the slot budget**: nothing here touches `outstanding`, so the
+    /// deadlock `acquire_exact` documents (heap-exact buffers starving `try_acquire`) cannot come
+    /// back. Retention is bounded by [`SMALL_FREE_PER_CLASS`] per class instead.
+    fn small_free(&self, n: usize) -> Option<Memory> {
+        let (class, size) = small_class(n)?;
+        if size >= self.inner.slot_size {
+            return None; // a slot-sized (or larger) box is the slot path's business, not this one
+        }
+        if let Some(arc) = self.inner.small.lock().unwrap()[class].pop() {
+            return Some(Memory { inner: Some(arc), offset: 0, len: 0 });
+        }
+        // Miss: allocate the *class* size, pool-linked so it comes back to the bucket on drop.
+        self.inner.slot_allocations.fetch_add(1, Ordering::Relaxed);
+        Some(Memory::from_box(vec![0u8; size].into_boxed_slice(), &self.inner))
     }
 
     /// Take a slot from the free-list, or heap-allocate one on a miss.
@@ -187,17 +241,33 @@ impl PoolInner {
     /// A rejected backing is **disarmed** (bytes taken, pool link severed) before it
     /// drops, so `MemoryInner::drop`'s fallback cannot double-decrement the counters.
     fn recycle_arc(&self, mut arc: Arc<MemoryInner>) {
-        self.recycles.fetch_add(1, Ordering::Relaxed);
-        let keep = arc.buf.len() == self.slot_size;
-        // Decrement outstanding under the free-list lock so it stays consistent with
-        // try_acquire's cap check.
-        let mut free = self.free.lock().unwrap();
-        self.outstanding.fetch_sub(1, Ordering::Relaxed);
-        if keep && (free.len() as u64) < self.max_slots as u64 {
-            free.push(arc);
-        } else if let Some(inner) = Arc::get_mut(&mut arc) {
-            // Wrong size (an `acquire_exact` heap fallback) or list at cap: free the
-            // bytes, and disarm so the fallback drop path is a no-op.
+        let len = arc.buf.len();
+        if len == self.slot_size {
+            self.recycles.fetch_add(1, Ordering::Relaxed);
+            // Decrement outstanding under the free-list lock so it stays consistent with
+            // try_acquire's cap check.
+            let mut free = self.free.lock().unwrap();
+            self.outstanding.fetch_sub(1, Ordering::Relaxed);
+            if (free.len() as u64) < self.max_slots as u64 {
+                free.push(arc);
+                return;
+            }
+        } else if let Some((class, size)) = small_class(len) {
+            // A small-class box (see `Pool::small_free`), back in its bucket. Checked *after* the
+            // slot size, so a pool whose slot size happens to be a size class still treats
+            // slot-sized backings as slots. Deliberately touches no counter: these never entered
+            // the slot budget, so `outstanding` must not move.
+            if size == len && len < self.slot_size {
+                let mut small = self.small.lock().unwrap();
+                if small[class].len() < SMALL_FREE_PER_CLASS {
+                    small[class].push(arc);
+                    return;
+                }
+            }
+        }
+        // List at cap, or an odd size: free the bytes, and disarm so the fallback drop path is a
+        // no-op.
+        if let Some(inner) = Arc::get_mut(&mut arc) {
             drop(std::mem::take(&mut inner.buf));
             inner.pool = Weak::new();
         }
@@ -206,8 +276,23 @@ impl PoolInner {
     /// The cold fallback (from [`MemoryInner::drop`] — a concurrent-last-drop race or
     /// a CoW discard): only the bytes come back; re-wrapping pays one `Arc::new`.
     fn recycle_box(self: &Arc<Self>, buf: Box<[u8]>) {
+        let len = buf.len();
+        if len != self.slot_size {
+            // A small-class backing taking the cold path: re-bucket it (paying one `Arc::new`, as
+            // this path always does) without touching the slot budget it never joined.
+            if let Some((class, size)) = small_class(len) {
+                if size == len && len < self.slot_size {
+                    let mut small = self.small.lock().unwrap();
+                    if small[class].len() < SMALL_FREE_PER_CLASS {
+                        small[class]
+                            .push(Arc::new(MemoryInner { buf, pool: Arc::downgrade(self) }));
+                    }
+                    return;
+                }
+            }
+        }
         self.recycles.fetch_add(1, Ordering::Relaxed);
-        let keep = buf.len() == self.slot_size;
+        let keep = len == self.slot_size;
         let mut free = self.free.lock().unwrap();
         self.outstanding.fetch_sub(1, Ordering::Relaxed);
         if keep && (free.len() as u64) < self.max_slots as u64 {
@@ -830,6 +915,44 @@ mod tests {
         let _c = pool.try_acquire().expect("slot freed after drop");
         assert!(pool.try_acquire().is_none());
         drop(b);
+    }
+
+    /// A small-buffer producer — a compressed-audio encoder emitting ~200-byte packets — must stop
+    /// allocating once its size class has been round-tripped once, and must never disturb the slot
+    /// budget while doing so.
+    #[test]
+    fn acquire_exact_recycles_small_buffers() {
+        let pool = Pool::bounded(64 * 1024, 4);
+        // Warm the class, then hold nothing: each iteration acquires and drops.
+        let warm = pool.acquire_exact(212);
+        drop(warm);
+        let after_warm = pool.stats().slot_allocations;
+        for _ in 0..1000 {
+            let mut m = pool.acquire_exact(212);
+            assert!(m.capacity() >= 212, "at least the requested bytes");
+            m.set_len(212);
+            drop(m);
+        }
+        let stats = pool.stats();
+        assert_eq!(stats.slot_allocations, after_warm, "steady state allocates nothing");
+        // The small path is unlinked from the slot budget: all four slots stay available, which is
+        // what stops small buffers from starving `try_acquire` (and deadlocking a paced consumer).
+        assert_eq!(stats.outstanding, 0, "small buffers never enter the slot budget");
+        assert_eq!(pool.free_slots(), 4, "every slot still available");
+    }
+
+    /// Distinct size classes do not feed each other, and a buffer is never handed out smaller than
+    /// asked for.
+    #[test]
+    fn small_classes_are_kept_apart() {
+        let pool = Pool::new(64 * 1024);
+        for n in [1usize, 64, 65, 200, 1000, 4096, 8191] {
+            let a = pool.acquire_exact(n);
+            assert!(a.capacity() >= n, "{n}: at least n bytes");
+            drop(a);
+            let b = pool.acquire_exact(n);
+            assert!(b.capacity() >= n, "{n}: recycled buffer still fits");
+        }
     }
 
     #[test]
