@@ -10,6 +10,10 @@
 //! first decoded packet. An `OpusTags` comment packet is consumed silently. The first `pre_skip`
 //! samples (RFC 7845 §4.2) are trimmed and the header's `output_gain` applied.
 //!
+//! Output buffers are stamped on the decoder's own 48 kHz sample grid — see [`OpusDec::pts_now`]
+//! for why the decoder, not the container, owns this timeline — and that counter is re-based to
+//! the seek target on `FlushStart`.
+//!
 //! Backpressure mirrors `flacdec`: decoded PCM is emitted straight into pool buffers with a
 //! bounded pending carry, so a slow sink cannot make the decoder run ahead and balloon the pool.
 //! Opus is always 48 kHz on decode; sample-rate conversion is a downstream `audioresample`.
@@ -144,6 +148,9 @@ pub struct OpusDec {
     /// Decoded interleaved PCM not yet emitted — the bounded backpressure carry.
     pending: Vec<i16>,
     pending_pos: usize,
+    /// Interchannel samples emitted so far: the stream position, and hence the timestamp, of
+    /// the next buffer. Re-based to the seek target on `FlushStart`.
+    samples_emitted: u64,
 }
 
 impl Default for OpusDec {
@@ -163,7 +170,21 @@ impl OpusDec {
             output_gain_q7_8: 0,
             pending: Vec::new(),
             pending_pos: 0,
+            samples_emitted: 0,
         }
+    }
+
+    /// PTS for the current `samples_emitted`, on the 48 kHz output grid from a zero base —
+    /// the convention `flacdec`/`mp3dec` use for a stream whose container supplies no time.
+    /// Opus needs it most in Ogg, where there is none to supply: RFC 3533 §4 is explicit that
+    /// Ogg "has no concept of 'time'", and the page granule is an end-of-page position that
+    /// says nothing about where a packet *starts*. The decoder is the first element that knows
+    /// how many samples it has produced, so it owns this stream's time base and stamps it here.
+    /// [`OUTPUT_RATE`] is a nonzero constant (RFC 6716 §2), so this needs no unknown-rate guard.
+    fn pts_now(&self) -> Timestamp {
+        Timestamp::from_nanos(
+            (u128::from(self.samples_emitted) * 1_000_000_000 / OUTPUT_RATE as u128) as u64,
+        )
     }
 
     /// Announce the runtime `audio/raw` format once (spec: dynamic caps): 48 kHz, `s16`, the
@@ -209,6 +230,11 @@ impl OpusDec {
                 n += BYTES_PER_SAMPLE;
             }
             buf.memory.set_len(n);
+            // Stamp the buffer on the decoder's own timeline, then advance it by the
+            // interchannel samples just written (the same shape as `flacdec::emit_pending`).
+            buf.pts = self.pts_now();
+            self.samples_emitted += ((end - self.pending_pos) / self.channels.max(1)) as u64;
+            buf.duration = self.pts_now().saturating_sub(buf.pts);
             ctx.out(PadId(1)).push(buf);
             self.pending_pos = end;
         }
@@ -311,6 +337,20 @@ impl Element for OpusDec {
                 self.dec.reset();
                 self.pending.clear();
                 self.pending_pos = 0;
+                // …and re-base the sample counter the PTS is derived from. An Opus packet
+                // carries no position of its own, and the Ogg page granule that would give one
+                // is not visible this side of the demuxer — but the seek target *is* the
+                // position the pipeline rebased its running time to, so taking it from there
+                // is what keeps buffer timestamps and running time telling the same story.
+                // Without it the post-seek audio is stamped with pre-seek times and appears to
+                // jump backwards. The source reads `to_byte` from this same target; the
+                // decoder, which owns this stream's time base, reads `to_time`.
+                if let Some(t) = ctx.seek_target() {
+                    if let Some(ns) = t.to_time.nanos() {
+                        self.samples_emitted =
+                            (u128::from(ns) * OUTPUT_RATE as u128 / 1_000_000_000) as u64;
+                    }
+                }
             }
             // End of stream: flush the carry through the unbounded pool so the tail is emitted
             // even if this element was backpressured (Opus packets are self-contained — no
