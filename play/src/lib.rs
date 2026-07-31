@@ -18,11 +18,17 @@
 //! - [`player`] — the thin [`Player`] API the CLI drives.
 
 pub mod autoplug;
+pub mod chain;
 pub mod head;
 pub mod player;
 pub mod probe;
 pub mod seek;
+pub mod source;
+pub mod stereo;
 
 pub use autoplug::SinkChoice;
+pub use chain::{ChainHandles, ChainSpec, SinkSpec};
 pub use player::{Player, SinkPolicy};
 pub use probe::Kind;
+pub use source::SourceSpec;
+pub use stereo::AudioStereo;

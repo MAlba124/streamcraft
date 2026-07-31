@@ -72,6 +72,33 @@ pub enum SinkChoice {
     ExternalZeroCopy,
 }
 
+/// How the audio branch is wired — the two modes, side by side.
+///
+/// [`Policy`](Self::Policy) is what this controller has always done: pick a sink from the
+/// [`SinkChoice`] and reach it through [`wire_audio_chain`]'s tiered fallback (direct, then
+/// `+convert`, then `+convert+resample`), stopping at the first tier that negotiates. The sink
+/// adapts to the content.
+///
+/// [`Canonical`](Self::Canonical) is the gapless mode ([`crate::chain`]): every stage is forced
+/// and the chain provably ends in f32 / 48 kHz / 2 ch, because the sink **cannot** adapt — a
+/// shared `AudioOut` latches one device format so consecutive tracks can hand off inside it.
+///
+/// Neither replaces the other, and the `Policy` path is untouched byte for byte: a
+/// `SinkChoice` converts straight into this enum, and every existing entry point keeps its old
+/// signature by wrapping its argument here.
+pub enum AudioTarget {
+    /// The tiered fallback into a policy-chosen sink (the v1 behavior).
+    Policy(SinkChoice),
+    /// The forced canonical-output chain, into the spec's (possibly caller-supplied) sink.
+    Canonical(crate::chain::ChainSpec),
+}
+
+impl From<SinkChoice> for AudioTarget {
+    fn from(c: SinkChoice) -> Self {
+        AudioTarget::Policy(c)
+    }
+}
+
 /// What autoplug decided for one discovered pad, for the CLI's `track <pad>: <what>` line.
 pub struct TrackOutcome {
     /// The demux pad's name (`src_track<N>`, or the elementary synthetic name).
@@ -109,6 +136,11 @@ pub struct Wiring {
     /// it to drive pause/seek from window clicks + publish duration/pause to the HUD. `None`
     /// unless the waylandvideosink is in use.
     pub player_control: Option<std::sync::Arc<pf_present::PlayerControl>>,
+    /// The canonical audio chain's handles, when the audio branch was wired with
+    /// [`AudioTarget::Canonical`] — the gain/stretch element ids and the stretcher's position
+    /// counter, i.e. everything an app drives live. `None` on the tiered `Policy` path, which
+    /// has no such stages.
+    pub audio_chain: Option<crate::chain::ChainHandles>,
 }
 
 impl Wiring {
@@ -167,10 +199,12 @@ const VIDEO_SLOT: usize = 4 * 1024 * 1024;
 const VIDEO_SLOTS: u32 = 24;
 const VIDEO_QUEUE: usize = 16;
 /// The audio-pool policy: a decoded frame is a few KB, so a decoder gets a small-slot pool
-/// (64 KiB × 64) and a deep queue (64) — the interleave slack (see [`wire_audio`]).
-const AUDIO_SLOT: usize = 64 * 1024;
-const AUDIO_SLOTS: u32 = 64;
-const AUDIO_QUEUE: usize = 64;
+/// (64 KiB × 64) and a deep queue (64) — the interleave slack (see [`wire_audio`]). Public so
+/// the canonical chain ([`crate::chain`]) applies the *same* policy to each of its stages
+/// rather than inventing a second set of numbers.
+pub const AUDIO_SLOT: usize = 64 * 1024;
+pub const AUDIO_SLOTS: u32 = 64;
+pub const AUDIO_QUEUE: usize = 64;
 
 /// How autoplug learns a discovered pad's real codec family. Some demuxers publish a
 /// *per-track* offer menu whose first family is the codec ([`pf_mkv::MkvDemux`] via
@@ -207,7 +241,40 @@ pub fn autoplug_container(
     audio_sink: SinkChoice,
     zc_channel: Option<&std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
 ) -> Wiring {
+    autoplug_container_with(
+        p,
+        demux,
+        pads,
+        family_of,
+        audio_channels,
+        video_sink,
+        AudioTarget::Policy(audio_sink),
+        zc_channel,
+    )
+}
+
+/// [`autoplug_container`], with the audio branch's wiring mode spelled out — the tiered
+/// fallback ([`AudioTarget::Policy`], what `autoplug_container` passes) or the forced
+/// canonical-output chain ([`AudioTarget::Canonical`]).
+///
+/// The video, subtitle and drop branches are identical in both modes; only the one chosen audio
+/// pad's tail differs, which is why this is a mode on the audio argument rather than a second
+/// controller.
+#[allow(clippy::too_many_arguments)]
+pub fn autoplug_container_with(
+    p: &mut Pipeline,
+    demux: ElementId,
+    pads: &[profluens_core::pipeline::AddedPadInfo],
+    family_of: Option<&FamilyResolver<'_>>,
+    audio_channels: Option<&AudioChannels<'_>>,
+    video_sink: SinkChoice,
+    audio_sink: AudioTarget,
+    zc_channel: Option<&std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
+) -> Wiring {
     let mut w = Wiring::default();
+    // At most one audio pad is decoded, so the (non-`Copy`, sink-owning) target is consumed
+    // exactly once; every other pad takes a drop.
+    let mut audio_sink = Some(audio_sink);
 
     // Resolve every pad's real codec family once (the explicit override — MP4 — wins; else the
     // pad's declared menu, whose first family is the codec for per-track-menu demuxers — MKV).
@@ -336,11 +403,15 @@ pub fn autoplug_container(
         // bridge would otherwise let any audio decoder claim any audio pad).
         if Some(i) == audio_idx {
             if let Some(dec) = make_audio_decoder(family) {
-                match link_audio(p, (ap.element, &ap.name), dec, audio_sink, &mut w) {
+                // The chosen pad is the only consumer of the target; `take` moves the
+                // (sink-owning) spec in, and a second audio pad can never reach here.
+                let target = audio_sink.take().expect("one audio pad consumes the target");
+                let label = audio_target_label(&target);
+                match link_audio(p, (ap.element, &ap.name), dec, target, &mut w) {
                     Ok(name) => {
                         w.tracks.push(TrackOutcome {
                             pad: ap.name.clone(),
-                            summary: format!("{family} → {name} → {}", sink_label(audio_sink, false)),
+                            summary: format!("{family} → {name} → {label}"),
                             linked: true,
                         });
                         continue;
@@ -654,7 +725,7 @@ fn link_audio(
     p: &mut Pipeline,
     pad: (ElementId, &str),
     dec: Box<dyn Element>,
-    sink: SinkChoice,
+    sink: AudioTarget,
     w: &mut Wiring,
 ) -> Result<&'static str, String> {
     let name = audio_dec_name(dec.desc().name);
@@ -690,12 +761,14 @@ fn link_audio(
         // Device — and External/ExternalZeroCopy, which are *video*-only choices: audio always
         // uses the device sink (it provides the pipeline clock). The GUI pairs an External video
         // choice with `audio: Device`; a stray `audio: External*` grabs the device.
-        SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy => {
+        AudioTarget::Policy(
+            SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy,
+        ) => {
             let s = p.add(pf_pipewire::PipeWireAudioSink::new());
             wire_audio_chain(p, dec_id, s, "pipewireaudiosink")?;
             w.audio_sink = Some(s);
         }
-        SinkChoice::Drop => {
+        AudioTarget::Policy(SinkChoice::Drop) => {
             let (ts, _stats) = TestSink::new();
             let s = p.add(ts);
             // A drop sink speaks `bytes` — the decoder's `audio/raw`→`bytes` bridge links
@@ -703,9 +776,24 @@ fn link_audio(
             p.link((dec_id, "src"), (s, "sink")).map_err(|e| format!("{name} ! dropsink: {e:?}"))?;
             w.audio_sink = Some(s);
         }
+        // The forced canonical chain — no tiers, no fallback: it either wires the full
+        // f32/48k/2ch conform or it reports why (see `crate::chain`).
+        AudioTarget::Canonical(spec) => {
+            let h = crate::chain::wire_canonical_audio_chain(p, (dec_id, "src"), spec)?;
+            w.audio_sink = Some(h.sink);
+            w.audio_chain = Some(h);
+        }
     }
     w.audio_dec = Some(dec_id);
     Ok(name)
+}
+
+/// The sink label for an audio `track` line, over either wiring mode.
+fn audio_target_label(t: &AudioTarget) -> &'static str {
+    match t {
+        AudioTarget::Policy(c) => sink_label(*c, false),
+        AudioTarget::Canonical(spec) => spec.sink.label(),
+    }
 }
 
 /// Link `dec → device_sink`, inserting `audioconvert` then `audioconvert+audioresample`
@@ -766,6 +854,7 @@ fn audio_dec_name(desc_name: &str) -> &'static str {
         "aacdec" => "aacdec",
         "flacdec" => "flacdec",
         "mp3dec" => "mp3dec",
+        "opusdec" => "opusdec",
         "ac3dec" => "ac3dec",
         "eac3dec" => "eac3dec",
         _ => "audiodec",
@@ -808,6 +897,18 @@ pub fn wire_elementary_audio(
     pad_name: &str,
     audio_sink: SinkChoice,
 ) -> Wiring {
+    wire_elementary_audio_with(p, src, dec, pad_name, AudioTarget::Policy(audio_sink))
+}
+
+/// [`wire_elementary_audio`], with the audio branch's wiring mode spelled out — see
+/// [`AudioTarget`].
+pub fn wire_elementary_audio_with(
+    p: &mut Pipeline,
+    src: ElementId,
+    dec: Box<dyn Element>,
+    pad_name: &str,
+    audio_sink: AudioTarget,
+) -> Wiring {
     let mut w = Wiring::default();
     let name = audio_dec_name(dec.desc().name);
     let dec_id = p.add_boxed(dec);
@@ -823,7 +924,9 @@ pub fn wire_elementary_audio(
     p.set_queue_capacity(dec_id, AUDIO_QUEUE);
     match audio_sink {
         // Device/External* all use the audio device (see the note in `link_audio`).
-        SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy => {
+        AudioTarget::Policy(
+            SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy,
+        ) => {
             let s = p.add(pf_pipewire::PipeWireAudioSink::new());
             match wire_audio_chain(p, dec_id, s, "pipewireaudiosink") {
                 Ok(()) => {
@@ -842,7 +945,7 @@ pub fn wire_elementary_audio(
                 }),
             }
         }
-        SinkChoice::Drop => {
+        AudioTarget::Policy(SinkChoice::Drop) => {
             let (ts, _stats) = TestSink::new();
             let s = p.add(ts);
             p.link((dec_id, "src"), (s, "sink")).expect("audiodec ! dropsink");
@@ -853,6 +956,30 @@ pub fn wire_elementary_audio(
                 summary: format!("{name} → drop sink"),
                 linked: true,
             });
+        }
+        // COLD: naming a track for the report, once per build — not on any streaming path
+        // (spec: allocation discipline — one-time setup takes the documented exception).
+        #[allow(clippy::disallowed_methods)]
+        AudioTarget::Canonical(spec) => {
+            // Read the label before the spec (which owns the boxed sink) is moved in.
+            let label = spec.sink.label();
+            match crate::chain::wire_canonical_audio_chain(p, (dec_id, "src"), spec) {
+                Ok(h) => {
+                    w.audio_sink = Some(h.sink);
+                    w.audio_dec = Some(dec_id);
+                    w.audio_chain = Some(h);
+                    w.tracks.push(TrackOutcome {
+                        pad: pad_name.to_string(),
+                        summary: format!("{name} → {label}"),
+                        linked: true,
+                    });
+                }
+                Err(e) => w.tracks.push(TrackOutcome {
+                    pad: pad_name.to_string(),
+                    summary: format!("(dropped: {e})"),
+                    linked: false,
+                }),
+            }
         }
     }
     w

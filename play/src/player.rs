@@ -16,10 +16,10 @@ use std::collections::HashMap;
 
 use profluens_core::pipeline::{Pipeline, SeekIndex};
 use profluens_core::time::Timestamp;
-use profluens_elements::io::FileSrc;
-
-use crate::autoplug::{self, SinkChoice, TrackOutcome, Wiring};
+use crate::autoplug::{self, AudioTarget, SinkChoice, TrackOutcome, Wiring};
+use crate::chain::{ChainHandles, ChainSpec};
 use crate::probe::{self, Kind};
+use crate::source::SourceSpec;
 use crate::{head, seek};
 
 /// Which real sinks to grab (a headless / silent run drops instead — see the CLI's
@@ -46,6 +46,16 @@ pub struct Player {
     wiring: Wiring,
     seek_index: SeekIndex,
     duration_ns: Option<u64>,
+    /// Whether this player was opened on a growing source.
+    ///
+    /// Deliberately a `bool` and **not** a retained [`FrontierHandle`]. `growingfilesrc` treats
+    /// "every handle dropped without `finish()`/`abort()`" as an abandoned download and winds
+    /// the stream down (`End::Abandoned`) — it detects that by the handle `Arc`'s strong count
+    /// reaching one. A copy squirrelled away in here would hold that count at two forever, so a
+    /// caller who dropped their handle (or whose downloader panicked) would get a pipeline
+    /// parked at the frontier until the process died, instead of a clean EOS and a bus warning.
+    /// The convenience of `player.frontier()` is not worth disarming that.
+    growing: bool,
 }
 
 impl Player {
@@ -55,7 +65,35 @@ impl Player {
     /// error here — [`any_track_linked`](Self::any_track_linked) reports that, so the CLI
     /// can distinguish "unknown file" from "known file, nothing to play".
     pub fn open(path: &str, policy: SinkPolicy) -> Result<Player, String> {
-        Self::open_inner(path, policy, None)
+        Self::open_inner(
+            SourceSpec::path(path),
+            policy.video,
+            AudioTarget::Policy(policy.audio),
+            None,
+        )
+    }
+
+    /// Open with the **canonical-output audio chain** (spec: `gapless.md` Phase 2): the audio
+    /// branch is forced through `audioconvert(f32) → audiostereo → audioresample(48k)` and the
+    /// spec's optional stretch/gain stages, so whatever the file contains, the sink is offered
+    /// [`CANONICAL`](crate::chain::CANONICAL) — f32, 48 kHz, 2 ch.
+    ///
+    /// This is the mode a shared `AudioOut` requires, because its device format is latched once
+    /// for the life of the application and every track's producer must speak it. The sink
+    /// itself is the spec's ([`SinkSpec::Injected`](crate::chain::SinkSpec::Injected) for the
+    /// engine's producer element; a policy sink otherwise).
+    ///
+    /// `source` may be a complete file or one still downloading — see [`SourceSpec`] for the
+    /// growing-file open policy. `video` chooses what happens to any video track in the
+    /// container (audio-only sources ignore it); pass [`SinkChoice::Drop`] for a music player.
+    ///
+    /// Drive the built chain through [`audio_chain`](Self::audio_chain).
+    pub fn open_canonical(
+        source: SourceSpec,
+        chain: ChainSpec,
+        video: SinkChoice,
+    ) -> Result<Player, String> {
+        Self::open_inner(source, video, AudioTarget::Canonical(chain), None)
     }
 
     /// Open a player wired for the **zero-copy** VA-API display path: when `policy.video` is
@@ -69,18 +107,31 @@ impl Player {
         policy: SinkPolicy,
         channel: std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>,
     ) -> Result<Player, String> {
-        Self::open_inner(path, policy, Some(channel))
+        Self::open_inner(
+            SourceSpec::path(path),
+            policy.video,
+            AudioTarget::Policy(policy.audio),
+            Some(channel),
+        )
     }
 
     fn open_inner(
-        path: &str,
-        policy: SinkPolicy,
+        mut source: SourceSpec,
+        video: SinkChoice,
+        audio: AudioTarget,
         zc_channel: Option<std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
     ) -> Result<Player, String> {
-        let prefix = head::read_prefix(path, probe::PREFIX_LEN)
-            .map_err(|e| format!("cannot read '{path}': {e}"))?;
+        // Typefind. For a growing source this is the one blocking wait in the whole open: it
+        // returns as soon as the (64-byte) prefix is readable — see `crate::source`, policy 1.
+        let prefix = source
+            .read_prefix(probe::PREFIX_LEN)
+            .map_err(|e| format!("cannot read '{}': {e}", source.path_str()))?;
         let kind = probe::probe(&prefix)?;
-        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // The length everything downstream measures against: the caller's `total_hint` for a
+        // growing source, the file's own size otherwise (`crate::source`, policy 4).
+        let on_disk = std::fs::metadata(source.path_str()).map(|m| m.len()).unwrap_or(0);
+        let file_len = source.index_len(on_disk);
+        let growing = source.is_growing();
 
         let mut p = Pipeline::new();
         // 1080p I420 is ~3.1 MiB/frame; 4 MiB shared slots leave headroom up to ~1600×1300.
@@ -88,27 +139,42 @@ impl Player {
         p.set_pool(4 * 1024 * 1024, 24);
 
         let (wiring, seek_index, duration_ns) = if kind.is_elementary() {
-            Self::build_elementary(&mut p, path, kind, file_len, policy)?
+            Self::build_elementary(&mut p, &mut source, kind, file_len, audio)?
         } else {
-            Self::build_container(&mut p, path, &prefix, kind, file_len, policy, zc_channel.as_ref())?
+            Self::build_container(
+                &mut p,
+                &mut source,
+                &prefix,
+                kind,
+                file_len,
+                video,
+                audio,
+                zc_channel.as_ref(),
+            )?
         };
 
         p.set_seek_index(seek_index.clone());
-        Ok(Player { pipeline: p, kind, wiring, seek_index, duration_ns })
+        Ok(Player { pipeline: p, kind, wiring, seek_index, duration_ns, growing })
     }
 
     /// Build the container path: `filesrc → demux`, preroll, autoplug the discovered pads.
     #[allow(clippy::too_many_arguments)]
     fn build_container(
         p: &mut Pipeline,
-        path: &str,
+        source: &mut SourceSpec,
         prefix: &[u8],
         kind: Kind,
         file_len: u64,
-        policy: SinkPolicy,
+        video: SinkChoice,
+        audio: AudioTarget,
         zc_channel: Option<&std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
     ) -> Result<(Wiring, SeekIndex, Option<u64>), String> {
-        let src = p.add(FileSrc::new(path));
+        // COLD: one path copy per open. `source` is borrowed mutably below (`take_element`),
+        // so the path cannot stay a borrow of it.
+        #[allow(clippy::disallowed_methods)]
+        let path = source.path_str().to_string();
+        let path = path.as_str();
+        let src = p.add_boxed(source.take_element()?);
 
         // Per-container demuxer construction + seek index. `mp4_families` is the explicit
         // pad→family map MP4 needs (its demux src pads share one all-families offer menu that
@@ -121,13 +187,20 @@ impl Player {
         let mut audio_channels: HashMap<String, u16> = HashMap::new();
         let (demux, seek_info) = match kind {
             Kind::Mkv => {
-                let header = head::mkv_header_prefix(path)
-                    .map_err(|e| format!("mkv header: {e}"))?;
-                let info = seek::mkv_seek_index(path, &header, file_len);
+                let header = container_head(source, Kind::Mkv)?;
                 // A throwaway reader parses the same header for each track's channel count;
                 // the pad name mirrors the demuxer's `src_track<track_number>`.
                 let mut probe = pf_mkv::MatroskaReader::new();
                 let _ = probe.push(&header);
+                // The Cues chain is resolved with a positioned read *of the file*, which a
+                // growing source may not have received yet — so an incomplete download gets the
+                // proportional index (over the hinted final length) plus the header's declared
+                // duration, rather than a `pread` past the frontier.
+                let info = if source.is_complete() {
+                    seek::mkv_seek_index(path, &header, file_len)
+                } else {
+                    seek::proportional(file_len, probe.duration_ns())
+                };
                 for t in probe.tracks() {
                     if t.channels > 0 {
                         audio_channels.insert(format!("src_track{}", t.track_number), t.channels as u16);
@@ -136,7 +209,7 @@ impl Player {
                 (p.add(pf_mkv::MkvDemux::new(header)), info)
             }
             Kind::Mp4 => {
-                let hb = head::mp4_head(path).map_err(|e| format!("mp4 head: {e}"))?;
+                let hb = container_head(source, Kind::Mp4)?;
                 // The reader resolves the sample tables from the same head bytes — reused for
                 // the (keyframe-exact) seek index AND the pad→family map, before the bytes are
                 // handed to the demuxer. The pad name mirrors the demuxer's `src_track<id>`.
@@ -154,13 +227,13 @@ impl Player {
                 // Ogg's demuxer emits raw `bytes` packets on a single static pad (v1: first
                 // logical bitstream only). The codec rides in the BOS page — sniff it from the
                 // prefix so we can wire the right de-framer/decoder (or drop cleanly).
-                return Self::build_ogg(p, src, prefix, file_len, policy);
+                return Self::build_ogg(p, src, source, prefix, file_len, audio);
             }
             Kind::Avi => {
                 // AVI: `RIFF('AVI ' …)`, `hdrl` (stream headers) then `movi` (interleaved
                 // chunks). `avidemux` publishes per-stream offer menus (like MKV — the pad's
                 // declared family is the codec), so no MP4-style family override is needed.
-                let header = head::avi_head(path).map_err(|e| format!("avi head: {e}"))?;
+                let header = container_head(source, Kind::Avi)?;
                 let info = seek::avi_seek_index(&header, file_len);
                 // Per-stream channel counts for the stereo preference (pad `src_stream<index>`).
                 if let Ok((h, _)) = pf_avi::probe_header(&header) {
@@ -183,24 +256,62 @@ impl Player {
         let ch_resolver = |name: &str| audio_channels.get(name).copied();
         let audio_ch: Option<&autoplug::AudioChannels<'_>> =
             if audio_channels.is_empty() { None } else { Some(&ch_resolver) };
-        let wiring = autoplug::autoplug_container(
-            p, demux, &pads, family_of, audio_ch, policy.video, policy.audio, zc_channel,
+        let wiring = autoplug::autoplug_container_with(
+            p, demux, &pads, family_of, audio_ch, video, audio, zc_channel,
         );
         Ok((wiring, seek_info.index, seek_info.duration_ns))
     }
 
     /// The Ogg path: sniff the first logical bitstream's codec magic from the prefix and wire
-    /// `filesrc → oggdemux → oggflacdeframe → flacdec` for FLAC-in-Ogg; anything else (Opus,
-    /// Vorbis, Theora — no decoder in-tree) is reported and the file plays nothing.
+    /// the matching chain — `filesrc → oggdemux → oggflacdeframe → flacdec` for FLAC-in-Ogg,
+    /// `filesrc → oggdemux → opusdec` for Ogg-Opus. Anything else (Vorbis, Theora — no
+    /// decoder in-tree) is reported and the file plays nothing.
+    ///
+    /// The two audio mappings need different amounts of de-framing, and the difference is
+    /// the mapping specs', not ours:
+    /// - **FLAC-in-Ogg** re-uses the *native* FLAC byte stream, so its first packet is a
+    ///   native stream head behind a 9-byte `0x7F "FLAC"` mapping prefix (xiph "Ogg Mapping
+    ///   for FLAC" §1). `flacdec` wants the native stream, so `oggflacdeframe` strips that
+    ///   prefix and concatenates the packets back into one.
+    /// - **Ogg-Opus** is packet-for-packet: "each Opus packet … is placed directly into an
+    ///   Ogg packet" (RFC 7845 §3), and its two header packets (`OpusHead` §5.1, `OpusTags`
+    ///   §5.2) are Opus's own, not an Ogg wrapper. `oggdemux` already emits **one Ogg packet
+    ///   per buffer**, which *is* `opusdec`'s input contract, and `opusdec` consumes both
+    ///   header packets itself — including arming the RFC 7845 §4.2 pre-skip trim from
+    ///   `OpusHead`. So there is nothing left for a de-framer to do, and inserting one would
+    ///   only risk breaking the packet boundaries the decoder depends on.
+    // Everything here runs **once**, while the pipeline is being built: boxing a decoder to hand
+    // to `wire_elementary_audio`, and naming a track for the report. Neither is on any streaming
+    // path (spec: allocation discipline — one-time setup takes the documented exception).
+    #[allow(clippy::disallowed_methods)]
     fn build_ogg(
         p: &mut Pipeline,
         src: profluens_core::id::ElementId,
+        source: &SourceSpec,
         prefix: &[u8],
         file_len: u64,
-        policy: SinkPolicy,
+        audio: AudioTarget,
     ) -> Result<(Wiring, SeekIndex, Option<u64>), String> {
+        let path = source.path_str();
         let codec = ogg_first_codec(prefix);
-        let seek_info = seek::proportional(file_len, None); // no keyframe index for ogg v1
+        // No keyframe index for ogg v1, but both ends of the file give a duration — and a
+        // duration is what turns the proportional fallback from "unavailable" into a
+        // working seek bar. Both reads are best-effort: an unreadable end costs the
+        // duration, not the playback.
+        //
+        // The tail read is gated on the whole file being readable (`crate::source`, policy 5).
+        // Ogg's duration lives in the *last* page's granule position, so on a half-downloaded
+        // file "the tail" is the download frontier and its granule is how far the download has
+        // got — which would be reported as the length of the episode. Reporting no duration
+        // until the download completes is the honest answer; there is no head-side alternative
+        // for this container.
+        let head = head::read_prefix(path, head::OGG_HEAD_LEN).unwrap_or_default();
+        let tail = if source.is_complete() {
+            head::read_tail(path, head::OGG_TAIL_LEN).unwrap_or_default().0
+        } else {
+            Vec::new()
+        };
+        let seek_info = seek::ogg_seek_index(&head, &tail, file_len);
         let mut w = Wiring::default();
         match codec {
             OggCodec::Flac => {
@@ -212,15 +323,33 @@ impl Player {
                 p.link((demux, "src"), (deframe, "sink")).map_err(|e| format!("oggdemux ! oggflacdeframe: {e:?}"))?;
                 // The de-framer's byte src is the elementary FLAC stream — reuse the
                 // elementary-audio wiring from its src pad.
-                let sub = autoplug::wire_elementary_audio(
+                let sub = autoplug::wire_elementary_audio_with(
                     p,
                     deframe,
                     Box::new(pf_flac::FlacDec::new()),
                     "ogg/flac",
-                    policy.audio,
+                    audio,
                 );
                 w = sub;
             }
+            OggCodec::Opus => {
+                // filesrc → oggdemux → opusdec → audio chain. No de-framer stage: see the
+                // mapping note on this function. `oggdemux`'s src pad offers `bytes`, which
+                // `opusdec`'s sink accepts alongside `opus`, so the link needs no bridge.
+                let demux = p.add(pf_ogg::OggDemux::new());
+                p.link((src, "src"), (demux, "sink"))
+                    .map_err(|e| format!("filesrc ! oggdemux: {e:?}"))?;
+                w = autoplug::wire_elementary_audio_with(
+                    p,
+                    demux,
+                    Box::new(pf_opus::OpusDec::new()),
+                    "ogg/opus",
+                    audio,
+                );
+            }
+            // Vorbis is the one common Ogg audio mapping still without an in-tree decoder
+            // (adoption is being evaluated separately); Theora likewise for video. Both fall
+            // through to the honest "no decoder" report rather than a half-wired chain.
             other => {
                 w.tracks.push(TrackOutcome {
                     pad: "ogg".to_string(),
@@ -235,24 +364,33 @@ impl Player {
     /// Build an elementary (container-less) audio stream: `filesrc → parser/decoder → chain`.
     fn build_elementary(
         p: &mut Pipeline,
-        path: &str,
+        source: &mut SourceSpec,
         kind: Kind,
         file_len: u64,
-        policy: SinkPolicy,
+        audio: AudioTarget,
     ) -> Result<(Wiring, SeekIndex, Option<u64>), String> {
-        let src = p.add(FileSrc::new(path));
-        // No keyframe index; duration is unknown pre-decode, so time seeking is proportional
-        // only when a duration turns up (it doesn't, here) — the honest v1.
-        let seek_info = seek::proportional(file_len, None);
+        // COLD: one path copy per open (see `build_container`).
+        #[allow(clippy::disallowed_methods)]
+        let path = source.path_str().to_string();
+        let path = path.as_str();
+        let src = p.add_boxed(source.take_element()?);
+        // An elementary stream has no header field for its duration and no element for its
+        // index, but the *codec* leaves both lying around somewhere — in an MP3's first
+        // frame, in a FLAC's metadata chain, in a WAV's `fmt `/`data` pair. Reading those
+        // windows here (app-side IO before the pipeline, the sanctioned pattern) is what
+        // gives the player a seek bar over a bare music file at all: without a duration,
+        // `SeekIndex::resolve` has nothing to be proportional to and time seeking is simply
+        // unavailable. ADTS AAC is the one that stays unknown — see the module docs.
+        let seek_info = elementary_seek_info(source, kind, file_len);
 
         let wiring = match kind {
-            Kind::Flac => autoplug::wire_elementary_audio(
-                p, src, Box::new(pf_flac::FlacDec::new()), "flac", policy.audio,
+            Kind::Flac => autoplug::wire_elementary_audio_with(
+                p, src, Box::new(pf_flac::FlacDec::new()), "flac", audio,
             ),
-            Kind::Mp3 => autoplug::wire_elementary_audio(
-                p, src, Box::new(pf_mp3::Mp3Dec::new()), "mp3", policy.audio,
+            Kind::Mp3 => autoplug::wire_elementary_audio_with(
+                p, src, Box::new(pf_mp3::Mp3Dec::new()), "mp3", audio,
             ),
-            Kind::Wav => Self::build_wav(p, src, path, policy)?,
+            Kind::Wav => Self::build_wav(p, src, path, audio)?,
             Kind::AdtsAac => {
                 // Bare ADTS: `filesrc → adtsparse → aacdec → audio chain`. `adtsparse`
                 // synthesizes the ASC head from the first ADTS frame and strips each frame's
@@ -261,8 +399,8 @@ impl Player {
                 let parse = p.add(pf_aac::AdtsParse::new());
                 p.link((src, "src"), (parse, "sink"))
                     .map_err(|e| format!("filesrc ! adtsparse: {e:?}"))?;
-                autoplug::wire_elementary_audio(
-                    p, parse, Box::new(pf_aac::AacDec::new()), "adts", policy.audio,
+                autoplug::wire_elementary_audio_with(
+                    p, parse, Box::new(pf_aac::AacDec::new()), "adts", audio,
                 )
             }
             _ => unreachable!("build_elementary called with a container kind"),
@@ -278,7 +416,7 @@ impl Player {
         p: &mut Pipeline,
         src: profluens_core::id::ElementId,
         path: &str,
-        policy: SinkPolicy,
+        audio: AudioTarget,
     ) -> Result<Wiring, String> {
         use profluens_audio::{AudioConvert, SampleFormat, WavParse};
 
@@ -286,9 +424,36 @@ impl Player {
         p.link((src, "src"), (parse, "sink")).map_err(|e| format!("filesrc ! wavparse: {e:?}"))?;
 
         let mut w = Wiring::default();
-        match policy.audio {
+        match audio {
+            // The canonical chain needs an announcing upstream, and `wavparse` emits raw
+            // `bytes` without announcing `audio/raw` at all — so the *pinned* converter that
+            // the policy path already uses becomes the chain's head here. Its output is
+            // `audio/raw` at the header's rate/channels in the canonical sample format, which
+            // is exactly what `wire_canonical_audio_chain` expects to be handed; the chain's
+            // own `audioconvert(f32)` then sees f32 already and passes through byte for byte.
+            // COLD: naming the track for the report, once per build (see `link_audio`).
+            #[allow(clippy::disallowed_methods)]
+            AudioTarget::Canonical(spec) => {
+                let hdr = wav_header(path)
+                    .ok_or_else(|| "wavparse: unreadable WAV header".to_string())?;
+                let conv = p.add(AudioConvert::with_input(hdr, crate::chain::CANONICAL_SAMPLE));
+                p.link((parse, "src"), (conv, "sink"))
+                    .map_err(|e| format!("wavparse ! audioconvert: {e:?}"))?;
+                let label = spec.sink.label();
+                let h = crate::chain::wire_canonical_audio_chain(p, (conv, "src"), spec)?;
+                w.audio_sink = Some(h.sink);
+                w.audio_chain = Some(h);
+                w.tracks.push(TrackOutcome {
+                    pad: "wav".to_string(),
+                    summary: format!("wavparse → audioconvert → {label}"),
+                    linked: true,
+                });
+                return Ok(w);
+            }
             // Device/External* all use the audio device (External* are video-only choices).
-            SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy => {
+            AudioTarget::Policy(
+                SinkChoice::Device | SinkChoice::External | SinkChoice::ExternalZeroCopy,
+            ) => {
                 // Parse the header up front (a small prefix read) to pin the converter input.
                 let hdr = wav_header(path).ok_or_else(|| "wavparse: unreadable WAV header".to_string())?;
                 let conv = p.add(AudioConvert::with_input(hdr, SampleFormat::S16));
@@ -302,7 +467,7 @@ impl Player {
                     linked: true,
                 });
             }
-            SinkChoice::Drop => {
+            AudioTarget::Policy(SinkChoice::Drop) => {
                 use profluens_elements::testing::TestSink;
                 let (ts, _s) = TestSink::new();
                 let sink = p.add(ts);
@@ -374,6 +539,35 @@ impl Player {
         self.wiring.overlay
     }
 
+    /// The canonical audio chain's handles, when this player was opened with
+    /// [`open_canonical`](Self::open_canonical) and an audio track linked — the `audiogain` /
+    /// `audiostretch` element ids for live property changes, the stretcher's source-time
+    /// position counter, and the sink the chain ends in.
+    ///
+    /// Drive them against [`Pipeline::prop_handle`](profluens_core::pipeline::Pipeline::prop_handle),
+    /// taken from [`self.pipeline`](Self::pipeline) after the topology is built:
+    ///
+    /// ```ignore
+    /// let props = player.pipeline.prop_handle();
+    /// player.audio_chain().unwrap().set_gain_db(&props, -3.5)?;
+    /// ```
+    ///
+    /// `None` on the tiered (`Player::open`) path, which builds no such stages.
+    pub fn audio_chain(&self) -> Option<&ChainHandles> {
+        self.wiring.audio_chain.as_ref()
+    }
+
+    /// Whether this player is reading a still-downloading file.
+    ///
+    /// The [`FrontierHandle`] itself is *not* re-exposed here — the caller who built the spec
+    /// with [`SourceSpec::growing`](crate::source::SourceSpec::growing) already owns it, and it
+    /// is the last one alive besides the element's. That is what lets `growingfilesrc` notice
+    /// an abandoned download and end the stream instead of parking on it forever; see the
+    /// [`growing`](Self::growing) field note.
+    pub fn is_growing(&self) -> bool {
+        self.growing
+    }
+
     /// The ids the stats tap watches: `(label, id)` for each present decoder/sink.
     pub fn watched(&self) -> Vec<(&'static str, profluens_core::id::ElementId)> {
         let w = &self.wiring;
@@ -394,6 +588,125 @@ impl Player {
         self.pipeline.run()
     }
 }
+
+/// Duration + time→byte index for an elementary stream, from whatever window its format
+/// keeps the answers in ([`head`] reads, [`seek`] parses).
+///
+/// Every read here is best-effort: a head or tail that cannot be read costs the file its
+/// seek bar, never its playback, so a failure degrades to the empty index rather than
+/// failing the open. That matters because these reads are pure enrichment — the pipeline
+/// itself needs none of them.
+///
+/// ADTS AAC is deliberately absent: an ADTS stream declares no duration anywhere and has no
+/// index, so the only route to either is walking every frame header in the file. That is a
+/// full read at open time for a format no music library uses, and reporting no duration is
+/// the honest alternative.
+/// On a **growing** source every read here is additionally clamped to the download frontier and
+/// the tail read is skipped entirely until the whole file is readable (`crate::source`, policies
+/// 2 and 5). That costs nothing that matters: all three formats state their duration in the
+/// *head* — MP3 in the Xing/LAME frame, FLAC in STREAMINFO, WAV in the `fmt `/`data` pair — so
+/// the answer is correct from the first kilobyte and does not drift as bytes arrive. The tail
+/// only carries trailing ID3v1/APEv2 tags, whose absence costs a few bytes of accuracy in the
+/// audio-length estimate, and reading it early would find the download frontier instead.
+// COLD: app-side head/tail windows read once per open, before the pipeline exists — the
+// documented `clippy.toml` exception (same as the container head builders in `crate::head`).
+#[allow(clippy::disallowed_methods)]
+fn elementary_seek_info(source: &SourceSpec, kind: Kind, file_len: u64) -> seek::SeekInfo {
+    let path = source.path_str();
+    // A growing source may not read past the frontier; `read_prefix` clamps to it (and to the
+    // budget), so a head that has not arrived simply yields a shorter window and the parse
+    // degrades to the proportional fallback rather than reading a torn append.
+    let bounded_head = |want: usize| source.read_prefix(want).ok();
+    match kind {
+        Kind::Mp3 => {
+            let head = if source.is_growing() {
+                match bounded_head(head::MAX_MP3_HEAD.min(1024 * 1024) as usize) {
+                    Some(h) => h,
+                    None => return seek::proportional(file_len, None),
+                }
+            } else {
+                let Ok(h) = head::mp3_head(path) else {
+                    return seek::proportional(file_len, None);
+                };
+                h
+            };
+            let (tail, base) = if source.is_complete() {
+                head::read_tail(path, head::MP3_TAIL_LEN).unwrap_or_default()
+            } else {
+                (Vec::new(), 0)
+            };
+            seek::mp3_seek_index(&head, &tail, base, file_len)
+        }
+        Kind::Flac => {
+            let head = if source.is_growing() {
+                bounded_head(1024 * 1024)
+            } else {
+                head::flac_head(path).ok()
+            };
+            match head {
+                Some(h) => seek::flac_seek_index(&h, file_len),
+                None => seek::proportional(file_len, None),
+            }
+        }
+        Kind::Wav => match bounded_head(WAV_HEAD_LEN) {
+            Some(head) => seek::wav_seek_index(&head, file_len),
+            None => seek::proportional(file_len, None),
+        },
+        // ADTS AAC, and anything else that reaches here.
+        _ => seek::proportional(file_len, None),
+    }
+}
+
+/// The container head bytes for `kind`, honouring a growing source's frontier.
+///
+/// A complete file takes the existing path-based walk unchanged — same reads, same bounds, same
+/// errors. A growing one walks a **bounded window** of what has downloaded
+/// ([`SourceSpec::read_head_window`]) with [`head`]'s byte-slice variants, and, when the walk
+/// says "the head is not all here yet", waits for the frontier to move and walks again, up to
+/// [`crate::source::OPEN_TIMEOUT`]. A head that never arrives fails the open with the walk's own
+/// message — you cannot demux a container whose track metadata is still downloading, and a
+/// track-less player would be a far worse way to learn that.
+fn container_head(source: &SourceSpec, kind: Kind) -> Result<Vec<u8>, String> {
+    let path = source.path_str();
+    if !source.is_growing() {
+        return match kind {
+            Kind::Mkv => head::mkv_header_prefix(path).map_err(|e| format!("mkv header: {e}")),
+            Kind::Mp4 => head::mp4_head(path).map_err(|e| format!("mp4 head: {e}")),
+            Kind::Avi => head::avi_head(path).map_err(|e| format!("avi head: {e}")),
+            _ => Err(format!("no container head walk for {}", kind.label())),
+        };
+    }
+    let deadline = SourceSpec::open_deadline();
+    let mut last_len = 0u64;
+    loop {
+        let window = source
+            .read_head_window()
+            .map_err(|e| format!("cannot read '{path}': {e}"))?;
+        let walked = match kind {
+            Kind::Mkv => head::mkv_header_from(&window).map_err(|e| format!("mkv header: {e}")),
+            Kind::Mp4 => head::mp4_head_from(&window).map_err(|e| format!("mp4 head: {e}")),
+            Kind::Avi => head::avi_head_from(&window).map_err(|e| format!("avi head: {e}")),
+            _ => return Err(format!("no container head walk for {}", kind.label())),
+        };
+        match walked {
+            Ok(h) => return Ok(h),
+            Err(e) => {
+                // Not there yet — wait for the download to deliver more and walk again. When
+                // the frontier will not move (finished, or the deadline passed), the walk's
+                // error is the final answer.
+                let have = source.readable().unwrap_or(0).max(window.len() as u64);
+                if !source.wait_for_growth(have.max(last_len), deadline) {
+                    return Err(e);
+                }
+                last_len = have;
+            }
+        }
+    }
+}
+
+/// How much of a WAV to read for its header: the `RIFF`/`fmt `/`data` chunk region, plus
+/// room for the `LIST`/`INFO` metadata a tagger may put in front of `data`.
+const WAV_HEAD_LEN: usize = 4096;
 
 /// Parse a WAV file's `AudioFormat` from a small prefix (app-side controller IO, before the
 /// pipeline — the sanctioned `clippy.toml` exception). `None` on any read/parse failure.

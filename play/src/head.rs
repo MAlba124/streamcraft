@@ -12,8 +12,16 @@
 //!   8 MiB bound.
 //! - MP4: the `Mp4Demux::new` head — `ftyp` + the whole `moov`, box-walked with seeks so
 //!   a multi-GB file is never slurped. Lifted from `mp4/examples/remux_to_mkv.rs`.
-//! - Ogg / FLAC / MP3 / ADTS / WAV: no head — the demuxer/decoder learns everything from
-//!   the stream itself, so the controller reads nothing here.
+//! - Ogg / FLAC / MP3 / ADTS / WAV: no head is needed to *build* the graph — the
+//!   decoder learns everything from the stream itself.
+//!
+//! The elementary formats do, however, need a head to answer the two questions a graph
+//! cannot: **how long is this, and which byte is three minutes in**. An MP3 states neither
+//! anywhere except inside its first frame; a FLAC states both, in metadata blocks the
+//! decoder consumes and discards; an Ogg stream states its length only in the granule
+//! position of its *last* page. So [`mp3_head`], [`flac_head`] and [`read_tail`] read the
+//! windows [`crate::seek`] parses those out of — the same app-side-IO-before-the-pipeline
+//! shape as the container heads above, and under the same `clippy.toml` exception.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -32,6 +40,103 @@ pub fn read_prefix(path: &str, want: usize) -> std::io::Result<Vec<u8>> {
     let n = f.read(&mut buf)?;
     buf.truncate(n);
     Ok(buf)
+}
+
+/// Read the **last** `want` bytes of the file (fewer if it is shorter), for the metadata
+/// formats keep at the end: an Ogg stream's final granule position, and the APEv2 / ID3v1
+/// pair an MP3 may carry behind its audio.
+///
+/// Returned with the file offset its first byte sits at, because every measurement over a
+/// tail window is derived from an *absolute* offset — `pf_mp3::id3::ape_tail_len` looks at
+/// the last 32 bytes, an ID3v1 block is by definition the last 128, and a caller that has
+/// forgotten where the window starts cannot tell a short file from a short read.
+#[allow(clippy::disallowed_methods)] // app-side tail read before the pipeline; see module docs + clippy.toml
+pub fn read_tail(path: &str, want: usize) -> std::io::Result<(Vec<u8>, u64)> {
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let take = (want as u64).min(len);
+    let base = len - take;
+    f.seek(SeekFrom::Start(base))?;
+    let mut buf = vec![0u8; take as usize];
+    f.read_exact(&mut buf)?;
+    Ok((buf, base))
+}
+
+/// How much of an Ogg file's tail to read looking for the last page. RFC 3533 §6 caps a
+/// page at 65307 bytes (27-byte header + 255 lacing values + 255 × 255 payload), so a
+/// 64 KiB window always contains the whole of the final page — which ends at EOF — and the
+/// backwards scan in `pf_ogg::last_granule` always has a complete, CRC-checkable page to
+/// find.
+pub const OGG_TAIL_LEN: usize = 64 * 1024;
+
+/// How much of an Ogg file's head to read for its bos page. The typefind prefix is 64 bytes
+/// — enough to *recognise* a mapping's magic, but not to parse and CRC-check the page that
+/// carries it (a FLAC-in-Ogg bos page runs to ~80 bytes, and a mapping may use more), and
+/// `pf_ogg::PageHeader::parse` rightly refuses a page it cannot verify. 8 KiB covers any
+/// identification header and still costs one small read.
+pub const OGG_HEAD_LEN: usize = 8 * 1024;
+
+/// How much of an MP3's tail to read looking for its trailing tags. An ID3v1 block is 128
+/// bytes and an APEv2 tag in front of it is rarely more than a few KiB; 64 KiB is the same
+/// window `pf-tags` uses for the whole trailing-tag family, and it costs one read.
+pub const MP3_TAIL_LEN: usize = 64 * 1024;
+
+/// The MP3 head: the leading ID3v2 tag, if any, **and the first audio frame behind it** —
+/// the single contiguous window `pf_mp3::props::probe_props` needs, since the Xing/VBRI
+/// header that states the frame count and the seek table is buried inside that first
+/// frame's otherwise-unused payload.
+///
+/// Two reads at worst, one for any ordinary file: 128 KiB covers the tag and the frame for
+/// everything but an oversized cover image, and only then is the exact size re-read. The
+/// 8 KiB of audio past the tag is far more than the 1441-byte maximum MPEG-1 Layer III
+/// frame, leaving room for the junk taggers leave between the tag and the first sync word.
+///
+/// A declared tag size is never trusted past [`MAX_MP3_HEAD`]: it is 3.5 bytes of
+/// attacker-controlled length, and a player should not allocate half a gigabyte because a
+/// file said so. Past the bound the probe simply reads what it can, and reports what it
+/// can find in it.
+#[allow(clippy::disallowed_methods)] // app-side header read before the pipeline; see module docs + clippy.toml
+pub fn mp3_head(path: &str) -> std::io::Result<Vec<u8>> {
+    /// Enough for the tag and first frame of any file a tagger wrote by hand.
+    const FIRST_TRY: usize = 128 * 1024;
+    /// Audio to keep past the tag — `probe_props` wants one whole frame (≤ 1441 bytes).
+    const PROBE_BYTES: u64 = 8 * 1024;
+
+    let head = read_prefix(path, FIRST_TRY)?;
+    let v2 = pf_mp3::id3::v2_total_len(&head).map_or(0, |n| n as u64);
+    let want = v2.saturating_add(PROBE_BYTES).min(MAX_MP3_HEAD);
+    if want <= head.len() as u64 {
+        return Ok(head); // the first read already covers it (or is the whole file)
+    }
+    read_prefix(path, usize::try_from(want).unwrap_or(usize::MAX))
+}
+
+/// Cap on the MP3 head read — see [`mp3_head`]. 32 MiB is past any real cover art and far
+/// short of a denial of service.
+pub const MAX_MP3_HEAD: u64 = 32 * 1024 * 1024;
+
+/// The FLAC head: the `fLaC` marker and the whole metadata-block chain (§8.1) — STREAMINFO
+/// for the duration, SEEKTABLE for the index, and the chain's end for the file offset that
+/// index's offsets are relative to.
+///
+/// The chain has no length field of its own, so "did I read enough" is answered by asking
+/// `pf_flac::tags::audio_start` whether the walk reached a last-block flag. 1 MiB covers a
+/// chain with ordinary embedded art; a file with a bigger picture costs a second, 16 MiB
+/// read. Past even that the head is returned truncated rather than grown without limit —
+/// STREAMINFO is in the first 42 bytes regardless, so the duration survives; only the exact
+/// seek index is lost, and [`crate::seek`] falls back to the proportional estimate.
+#[allow(clippy::disallowed_methods)] // app-side header read before the pipeline; see module docs + clippy.toml
+pub fn flac_head(path: &str) -> std::io::Result<Vec<u8>> {
+    const FIRST_TRY: usize = 1024 * 1024;
+    const MAX: usize = 16 * 1024 * 1024;
+
+    let head = read_prefix(path, FIRST_TRY)?;
+    // A short read means the whole file is already here; a complete chain means we have
+    // everything that matters. Either way there is nothing to gain from reading again.
+    if head.len() < FIRST_TRY || pf_flac::tags::audio_start(&head).is_some() {
+        return Ok(head);
+    }
+    read_prefix(path, MAX)
 }
 
 /// The MKV stream head: everything before the first `Cluster` — the EBML Header plus the
@@ -58,6 +163,85 @@ pub fn mkv_header_prefix(path: &str) -> std::io::Result<Vec<u8>> {
     })?;
     head.truncate(cluster);
     Ok(head)
+}
+
+// --- byte-slice head walks (the growing-file path) ------------------------------------
+//
+// The three container walks above open the file and read it themselves, which is right for a
+// complete file. A **growing** file (`crate::source`) may only be read up to the download
+// frontier, and the walk must not wander past it — so the growing path reads one bounded
+// window first and hands it here. Same logic, same bounds, no IO: the slice *is* the limit,
+// which is what makes "a torn append can never be parsed" a structural property rather than a
+// hope. The path-based functions above are deliberately left untouched.
+
+/// [`mkv_header_prefix`] over an already-read window: everything before the first `Cluster`.
+/// Errors when no Cluster appears in the window — for a growing file that means "the header
+/// has not finished downloading", which the caller reports rather than guesses around.
+pub fn mkv_header_from(window: &[u8]) -> std::io::Result<Vec<u8>> {
+    let cluster = window.windows(4).position(|w| w == id::CLUSTER).ok_or_else(|| {
+        std::io::Error::other(
+            "no Cluster in the readable window — not a (supported/streamable) Matroska file, \
+             or its header has not been read yet",
+        )
+    })?;
+    // COLD: one head buffer per open, never on a buffer path.
+    #[allow(clippy::disallowed_methods)]
+    Ok(window[..cluster].to_vec())
+}
+
+/// [`avi_head`] over an already-read window: up to and including the `movi` four-CC.
+pub fn avi_head_from(window: &[u8]) -> std::io::Result<Vec<u8>> {
+    let movi = window.windows(4).position(|w| w == b"movi").ok_or_else(|| {
+        std::io::Error::other(
+            "no 'movi' list in the readable window — not a (supported) AVI file, or its header \
+             has not been read yet",
+        )
+    })?;
+    // COLD: one head buffer per open, never on a buffer path.
+    #[allow(clippy::disallowed_methods)]
+    Ok(window[..movi + 4].to_vec())
+}
+
+/// [`mp4_head`] over an already-read window: `ftyp` + everything up to (not including) `mdat`,
+/// box-walked within the window. Errors when the walk reaches the end of the window without
+/// finding `mdat` — either a `moov`-after-`mdat` (non-streamable) file, or, for a growing
+/// source, a `moov` that has not arrived yet. Both are "cannot build the graph from these
+/// bytes", reported rather than half-wired.
+pub fn mp4_head_from(window: &[u8]) -> std::io::Result<Vec<u8>> {
+    let len = window.len() as u64;
+    let mut at = 0u64;
+    loop {
+        if at + 8 > len {
+            return Err(std::io::Error::other(
+                "no mdat box in the readable window — is this a faststart (moov-before-mdat) \
+                 MP4, and has its moov been read yet?",
+            ));
+        }
+        let hdr = &window[at as usize..at as usize + 8];
+        let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        if &hdr[4..8] == b"mdat" {
+            break;
+        }
+        let advance = match size {
+            0 => len - at, // a box with size 0 runs to EOF (ISO/IEC 14496-12 §4.2)
+            1 => {
+                // 64-bit `largesize` follows the 8-byte header (§4.2).
+                if at + 16 > len {
+                    return Err(std::io::Error::other("truncated 64-bit box header"));
+                }
+                let b = &window[at as usize + 8..at as usize + 16];
+                u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+            }
+            n => n,
+        };
+        if advance == 0 {
+            return Err(std::io::Error::other("zero-size box while scanning for mdat"));
+        }
+        at += advance;
+    }
+    // COLD: one head buffer per open, never on a buffer path.
+    #[allow(clippy::disallowed_methods)]
+    Ok(window[..at as usize].to_vec())
 }
 
 /// The MP4 head: `ftyp` + everything up to (not including) `mdat`, box-walked with seeks so
