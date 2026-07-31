@@ -11,8 +11,13 @@
 //!
 //! The timing bounds are deliberately loose — milliseconds against microsecond-scale fixes — so
 //! they fail on a return of tick quantisation rather than on ordinary scheduler jitter.
-
-//! TEMPORARY scheduler audit probes. Delete after the audit.
+//!
+//! Not covered: a sink starved across an *entire* pause window. It stays blocked in `up.pop()`
+//! the whole time and so never reaches the gate, delivering neither `Paused` nor `Resumed` —
+//! balanced, but a device sink is never told the pipeline paused. Whether that matters is a
+//! design question (a starved sink has nothing to play), and a test for it would be asserting
+//! a precondition the scheduler does not establish, so there is deliberately no test here
+//! rather than one that passes vacuously at 0/0.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,105 +51,14 @@ static SINK_PADS: [PadDesc; 1] = [PadDesc {
     dynamic: false,
     validate: None,
 }];
-static XFORM_PADS: [PadDesc; 2] = [
-    PadDesc { name: "sink", direction: Direction::Sink, offers: &OFFERS, dynamic: false, validate: None },
-    PadDesc { name: "src", direction: Direction::Src, offers: &OFFERS, dynamic: false, validate: None },
-];
-
 const LAT: LatencyDesc =
     LatencyDesc { min: Timestamp::ZERO, max: Timestamp::ZERO, is_live: false, jitter: Timestamp::ZERO };
-
-// ---------------------------------------------------------------------------
-// Burst source: emit `burst` buffers as fast as it can, then stall (produce
-// nothing) for `stall`, then emit `burst` more, then EOS.
-// ---------------------------------------------------------------------------
-static BURST_DESC: ElementDesc = ElementDesc {
-    name: "burstsrc",
-    pads: &SRC_PADS,
-    props: &[],
-    sched: SchedHint::Active,
-    inputs: InputPolicy::None,
-    latency: LAT,
-    make_default: None,
-};
-
-struct BurstSrc {
-    burst: u64,
-    produced: u64,
-    stall: Duration,
-    stall_started: Option<Instant>,
-    stalled_done: bool,
-}
-
-impl BurstSrc {
-    fn new(burst: u64, stall: Duration) -> Self {
-        Self { burst, produced: 0, stall, stall_started: None, stalled_done: false }
-    }
-}
-
-impl Element for BurstSrc {
-    fn desc(&self) -> &'static ElementDesc { &BURST_DESC }
-    fn start(&mut self, _c: &mut Ctx) -> Result<(), Error> { Ok(()) }
-    fn process(&mut self, ctx: &mut Ctx, _i: Inputs<'_>) -> Result<Flow, Error> {
-        if self.produced >= self.burst && !self.stalled_done {
-            let t0 = *self.stall_started.get_or_insert_with(Instant::now);
-            if t0.elapsed() < self.stall {
-                return Ok(Flow::Ok); // stall: no output
-            }
-            self.stalled_done = true;
-        }
-        if self.produced >= self.burst * 2 {
-            return Ok(Flow::Eos);
-        }
-        // Emit the whole burst as ONE batch so the consumer really receives a
-        // multi-buffer backlog in a single pop.
-        for _ in 0..self.burst {
-            let Some(mut b) = ctx.try_alloc(PadId(0)) else { return Ok(Flow::Ok) };
-            b.memory.as_mut_full()[..1].copy_from_slice(&[1u8]);
-            b.memory.set_len(1);
-            self.produced += 1;
-            ctx.out(PadId(0)).push(b);
-        }
-        Ok(Flow::Ok)
-    }
-    fn event(&mut self, _c: &mut Ctx, _e: &Event) -> Result<(), Error> { Ok(()) }
-    fn stop(&mut self, _c: &mut Ctx) {}
-}
-
-// ---------------------------------------------------------------------------
-// Active passthrough head: moves every input buffer to its output.
-// ---------------------------------------------------------------------------
-static PASS_DESC: ElementDesc = ElementDesc {
-    name: "passhead",
-    pads: &XFORM_PADS,
-    props: &[],
-    sched: SchedHint::Active,
-    inputs: InputPolicy::Single,
-    latency: LAT,
-    make_default: None,
-};
-
-struct PassHead;
-impl Element for PassHead {
-    fn desc(&self) -> &'static ElementDesc { &PASS_DESC }
-    fn start(&mut self, _c: &mut Ctx) -> Result<(), Error> { Ok(()) }
-    fn process(&mut self, ctx: &mut Ctx, mut i: Inputs<'_>) -> Result<Flow, Error> {
-        while let Some(b) = i.pop() {
-            ctx.out(PadId(1)).push(b);
-        }
-        Ok(Flow::Ok)
-    }
-    fn event(&mut self, _c: &mut Ctx, _e: &Event) -> Result<(), Error> { Ok(()) }
-    fn stop(&mut self, _c: &mut Ctx) {}
-}
 
 // ---------------------------------------------------------------------------
 // A sink that consumes exactly ONE buffer per process() call and produces
 // nothing. Passive variant (inlines into its upstream's group) and active
 // variant (its own group head).
 // ---------------------------------------------------------------------------
-struct Counter(Arc<AtomicU64>);
-
 static SLOW_PASSIVE_DESC: ElementDesc = ElementDesc {
     name: "slowpassive",
     pads: &SINK_PADS,
@@ -177,39 +91,6 @@ impl Element for SlowSink {
         Ok(Flow::Ok)
     }
     fn event(&mut self, _c: &mut Ctx, _e: &Event) -> Result<(), Error> { Ok(()) }
-    fn stop(&mut self, _c: &mut Ctx) {}
-}
-
-// ---------------------------------------------------------------------------
-// scheduler 6: live property-set latency on an idle-parked group.
-// ---------------------------------------------------------------------------
-static PROP_SRC_DESC: ElementDesc = ElementDesc {
-    name: "propsrc",
-    pads: &SRC_PADS,
-    props: &[profluens_core::element::PropDesc {
-        name: "knob",
-        allowed: profluens_core::format::Constraint::Any,
-        live: true,
-    }],
-    sched: SchedHint::Active,
-    inputs: InputPolicy::None,
-    latency: LAT,
-    make_default: None,
-};
-struct PropSrc { seen: Arc<AtomicU64>, ran: Arc<AtomicBool> }
-impl Element for PropSrc {
-    fn desc(&self) -> &'static ElementDesc { &PROP_SRC_DESC }
-    fn start(&mut self, _c: &mut Ctx) -> Result<(), Error> { Ok(()) }
-    fn process(&mut self, _c: &mut Ctx, _i: Inputs<'_>) -> Result<Flow, Error> {
-        self.ran.store(true, Ordering::Release);
-        Ok(Flow::Ok)
-    }
-    fn event(&mut self, _c: &mut Ctx, e: &Event) -> Result<(), Error> {
-        if matches!(e, Event::PropChanged { .. }) {
-            self.seen.fetch_add(1, Ordering::Release);
-        }
-        Ok(())
-    }
     fn stop(&mut self, _c: &mut Ctx) {}
 }
 
@@ -515,73 +396,6 @@ fn paused_and_resumed_balance_on_a_busy_pipeline() {
     // `(CYCLES, CYCLES)` is strictly stronger than the invariant and fails under load.
     assert_eq!(np, nr, "every delivered Paused needs its Resumed (got {np} / {nr})");
     assert!(np > 0, "no pause was observed at all — the test exercised nothing");
-}
-
-// ---------------------------------------------------------------------------
-// scheduler 9: an upstream-starved sink announces `Paused` at the gate, then falls
-// through (last_progressed was true) into a pass that blocks in `up.pop()`.
-// A resume landing while it is blocked there is never seen by the gate: on the
-// next loop top `maybe_paused()` is already false, so `Event::Resumed` is never
-// delivered and `paused_announced` stays true — the following pause then
-// delivers no `Event::Paused` either.
-// ---------------------------------------------------------------------------
-static SLOW_SRC_DESC: ElementDesc = ElementDesc {
-    name: "slowdripsrc",
-    pads: &SRC_PADS,
-    props: &[],
-    sched: SchedHint::Active,
-    inputs: InputPolicy::None,
-    latency: LAT,
-    make_default: None,
-};
-struct SlowDripSrc { last: Option<Instant> }
-impl Element for SlowDripSrc {
-    fn desc(&self) -> &'static ElementDesc { &SLOW_SRC_DESC }
-    fn start(&mut self, _c: &mut Ctx) -> Result<(), Error> { Ok(()) }
-    fn process(&mut self, ctx: &mut Ctx, _i: Inputs<'_>) -> Result<Flow, Error> {
-        let now = Instant::now();
-        if let Some(t) = self.last {
-            if now.duration_since(t) < Duration::from_millis(4) {
-                return Ok(Flow::Ok);
-            }
-        }
-        self.last = Some(now);
-        let Some(mut b) = ctx.try_alloc(PadId(0)) else { return Ok(Flow::Ok) };
-        b.memory.set_len(0);
-        ctx.out(PadId(0)).push(b);
-        Ok(Flow::Ok)
-    }
-    fn event(&mut self, _c: &mut Ctx, _e: &Event) -> Result<(), Error> { Ok(()) }
-    fn stop(&mut self, _c: &mut Ctx) {}
-}
-
-static DRAIN_SINK_DESC: ElementDesc = ElementDesc {
-    name: "drainsink",
-    pads: &SINK_PADS,
-    props: &[],
-    sched: SchedHint::Active,
-    inputs: InputPolicy::Single,
-    latency: LAT,
-    make_default: None,
-};
-struct DrainSink { seen_p: Arc<AtomicU64>, seen_r: Arc<AtomicU64>, ran: Arc<AtomicBool> }
-impl Element for DrainSink {
-    fn desc(&self) -> &'static ElementDesc { &DRAIN_SINK_DESC }
-    fn start(&mut self, _c: &mut Ctx) -> Result<(), Error> { Ok(()) }
-    fn process(&mut self, _c: &mut Ctx, mut i: Inputs<'_>) -> Result<Flow, Error> {
-        self.ran.store(true, Ordering::Release);
-        while i.pop().is_some() {}
-        Ok(Flow::Ok)
-    }
-    fn event(&mut self, _c: &mut Ctx, e: &Event) -> Result<(), Error> {
-        match e {
-            Event::Paused => { self.seen_p.fetch_add(1, Ordering::Release); }
-            Event::Resumed => { self.seen_r.fetch_add(1, Ordering::Release); }
-            _ => {}
-        }
-        Ok(())
-    }
-    fn stop(&mut self, _c: &mut Ctx) {}
 }
 
 // ---------------------------------------------------------------------------
