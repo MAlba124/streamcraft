@@ -80,6 +80,48 @@ impl StreamState {
     }
 }
 
+/// How much [`OggReader::recycle`] retains: a **byte** budget (so a stream of ~1 KiB Opus
+/// packets keeps a page's worth of buffers, while one giant Vorbis setup header keeps
+/// nothing), plus a count backstop for degenerate all-tiny-packet streams. Worst-case
+/// retention is `SPARE_MAX_BYTES`, i.e. a quarter of one pool slot.
+const SPARE_MAX_BYTES: usize = 256 * 1024;
+const SPARE_MAX_COUNT: usize = 512;
+
+/// How far the page parser runs ahead of the consumer, in queued packets.
+///
+/// The parser used to run to the end of every `push`: a 1 MiB transport chunk turned into
+/// ~3 400 queued packets — ~3 MB of `Vec`s — *before* the consumer saw the first one, which
+/// also meant no drained buffer could ever be reused for a packet in the same chunk (the
+/// recycle list was empty when they were all built). Parsing a bounded look-ahead and
+/// refilling from [`next_packet`](OggReader::next_packet) closes that loop, and costs
+/// nothing: parsing is resumable by construction (`buf`/`pos` already carry the state).
+/// The queue can overshoot by one page's packet count — a page is parsed whole.
+const READY_AHEAD: usize = 32;
+
+/// A buffer for the next packet's bytes: a recycled one when the caller handed one back
+/// ([`OggReader::recycle`]) — the steady-state zero-allocation path — else a fresh,
+/// **exactly-sized** `Vec` (one allocation, no doubling).
+// COLD: only reached when the recycle list is empty (stream start, or a caller that never
+// recycles — `demux_all`); the steady-state element path hits the `pop` above it.
+#[allow(clippy::disallowed_methods)]
+fn take_spare(spare: &mut Spare, want: usize) -> Vec<u8> {
+    match spare.free.pop() {
+        Some(mut v) => {
+            spare.bytes -= v.capacity();
+            v.clear(); // capacity retained — this is the whole point
+            v
+        }
+        None => Vec::with_capacity(want),
+    }
+}
+
+/// The recycled-packet-buffer free list, with its retained-capacity total.
+#[derive(Default)]
+struct Spare {
+    free: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
 /// A streaming Ogg demuxer. Feed bytes with [`push`](Self::push); pull decoded packets
 /// with [`next_packet`](Self::next_packet). Holds one [`StreamState`] per serial so
 /// multiplexed streams reassemble independently.
@@ -92,6 +134,9 @@ pub struct OggReader {
     streams: HashMap<u32, StreamState>,
     /// Ready packets awaiting the caller.
     ready: VecDeque<Packet>,
+    /// Packet buffers handed back by [`recycle`](Self::recycle), reused for the next
+    /// packet instead of allocating one. Bounded by `SPARE_MAX_BYTES`/`SPARE_MAX_COUNT`.
+    spare: Spare,
     /// Diagnostics: count of resync events (pattern/version/CRC failures skipped).
     resyncs: u64,
     /// Diagnostics: total pages successfully parsed.
@@ -107,17 +152,19 @@ impl OggReader {
             pos: 0,
             streams: HashMap::new(),
             ready: VecDeque::new(),
+            spare: Spare::default(),
             resyncs: 0,
             pages_parsed: 0,
         }
     }
 
-    /// Feed more input. Parses as many whole pages as are now available, queueing any
-    /// completed packets for [`next_packet`](Self::next_packet). Partial trailing bytes
-    /// are retained for the next `push`.
+    /// Feed more input. Parses whole pages up to the [`READY_AHEAD`] look-ahead, queueing
+    /// their completed packets for [`next_packet`](Self::next_packet), which resumes the
+    /// parse as the queue drains. Partial trailing bytes are retained for the next `push`,
+    /// as are pages beyond the look-ahead — nothing is dropped, only deferred.
     pub fn push(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
-        self.drive();
+        self.drive(READY_AHEAD);
     }
 
     /// Signal end of input: no more bytes will be pushed. Any bytes left in the buffer
@@ -127,16 +174,46 @@ impl OggReader {
     /// Returns the number of unparsed leftover bytes discarded (0 on a clean stream end
     /// at a page boundary).
     pub fn finish(&mut self) -> usize {
-        self.drive();
+        // Unbounded: every remaining page must be parsed before the buffer is dropped, or
+        // the look-ahead cap would silently discard queued input.
+        self.drive(usize::MAX);
         let leftover = self.buf.len() - self.pos;
         self.buf.clear();
         self.pos = 0;
         leftover
     }
 
-    /// Pull the next ready packet, or `None` if none is currently assembled.
+    /// Pull the next ready packet, or `None` if none is currently assembled. Resumes the
+    /// page parse when the queue runs dry, so a bounded look-ahead is invisible to callers:
+    /// draining in a loop yields exactly the packets an unbounded parse would have.
     pub fn next_packet(&mut self) -> Option<Packet> {
+        if self.ready.is_empty() {
+            self.drive(READY_AHEAD);
+        }
         self.ready.pop_front()
+    }
+
+    /// Hand a drained packet's buffer back so the **next** packet reuses it instead of
+    /// allocating (spec: performance — no steady-state heap traffic).
+    ///
+    /// A consumer that copies the bytes out and drops the packet — every streaming caller,
+    /// [`OggDemux`](crate::OggDemux) included — otherwise pays one allocation per packet
+    /// forever: the buffer is freed and the next packet allocates an identical one. Calling
+    /// this instead makes the read path allocation-free in steady state. Optional: a caller
+    /// that keeps its packets (`demux_all`) simply never calls it and behaves as before.
+    /// Retention is bounded (see `SPARE_MAX_BYTES`/`SPARE_MAX_COUNT`); anything over the
+    /// bound is dropped, so this can never grow the reader's footprint.
+    pub fn recycle(&mut self, mut data: Vec<u8>) {
+        let cap = data.capacity();
+        if cap == 0
+            || self.spare.bytes + cap > SPARE_MAX_BYTES
+            || self.spare.free.len() >= SPARE_MAX_COUNT
+        {
+            return;
+        }
+        data.clear();
+        self.spare.bytes += cap;
+        self.spare.free.push(data);
     }
 
     /// Number of resynchronisation events so far (bad capture pattern, version, or CRC).
@@ -149,9 +226,14 @@ impl OggReader {
         self.pages_parsed
     }
 
-    /// Parse all currently-available pages from `buf[pos..]`.
-    fn drive(&mut self) {
+    /// Parse currently-available pages from `buf[pos..]`, stopping once `ahead` packets are
+    /// queued (`usize::MAX` = parse everything). Resumable: `buf`/`pos` and the per-serial
+    /// reassembly carry the whole parse state, so a later call continues mid-stream.
+    fn drive(&mut self, ahead: usize) {
         loop {
+            if self.ready.len() >= ahead {
+                break; // look-ahead full — the rest stays buffered for the next call
+            }
             // Nothing more can be a page if fewer than the fixed header remain, unless
             // there is enough to at least try (parse reports NeedMore). Try to parse at
             // the cursor.
@@ -163,9 +245,9 @@ impl OggReader {
                 Ok(page) => {
                     let len = page.len();
                     // `page` borrows `self.buf`, so drive the reassembly through a free
-                    // function over the disjoint `streams`/`ready` fields rather than a
-                    // `&mut self` method (which the borrow checker would reject).
-                    handle_page(&mut self.streams, &mut self.ready, &page);
+                    // function over the disjoint `streams`/`ready`/`spare` fields rather
+                    // than a `&mut self` method (which the borrow checker would reject).
+                    handle_page(&mut self.streams, &mut self.ready, &mut self.spare, &page);
                     self.pos += len;
                     self.pages_parsed += 1;
                 }
@@ -251,11 +333,22 @@ impl Default for OggReader {
 
 /// Feed one verified page's segments into the per-serial reassembly, queueing any
 /// completed packets onto `ready`. A free function (not a `&mut self` method) because
-/// `page` borrows the reader's input buffer while `streams`/`ready` are disjoint —
+/// `page` borrows the reader's input buffer while `streams`/`ready`/`spare` are disjoint —
 /// passing them explicitly is what lets the borrow checker see the disjointness.
+///
+/// ## Allocation shape (spec: performance — no steady-state heap traffic)
+/// The page body is the concatenation of its segments **in order** (§5), so every byte of a
+/// packet that lies on this page is one *contiguous* run of it: `payload[run_start..off]`.
+/// The reassembly therefore copies a packet **once**, when it completes, instead of once
+/// per 255-byte lacing value — a 949-byte packet is 4 lacing values, i.e. 4 appends into a
+/// growing `Vec` (≈4 reallocations, since the completed packet used to leave a
+/// *zero-capacity* `Vec` behind for the next one to re-grow from). `state.partial` is now
+/// touched only by packets that genuinely span a page boundary, and completed packets are
+/// built in recycled buffers ([`OggReader::recycle`]).
 fn handle_page(
     streams: &mut HashMap<u32, StreamState>,
     ready: &mut VecDeque<Packet>,
+    spare: &mut Spare,
     page: &PageHeader<'_>,
 ) {
     let serial = page.serial();
@@ -284,40 +377,60 @@ fn handle_page(
     let table = page.segment_table();
     let payload = page.payload();
     let mut off = 0usize;
+    // Where the current packet's bytes *on this page* start. Segments are contiguous in
+    // `payload`, so this run is the packet's whole contribution from this page.
+    let mut run_start = 0usize;
     // Index of the last lacing value, to know if the final packet on the page is
     // complete (last lacing < 255) or spills to the next page (last lacing == 255).
     let last_idx = table.len().wrapping_sub(1);
 
     for (i, &lacing) in table.iter().enumerate() {
-        let seg = &payload[off..off + lacing as usize];
         off += lacing as usize;
-        state.partial.extend_from_slice(seg);
-        state.in_progress = true;
-
-        if lacing < 255 {
-            // Packet complete. A completed packet — whether or not it is the last on the
-            // page — belongs to this page, so it takes this page's granule (§6: granule
-            // covers "all frames finished on this page").
-            let data = std::mem::take(&mut state.partial);
-            state.in_progress = false;
-            let is_last_on_page = i == last_idx;
-            let packet = Packet {
-                serial,
-                granule,
-                bos: state.pending_bos,
-                // Tag eos only for the packet completing on the eos page's *last*
-                // segment — the stream's final packet. A mid-page packet on an eos page
-                // is not "the" eos packet. For the common one-packet-per-eos-page case
-                // this is exactly right.
-                eos: eos && is_last_on_page,
-                data,
-            };
-            // Once the first packet is emitted, later packets are not bos.
-            state.pending_bos = false;
-            ready.push_back(packet);
+        if lacing == 255 {
+            // Packet continues into the next segment / page: keep extending the run.
+            continue;
         }
-        // lacing == 255: packet continues into the next segment / page; keep
-        // accumulating in `partial` with in_progress = true.
+        // Packet complete. A completed packet — whether or not it is the last on the
+        // page — belongs to this page, so it takes this page's granule (§6: granule
+        // covers "all frames finished on this page").
+        let tail = &payload[run_start..off];
+        run_start = off;
+        let data = if state.partial.is_empty() {
+            // The whole packet lies on this page: one right-sized copy straight out of
+            // the page body, into a recycled buffer when one is available.
+            let mut v = take_spare(spare, tail.len());
+            v.extend_from_slice(tail);
+            v
+        } else {
+            // Continued from an earlier page (§6, flag 0x01): finish the carried prefix
+            // and hand it over, leaving a *recycled* buffer behind — never a
+            // zero-capacity one for the next packet to re-grow from.
+            state.partial.extend_from_slice(tail);
+            std::mem::replace(&mut state.partial, take_spare(spare, 0))
+        };
+        state.in_progress = false;
+        let is_last_on_page = i == last_idx;
+        let packet = Packet {
+            serial,
+            granule,
+            bos: state.pending_bos,
+            // Tag eos only for the packet completing on the eos page's *last*
+            // segment — the stream's final packet. A mid-page packet on an eos page
+            // is not "the" eos packet. For the common one-packet-per-eos-page case
+            // this is exactly right.
+            eos: eos && is_last_on_page,
+            data,
+        };
+        // Once the first packet is emitted, later packets are not bos.
+        state.pending_bos = false;
+        ready.push_back(packet);
+    }
+
+    // A trailing run the page did not terminate (last lacing == 255) is the only thing
+    // that carries into `partial` — one append per page, not one per lacing value.
+    if run_start < off {
+        state.partial.extend_from_slice(&payload[run_start..off]);
+        state.in_progress = true;
     }
 
     if eos {

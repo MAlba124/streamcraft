@@ -115,6 +115,32 @@ static DEMUX_DESC: ElementDesc = ElementDesc {
     make_default: Some(|| Box::new(OggDemux::new())),
 };
 
+/// How many packets one `process()` call emits before yielding, leaving the rest queued in
+/// the reader and the remaining input un-popped (spec: Scheduling — the pipeline paces
+/// producers at group boundaries). Ogg packets are *small*, so pool exhaustion — the signal
+/// [`Ctx::try_alloc`] gives a frame-sized producer — never arrives to stop this one: a
+/// 949-byte packet takes a size-classed buffer that is deliberately outside the slot budget
+/// (see [`Ctx::alloc_exact`]). Without a self-imposed budget the demuxer converts *every
+/// byte the scheduler has buffered* into one batch — measured at 19 770 buffers, ~1.8 GiB
+/// live, from a 5.5 MB file. Yielding cannot stall: the yield happens *after* emitting, so
+/// the pass always made progress, and the scheduler re-enters with the backlog intact.
+///
+/// The value is a tuning knob, not a correctness bound — but 32 is not arbitrary. It is
+/// where the pool's small-buffer free list stops recycling: those buckets retain a bounded
+/// number of buffers *per size class*, and a batch bigger than that leaves every extra
+/// buffer to be freed and re-allocated on the next pass. Measured on the 5.5 MB Opus file
+/// (`examples/ogg_read_alloc_check`, pipeline mode): 16 → 0.504, **32 → 0.396**, 64 → 1.241,
+/// 256 → 1.399 allocations per packet.
+const EMIT_BUDGET: usize = 32;
+
+/// The un-emitted tail of an over-slot packet, parked because the pool ran dry mid-packet
+/// (spec: the backpressure rule). At most one exists: the demuxer stops pulling packets the
+/// moment it parks, so everything behind it stays queued in the [`OggReader`].
+struct Carry {
+    data: Vec<u8>,
+    off: usize,
+}
+
 /// Demultiplexes a single logical Ogg bitstream: an Ogg byte stream on the sink pad,
 /// one reassembled codec packet **per output buffer** on the src pad.
 ///
@@ -123,12 +149,31 @@ static DEMUX_DESC: ElementDesc = ElementDesc {
 /// needs one dynamic src pad per serial (a documented follow-up — `spec/NOTES.md`). The
 /// wrapped [`OggReader`] already demuxes every serial and resyncs past corruption without
 /// panicking, so bad input is safe; this element just filters to one serial.
-#[derive(Default)]
 pub struct OggDemux {
     reader: OggReader,
     /// The serial we locked onto — the first one a packet arrived for. `None` until the
     /// first packet is seen, after which only this serial's packets are emitted.
     serial: Option<u32>,
+    /// The pool's slot size, probed once at `start` (`usize::MAX` if the probe found the
+    /// pool full, which makes every packet take the right-sized path). Decides which
+    /// packets are worth a whole slot — see [`emit_packet`](Self::emit_packet).
+    slot: usize,
+    /// An over-slot packet stalled on pool exhaustion. While set, the element consumes no
+    /// input (spec: the backpressure rule).
+    pending: Option<Carry>,
+}
+
+impl Default for OggDemux {
+    fn default() -> Self {
+        Self {
+            reader: OggReader::default(),
+            serial: None,
+            // "No packet is slot-sized" until `start` probes the real slot size — the
+            // right-sized branch, correct (if not pool-backed) for any packet.
+            slot: usize::MAX,
+            pending: None,
+        }
+    }
 }
 
 impl OggDemux {
@@ -141,38 +186,126 @@ impl OggDemux {
     /// split across buffers (it cannot fit one fixed slot); packets up to a slot stay 1:1,
     /// which covers everything short of a multi-page giant. A zero-length packet still
     /// emits one empty buffer, so nil packets survive the round-trip.
-    fn emit_packet(ctx: &mut Ctx, data: &[u8]) {
-        // Empty packet: emit exactly one zero-length buffer to preserve the boundary.
-        if data.is_empty() {
-            let mut buf = ctx.alloc(SRC);
-            buf.memory.set_len(0);
-            ctx.out(SRC).push(buf);
-            return;
+    ///
+    /// Returns the offset it emitted up to: `< data.len()` means the pool ran dry part-way
+    /// through an over-slot packet, and the caller parks the remainder and stops consuming
+    /// input.
+    ///
+    /// ## Which allocator (spec: Memory)
+    /// - **Up to a slot** — the whole of real Ogg audio, where the mean packet is ~1 KB:
+    ///   [`Ctx::alloc_exact`], which serves it from the size-classed recycling free list
+    ///   (or a slot when it genuinely fills one). [`Ctx::alloc`] used to hand a *full
+    ///   128 KiB slot* to a 949-byte packet — a 138× amplification that, batched, put
+    ///   431 MiB–1.8 GiB of live heap behind a few-MB file, and allocated a fresh slot per
+    ///   packet because the free list was empty every time.
+    /// - **Over a slot** — genuinely slot-sized work: [`Ctx::try_alloc`] chunked to the
+    ///   slot, with the park/resume carry, i.e. the pooled backpressure discipline the
+    ///   framework asks a producer for (`mp4demux`/`mkvmux` do the same).
+    ///
+    /// Either way the buffer boundaries are exactly what the old slot-chunked path
+    /// produced, so the emitted framing is unchanged.
+    fn emit_packet(ctx: &mut Ctx, data: &[u8], slot: usize) -> usize {
+        if data.len() > slot {
+            return Self::emit_bounded(ctx, data, 0, slot);
         }
-        let mut off = 0;
+        Self::emit_exact(ctx, data, 0, slot);
+        data.len()
+    }
+
+    /// Push `data[off..]` through **pooled slots** ([`Ctx::try_alloc`]), chunked to the slot
+    /// size, returning the new offset — `< data.len()` means the pool ran dry and the caller
+    /// must carry the remainder and stop consuming input (spec: the backpressure rule).
+    fn emit_bounded(ctx: &mut Ctx, data: &[u8], mut off: usize, slot: usize) -> usize {
         while off < data.len() {
-            let mut buf = ctx.alloc(SRC);
-            let cap = buf.memory.capacity();
-            debug_assert!(cap > 0, "oggdemux: zero-capacity pool slot");
+            let Some(mut buf) = ctx.try_alloc(SRC) else { return off };
+            debug_assert!(buf.memory.capacity() > 0, "oggdemux: zero-capacity pool slot");
+            let cap = buf.memory.capacity().min(slot).max(1);
             let n = cap.min(data.len() - off);
             buf.memory.as_mut_full()[..n].copy_from_slice(&data[off..off + n]);
             buf.memory.set_len(n);
             ctx.out(SRC).push(buf);
             off += n;
         }
+        off
     }
 
-    /// Drain every packet the reader has reassembled so far, emitting those on the locked
-    /// serial. The first packet seen locks the serial (the first bos serial in a
-    /// well-formed stream).
-    fn drain(&mut self, ctx: &mut Ctx) {
+    /// Emit `data[off..]` as **exact-size** buffers ([`Ctx::alloc_exact`] — a right-sized
+    /// recycled or heap buffer, never a slot-sized over-allocation), chunked to `slot` so the
+    /// boundaries match [`emit_bounded`](Self::emit_bounded)'s byte for byte. Never blocks:
+    /// the steady-state path for packets that fit a slot, and the whole of the EOS flush,
+    /// where waiting for a slot is no longer possible.
+    fn emit_exact(ctx: &mut Ctx, data: &[u8], mut off: usize, slot: usize) {
+        loop {
+            // A zero-length packet emits exactly one empty buffer, preserving the boundary.
+            let n = slot.max(1).min(data.len() - off);
+            let mut buf = ctx.alloc_exact(SRC, n);
+            buf.memory.as_mut_full()[..n].copy_from_slice(&data[off..off + n]);
+            buf.memory.set_len(n);
+            ctx.out(SRC).push(buf);
+            off += n;
+            if off >= data.len() {
+                return;
+            }
+        }
+    }
+
+    /// Drain packets the reader has reassembled, emitting those on the locked serial. The
+    /// first packet seen locks the serial (the first bos serial in a well-formed stream).
+    ///
+    /// `false` = stop consuming input this pass: either the pool ran dry mid-packet (the
+    /// remainder is parked in `pending`) or the emission budget is spent. Everything not yet
+    /// emitted stays queued inside the [`OggReader`], so nothing is lost and the next pass
+    /// resumes exactly here.
+    fn drain(&mut self, ctx: &mut Ctx) -> bool {
+        let slot = self.slot;
+        // A parked packet precedes everything queued behind it — finish it first.
+        if let Some(mut c) = self.pending.take() {
+            c.off = Self::emit_bounded(ctx, &c.data, c.off, slot);
+            if c.off < c.data.len() {
+                self.pending = Some(c);
+                return false; // pool still dry
+            }
+            self.reader.recycle(c.data);
+        }
+        let mut budget = EMIT_BUDGET;
+        while let Some(packet) = self.reader.next_packet() {
+            let serial = *self.serial.get_or_insert(packet.serial);
+            if packet.serial != serial {
+                // Packets on other serials are ignored — single-stream demux (follow-up:
+                // dynamic pads for multi-stream).
+                self.reader.recycle(packet.data);
+                continue;
+            }
+            let off = Self::emit_packet(ctx, &packet.data, slot);
+            if off < packet.data.len() {
+                self.pending = Some(Carry { data: packet.data, off });
+                return false;
+            }
+            self.reader.recycle(packet.data);
+            budget -= 1;
+            if budget == 0 {
+                return false; // yield — the rest stays queued for the next pass
+            }
+        }
+        true
+    }
+
+    /// The EOS/stop flush: everything still queued goes out with **exact-size** allocations
+    /// — there is no next pass to wait for a pool slot in. Bounded in volume: the
+    /// steady-state path only consumed input while it could emit, so at most one input
+    /// chunk's worth of packets is queued here.
+    fn flush(&mut self, ctx: &mut Ctx) {
+        let slot = self.slot;
+        if let Some(c) = self.pending.take() {
+            Self::emit_exact(ctx, &c.data, c.off, slot);
+            self.reader.recycle(c.data);
+        }
         while let Some(packet) = self.reader.next_packet() {
             let serial = *self.serial.get_or_insert(packet.serial);
             if packet.serial == serial {
-                Self::emit_packet(ctx, &packet.data);
+                Self::emit_exact(ctx, &packet.data, 0, slot);
             }
-            // Packets on other serials are ignored — single-stream demux (follow-up:
-            // dynamic pads for multi-stream).
+            self.reader.recycle(packet.data);
         }
     }
 }
@@ -182,40 +315,55 @@ impl Element for OggDemux {
         &DEMUX_DESC
     }
 
-    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+    fn start(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
         self.reader = OggReader::new();
         self.serial = None;
+        self.pending = None;
+        // Probe the pool's slot size once: the buffer is dropped immediately (recycling the
+        // slot), and the size is what tells `emit_packet` whether a packet is worth one.
+        // A full pool at start is not a real case; `usize::MAX` then means "no packet is
+        // slot-sized", which is the safe, right-sized branch.
+        self.slot = ctx.try_alloc(SRC).map_or(usize::MAX, |b| b.memory.capacity());
         Ok(())
     }
 
     fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        // Backpressure: resume any parked emission first, and consume input only while
+        // emission keeps up (un-popped input stays buffered for the next pass, so the
+        // scheduler's gates absorb a fast source racing a slow consumer — not this element).
+        if !self.drain(ctx) {
+            return Ok(Flow::Ok);
+        }
         while let Some(buf) = inputs.pop() {
             // Feed the bytes to the page engine; it parses whole pages and queues
             // reassembled packets. `buf` recycles on drop at the end of this iteration.
             self.reader.push(buf.memory.data());
-            self.drain(ctx);
+            if !self.drain(ctx) {
+                return Ok(Flow::Ok);
+            }
         }
         Ok(Flow::Ok)
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // On EOS, tell the reader no more bytes are coming and drain any final packet a
+        // On EOS, tell the reader no more bytes are coming and flush every packet a
         // just-closed page completed. `finish` drops only unparsable trailing garbage; a
         // clean stream ends on a page boundary with nothing left.
         if matches!(event, Event::Eos) {
             self.reader.finish();
-            self.drain(ctx);
+            self.flush(ctx);
         }
         Ok(())
     }
 
     fn stop(&mut self, ctx: &mut Ctx) {
         // Belt-and-braces: flush any final packet even if `event(Eos)` was not delivered.
-        // `finish` + `drain` are idempotent once the queue is empty.
+        // `finish` + `flush` are idempotent once the queue is empty.
         self.reader.finish();
-        self.drain(ctx);
+        self.flush(ctx);
         self.reader = OggReader::new();
         self.serial = None;
+        self.pending = None;
     }
 }
 

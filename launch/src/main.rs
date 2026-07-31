@@ -487,13 +487,13 @@ fn print_health(tap: &profluens_core::counters::TapHandle) {
         "  slots {:>10} outstanding  {:>10} high water  {:>10} capacity",
         pool.outstanding, pool.high_water, pool.max_slots
     );
-    let reuse = if pool.acquires > 0 {
-        100.0 * (1.0 - pool.slot_allocations as f64 / pool.acquires as f64)
-    } else {
-        0.0
-    };
+    // Deliberately no "% reused": `acquires`/`recycles` count SLOT traffic only, while
+    // `slot_allocations` counts every box the pool ever had to allocate — slots and size-classed
+    // small buffers alike. Dividing one by the other compares different populations and prints
+    // nonsense (a small-buffer-heavy demuxer read "-21116% reused"). Flat `slot_allocations`
+    // across a run is the signal; a climbing one means the pool is missing.
     println!(
-        "  {:>10} acquires  {:>10} recycles  {:>10} heap allocations ({reuse:.1}% reused)",
+        "  {:>10} slot acquires  {:>10} slot recycles  {:>10} boxes allocated (slots + small)",
         pool.acquires, pool.recycles, pool.slot_allocations
     );
     println!("scheduler:");
