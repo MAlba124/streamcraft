@@ -783,32 +783,36 @@ fn rendered_after_seek(name: &str, secs: f64, to: Duration) -> f64 {
     rig.cap.captured_len() as f64 / STRIDE as f64 / 48_000.0
 }
 
-/// **Pins a defect that is not this crate's** — a mid-file seek currently ends the track
-/// instead of resuming from the target.
+/// A mid-file seek is followed by the rest of the track.
 ///
-/// The engine's own part is correct and is asserted above: the target is resolved through the
-/// track's `SeekIndex` and the *resolved cue* is what gets seeked to, never the request. What
-/// happens next is upstream. It was reproduced with the engine removed entirely — a plain
-/// `PipeWireAudioSink::with_output` on a capture output, driven by `Player::open_canonical` at
-/// the same pacing — and it reproduces identically for **WAV, MP3 and FLAC**, i.e. regardless of
-/// whether the seek index is keyframe-exact (WAV resolves through 80 real entries) or purely
-/// proportional (an in-process FLAC has none). `run()` returns `Ok(())`, so the stream is ending
-/// cleanly rather than failing: something in the canonical chain or the attached sink treats the
-/// post-flush re-prime as end of stream. Note that none of the three glue stages
-/// (`audioconvert`/`audiostereo`/`audioresample`) handles `Event::FlushStart` at all — which
-/// `gapless.md` already lists as an independent fix to make.
+/// This test used to be **inverted** — it asserted that a seek yielded *no* further audio, and
+/// pinned an upstream defect so that fixing it would fail loudly here. It did, and this is the
+/// restored expectation.
 ///
-/// The assertion is deliberately inverted: it holds while the defect is present and **fails the
-/// moment it is fixed**, which is exactly when someone should come back here, restore the real
-/// expectation (`≈ secs - target`), and delete this note.
+/// The defect was in the scheduler, not in this crate and not in the audio glue: a group thread
+/// left its loop for good the moment its head reached end of stream, and the seek-generation
+/// check that revives a stream lives *inside* that loop. A player reads a whole track into its
+/// buffers within a few hundred milliseconds and then spends minutes playing it out, so by the
+/// time anyone seeked, the only thread that could re-read the file was gone; the flush still
+/// reached the sink, which discarded its staged audio, found its upstream ring closed, and
+/// declared end of stream. End of stream now travels in band and a finished group parks alive
+/// (`core/src/pipeline.rs`, `run_group`), so a seek finds something that can still read.
+///
+/// The engine's own part was correct throughout and is asserted above: the target is resolved
+/// through the track's `SeekIndex` and the *resolved cue* is what gets seeked to, never the
+/// request — which is why the numbers below are approximate rather than exact.
 #[test]
-fn a_seek_currently_yields_no_further_audio_upstream_defect() {
+fn a_seek_is_followed_by_the_rest_of_the_track() {
     let forward = rendered_after_seek("m_fwd.flac", 8.0, Duration::from_secs(4));
     let backward = rendered_after_seek("m_back.flac", 8.0, Duration::from_millis(400));
+    // Generous windows: the index floors to the preceding cue, and the device's in-flight tail
+    // at the instant of the seek is dropped with it (documented in `Engine::seek`).
     assert!(
-        forward < 0.5 && backward < 0.5,
-        "a seek now yields audio again (forward {forward:.2} s, backward {backward:.2} s) — the \
-         upstream seek defect looks fixed. Replace this test with the real expectation: a seek to \
-         4 s in an 8 s track should be followed by about 4 s, and a seek back to 0.4 s by about 7.6."
+        (3.0..=5.0).contains(&forward),
+        "a seek to 4 s in an 8 s track should be followed by about 4 s of audio, got {forward:.2}"
+    );
+    assert!(
+        (6.5..=8.5).contains(&backward),
+        "a seek back to 0.4 s should be followed by about 7.6 s of audio, got {backward:.2}"
     );
 }

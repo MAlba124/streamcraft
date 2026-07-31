@@ -238,15 +238,6 @@ impl Engine {
     /// position, and rebasing to the request while content resumes earlier would leave the
     /// pipeline permanently behind its own clock.
     ///
-    /// **Known limitation, not this crate's.** A mid-file seek currently *ends* the track rather
-    /// than resuming from the target: the flush lands, the position reports the target, and no
-    /// further audio follows. It reproduces with the engine removed entirely (a plain
-    /// `PipeWireAudioSink::with_output` driven by `Player::open_canonical`) and for WAV, MP3 and
-    /// FLAC alike, so it is neither the queue nor the index. The engine's own behaviour around it
-    /// is sound — no panic, no stall, no stuck queue — and is asserted in
-    /// `tests/robustness.rs`, which also pins the defect so that fixing it upstream fails loudly
-    /// here.
-    ///
     /// Seeking during a gapless handoff is allowed and safe, with one documented consequence:
     /// the output ring is a single byte stream, so a seek issued in the instant after the
     /// previous track detached but before its tail has played out drops that tail too. The user

@@ -28,6 +28,8 @@ struct Step {
     at: f64,
     what: &'static str,
     run: fn(&Engine, &str),
+    /// Whether this step ends the gapless runway measurement — see the seek step below.
+    ends_runway_watch: bool,
 }
 
 fn main() -> Result<(), String> {
@@ -40,16 +42,40 @@ fn main() -> Result<(), String> {
     println!("engine open — output renders {:?}", engine.output().format());
 
     let script: &[Step] = &[
-        Step { at: 1.0, what: "enqueue B (the gapless append)", run: |_, _| {} },
-        Step { at: 4.5, what: "pause", run: |e, _| e.pause() },
-        Step { at: 5.5, what: "resume", run: |e, _| e.resume() },
-        Step { at: 6.5, what: "volume 0.30 (ramped)", run: |e, _| e.set_volume(0.30) },
-        Step { at: 7.5, what: "volume 1.00 (ramped)", run: |e, _| e.set_volume(1.00) },
-        Step { at: 8.5, what: "set_idle(true) — park the device", run: |e, _| e.set_idle(true) },
-        Step { at: 9.5, what: "set_idle(false) — unpark", run: |e, _| e.set_idle(false) },
-        // Last on purpose: a mid-file seek currently ends the track (a known upstream defect —
-        // see `Engine::seek`), so anything after it would not get to run.
-        Step { at: 10.5, what: "seek to 2.0 s", run: |e, _| e.seek(Duration::from_secs(2)) },
+        Step { at: 1.0, what: "enqueue B (the gapless append)", run: |_, _| {}, ends_runway_watch: false },
+        Step { at: 4.5, what: "pause", run: |e, _| e.pause(), ends_runway_watch: false },
+        Step { at: 5.5, what: "resume", run: |e, _| e.resume(), ends_runway_watch: false },
+        Step { at: 6.5, what: "volume 0.30 (ramped)", run: |e, _| e.set_volume(0.30), ends_runway_watch: false },
+        Step { at: 7.5, what: "volume 1.00 (ramped)", run: |e, _| e.set_volume(1.00), ends_runway_watch: false },
+        Step { at: 8.5, what: "set_idle(true) — park the device", run: |e, _| e.set_idle(true), ends_runway_watch: false },
+        Step { at: 9.5, what: "set_idle(false) — unpark", run: |e, _| e.set_idle(false), ends_runway_watch: false },
+        // A mid-file seek used to *end* the track: the scheduler retired a group the moment its
+        // head reached end of stream, so by the time anyone seeked there was nothing left alive
+        // to re-read the file. It resumes now — which is why steps follow it. If playback did
+        // not survive the seek this script would stall here, audibly and visibly.
+        //
+        // `ends_runway_watch`: a seek deliberately drops whatever is still in the ring (see
+        // `Engine::seek`), so the runway goes to zero by design. Measuring the gapless runway
+        // past this point would report that as an underrun, which is the one thing this example
+        // exists to detect — so the window closes here.
+        Step {
+            at: 10.5,
+            what: "seek to 2.0 s",
+            run: |e, _| e.seek(Duration::from_secs(2)),
+            ends_runway_watch: true,
+        },
+        Step {
+            at: 13.0,
+            what: "volume 0.50 — still playing after the seek",
+            run: |e, _| e.set_volume(0.50),
+            ends_runway_watch: false,
+        },
+        Step {
+            at: 14.0,
+            what: "volume 1.00",
+            run: |e, _| e.set_volume(1.00),
+            ends_runway_watch: false,
+        },
     ];
 
     let start = Instant::now();
@@ -100,6 +126,9 @@ fn main() -> Result<(), String> {
                 watching = true;
             } else {
                 (step.run)(&engine, b);
+                if step.ends_runway_watch {
+                    watching = false;
+                }
                 println!(
                     "[{t:5.2}] {} (paused={}, idle={}, volume={:.2})",
                     step.what,
