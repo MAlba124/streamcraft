@@ -385,7 +385,7 @@ impl Mp4Demux {
                 return Ok((family, track.entry.config_record.clone(), Reframer::Passthrough));
             }
         }
-        Ok((track.family(), track.codec_head().to_vec(), track.reframer().clone()))
+        Ok((track.family(), track.codec_head().to_vec(), *track.reframer()))
     }
 
     /// Drain samples the reader has resolved, emitting each on its track's src pad —

@@ -23,6 +23,13 @@
 //!   for the `avcC`/`hvcC` → Annex B reframing (the identical ISO/IEC 14496-15 configuration
 //!   record rides both an MKV `CodecPrivate` and an MP4 `avc1`/`hvc1` sample entry — one
 //!   parser, tested once; see `spec/NOTES.md`, "Reframer reuse").
+//! - [`ilst`] — **metadata + no-decode props**, pure `&[u8]` functions for a tag scanner:
+//!   [`locate_moov`] finds `moov` in a bounded prefix read (before or after the `mdat`),
+//!   [`parse_moov_tags`] walks `udta` → `meta` (a FullBox, §8.11.1) → `ilst` and pushes
+//!   canonical Vorbis-comment keys into a [`TagSink`](profluens_core::event::TagSink), and
+//!   [`props_from_moov`] reads duration/rate/channels off `mdhd`/`mvhd`/`stsd`. No IO, no
+//!   element, and **no heap allocation** — text borrows the input, numbers format into a stack
+//!   buffer, and the one variable-length key uses the caller's scratch `Arena`.
 //! - [`Mp4Reader`] — the two-phase parse engine ([`reader`]): **resolution** folds the `moov`
 //!   sample tables into one file-offset-sorted [`reader::Sample`] list per track
 //!   (`(offset, size, dts, pts, sync)`; `pts = dts + ctts` in media ticks, i128-safe, with a
@@ -54,9 +61,11 @@
 pub mod boxes;
 pub mod codec;
 pub mod element;
+pub mod ilst;
 pub mod reader;
 
 pub use codec::{family_for, SampleEntry};
+pub use ilst::{locate_moov, parse_moov_tags, props_from_moov, MoovExtent, Mp4Props};
 pub use element::Mp4Demux;
 pub use reader::{Mp4Error, Mp4Reader, ResolvedSample, Sample, SamplePayload, Track};
 
