@@ -1,18 +1,51 @@
 use crate::math_utils;
 use num::complex::Complex64;
 use num::Zero;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 // Constants
 const MIN_FFT_SIZE: usize = 32;
 
+/// Process-wide FFT plan cache.
+///
+/// `rustfft` caches a size's plan inside its planner, so one planner per `FftManager` was ~38K
+/// plan-building allocations/song. A *thread-local* planner fixed that, but a quality search runs
+/// twelve worker threads over fifteen comparisons and each thread then built its own twiddle tables
+/// — `new_with_avx`'s `sincos` was 2.2% of a comparison, so ~3% of a sweep spent computing the same
+/// tables twelve times. `Arc<dyn Fft<f64>>` is `Send + Sync` (rustfft requires it of the trait), so
+/// the plans are shared instead. The lock is taken once per transform and the critical section is a
+/// hash lookup after the first build; a sweep takes it a few thousand times across twelve threads.
+type Plan = Arc<dyn Fft<f64>>;
+
+fn plan_cache() -> &'static Mutex<HashMap<(usize, bool), Plan>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, bool), Plan>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cached plan for `size`, built on first use. `inverse` picks the direction.
+fn plan(size: usize, inverse: bool) -> Plan {
+    let mut cache = plan_cache().lock().expect("fft plan cache poisoned");
+    if let Some(cached) = cache.get(&(size, inverse)) {
+        return Arc::clone(cached);
+    }
+    let built = PLANNER.with(|planner| {
+        let mut planner = planner.borrow_mut();
+        if inverse {
+            planner.plan_fft_inverse(size)
+        } else {
+            planner.plan_fft_forward(size)
+        }
+    });
+    cache.insert((size, inverse), Arc::clone(&built));
+    built
+}
+
 thread_local! {
-    /// Per-thread shared FFT planner. `rustfft` caches each transform size's plan inside the
-    /// planner, so reusing one planner across every `FftManager` means a given size's plan is built
-    /// once per thread instead of rebuilt on each construction — the per-`FftManager::new` planner
-    /// was ~38K plan-building allocations/song in the alignment path. Thread-local (not a global
-    /// mutex) so the parallel search threads never contend.
+    /// Builder for [`plan`]; `rustfft`'s planner is not `Sync`, so it stays thread-local and only
+    /// its *output* is shared.
     static PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::<f64>::new());
     /// Per-thread reusable rustfft out-of-place scratch buffer.
     static FFT_SCRATCH: RefCell<Vec<Complex64>> = const { RefCell::new(Vec::new()) };
@@ -52,7 +85,7 @@ impl FftManager {
     /// with `0.0` before staging and staging before padding with `Complex64::zero()` write the same
     /// `(0, 0)` elements, so the transform input is bit-identical.
     pub fn freq_from_time_domain(&mut self, time_channel: &[f64], freq_channel: &mut [Complex64]) {
-        let real_to_complex = PLANNER.with(|p| p.borrow_mut().plan_fft_forward(self.fft_size));
+        let real_to_complex = plan(self.fft_size, false);
         // Reused thread-local buffers rather than a fresh `Vec` per transform. `complex_time_domain`
         // stages `time_channel` as real-valued complex (`re = x, im = 0` — the exact
         // `float_vec_to_real_valued_complex_vec`); the scratch is sized by the plan.
@@ -85,7 +118,7 @@ impl FftManager {
         freq_channel: &mut [Complex64],
         time_channel: &mut [f64],
     ) {
-        let complex_to_real = PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(self.fft_size));
+        let complex_to_real = plan(self.fft_size, true);
 
         // `complex_td` is the inverse transform's *output* — `process_outofplace` overwrites it, so
         // its previous contents are irrelevant and it only needs to be `fft_size` long. Reuse

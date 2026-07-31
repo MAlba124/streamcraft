@@ -468,3 +468,45 @@ Four of four paired runs. Combined with the shared reference spectrogram above, 
 `transcode --target 4.5` goes **32.57 G → 26.15 G instructions (−19.7%)** and its 15-point sweep
 1.4 s → 837 ms, with a byte-identical `.opus`. MOS-LQO bit-identical across the nine-point sweep;
 tests 38 pass / same 11 pre-existing failures.
+
+## Shared FFT plans — `fft_manager.rs`
+
+**Why.** After the hoist, `perf annotate` put 2.2% of a comparison in libm's `__sincos_fma`, and its
+caller was **`rustfft`'s `new_with_avx`** — twiddle-table construction, not (as a symbol-only reading
+of the profile suggested) the gammatone's `make_filters`. A per-thread planner already stopped a
+size's plan being rebuilt per `FftManager`, but a quality search runs twelve workers over fifteen
+comparisons, so each thread still built the same tables from scratch: ~3% of a sweep computing the
+identical twiddles twelve times.
+
+**The change.** `Arc<dyn Fft<f64>>` is `Send + Sync` — rustfft requires it of the trait, precisely so
+plans can be shared — so the plans now live in a process-wide `HashMap` keyed by `(size, inverse)`.
+The thread-local planner stays as the *builder*, since `FftPlanner` itself is not `Sync`; only its
+output is shared. The lock is taken once per transform and the critical section is a hash lookup
+after the first build (a sweep takes it a few thousand times across twelve threads).
+
+**Result** — a full `transcode --target 4.5`, interleaved:
+
+| | instructions | cycles |
+|---|---|---|
+| before | 26.15 G | ~25.73 G |
+| **after** | **24.50 G** (−6.3%) | **~25.16 G** (−2.2%) |
+
+Four of four paired runs on both counters. Cycles move less than instructions because twelve threads
+were building their twiddles concurrently — the work was real, but partly hidden by parallelism.
+Byte-identical `.opus`; MOS-LQO bit-identical across the nine-point sweep.
+
+**Two things measured and rejected in this round.**
+
+- *Caching the gammatone filter coefficients process-wide.* Same idea, same shape as the caches
+  above, applied to `make_filters` — **+0.2% instructions, no cycle change**. `make_filters` is
+  simply cheap; the `sincos` in the profile was never it. The lesson is the attribution: bucketing a
+  profile by symbol name alone (`__sincos_fma` → "must be the ERB filters") invented a hot spot that
+  did not exist. Read the caller.
+- *Eliminating the convolution's padded matrix* (reading the input with clamped indices, interior
+  fast path). Worth ~4% when first considered; after the NSIM hoist removed two of the five
+  convolutions it is **~2%**, for a hot-kernel rewrite with new border cases. Not taken.
+
+**Profile after this round**: gammatone filterbank 45.9%, convolution kernel 13.4%, the per-offset
+NSIM passes 8.5%, `rustfft` 11.1%, nothing else above 3%. The gammatone is hand-written AVX2 with
+register-resident state and bounded by its own dependency chain; everything else left changes results
+(FMA, `f32`, a real-input transform, or ViSQOL's `DEFAULT_WINDOW_SIZE`).
