@@ -76,7 +76,13 @@ impl Constraint {
                 // Rat/Id ranges the step is ignored for now (TODO: rational steps).
                 match (v, *min, *step) {
                     (Value::Int(vi), Value::Int(mi), Value::Int(si)) => {
-                        si <= 0 || (vi - mi).rem_euclid(si) == 0
+                        // `checked_sub`: the bounds come from an element's `OfferDesc`, so a range
+                        // wider than `i64::MAX` — the plausible "any integer" idiom
+                        // `Range { min: i64::MIN, max: i64::MAX, step: n }` — overflowed here.
+                        // Debug panicked; release wrapped and silently accepted or rejected the
+                        // wrong values. A range that wide cannot meaningfully constrain a step, so
+                        // treat it as unstepped.
+                        si <= 0 || vi.checked_sub(mi).is_none_or(|d| d.rem_euclid(si) == 0)
                     }
                     _ => true,
                 }

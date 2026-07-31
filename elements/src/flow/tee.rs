@@ -113,7 +113,19 @@ impl Element for Tee {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // A FormatChange terminates at this element — the scheduler re-fixates our sink pad and
+        // consumes the event — so a pure transport has to re-announce it onward, verbatim, or its
+        // downstream never re-fixates. `queue` has always done this; `tee` never did, while its own
+        // module doc claimed `forward_format` "rides the events". The result was silent corruption
+        // rather than a loud error: with a tee inserted, a source announcing 48 kHz into sinks that
+        // only accept 44.1 kHz ran to completion with zero bus errors and zero FormatChanges
+        // delivered, leaving both branches decoding the new format as the old one. Both branches
+        // need it — that is the whole point of a tee.
+        if let Event::FormatChange(f) = event {
+            ctx.forward_format(PadId(1), f.clone());
+            ctx.forward_format(PadId(2), f.clone());
+        }
         Ok(())
     }
     fn stop(&mut self, _ctx: &mut Ctx) {}
