@@ -7,9 +7,25 @@
 //! Construction picks the branch count ([`Tee::new`], up to [`MAX_BRANCHES`]);
 //! only `src_0..src_{n-1}` are pushed to — the static pad table's spares stay
 //! silent (the `MkvMuxN` static-pad convention while dynamic sink/src growth
-//! is core-side pending work).
+//! is core-side pending work). Output pushed to an unlinked spare is dropped and
+//! counted by the scheduler (`elements/tests/unlinked.rs`), never accumulated.
+//!
+//! **What the branches must not do: mutate in place.** The tee itself is free, but
+//! the sharing it creates is not. [`Memory::as_mut_full`] is uniqueness-gated: on a
+//! shared buffer it copy-on-writes the **whole slot** and takes that copy from
+//! [`Pool::acquire_exact`], whose fallback — once the pool has no free slot, and
+//! `small_free` refuses a slot-sized request — is a fresh *unpooled* heap box. So the
+//! first branch that writes into what it received pays a full-slot `memcpy` plus a
+//! malloc/free per buffer, with no backpressure gating it. Measured on
+//! `testsrc ! tee(2) ! [mutating sink, testsink]` with a 2-slot pool:
+//! 1.7 allocations and ~55 KiB of malloc churn *per buffer* (447 MB over a 512 MiB
+//! stream), against a flat 0.00/buffer for the same graph with slots to spare.
+//! A branch that needs to modify its copy should allocate its own output and write
+//! into that, exactly as a transform element does.
 //!
 //! [`Memory`]: profluens_core::memory::Memory
+//! [`Memory::as_mut_full`]: profluens_core::memory::Memory::as_mut_full
+//! [`Pool::acquire_exact`]: profluens_core::memory::Pool::acquire_exact
 
 use profluens_core::batch::Inputs;
 use profluens_core::ctx::Ctx;
