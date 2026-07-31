@@ -31,7 +31,11 @@
 //!    request sends `Connection: close`.
 //!
 //! Only the `chunked` transfer coding is decoded; any other transfer coding (e.g.
-//! `gzip`) is rejected, as this element does not implement content decoders.
+//! `gzip`) is rejected, as this element does not implement content decoders. For the
+//! same reason the request asks for `Accept-Encoding: identity` and a response that
+//! applies a `Content-Encoding` anyway is rejected (RFC 9110 §8.4): a content coding
+//! survives de-chunking, so emitting it would hand coded bytes downstream as if they
+//! were the resource.
 //!
 //! ## `https://` (TLS)
 //! TLS rides the same architecture (see [`crate::tls`]): the handshake happens in
@@ -50,6 +54,7 @@
 //!   or rekey mid-download gets its response queued but never flushed (the reactor
 //!   has no streaming send yet); receive-direction decryption is unaffected.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -120,6 +125,28 @@ struct Url {
 // host/path strings become the `Url` returned to the caller.
 #[allow(clippy::disallowed_methods)]
 fn parse_http_url(url: &str) -> Result<Url, Error> {
+    // The host and path extracted below are formatted straight into the request head
+    // in `start()`, so an octet that can end a line there is an injection: a CR or LF
+    // in the request target closes the request-line early and everything after it
+    // becomes an attacker-chosen field line — or a second request (RFC 9112 §11.1
+    // response splitting, §11.2 request smuggling). A bare SP splits the request-line
+    // into the wrong three tokens the same way.
+    //
+    // None of these are legal in a URI to begin with: RFC 3986 §2 builds every
+    // component from the unreserved, reserved and percent-encoded sets, so controls,
+    // SP and DEL must already have been percent-encoded by whoever produced the URL.
+    // Reject rather than escape — a URL is attacker-influenced data in a media
+    // framework (playlists, manifests, config), and silently "repairing" one is how a
+    // fetch ends up somewhere other than where the caller asked. Bytes >= 0x80 are
+    // left alone: also not strictly legal unencoded, but harmless here and common in
+    // hand-written UTF-8 paths.
+    if let Some(bad) = url.bytes().find(|&b| b < 0x21 || b == 0x7f) {
+        return Err(Error::Resource(format!(
+            "httpsrc: illegal octet {bad:#04x} in URL {url:?} (RFC 3986 §2: controls, \
+             space and DEL must be percent-encoded)"
+        )));
+    }
+
     let (rest, tls) = if let Some(rest) = url.strip_prefix("http://") {
         (rest, false)
     } else if let Some(rest) = url.strip_prefix("https://") {
@@ -735,6 +762,12 @@ fn read_headers(stream: &mut impl Read, url: &str) -> Result<Head, Error> {
             let leftover = buf[body_start..].to_vec();
             buf.truncate(pos); // keep just the status line + header lines
             parse_status(&buf, url)?;
+            // Refuse anything we would have to decode before the body is the resource,
+            // in the order the sender wrapped it: transfer coding (a property of the
+            // message) outside, content coding (a property of the representation)
+            // inside. `parse_framing` then only has to decide how the body is framed.
+            check_transfer_coding(&buf, url)?;
+            check_content_coding(&buf, url)?;
             let framing = parse_framing(&buf, url)?;
             return Ok(Head { framing, leftover });
         }
@@ -779,18 +812,173 @@ fn parse_status(header_block: &[u8], url: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Return the last value of header `name` (case-insensitive, RFC 9112 header names are
-/// case-insensitive tokens), trimmed of surrounding whitespace. `header_block` is the
-/// status line plus header lines, without the trailing CRLF-CRLF. Later occurrences
-/// win, which matters for none of our fields but keeps the lookup unsurprising.
-fn header_value<'a>(header_block: &'a str, name: &str) -> Option<&'a str> {
+/// Replace every obs-fold in a header block with a SP (RFC 9112 §5.2). A field value
+/// could historically be continued on the following line by starting that line with a
+/// space or horizontal tab (`obs-fold = OWS CRLF RWS`); §5.2 deprecates it but is
+/// explicit about what a client owes it: "a user agent that receives an obs-fold in a
+/// response message that is not within a `message/http` container MUST replace each
+/// received obs-fold with one or more SP octets prior to interpreting the field value".
+///
+/// This is not cosmetic. Deciding *what is a field line* is the first act of
+/// interpreting a field value, and the lookup below tolerates whitespace around a field
+/// name, so a continuation left folded reads as a field line in its own right:
+/// `X-Note: see\r\n Content-Length: 3` conjures a `Content-Length` nobody sent as a
+/// field, and that value goes on to frame the body. Anything able to get text echoed
+/// into a response header could shorten a download to a length of its choosing, with no
+/// error raised anywhere.
+///
+/// Returns [`Cow::Borrowed`] untouched when nothing is folded — every well-formed
+/// response, since §5.2 also says senders MUST NOT generate a fold.
+// COLD: runs once per response, over the header block only; allocates only for the
+// deprecated folded form.
+#[allow(clippy::disallowed_methods)]
+fn unfold_obs_fold(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let folded = |i: usize| bytes[i] == b'\n' && matches!(bytes.get(i + 1), Some(b' ' | b'\t'));
+    if !(0..bytes.len()).any(folded) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for i in (0..bytes.len()).filter(|&i| folded(i)) {
+        // Drop the line break (and the CR before it, when present) and leave a SP in
+        // its place; the continuation keeps its own leading whitespace, so the fold
+        // becomes the "one or more SP octets" §5.2 asks for. Every cut is at an ASCII
+        // CR/LF, so the slices stay on UTF-8 boundaries.
+        let end = if i > 0 && bytes[i - 1] == b'\r' { i - 1 } else { i };
+        out.push_str(&text[copied..end]);
+        out.push(' ');
+        copied = i + 1;
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// Every value of header `name` (case-insensitive, RFC 9112 header names are
+/// case-insensitive tokens), in the order the field lines appear, each trimmed of
+/// surrounding whitespace. `header_block` is the status line plus header lines, without
+/// the trailing CRLF-CRLF.
+///
+/// All of them, not just one: RFC 9110 §5.3 makes repeated field lines of the same name
+/// equivalent to a single field whose value is those values joined by commas, so a
+/// recipient that reads one line has seen only part of the field. Fields whose framing
+/// consequences depend on the whole list (`Content-Length`) must iterate this.
+fn header_values<'a>(header_block: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
     header_block
         .lines()
         .skip(1) // the status line, not a header field
         .filter_map(|line| line.split_once(':'))
-        .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+        .filter(move |(k, _)| k.trim().eq_ignore_ascii_case(name))
         .map(|(_, v)| v.trim())
-        .last()
+}
+
+/// Return the last value of header `name`. Later occurrences win, which matters for
+/// none of the fields read this way but keeps the lookup unsurprising; see
+/// [`header_values`] for the fields where every occurrence has to be considered.
+fn header_value<'a>(header_block: &'a str, name: &'a str) -> Option<&'a str> {
+    header_values(header_block, name).last()
+}
+
+/// Reject a transfer-coding stack we cannot fully undo (RFC 9112 §6.1
+/// `Transfer-Encoding`).
+///
+/// §6.1: the field "lists the transfer coding names corresponding to the sequence of
+/// transfer codings that have been (or will be) applied to the content in order to form
+/// the message body" — a list the recipient has to unwind in full. Its own example is
+/// `gzip, chunked`.
+///
+/// This is deliberately a different question from the one [`parse_framing`] answers.
+/// *Which* coding is final decides the framing (§6.3 rule 4), and for `gzip, chunked`
+/// that is `chunked`, correctly — but undoing that outer layer only uncovers the gzip
+/// member underneath, and `chunked` (§7.1) is the sole coding this element implements.
+/// Emitting what falls out is the same silent corruption as an undecoded content coding
+/// (see [`check_content_coding`]), so framing selection stays where it is and the
+/// decodability of the rest of the stack is checked here.
+///
+/// §6.1 phrases the obligation from the sending side — a sender may only stack codings
+/// under a final `chunked` (or close-delimit the response), and a server facing a coding
+/// it does not understand "SHOULD respond with 501 (Not Implemented)". A *response*
+/// recipient has no such reply to send, which leaves failing loudly as the only honest
+/// move: the alternative is handing coded bytes downstream as the payload.
+fn check_transfer_coding(header_block: &[u8], url: &str) -> Result<(), Error> {
+    // Same lossy-then-unfold reading as `parse_framing` (§5.2), and every field line,
+    // since repeated lines are one comma-joined list (RFC 9110 §5.3).
+    let lossy = String::from_utf8_lossy(header_block);
+    let text = unfold_obs_fold(&lossy);
+    let mut codings = 0usize;
+    for value in header_values(&text, "Transfer-Encoding") {
+        for coding in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            codings += 1;
+            // §7: transfer-coding names are case-insensitive tokens.
+            if !coding.eq_ignore_ascii_case("chunked") {
+                return Err(Error::Resource(format!(
+                    "httpsrc: {url} applied Transfer-Encoding {coding:?} — this element \
+                     decodes only `chunked` and will not pass coded bytes off as the body"
+                )));
+            }
+        }
+    }
+    // §6.1: "A sender MUST NOT apply the chunked transfer coding more than once to a
+    // message body." `fill_chunked` undoes exactly one layer, so a repeat would leave
+    // chunk framing sitting in the bytes we emit.
+    if codings > 1 {
+        return Err(Error::Resource(format!(
+            "httpsrc: {url} applied the chunked transfer coding {codings} times \
+             (RFC 9112 §6.1: at most once); this element decodes one layer"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a response whose body is not the resource yet (RFC 9110 §8.4
+/// `Content-Encoding`).
+///
+/// A *transfer* coding is framing, and this element strips the one it supports. A
+/// *content* coding is part of the representation itself — §8.4 defines the field as
+/// "what decoding mechanisms have to be applied in order to obtain data in the media
+/// type referenced by the Content-Type header field" — so it outlives de-chunking:
+/// decode `Transfer-Encoding: chunked` off a `Content-Encoding: gzip` response and what
+/// falls out is the gzip member, not the file. Pushing that downstream as the payload
+/// is silent corruption, handing a demuxer DEFLATE noise where a container should be.
+/// We implement no content decoders, so the only honest move is to say so and stop.
+///
+/// The request advertises `Accept-Encoding: identity`, which is what makes a coded
+/// response the server's mistake rather than ours: RFC 9110 §12.5.3 rule 1 is that
+/// *without* an `Accept-Encoding` field "any content coding is considered acceptable by
+/// the user agent", so a client with no decoders has to ask for none.
+fn check_content_coding(header_block: &[u8], url: &str) -> Result<(), Error> {
+    // Same lossy-then-unfold reading as `parse_framing` — a folded `Content-Encoding`
+    // must not read as an empty one and slip through.
+    let lossy = String::from_utf8_lossy(header_block);
+    let text = unfold_obs_fold(&lossy);
+    for value in header_values(&text, "Content-Encoding") {
+        // §8.4: a list of codings in the order they were applied; the names are
+        // case-insensitive tokens (RFC 9112 §7).
+        for coding in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            // §8.4.1: `identity` is the reserved "no transformation" name — a sender
+            // SHOULD NOT even list it, but it is nothing we would have to undo.
+            if !coding.eq_ignore_ascii_case("identity") {
+                return Err(Error::Resource(format!(
+                    "httpsrc: {url} applied Content-Encoding {coding:?} despite \
+                     `Accept-Encoding: identity` — this element implements no content \
+                     decoders and will not pass coded bytes off as the body"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `Content-Length` value, which RFC 9112 §6.2 spells `1*DIGIT`. `str::parse`
+/// alone is too generous: it also accepts a leading `+`, so `Content-Length: +5` would
+/// slip through as 5 and frame a longer body short — the same silent truncation, one
+/// octet away. A sign is also precisely the kind of difference that makes two
+/// recipients on a path disagree about where a body ends (§11.2).
+fn parse_content_length(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok() // still fallible: more digits than fit a u64
 }
 
 /// Choose the message-body framing from the response header block (RFC 9112 §6.3).
@@ -801,7 +989,11 @@ fn header_value<'a>(header_block: &'a str, name: &str) -> Option<&'a str> {
 /// coding — is decoded; any other coding is rejected, since we implement no content
 /// decoders.
 fn parse_framing(header_block: &[u8], url: &str) -> Result<Framing, Error> {
-    let text = String::from_utf8_lossy(header_block);
+    // Field values are not required to be UTF-8, so the block is read lossily. Any
+    // obs-fold is unfolded first: §5.2 requires it before a field value is interpreted,
+    // and which lines *are* field lines is the first thing framing depends on.
+    let lossy = String::from_utf8_lossy(header_block);
+    let text = unfold_obs_fold(&lossy);
 
     // RFC 9112 §6.1: Transfer-Encoding is a comma-separated list of coding names; the
     // *final* one determines framing (§6.3 rule 4). Names are case-insensitive (§7).
@@ -820,22 +1012,36 @@ fn parse_framing(header_block: &[u8], url: &str) -> Result<Framing, Error> {
         )));
     }
 
-    // RFC 9112 §6.2: a decimal octet count. §6.3 rule 5 allows a comma-separated list
-    // only if every value is identical; we accept a single value and otherwise treat
-    // the framing as invalid.
-    if let Some(cl) = header_value(&text, "Content-Length") {
-        let mut values = cl.split(',').map(str::trim);
-        let first = values.next().unwrap_or("");
-        let len: u64 = first.parse().map_err(|_| {
-            Error::Resource(format!(
-                "httpsrc: invalid Content-Length {cl:?} from {url}"
-            ))
-        })?;
-        if !values.all(|v| v == first) {
-            return Err(Error::Resource(format!(
-                "httpsrc: conflicting Content-Length {cl:?} from {url}"
-            )));
+    // RFC 9112 §6.2: a decimal octet count. §6.3 rule 5 allows a list only if every
+    // value is valid and they are all identical; anything else makes the framing
+    // invalid, and for a response "received by a user agent, the user agent MUST close
+    // the connection to the server and discard the received response".
+    //
+    // That list arrives in either of two spellings — comma-separated inside one field
+    // line, or spread over repeated `Content-Length` field lines, which RFC 9110 §5.3
+    // defines as the same field — so both are folded into one pass here. Reading only
+    // one of the lines is how `Content-Length: 100` followed by `Content-Length: 3`
+    // frames a 100-byte body as 3 bytes and reports a successful download: a short file
+    // the caller has no way to notice.
+    let mut length: Option<u64> = None;
+    for value in header_values(&text, "Content-Length") {
+        for part in value.split(',').map(str::trim) {
+            let n = parse_content_length(part).ok_or_else(|| {
+                Error::Resource(format!(
+                    "httpsrc: invalid Content-Length {part:?} from {url}"
+                ))
+            })?;
+            match length {
+                Some(prev) if prev != n => {
+                    return Err(Error::Resource(format!(
+                        "httpsrc: conflicting Content-Length ({prev} then {n}) from {url}"
+                    )));
+                }
+                _ => length = Some(n),
+            }
         }
+    }
+    if let Some(len) = length {
         return Ok(Framing::Length(len));
     }
 
@@ -884,8 +1090,13 @@ impl Element for HttpSrc {
         } else {
             format!("{}:{}", url.host, url.port)
         };
+        // `Accept-Encoding: identity` asks for the resource uncoded. It has to be said
+        // out loud: RFC 9110 §12.5.3 rule 1 makes *every* content coding acceptable to a
+        // client that sends no `Accept-Encoding`, and we implement no content decoders
+        // (see `check_content_coding`).
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: profluens\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+             Accept-Encoding: identity\r\nUser-Agent: profluens\r\n\r\n",
             url.path, host_header
         );
 
@@ -1030,7 +1241,9 @@ impl Element for HttpSrc {
 #[cfg(test)]
 mod tests {
     use super::{
-        header_value, parse_chunk_size, parse_framing, parse_http_url, parse_status, Framing,
+        check_content_coding, check_transfer_coding, header_value, header_values,
+        parse_chunk_size, parse_framing, parse_http_url, parse_status, unfold_obs_fold, Cow,
+        Framing,
     };
 
     #[test]
@@ -1174,5 +1387,132 @@ mod tests {
         assert!(parse_chunk_size(b";only-ext", "u").is_err());
         // 17 hex digits overflow u64 (RFC 9112 §7.1: guard integer overflow).
         assert!(parse_chunk_size(b"1ffffffffffffffff", "u").is_err());
+    }
+
+    #[test]
+    fn header_lookup_yields_every_field_line() {
+        // RFC 9110 §5.3: repeated field lines are one comma-joined field, so a lookup
+        // that has to weigh the whole field must see all of them.
+        let block = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX: y\r\nContent-Length: 3";
+        let all: Vec<_> = header_values(block, "content-length").collect();
+        assert_eq!(all, ["100", "3"]);
+        // ... while the single-value lookup still reports the last occurrence.
+        assert_eq!(header_value(block, "Content-Length"), Some("3"));
+    }
+
+    #[test]
+    fn obs_fold_is_replaced_by_a_space() {
+        // RFC 9112 §5.2: a user agent MUST replace each obs-fold with SP before
+        // interpreting the field value. Untouched when nothing is folded.
+        let plain = "HTTP/1.1 200 OK\r\nContent-Length: 5";
+        assert!(matches!(unfold_obs_fold(plain), Cow::Borrowed(_)));
+        assert_eq!(unfold_obs_fold("A: one\r\n two"), "A: one  two");
+        assert_eq!(unfold_obs_fold("A: one\r\n\ttwo"), "A: one \ttwo");
+        // A bare-LF line ending folds too: `.lines()` breaks on it either way.
+        assert_eq!(unfold_obs_fold("A: one\n two"), "A: one  two");
+        // The last line has no fold to join, and a following field line is not one.
+        assert_eq!(unfold_obs_fold("A: one\r\nB: two"), "A: one\r\nB: two");
+    }
+
+    #[test]
+    fn framing_ignores_a_content_length_smuggled_in_a_folded_value() {
+        // The continuation belongs to `X-Note`; unfolded it can no longer pass for a
+        // field line of its own, so the real Content-Length stands (§5.2).
+        let block = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-Note: see\r\n Content-Length: 3";
+        match parse_framing(block, "u").unwrap() {
+            Framing::Length(n) => assert_eq!(n, 100),
+            other => panic!("expected Length(100), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn framing_rejects_content_length_split_over_field_lines() {
+        // §6.3 rule 5 via §5.3: repeated field lines are the same list as one written
+        // with commas, so differing values are just as unrecoverable. Taking the last
+        // framed a 100-byte body as 3 bytes and called it a completed download.
+        let split = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Length: 3";
+        assert!(parse_framing(split, "u").is_err());
+        // Identical repeats stay legal, exactly as the comma-list form does.
+        let same = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Length: 7";
+        match parse_framing(same, "u").unwrap() {
+            Framing::Length(n) => assert_eq!(n, 7),
+            other => panic!("expected Length(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn framing_rejects_a_signed_content_length() {
+        // §6.2 is `1*DIGIT`; `str::parse::<u64>` also takes a leading `+`, which framed
+        // a 100-byte body as 5 bytes and reported the download complete.
+        assert!(parse_framing(b"HTTP/1.1 200 OK\r\nContent-Length: +5", "u").is_err());
+        assert!(parse_framing(b"HTTP/1.1 200 OK\r\nContent-Length: 0x10", "u").is_err());
+        // A count that does not fit a u64 is invalid too, not a wrapped one.
+        let huge = b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999";
+        assert!(parse_framing(huge, "u").is_err());
+    }
+
+    #[test]
+    fn transfer_coding_rejects_only_what_we_cannot_undo() {
+        // `chunked` alone is the one coding `fill_chunked` undoes — the happy path, and
+        // an absent field is nothing to undo at all.
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked";
+        assert!(check_transfer_coding(chunked, "u").is_ok());
+        assert!(check_transfer_coding(b"HTTP/1.1 200 OK\r\nContent-Length: 5", "u").is_ok());
+        // §7: coding names are case-insensitive tokens.
+        let cased = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked";
+        assert!(check_transfer_coding(cased, "u").is_ok());
+
+        // §6.1: the list is the sequence of codings applied, and we can only undo the
+        // outermost one — `parse_framing` still frames this as chunked (§6.3 rule 4),
+        // which is why the decodability question has to be asked separately.
+        let stacked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked";
+        assert!(check_transfer_coding(stacked, "u").is_err());
+        assert!(matches!(
+            parse_framing(stacked, "u").unwrap(),
+            Framing::Chunked(_)
+        ));
+        // ... including when the list is spread over field lines (RFC 9110 §5.3).
+        let split = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked";
+        assert!(check_transfer_coding(split, "u").is_err());
+        // §6.1: chunked MUST NOT be applied more than once; we decode one layer.
+        let twice = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked";
+        assert!(check_transfer_coding(twice, "u").is_err());
+    }
+
+    #[test]
+    fn content_coding_rejects_only_what_needs_decoding() {
+        // RFC 9110 §8.4: a content coding survives de-chunking, so a body under one is
+        // not the resource and must not be emitted as if it were.
+        assert!(check_content_coding(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip", "u").is_err());
+        let chunked_and_coded =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Encoding: gzip";
+        assert!(check_content_coding(chunked_and_coded, "u").is_err());
+        // Every coding in the list counts, not just the first (§8.4: they are listed in
+        // the order applied), and the names are case-insensitive.
+        let listed = b"HTTP/1.1 200 OK\r\nContent-Encoding: identity, BR";
+        assert!(check_content_coding(listed, "u").is_err());
+        // A folded value must not read as an empty one and slip through (§5.2).
+        let folded = b"HTTP/1.1 200 OK\r\nContent-Encoding:\r\n gzip";
+        assert!(check_content_coding(folded, "u").is_err());
+        // `identity` (§8.4.1) and an absent field are nothing to decode.
+        let identity = b"HTTP/1.1 200 OK\r\nContent-Encoding: identity";
+        assert!(check_content_coding(identity, "u").is_ok());
+        assert!(check_content_coding(b"HTTP/1.1 200 OK\r\nContent-Length: 5", "u").is_ok());
+    }
+
+    #[test]
+    fn url_rejects_octets_that_would_split_the_request() {
+        // CR/LF in the request target ends the request-line and injects field lines of
+        // the caller's choosing (RFC 9112 §11.1, §11.2); a bare SP mis-splits it.
+        assert!(parse_http_url("http://example.com/a\r\nX-Injected: 1").is_err());
+        assert!(parse_http_url("http://example.com\r\nX-Injected: 1/a").is_err());
+        assert!(parse_http_url("http://example.com/a\nb").is_err());
+        assert!(parse_http_url("http://example.com/a b").is_err());
+        assert!(parse_http_url("http://example.com/a\0b").is_err());
+        // Percent-encoded, as RFC 3986 §2 requires, it is just a path.
+        assert_eq!(
+            parse_http_url("http://example.com/a%0d%0ab").unwrap().path,
+            "/a%0d%0ab"
+        );
     }
 }
