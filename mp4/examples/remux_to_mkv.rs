@@ -209,7 +209,10 @@ fn main() {
         let done = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
             while !done.load(std::sync::atomic::Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // `park_timeout`, not `sleep`: the loop re-checks `done` only after the wait, and
+                // an uninterruptible sleep would hold the process open for a whole slice after the
+                // remux finished — a 500 ms floor on a run that takes under a millisecond.
+                std::thread::park_timeout(std::time::Duration::from_millis(500));
                 if let Some(s) = tap.snapshot(mux) {
                     eprint!("\rmuxed {:>8.1} MiB…", s.bytes_out as f64 / (1024.0 * 1024.0));
                 }
@@ -220,9 +223,12 @@ fn main() {
 
     let started = Instant::now();
     p.run().expect("remux run");
-    done.store(true, std::sync::atomic::Ordering::Release);
-    let _ = progress.join();
+    // Sample the elapsed time before joining the observer, so the reported rate is the remux and
+    // not the shutdown handshake.
     let secs = started.elapsed().as_secs_f64();
+    done.store(true, std::sync::atomic::Ordering::Release);
+    progress.thread().unpark(); // `done` is published before this, so the wake cannot be lost
+    let _ = progress.join();
 
     let out_len = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     println!(

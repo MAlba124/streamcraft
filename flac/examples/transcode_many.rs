@@ -78,7 +78,9 @@ fn main() {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(150));
+                // `park_timeout`, not `sleep` — see the unpark below; an uninterruptible sleep
+                // holds the process open for a whole slice after the work is done.
+                std::thread::park_timeout(Duration::from_millis(150));
                 let mut line = String::from("\r");
                 for (sink, name) in sinks.iter().zip(&names) {
                     let bytes = tap.snapshot(*sink).map_or(0, |s| s.bytes_in);
@@ -95,6 +97,7 @@ fn main() {
     let result = p.run();
     let wall = t0.elapsed();
     stop.store(true, Ordering::Release);
+    observer.thread().unpark(); // `stop` is published before this, so the wake cannot be lost
     let _ = observer.join();
     eprintln!();
 

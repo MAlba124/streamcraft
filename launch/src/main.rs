@@ -386,7 +386,10 @@ impl Progress {
                 let mut prev_bytes = 0u64;
                 let mut prev_at = Instant::now();
                 while !stop2.load(Ordering::Acquire) {
-                    std::thread::sleep(Self::POLL);
+                    // `park_timeout`, not `sleep`: `finish` unparks after setting `stop`, so the
+                    // CLI exits at once instead of waiting out however much of the poll interval
+                    // happened to be left — up to `POLL` on every single invocation.
+                    std::thread::park_timeout(Self::POLL);
                     let produced = first.and_then(|id| tap.snapshot(id)).map_or(0, |s| s.bytes_out);
                     let consumed = last.and_then(|id| tap.snapshot(id)).map_or(0, |s| s.bytes_in);
                     let now = Instant::now();
@@ -417,6 +420,7 @@ impl Progress {
     /// Stop the observer and replace the live line with a final summary.
     fn finish(self, tap: &TapHandle, last: Option<ElementId>) {
         self.stop.store(true, Ordering::Release);
+        self.handle.thread().unpark(); // `stop` is published before this, so the wake cannot be lost
         let _ = self.handle.join();
         let consumed = last.and_then(|id| tap.snapshot(id)).map_or(0, |s| s.bytes_in);
         let elapsed = tap.now().nanos().map_or(0.0, |n| n as f64 / 1e9);
