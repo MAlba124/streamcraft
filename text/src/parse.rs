@@ -300,25 +300,37 @@ pub fn cue_body_ass_dialogue(block_body: &str) -> String {
 }
 
 /// `H:MM:SS.cc` (ASS — centiseconds) → nanoseconds. `None` on malformation.
+///
+/// The centisecond field is **checked**: `cc * 10` on an untrusted 19-digit field overflows
+/// `u64` (a debug-build panic), and `hms_to_ns`'s `< 1000` range test only runs afterwards.
 fn ass_time(s: &str) -> Option<u64> {
     let (hms, cc) = s.trim().split_once('.')?;
     // Centiseconds: two digits → milliseconds = cc * 10.
     let cc: u64 = cc.trim().parse().ok()?;
-    hms_to_ns(hms, cc * 10)
+    hms_to_ns(hms, cc.checked_mul(10)?)
 }
 
 /// Strip ASS override blocks (`{\...}`) and convert `\N`/`\n` to newlines and `\h` to a space
 /// (Aegisub/libass text conventions). Everything else is literal.
+///
+/// An **unbalanced** `{` is literal, not an opening brace: libass renders a brace that never
+/// closes as text, and treating it as an override start would silently swallow the rest of the
+/// cue (a bare `{` in dialogue is common enough that this is real caption loss). `last_close`
+/// is computed once, so this stays linear. A stray `}` outside a block is likewise literal.
 fn strip_ass(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    // The last byte offset a `}` occupies: a `{` after it can never be closed.
+    let last_close = s.rfind('}');
+    let mut chars = s.char_indices().peekable();
     let mut depth = 0u32; // inside a `{...}` override block
-    while let Some(c) = chars.next() {
+    while let Some((i, c)) = chars.next() {
         match c {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
+            '{' if depth > 0 || last_close.is_some_and(|j| j > i) => {
+                depth = depth.saturating_add(1)
+            }
+            '}' if depth > 0 => depth -= 1,
             _ if depth > 0 => {} // swallow override-block content
-            '\\' => match chars.peek() {
+            '\\' => match chars.peek().map(|&(_, c)| c) {
                 Some('N') | Some('n') => {
                     chars.next();
                     out.push('\n');
@@ -373,7 +385,12 @@ fn parse_arrow_timing(line: &str, time: fn(&str) -> Option<u64>) -> Option<(Time
 }
 
 /// `[HH:]MM:SS` + a millisecond remainder → nanoseconds. Hours are optional (WebVTT allows
-/// `MM:SS`); minutes/seconds are required. `None` on any non-numeric field.
+/// `MM:SS`); minutes/seconds are required. `None` on any non-numeric or out-of-range field.
+///
+/// Every step is **checked**: `h` comes from untrusted digits, and `h * 3600 * 1000 * 1_000_000`
+/// overflows `u64` from about seven digits of hours upward (`6000000:00:00,000` is enough), which
+/// is a debug-build panic and a silently wrapped timestamp in release. A subtitle file is
+/// attacker-controlled input, so an out-of-range timestamp must be a rejected cue, not a crash.
 fn hms_to_ns(hms: &str, ms: u64) -> Option<u64> {
     let parts: Vec<&str> = hms.trim().split(':').collect();
     let (h, m, s): (u64, u64, u64) = match parts.as_slice() {
@@ -384,18 +401,25 @@ fn hms_to_ns(hms: &str, ms: u64) -> Option<u64> {
     if m >= 60 || s >= 60 || ms >= 1000 {
         return None; // out-of-range field — a malformed timestamp
     }
-    Some(((h * 3600 + m * 60 + s) * 1000 + ms) * 1_000_000)
+    h.checked_mul(3600)?
+        .checked_add(m * 60 + s)?
+        .checked_mul(1000)?
+        .checked_add(ms)?
+        .checked_mul(1_000_000)
 }
 
-/// Drop every `<...>` run, keeping the text between (HTML-ish / WebVTT inline tags). An
-/// unbalanced `<` with no `>` swallows to end-of-string (a truncated tag reveals no text).
+/// Drop every `<...>` run, keeping the text between (HTML-ish / WebVTT inline tags). A `<` with
+/// **no `>` anywhere after it** cannot be a tag, so it is kept literally rather than swallowing
+/// the rest of the cue — an unescaped `<` in dialogue ("5 < 6 minutes") is common in SubRip and
+/// used to delete everything after it.
 fn strip_angle_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    let last_gt = s.rfind('>');
     let mut in_tag = false;
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
         match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
+            '<' if !in_tag && last_gt.is_some_and(|j| j > i) => in_tag = true,
+            '>' if in_tag => in_tag = false,
             _ if in_tag => {}
             _ => out.push(c),
         }
@@ -404,8 +428,15 @@ fn strip_angle_tags(s: &str) -> String {
 }
 
 /// Case-insensitive `strip_prefix` for the ASS `Format:` / `Dialogue:` keywords.
+///
+/// Compares **bytes**, never `&str` slices: `s[..prefix.len()]` panics when the split point
+/// lands inside a multi-byte character, and an `[Events]` section of untrusted text routinely
+/// contains non-ASCII lines (a CJK caption line, a stray translated note). The keywords are
+/// ASCII, so a byte-wise `eq_ignore_ascii_case` is exactly equivalent — and a prefix match on
+/// ASCII bytes is always a char boundary, so the tail slice is safe.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    let head = s.as_bytes().get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix.as_bytes()) {
         Some(&s[prefix.len()..])
     } else {
         None
@@ -548,5 +579,199 @@ mod tests {
         // 61 seconds / 61 minutes / 1000 ms are all invalid.
         assert!(parse_srt("00:00:61,000 --> 00:00:62,000\nx\n").is_empty());
         assert!(parse_srt("00:61:00,000 --> 00:62:00,000\nx\n").is_empty());
+    }
+
+    // ---- untrusted-input robustness (spec: a crash on a downloaded file is a P0) -------
+
+    /// A line inside `[Events]` that is not one of the ASS keywords used to panic: the
+    /// case-insensitive prefix test sliced `line[..7]` / `line[..9]`, and a byte offset landing
+    /// inside a multi-byte character is a hard `&str` slice panic. Any non-ASCII line in the
+    /// events section triggers it — routine in CJK-subtitled files.
+    #[test]
+    fn ass_non_ascii_line_in_events_does_not_panic() {
+        assert!(parse_ass("[Events]\n日本語あいうえお\n").is_empty());
+        assert!(parse_ass("[Events]\n日本語\n").is_empty(), "9 bytes: the Dialogue: split point");
+        assert!(parse_ass("[Events]\nÜbersetzung\n").is_empty());
+        // A well-formed Dialogue line among the noise still parses.
+        let doc = "[Events]\n\
+                   Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                   日本語のコメント行\n\
+                   Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,ok\n";
+        let cues = parse_ass(doc);
+        assert_eq!(cues.len(), 1, "the junk line is skipped, the real cue survives");
+        assert_eq!(cues[0].text, "ok");
+    }
+
+    /// A timestamp with an enormous hours field overflowed `h * 3600 * 1000 * 1_000_000` —
+    /// a panic under debug overflow checks, a silently wrapped (wrong) timestamp in release.
+    /// Seven digits of hours is enough; the field is attacker-controlled.
+    #[test]
+    fn absurd_timestamps_are_rejected_not_overflowed() {
+        assert!(parse_srt("6000000:00:00,000 --> 6000000:00:01,000\nx\n").is_empty());
+        assert!(parse_srt("18446744073709551615:00:00,000 --> 0:00:01,000\nx\n").is_empty());
+        assert!(parse_vtt("WEBVTT\n\n6000000:00:00.000 --> 6000000:00:01.000\nx\n").is_empty());
+        let ass = |t: &str| {
+            format!(
+                "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, \
+                 Effect, Text\nDialogue: 0,{t},0:00:02.00,D,,0,0,0,,hi\n"
+            )
+        };
+        assert!(parse_ass(&ass("6000000:00:00.00")).is_empty(), "ass hours overflow");
+        assert!(
+            parse_ass(&ass("0:00:00.1844674407370955162")).is_empty(),
+            "ass centiseconds * 10 overflow"
+        );
+        // The largest timestamp that still fits is accepted, so the guard is not over-eager.
+        let cues = parse_srt("5000:00:00,000 --> 5000:00:01,000\nx\n");
+        assert_eq!(cues.len(), 1, "5000 h is large but representable");
+    }
+
+    /// A `{` with no matching `}` is literal text, not the start of an override block — the old
+    /// parser swallowed everything after it, deleting the rest of the caption.
+    #[test]
+    fn unbalanced_ass_brace_does_not_eat_the_caption() {
+        assert_eq!(strip_ass("50% {not an override at all"), "50% {not an override at all");
+        assert_eq!(strip_ass("a } stray close"), "a } stray close");
+        // A real override block still strips, including nested braces.
+        assert_eq!(strip_ass("{\\i1}hi{\\i0} there"), "hi there");
+        assert_eq!(strip_ass("{\\t({\\fs20})}text"), "text", "nested override block");
+    }
+
+    /// A `<` with no `>` after it is literal text: an unescaped `<` in SubRip dialogue used to
+    /// delete the remainder of the cue.
+    #[test]
+    fn unterminated_angle_bracket_keeps_the_text() {
+        assert_eq!(cue_body_srt("5 < 6 minutes left"), "5 < 6 minutes left");
+        assert_eq!(cue_body_vtt("a < b"), "a < b");
+        // A genuine tag still strips.
+        assert_eq!(cue_body_srt("<i>x</i> < y"), "x < y");
+    }
+
+    /// A pile of degenerate documents: none may panic, all must terminate.
+    #[test]
+    fn degenerate_documents_never_panic() {
+        for doc in [
+            "",
+            "\u{feff}",
+            "\r\n\r\n\r\n",
+            "-->",
+            "1\n-->\n\n",
+            "00:00:00,000 -->",
+            "--> 00:00:00,000",
+            "WEBVTT",
+            "WEBVTT\n\n\n\n",
+            "[Events]",
+            "[Events]\nFormat:\nDialogue:\n",
+            "[Events]\nFormat: Text\nDialogue: \n",
+            "[",
+            "{{{{{{{{",
+            "<<<<<<<<",
+            "\u{feff}[Events]\nDialogue: 0,0:00:00.00,0:00:01.00,D,,0,0,0,,x\n",
+        ] {
+            let _ = parse_srt(doc);
+            let _ = parse_vtt(doc);
+            let _ = parse_ass(doc);
+            let _ = cue_body_srt(doc);
+            let _ = cue_body_vtt(doc);
+            let _ = cue_body_ass_dialogue(doc);
+        }
+    }
+
+    /// A seeded mutation fuzz over all six entry points — the regression guard for the whole
+    /// class of bug the checked arithmetic and byte-wise prefix test fix, not just the six
+    /// inputs that happened to be found.
+    ///
+    /// The byte-level mutation is the realistic model: `subparse` hands these parsers
+    /// `String::from_utf8_lossy(block)`, so **any** byte string is reachable input, and every
+    /// invalid sequence becomes U+FFFD — a 3-byte non-ASCII character that lands on the
+    /// `Format:`/`Dialogue:` split points. That is how the char-boundary panic was reachable
+    /// from arbitrary binary data, not merely from a CJK-subtitled file.
+    ///
+    /// Deterministic (fixed seed, xorshift64*) so a failure is always reproducible, and sized
+    /// to run in well under a second.
+    #[test]
+    fn mutation_fuzz_never_panics() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+            }
+        }
+        let seeds = [
+            "1\n00:00:01,000 --> 00:00:03,500\n<i>Hello</i> world\n\n\
+             2\n00:00:04,000 --> 00:00:05,000\nline one\nline two\n",
+            "WEBVTT\n\nNOTE a comment\n\ncue-1\n00:01.000 --> 00:03.000 line:90%\n\
+             <v Bob>hi</v> <c.yellow>there</c>\n",
+            "[Script Info]\nTitle: t\n\n[Events]\n\
+             Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+             Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,{\\i1}hi{\\i0}\\Nsecond, third\n",
+            "0,0,Default,,0,0,0,,{\\b1}bold{\\b0} caption\n",
+        ];
+        // Tokens that steer the mutator into the interesting branches far more often than
+        // chance would: the field separators, the markup delimiters, and numeric fields wide
+        // enough to overflow every multiply in `hms_to_ns` / `ass_time`.
+        let interesting: [&[u8]; 25] = [
+            b"-->", b":", b",", b".", b"<", b">", b"{", b"}", b"\\", b"\n", b"\r\n", b"[Events]",
+            b"Format:", b"Dialogue:", b"WEBVTT", b"NOTE", b"9", b"0", b"99999999999999999999",
+            b"6000000", b"18446744073709551615", "\u{65e5}".as_bytes(), b"\xff", b"\xc3",
+            b"\xe6\x97",
+        ];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for i in 0..20_000u32 {
+            let mut buf = seeds[i as usize % seeds.len()].as_bytes().to_vec();
+            for _ in 0..1 + rng.below(6) {
+                match rng.below(6) {
+                    0 if !buf.is_empty() => {
+                        let j = rng.below(buf.len());
+                        buf[j] ^= 1 << rng.below(8);
+                    }
+                    1 if !buf.is_empty() => {
+                        let j = rng.below(buf.len());
+                        buf.remove(j);
+                    }
+                    2 => {
+                        let j = rng.below(buf.len() + 1);
+                        buf.insert(j, rng.below(256) as u8);
+                    }
+                    3 => {
+                        let tok = interesting[rng.below(interesting.len())];
+                        let j = rng.below(buf.len() + 1);
+                        buf.splice(j..j, tok.iter().copied());
+                    }
+                    4 if !buf.is_empty() => {
+                        let j = rng.below(buf.len());
+                        buf[j] = interesting[rng.below(interesting.len())][0];
+                    }
+                    _ if !buf.is_empty() => {
+                        let n = rng.below(buf.len());
+                        buf.truncate(n);
+                    }
+                    _ => {}
+                }
+            }
+            // Exactly what `subparse` does with a Block payload.
+            let s = String::from_utf8_lossy(&buf);
+            let _ = parse_srt(&s);
+            let _ = parse_vtt(&s);
+            let _ = parse_ass(&s);
+            let _ = cue_body_srt(&s);
+            let _ = cue_body_vtt(&s);
+            let _ = cue_body_ass_dialogue(&s);
+        }
+    }
+
+    /// CRLF line endings (what a Windows-authored `.srt` actually ships) parse identically to LF.
+    #[test]
+    fn crlf_documents_parse_like_lf() {
+        let lf = "1\n00:00:01,000 --> 00:00:03,000\nHello\n\n2\n00:00:04,000 --> 00:00:05,000\nBye\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(parse_srt(&crlf), parse_srt(lf), "CRLF and LF agree");
+        assert_eq!(parse_srt(&crlf).len(), 2);
     }
 }
