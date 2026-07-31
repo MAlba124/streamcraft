@@ -172,31 +172,68 @@ impl<'a> BitReader<'a> {
         self.pos % 8 == 0
     }
 
+    /// The next 64 bits from the current *byte*, big-endian, zero-padded past the end of
+    /// the input. The low `pos % 8` bits of the last byte are not yet consumed; callers
+    /// shift left by `pos % 8` to left-justify the next unread bit.
+    ///
+    /// One unaligned 8-byte load replaces the old byte-at-a-time loop. `pos <= len*8` is an
+    /// invariant (every read that would pass the end returns `Eof` first), so `byte <= len`
+    /// and the subtraction below cannot underflow.
+    #[inline(always)]
+    fn peek_word(&self) -> u64 {
+        let byte = (self.pos >> 3) as usize;
+        match self.data.get(byte..byte + 8) {
+            // Fast path: one unaligned big-endian load (`mov` + `bswap`).
+            Some(s) => u64::from_be_bytes(s.try_into().expect("8-byte subslice")),
+            // Within 8 bytes of the end: zero-pad. Outlined so the hot path stays a
+            // bounds test and a load.
+            None => self.peek_word_tail(byte),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn peek_word_tail(&self, byte: usize) -> u64 {
+        let mut b = [0u8; 8];
+        let rem = self.data.len().saturating_sub(byte);
+        b[..rem].copy_from_slice(&self.data[byte..byte + rem]);
+        u64::from_be_bytes(b)
+    }
+
+    /// Read `n` bits where `1 <= n <= 57`, with the EOF check already done by the caller.
+    /// 57 is the limit because up to 7 already-consumed bits sit at the top of `peek_word`.
+    #[inline(always)]
+    fn take_bits(&mut self, n: u32) -> u64 {
+        debug_assert!((1..=57).contains(&n));
+        let w = self.peek_word() << (self.pos & 7);
+        self.pos += u64::from(n);
+        w >> (64 - n)
+    }
+
     /// Read `n` bits (`0..=64`), MSB first, into the low bits of the result.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<u64, ReadError> {
         debug_assert!(n <= 64);
         if n == 0 {
             return Ok(0);
         }
-        if self.bits_left() < n as u64 {
+        if self.bits_left() < u64::from(n) {
             return Err(ReadError::Eof);
         }
-        let mut result: u64 = 0;
-        let mut remaining = n;
-        while remaining > 0 {
-            let byte_idx = (self.pos / 8) as usize;
-            let bit_in_byte = (self.pos % 8) as u32;
-            let avail = 8 - bit_in_byte;
-            let take = remaining.min(avail);
-            // Extract `take` bits starting `bit_in_byte` from the top of this byte.
-            let byte = self.data[byte_idx] as u64;
-            let shift = avail - take;
-            let chunk = (byte >> shift) & ((1u64 << take) - 1);
-            result = (result << take) | chunk;
-            self.pos += take as u64;
-            remaining -= take;
+        if n <= 57 {
+            return Ok(self.take_bits(n));
         }
-        Ok(result)
+        Ok(self.read_bits_wide(n))
+    }
+
+    /// Wide fields (58..=64 bits) split into two in-range halves. Metadata only — the
+    /// audio path never gets here — so it is outlined to keep `read_bits` inlinable.
+    #[cold]
+    #[inline(never)]
+    fn read_bits_wide(&mut self, n: u32) -> u64 {
+        let hi = self.take_bits(32);
+        let lo = self.take_bits(n - 32);
+        (hi << (n - 32)) | lo
     }
 
     /// Read `n` bits as a two's-complement signed value, sign-extending from bit `n`.
@@ -217,17 +254,30 @@ impl<'a> BitReader<'a> {
 
     /// Read a FLAC unary code: count zero bits up to (and consuming) the terminating
     /// one bit (§9.2.7.2). Returns the count of zeros (the quotient).
+    #[inline]
     pub fn read_unary(&mut self) -> Result<u32, ReadError> {
         let mut count = 0u32;
         loop {
-            if self.bits_left() == 0 {
+            let left = self.bits_left();
+            if left == 0 {
                 return Err(ReadError::Eof);
             }
-            let bit = self.read_bits(1)?;
-            if bit == 1 {
-                return Ok(count);
+            let off = (self.pos & 7) as u32;
+            // Left-justify the next unread bit at the MSB; the whole zero run is then a
+            // single `lzcnt` instead of one branch per bit.
+            let w = self.peek_word() << off;
+            // Bits of `w` that are real input: the word holds `64 - off` unread bits, and
+            // `peek_word` zero-pads past the end, so cap by what the input actually has.
+            let valid = u64::from(64 - off).min(left) as u32;
+            let z = w.leading_zeros();
+            if z < valid {
+                self.pos += u64::from(z) + 1; // the zeros plus the terminating 1
+                return Ok(count + z);
             }
-            count += 1;
+            // No terminator inside this word: consume its zeros and refill. Saturating so a
+            // hostile all-zero stream cannot wrap the counter (it still ends in `Eof`).
+            count = count.saturating_add(valid);
+            self.pos += u64::from(valid);
         }
     }
 
