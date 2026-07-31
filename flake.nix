@@ -69,6 +69,16 @@
 
           shellHook = ''
             echo "profluens devshell — $(rustc --version)"
+            # `RUSTFLAGS` above is a fixed mkShell attribute, so it *overwrites* whatever the
+            # caller exported: `RUSTFLAGS=-C target-cpu=x86-64-v3 nix develop --command cargo
+            # build` silently builds with mold and nothing else. That has already cost one
+            # bogus benchmark — an A/B that was really the same build twice, reported as a
+            # 46% win. Append `EXTRA_RUSTFLAGS` so extra flags compose with the linker choice
+            # instead of being swallowed, and say so when they are in play.
+            if [ -n "''${EXTRA_RUSTFLAGS:-}" ]; then
+              export RUSTFLAGS="$RUSTFLAGS ''${EXTRA_RUSTFLAGS}"
+              echo "  RUSTFLAGS += ''${EXTRA_RUSTFLAGS}"
+            fi
           '';
         };
 
