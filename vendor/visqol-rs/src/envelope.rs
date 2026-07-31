@@ -1,34 +1,55 @@
+//! Envelope extraction for the alignment stage. Every intermediate — the centred signal, the
+//! frequency-domain buffers, the Hilbert scaling vector and the amplitude output — is carved from a
+//! bump [`Arena`] instead of the heap; the arithmetic is unchanged.
+
+use crate::convolution_2d::arena_slice;
 use crate::fast_fourier_transform;
 use crate::fft_manager::FftManager;
-use ndarray::Array1;
 use num::complex::Complex64;
+use profluens_core::memory::Arena;
 
 /// Calculates the upper envelope for a given time domain signal.
-pub fn calculate_upper_env(signal: &Array1<f64>) -> Option<ndarray::Array1<f64>> {
-    let mean = signal.mean()?;
-    let mut signal_centered = signal - mean;
-    let hilbert = calculate_hilbert(signal_centered.as_slice_mut()?)?;
-
-    let mut hilbert_amplitude = Array1::<f64>::zeros(hilbert.len());
-
-    for (amplitude, h) in hilbert_amplitude.iter_mut().zip(&hilbert) {
-        *amplitude = h.norm();
+///
+/// Two arenas, because a bump allocator cannot reclaim the middle of itself: the envelope goes into
+/// `out` (the caller needs it after this returns), while the transform buffers — several times the
+/// signal's own size, and dead the moment this returns — go into `scratch`, which the caller resets
+/// between calls. Sharing one arena would pile up ~300 MiB of dead FFT scratch across a whole-signal
+/// alignment.
+pub fn calculate_upper_env<'a>(
+    signal: &[f64],
+    out: &'a Arena,
+    scratch: &Arena,
+) -> Option<&'a mut [f64]> {
+    // `ArrayBase::mean` is `sum() / n` with ndarray's 8-way unrolled fold — keep it exactly (a plain
+    // left-to-right sum would round differently). `aview1` is a zero-copy view of the same
+    // contiguous samples, so it folds identically.
+    let mean = ndarray::aview1(signal).mean()?;
+    let signal_centered = arena_slice::<f64>(scratch, signal.len());
+    for (centered, &x) in signal_centered.iter_mut().zip(signal.iter()) {
+        *centered = x - mean;
     }
-    hilbert_amplitude += mean;
+    let hilbert = calculate_hilbert(signal_centered, scratch)?;
+
+    let hilbert_amplitude = arena_slice::<f64>(out, hilbert.len());
+
+    for (amplitude, h) in hilbert_amplitude.iter_mut().zip(hilbert.iter()) {
+        *amplitude = h.norm() + mean;
+    }
     Some(hilbert_amplitude)
 }
 
 /// Calculates the hilbert transform for a given time domain signal.
-pub fn calculate_hilbert(signal: &mut [f64]) -> Option<Array1<Complex64>> {
+pub fn calculate_hilbert<'a>(signal: &[f64], arena: &'a Arena) -> Option<&'a mut [Complex64]> {
     let mut fft_manager = FftManager::new(signal.len());
     let freq_domain_signal =
-        fast_fourier_transform::forward_1d_from_matrix(&mut fft_manager, signal);
+        fast_fourier_transform::forward_1d_from_matrix(&mut fft_manager, signal, arena);
 
     let is_odd = signal.len() % 2 == 1;
     let is_non_empty = !signal.is_empty();
 
     // Set up scaling vector
-    let mut hilbert_scaling = vec![0.0f64; freq_domain_signal.len()];
+    let hilbert_scaling = arena_slice::<f64>(arena, freq_domain_signal.len());
+    hilbert_scaling.fill(0.0); // arena memory is uninitialised; the original was `vec![0.0; n]`
     hilbert_scaling[0] = 1.0;
 
     if !is_odd && is_non_empty {
@@ -45,18 +66,17 @@ pub fn calculate_hilbert(signal: &mut [f64]) -> Option<Array1<Complex64>> {
 
     hilbert_scaling[1..n].fill(2.0);
 
-    let mut element_wise_product = Array1::<Complex64>::zeros(freq_domain_signal.len());
+    let element_wise_product = arena_slice::<Complex64>(arena, freq_domain_signal.len());
 
     for i in 0..freq_domain_signal.len() {
         element_wise_product[i] = freq_domain_signal[i] * hilbert_scaling[i];
     }
 
-    let mut hilbert =
-        fast_fourier_transform::inverse_1d(&mut fft_manager, element_wise_product.as_slice()?);
+    let hilbert = fast_fourier_transform::inverse_1d(&mut fft_manager, element_wise_product, arena);
     hilbert
         .iter_mut()
         .for_each(|element| *element = *element * 2.0 - 0.000001);
-    Some(Array1::<Complex64>::from_vec(hilbert))
+    Some(hilbert)
 }
 
 #[cfg(test)]
@@ -72,19 +92,23 @@ mod tests {
         },
     };
     use approx::assert_abs_diff_eq;
+    use profluens_core::memory::Arena;
 
     #[test]
     fn hilbert_transform_on_audio_signal() {
-        let (mut signal, _) = load_audio_files();
-        let result = calculate_hilbert(signal.data_matrix.as_slice_mut().unwrap()).unwrap();
+        let arena = Arena::default();
+        let (signal, _) = load_audio_files();
+        let result = calculate_hilbert(signal.data_matrix.as_slice().unwrap(), &arena).unwrap();
 
         assert_abs_diff_eq!(result[0].re, 0.000_303_661_691_188_833, epsilon = 0.0001);
     }
 
     #[test]
     fn envelope_on_audio_signal() {
+        let (out, scratch) = (Arena::default(), Arena::default());
         let (signal, _) = load_audio_files();
-        let result = calculate_upper_env(&signal.data_matrix).unwrap();
+        let result =
+            calculate_upper_env(signal.data_matrix.as_slice().unwrap(), &out, &scratch).unwrap();
 
         assert_abs_diff_eq!(result[0], 0.00030159861338215923, epsilon = 0.0001);
     }
@@ -98,11 +122,13 @@ mod tests {
         let fft_points = 2i32.pow(exponent as u32) as usize;
         let mut manager = fft_manager::FftManager::new(fft_points);
 
+        let arena = Arena::default();
         let result = calculate_fft_pointwise_product(
-            &ref_signal.data_matrix.to_vec(),
-            &deg_signal.data_matrix.to_vec(),
+            ref_signal.data_matrix.as_slice().unwrap(),
+            deg_signal.data_matrix.as_slice().unwrap(),
             &mut manager,
             fft_points,
+            &arena,
         );
 
         assert_abs_diff_eq!(result[0].re, 0.012231532484292984, epsilon = 0.001);
@@ -112,9 +138,11 @@ mod tests {
     fn calculate_inverse_fft_pointwise_product_on_audio_pair() {
         let (ref_signal, deg_signal) = load_audio_files();
 
+        let arena = Arena::default();
         let result = calculate_inverse_fft_pointwise_product(
-            &mut ref_signal.data_matrix.to_vec(),
-            &mut deg_signal.data_matrix.to_vec(),
+            ref_signal.data_matrix.as_slice().unwrap(),
+            deg_signal.data_matrix.as_slice().unwrap(),
+            &arena,
         );
 
         assert_abs_diff_eq!(result[0], 79.66060597338944, epsilon = 0.0001);
@@ -124,9 +152,11 @@ mod tests {
     fn calculate_best_lag_on_audio_signal() {
         let (ref_signal, deg_signal) = load_audio_files();
 
+        let arena = Arena::default();
         let result = calculate_best_lag(
             ref_signal.data_matrix.as_slice().unwrap(),
             deg_signal.data_matrix.as_slice().unwrap(),
+            &arena,
         )
         .unwrap();
 

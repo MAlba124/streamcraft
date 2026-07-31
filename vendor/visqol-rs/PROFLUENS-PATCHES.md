@@ -130,3 +130,92 @@ visqol-rs is vendored specifically for profluens. `Arena`/`ArrayViewMut2::from_s
 `convolution_2d.rs` (`arena_mat`, `binop_into`, `map_into`); the two unsafe `from_raw_parts_mut`s are the
 standard "typed view over a fresh, about-to-be-fully-written arena region" (f64 has no invalid bit
 patterns; the arena guarantees disjoint regions).
+
+## Allocation-free comparison — the whole remaining per-patch surface
+
+**Why.** After the rounds above, one 30 s ViSQOL comparison — the unit a `transcode --target` /
+`--recommend` search runs 15 times, in parallel — still made **7,029 heap allocations and churned
+2,494 MiB**. Everything left scaled with the patch count or the alignment slide window, i.e. it was
+paid again for every patch of every grid point.
+
+**Measuring it.** `opus/examples/visqol_alloc_check.rs` is the harness this round was driven by:
+libopus-encode/decode the WAV fixture, score the pair twice against a counting global allocator (the
+first run warms the SVR model, FFT planner, gammatone coefficients and thread-local scratch; the
+second is the steady-state number), and print allocations, bytes, **peak live bytes**, and the exact
+MOS bits. `VISQOL_ALLOC_PROFILE=1` samples backtraces and prints the call sites, so each round's next
+target is attributable without heaptrack. Knobs: `VISQOL_ALLOC_SECS` (default 30, loops a short
+fixture), `VISQOL_ALLOC_BITRATE`, `VISQOL_ALLOC_SAMPLE`.
+
+**The changes**, in descending order of what they removed:
+
+1. **NSIM per-patch results → inline `BandValues`** (−740). ViSQOL has 21 or 32 bands, but
+   `PatchSimilarityResult` held three `Vec<f64>`s — the one thing `measure_patch_similarity` produces
+   that must outlive the per-patch arena reset, so three heap allocations per patch per call site.
+   They are now a `[f64; 32] + len` that `Deref`s to `&[f64]` (callers index/iterate unchanged;
+   `Serialize` emits the same sequence). The `std_axis(Axis(1), 1.0)` that fed one of them is
+   replaced by `band_std_dev`, which reproduces ndarray 0.16's Welford recurrence element for element
+   (`delta`, `mean += delta/(i+1)`, `sum_sq = (x-mean).mul_add(delta, sum_sq)`, `sqrt(sum_sq/(n-1))`)
+   — bit-identical, and it drops ndarray's two result `Array1`s as well.
+2. **The alignment stage's transforms → arena** (−3,100, and ~1.8 GiB of churn). `forward_1d_*`,
+   `inverse_1d*`, `calculate_hilbert`, `calculate_upper_env`, `calculate_best_lag` and
+   `calculate_fft_pointwise_product` all minted `Vec`s per call (~30 per `globally_align`, ~74 calls
+   per comparison); they now carve from a bump arena. Several copies vanished outright rather than
+   moving: `freq_from_time_domain` zero-pads in its thread-local complex staging buffer instead of
+   resizing the caller's `Vec` (so no padded copy per transform), `inverse_1d_conj_sym` returns the
+   real time-domain buffer directly (the old form built an all-real complex vector and copied the
+   real parts back out), and `calculate_best_lag` indexes the wrap-around correlation window in place
+   instead of materialising it as `to_vec` + `to_vec` + `append`.
+3. **The fine-realignment loop → reusable buffers** (−900). The per-patch sliced audio, the aligned
+   pair and the two spectrograms were freshly allocated every patch. `slice_into` /
+   `align_and_truncate_into` / `globally_align_into` / `GammatoneSpectrogramBuilder::build_into` now
+   fill caller-owned storage that the loop reuses, so it only grows on the first patch or two.
+   `build_into` reclaims the destination `Spectrogram`'s backing `Vec` (`into_raw_vec_and_offset` →
+   `resize` → `from_shape_vec`) and refills `center_freq_bands` in place instead of cloning it.
+4. **`build_degraded_patch` → arena** (−1,880). The degraded candidate patch was
+   `slice(..).to_owned()` plus, for offsets spilling past the end, an `Array2::zeros` and a
+   `concatenate` — three allocations per call inside the O(patches × window) slide loop. It writes an
+   arena matrix now. The `PatchSimilarityComparator` trait went generic over patch storage (shared
+   borrows) to accept it, which also removed the `ref_patches[i].clone()` per backtrace step.
+5. **Reference patches → zero-copy views** (−80). `create_patches_from_indices` returns
+   `Vec<ArrayView2>`; a patch is a column range of the reference spectrogram and every consumer is
+   generic over storage, so copying each one out was pure cost.
+6. **DP tables → flat** (−148). `cumulative_similarity_dp`/`backtrace` were `Vec<Vec<_>>` — one
+   allocation per reference patch for rows that all have the same length.
+
+**Peak memory — the trap in this round.** Bump arenas trade allocation count for *retention*: naively
+arena-backing the alignment took peak live heap from 290 MiB to 538 MiB, because the one whole-signal
+`globally_align` (a 30 s clip needs a 4 M-point FFT — hundreds of MiB of transform scratch) can never
+free the middle of an arena. Two fixes, both in `globally_align_into`: the envelopes go in a separate
+`out` arena from the transform `scratch` (which is reset between the three phases), and the scratch is
+handed one up-front chunk sized for the largest phase — a bump arena only reuses a chunk across
+`reset` if the next phase's allocations still fit it, and the cross-correlation's buffers are twice the
+envelope's, so without the hint all three phases stacked. `compute_results` gives that one call its own
+pair of arenas, dropped immediately, so the caller's long-lived per-thread arena never grows to
+full-signal size.
+
+**Peak memory — where it actually goes.** With the above, the whole-signal alignment's scratch is a
+*single* 234 MiB chunk: no dead scratch stacks up, so there is nothing a mark/release ("sub-arena")
+API could reclaim — the peak is one phase's simultaneously-live data. What *did* reduce it was
+removing a redundant live buffer: `calculate_fft_pointwise_product` wrote the spectrum product into a
+third `fft_points`-long complex buffer when its left operand is dead the moment the product is
+formed. Multiplying in place drops one 64 MiB spectrum from a 4 M-point transform: **peak live
+279 → 215 MiB, maxrss 563 → 497 MiB.** (The chunk hint above follows: `2*16 + 8` bytes per point,
+not `3*16 + 8`.)
+
+**Result.** One 30 s comparison (`fixtures/out/audio.wav` looped, libopus-degraded):
+
+| | allocations | bytes churned | peak live | wall (2 comparisons) | maxrss |
+|---|---|---|---|---|---|
+| before this round | 7,029 | 2,494 MiB | 290 MiB | 8.0–8.8 s | 583 MiB |
+| **after** | **51** | **265 MiB** | **215 MiB** | **7.0–7.9 s** | **497 MiB** |
+
+Nothing left scales with the patch count: the 51 are the per-comparison spectrograms, the one global
+alignment, the DP tables, the arena chunks and the `SimilarityResult` outputs. Per-patch and
+per-slide-offset work allocates **nothing**.
+
+**Verification.** The MOS-LQO is **bit-identical** — `4.73136043548583984` on the 30 s fixture, checked
+after every individual change, and identical bit patterns at four degradation levels (8/12/16/24 kbps:
+`4012e24020000000`, `4012c36120000000`, `4012420480000000`, `4012ecbb80000000`). A full
+`transcode --target 4.5` search produces a **byte-identical** `.opus` (`769f03f8…`) and the same 15-point
+rate-distortion table. In-crate tests: **37 pass**, the same 11 fail as on pristine 0.3.1 (they load
+`test_data/*.wav`, which 0.3.1 `exclude`s from the package).

@@ -1,58 +1,89 @@
-use crate::audio_utils::real_valued_complex_vec_to_float_vec;
+//! The 1-D transform entry points. Every result buffer is carved from a caller-owned bump
+//! [`Arena`] rather than heap-allocated: the alignment path runs an envelope + cross-correlation
+//! per patch, so these were ~2.4 K allocations (and most of the ~2.5 GiB of allocation churn) per
+//! ViSQOL comparison. The transforms themselves are untouched — same rustfft plans, same staging,
+//! same scaling — so every output is bit-identical.
+
+use crate::convolution_2d::arena_slice;
 use crate::fft_manager::FftManager;
 use num::complex::Complex64;
-use num::Zero;
+use profluens_core::memory::Arena;
 
 /// Performs a fast fourier transform on `input_signal` using `fft_manager` and returns the complex signal in the frequency domain.
-pub fn forward_1d_from_matrix(
+///
+/// `input_signal` shorter than `fft_size` is zero-padded inside [`FftManager::freq_from_time_domain`]
+/// (it used to be copied into an owned, padded `Vec` first).
+pub fn forward_1d_from_matrix<'a>(
     fft_manager: &mut FftManager,
     input_signal: &[f64],
-) -> Vec<Complex64> {
-    let mut temp_time_buffer = input_signal.to_vec();
-
-    let mut temp_freq_buffer = vec![Complex64::zero(); fft_manager.fft_size];
-    fft_manager.freq_from_time_domain(&mut temp_time_buffer, &mut temp_freq_buffer);
-
+    arena: &'a Arena,
+) -> &'a mut [Complex64] {
+    let temp_freq_buffer = arena_slice::<Complex64>(arena, fft_manager.fft_size);
+    fft_manager.freq_from_time_domain(input_signal, temp_freq_buffer);
     temp_freq_buffer
 }
+
 /// Performs a fast fourier transform on `input_signal` using `fft_manager` and the desired number of fft_points and returns the complex signal in the frequency domain.
-pub fn forward_1d_from_points(
+///
+/// `num_fft_points` is the manager's own transform size, so the zero-padding to it is exactly the
+/// padding [`forward_1d_from_matrix`] already applies — this is now a naming wrapper.
+pub fn forward_1d_from_points<'a>(
     fft_manager: &mut FftManager,
     in_matrix: &[f64],
     num_fft_points: usize,
-) -> Vec<Complex64> {
-    let num_points_to_append = num_fft_points - in_matrix.len();
-    let mut signal = in_matrix.to_vec();
-    signal.extend(vec![0.0; num_points_to_append]);
-
-    forward_1d_from_matrix(fft_manager, &signal)
+    arena: &'a Arena,
+) -> &'a mut [Complex64] {
+    debug_assert!(in_matrix.len() <= num_fft_points);
+    forward_1d_from_matrix(fft_manager, in_matrix, arena)
 }
+
+/// The real-valued inverse transform: the leading `samples_per_channel` scaled time-domain samples.
+/// `input_signal` is consumed as rustfft scratch (the transform is out-of-place but may clobber its
+/// input), which is why it is taken by `&mut`.
+fn inverse_1d_real<'a>(
+    fft_manager: &mut FftManager,
+    input_signal: &mut [Complex64],
+    arena: &'a Arena,
+) -> &'a mut [f64] {
+    let temp_time_buffer = arena_slice::<f64>(arena, fft_manager.samples_per_channel);
+    fft_manager.time_from_freq_domain(input_signal, temp_time_buffer);
+    fft_manager.apply_reverse_fft_scaling(temp_time_buffer);
+    temp_time_buffer
+}
+
 /// Performs an inverse fast fourier transform on `input_signal` using `fft_manager` and returns the real-valued signal in the time domain.
-pub fn inverse_1d(fft_manager: &mut FftManager, input_signal: &[Complex64]) -> Vec<Complex64> {
-    let mut temp_freq_buffer = input_signal.to_vec();
-    let mut temp_time_buffer = vec![f64::zero(); fft_manager.samples_per_channel];
-    fft_manager.time_from_freq_domain(&mut temp_freq_buffer, &mut temp_time_buffer);
-    fft_manager.apply_reverse_fft_scaling(&mut temp_time_buffer);
+pub fn inverse_1d<'a>(
+    fft_manager: &mut FftManager,
+    input_signal: &mut [Complex64],
+    arena: &'a Arena,
+) -> &'a mut [Complex64] {
+    let temp_time_buffer = inverse_1d_real(fft_manager, input_signal, arena);
 
     // This makes very little sense but oh well...
-    let mut out_vec = vec![Complex64::zero(); fft_manager.samples_per_channel];
-    for (i, elem) in out_vec.iter_mut().enumerate() {
-        elem.re = temp_time_buffer[i];
+    let out = arena_slice::<Complex64>(arena, temp_time_buffer.len());
+    for (elem, &t) in out.iter_mut().zip(temp_time_buffer.iter()) {
+        *elem = Complex64::new(t, 0.0);
     }
-    out_vec
+    out
 }
 
 /// Performs an inverse fast fourier transform on `input_signal` using `fft_manager` and returns the real-valued signal in the time domain.
-pub fn inverse_1d_conj_sym(fft_manager: &mut FftManager, in_matrix: &[Complex64]) -> Vec<f64> {
-    let inverse = inverse_1d(fft_manager, in_matrix);
-
-    real_valued_complex_vec_to_float_vec(&inverse)
+///
+/// The real parts *are* [`inverse_1d_real`]'s output — the old form built a complex vector whose
+/// imaginary parts were all zero and immediately copied the real parts back out.
+pub fn inverse_1d_conj_sym<'a>(
+    fft_manager: &mut FftManager,
+    in_matrix: &mut [Complex64],
+    arena: &'a Arena,
+) -> &'a mut [f64] {
+    inverse_1d_real(fft_manager, in_matrix, arena)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::fast_fourier_transform;
     use crate::fft_manager::FftManager;
+    use profluens_core::memory::Arena;
     use crate::test_utility::*;
     use ndarray::Array1;
     use num::complex::Complex64;
@@ -647,9 +678,11 @@ mod tests {
         let expected_matrix = Array1::from_vec(expected_complex_result);
         let mut fft_manager = FftManager::new(samples_mat.len());
 
+        let arena = Arena::default();
         let out_matrix = fast_fourier_transform::forward_1d_from_matrix(
             &mut fft_manager,
             samples_mat.as_slice().unwrap(),
+            &arena,
         );
         let tolerance = 0.00000001;
         compare_complex_vec(&expected_matrix.to_vec(), &out_matrix.to_vec(), tolerance);
@@ -1247,10 +1280,12 @@ mod tests {
 
         let mut fft_manager = FftManager::new(samples_mat.len());
         let num_points = samples_mat.len() + 1;
+        let arena = Arena::default();
         let out_matrix = fast_fourier_transform::forward_1d_from_points(
             &mut fft_manager,
             samples_mat.as_slice().unwrap(),
             num_points,
+            &arena,
         );
         assert_eq!(expected_matrix.len(), out_matrix.len());
         compare_complex_vec(&expected_matrix.to_vec(), &out_matrix.to_vec(), tolerance);
@@ -1331,12 +1366,14 @@ mod tests {
 
         let mut fft_manager = FftManager::new(samples_mat.len());
 
+        let arena = Arena::default();
         let spectrum = fast_fourier_transform::forward_1d_from_matrix(
             &mut fft_manager,
             samples_mat.as_slice().unwrap(),
+            &arena,
         );
 
-        let inverse = fast_fourier_transform::inverse_1d_conj_sym(&mut fft_manager, &spectrum);
+        let inverse = fast_fourier_transform::inverse_1d_conj_sym(&mut fft_manager, spectrum, &arena);
 
         compare_real_vec(&samples_mat.to_vec(), &inverse.to_vec(), tolerance);
     }
@@ -1485,12 +1522,14 @@ mod tests {
 
         let length = 65;
         let mut fft_manager = FftManager::new(length);
+        let arena = Arena::default();
         let spectrum = fast_fourier_transform::forward_1d_from_matrix(
             &mut fft_manager,
             samples_mat.as_slice().unwrap(),
+            &arena,
         );
         let complex_samples_result =
-            fast_fourier_transform::inverse_1d(&mut fft_manager, &spectrum);
+            fast_fourier_transform::inverse_1d(&mut fft_manager, spectrum, &arena);
 
         compare_complex_vec(
             &expected_complex_samples_mat.to_vec(),
@@ -1516,12 +1555,14 @@ mod tests {
 
         let mut manager = FftManager::new(samples_mat.len());
 
+        let arena = Arena::default();
         let spectrum = fast_fourier_transform::forward_1d_from_matrix(
             &mut manager,
             samples_mat.as_slice().unwrap(),
+            &arena,
         );
 
-        let result = fast_fourier_transform::inverse_1d_conj_sym(&mut manager, &spectrum);
+        let result = fast_fourier_transform::inverse_1d_conj_sym(&mut manager, spectrum, &arena);
 
         compare_real_vec(samples_mat.as_slice().unwrap(), &result, tolerance);
     }

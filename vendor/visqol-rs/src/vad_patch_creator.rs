@@ -2,7 +2,7 @@ use crate::patch_creator::PatchCreator;
 use crate::visqol_error::VisqolError;
 use crate::{analysis_window::AnalysisWindow, audio_signal::AudioSignal, math_utils, rms_vad};
 use itertools::Itertools;
-use ndarray::{s, Array2};
+use ndarray::{s, Array2, ArrayView2};
 /// Computes patch indices from a spectrogram by analyzing voice acitivity in the time domain and rejecting patches which are considered silent.
 pub struct VadPatchCreator {
     patch_size: usize,
@@ -59,20 +59,15 @@ impl PatchCreator for VadPatchCreator {
         Ok(ref_patch_indices)
     }
 
-    fn create_patches_from_indices(
+    fn create_patches_from_indices<'a>(
         &self,
-        spectrogram: &Array2<f64>,
+        spectrogram: &'a Array2<f64>,
         patch_indices: &[usize],
-    ) -> Vec<Array2<f64>> {
-        let mut patches = Vec::<Array2<f64>>::with_capacity(patch_indices.len());
-
-        let mut patch: Array2<f64>;
-
-        let mut end_col: usize;
+    ) -> Vec<ArrayView2<'a, f64>> {
+        let mut patches = Vec::with_capacity(patch_indices.len());
         for start_col in patch_indices {
-            end_col = start_col + self.patch_size;
-            patch = spectrogram.slice(s![.., *start_col..end_col]).to_owned();
-            patches.push(patch);
+            let end_col = start_col + self.patch_size;
+            patches.push(spectrogram.slice(s![.., *start_col..end_col]));
         }
         patches
     }

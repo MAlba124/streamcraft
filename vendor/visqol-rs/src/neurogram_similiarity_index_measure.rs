@@ -1,6 +1,8 @@
 use crate::convolution_2d::{binop_into, map_into, perform_valid_2d_conv_with_boundary};
-use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
-use ndarray::{arr2, Array2, ArrayBase, ArrayViewMut2, Axis, Data, Ix2};
+use crate::patch_similarity_comparator::{
+    BandValues, PatchSimilarityComparator, PatchSimilarityResult,
+};
+use ndarray::{arr2, Array2, ArrayBase, ArrayViewMut2, Data, Ix2};
 use profluens_core::memory::Arena;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
@@ -14,6 +16,29 @@ pub struct NeurogramSimiliarityIndexMeasure {
     /// `arr2`-allocated on *every* `compute_sim_map` call — in the hot alignment slide loop that was
     /// the single largest remaining allocator (~1.7M heap `Array2`s per song).
     window: Array2<f64>,
+}
+
+/// `map.std_axis(Axis(1), 1.0)` — the per-band standard deviation — without the two heap `Array1`s
+/// ndarray allocates for it (one for the variance, one for the `sqrt`ed copy).
+///
+/// This reproduces ndarray 0.16's [Welford one-pass recurrence](https://www.jstor.org/stable/1266577)
+/// *exactly*, element for element: `delta = x - mean`, `mean += delta / (i+1)`,
+/// `sum_sq = (x - mean).mul_add(delta, sum_sq)` (an FMA, as there), then `sqrt(sum_sq / (n - ddof))`.
+/// Each band's recurrence is independent and runs over ascending columns in both forms, so the
+/// result is bit-for-bit what `std_axis` returns.
+fn band_std_dev<S: Data<Elem = f64>>(map: &ArrayBase<S, Ix2>) -> BandValues {
+    let (nrows, ncols) = map.dim();
+    let dof = ncols as f64 - 1.0; // ddof = 1.0
+    BandValues::from_fn(nrows, |band| {
+        let (mut mean, mut sum_sq) = (0.0f64, 0.0f64);
+        for (index, &x) in map.row(band).iter().enumerate() {
+            let count = (index + 1) as f64;
+            let delta = x - mean;
+            mean += delta / count;
+            sum_sq = (x - mean).mul_add(delta, sum_sq);
+        }
+        (sum_sq / dof).sqrt()
+    })
 }
 
 /// The fixed NSIM 3×3 smoothing window.
@@ -156,26 +181,29 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
     /// realignment), so its three per-band result `Vec`s are a negligible allocation; the hot
     /// alignment slide loop uses [`measure_similarity_score`](Self::measure_similarity_score)
     /// instead, which needs none of them.
-    fn measure_patch_similarity(
+    fn measure_patch_similarity<Sr, Sd>(
         &self,
-        ref_patch: &mut ndarray::Array2<f64>,
-        deg_patch: &mut ndarray::Array2<f64>,
+        ref_patch: &ArrayBase<Sr, Ix2>,
+        deg_patch: &ArrayBase<Sd, Ix2>,
         arena: &Arena,
-    ) -> PatchSimilarityResult {
-        let sim_map = self.compute_sim_map(&*ref_patch, &*deg_patch, arena);
+    ) -> PatchSimilarityResult
+    where
+        Sr: Data<Elem = f64>,
+        Sd: Data<Elem = f64>,
+    {
+        let sim_map = self.compute_sim_map(ref_patch, deg_patch, arena);
 
-        // Per-band means straight into the result `Vec`s: same row-sum / ncols as
-        // `mean_axis(Axis(1)).to_vec()`, but without the intermediate owned `Array1`. This full
-        // measure runs ~twice per patch (backtrace + fine realignment), so those intermediates
-        // were a large share of the remaining allocations. `std_axis` stays as-is — ndarray's
-        // Welford variance isn't trivially reproducible bit-for-bit, and it's one alloc.
+        // Per-band means straight into the inline result storage: same row-sum / ncols as
+        // `mean_axis(Axis(1)).to_vec()`, but without the intermediate owned `Array1` *or* the
+        // result `Vec`. This full measure runs ~twice per patch (backtrace + fine realignment), so
+        // these were the largest remaining allocator in a comparison.
         let dncols = deg_patch.ncols() as f64;
-        let freq_band_deg_energy: Vec<f64> =
-            (0..deg_patch.nrows()).map(|i| deg_patch.row(i).sum() / dncols).collect();
+        let freq_band_deg_energy =
+            BandValues::from_fn(deg_patch.nrows(), |i| deg_patch.row(i).sum() / dncols);
         let sncols = sim_map.ncols() as f64;
-        let freq_band_means: Vec<f64> =
-            (0..sim_map.nrows()).map(|i| sim_map.row(i).sum() / sncols).collect();
-        let freq_band_std: Vec<f64> = sim_map.std_axis(Axis(1), 1.0).to_vec();
+        let freq_band_means =
+            BandValues::from_fn(sim_map.nrows(), |i| sim_map.row(i).sum() / sncols);
+        let freq_band_std = band_std_dev(&sim_map);
         // `Array1::mean()` is `sum() / n`; `iter().sum()` folds the same row means in the same order.
         let mean_freq_band_means =
             freq_band_means.iter().sum::<f64>() / freq_band_means.len() as f64;
@@ -202,18 +230,15 @@ mod tests {
     fn test_neurogram_measure() {
         let arena = Arena::default();
         let ref_patch = vec![1.0, 0.0, 0.0];
-        let mut ref_patch_mat = Array2::from_shape_vec((3, 1), ref_patch).unwrap();
+        let ref_patch_mat = Array2::from_shape_vec((3, 1), ref_patch).unwrap();
         let deg_patch = vec![0.0, 0.0, 0.0];
-        let mut deg_patch_mat = Array2::from_shape_vec((3, 1), deg_patch).unwrap();
+        let deg_patch_mat = Array2::from_shape_vec((3, 1), deg_patch).unwrap();
         let expected_result = [0.000125225, 0.00875062, 1.0];
 
         let sim_comparator = NeurogramSimiliarityIndexMeasure::default();
 
-        let result = sim_comparator.measure_patch_similarity(
-            &mut ref_patch_mat,
-            &mut deg_patch_mat,
-            &arena,
-        );
+        let result =
+            sim_comparator.measure_patch_similarity(&ref_patch_mat, &deg_patch_mat, &arena);
 
         assert_abs_diff_eq!(
             result.freq_band_means[0],
@@ -256,7 +281,7 @@ mod tests {
         )
         .unwrap();
 
-        let full = sim.measure_patch_similarity(&mut r.clone(), &mut d.clone(), &arena);
+        let full = sim.measure_patch_similarity(&r, &d, &arena);
         let score = sim.measure_similarity_score(&r, &d, &arena);
         // ...and a zero-copy view of the degraded patch must give the identical score (this is the
         // path the slide loop takes).

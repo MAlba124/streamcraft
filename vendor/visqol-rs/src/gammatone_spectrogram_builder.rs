@@ -25,8 +25,34 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         signal: &AudioSignal,
         window: &AnalysisWindow,
     ) -> Result<Spectrogram, VisqolError> {
-        let time_domain_signal = &signal.data_matrix;
-        let sample_rate = signal.sample_rate;
+        let mut out = Spectrogram::empty();
+        self.build_into(
+            signal.data_matrix.as_slice().expect("audio signal is contiguous"),
+            signal.sample_rate,
+            window,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+}
+
+impl<const NUM_BANDS: usize> GammatoneSpectrogramBuilder<NUM_BANDS> {
+    /// Build the spectrogram of `samples` **into a caller-owned [`Spectrogram`]**, reusing its
+    /// backing buffers.
+    ///
+    /// The fine-realignment loop builds two spectrograms per patch, so the owned `Array2::zeros` and
+    /// the `center_freqs.clone()` of the allocating [`SpectrogramBuilder::build`] were ~300
+    /// allocations per comparison. Consecutive patches are near-identical in size, so the reused
+    /// `Vec` only ever grows on the first few — allocation-free in steady state, and the values
+    /// written are exactly the same.
+    pub fn build_into(
+        &mut self,
+        samples: &[f64],
+        sample_rate: u32,
+        window: &AnalysisWindow,
+        out: &mut Spectrogram,
+    ) -> Result<(), VisqolError> {
+        let time_domain_signal = samples;
         let max_freq = if NUM_BANDS == NUM_BANDS_SPEECH {
             Self::SPEECH_MODE_MAX_FREQ
         } else {
@@ -63,24 +89,21 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         }
 
         let num_cols = 1 + ((time_domain_signal.len() - window.size) / hop_size);
-        let mut out_matrix = Array2::<f64>::zeros((NUM_BANDS, num_cols));
+        // Reclaim the destination's backing `Vec` and resize it in place — a shrink keeps the
+        // capacity, so successive patches of similar length reuse the same allocation. Every
+        // element is written below, so the fill value is irrelevant.
+        let mut buffer = std::mem::take(&mut out.data).into_raw_vec_and_offset().0;
+        buffer.clear();
+        buffer.resize(NUM_BANDS * num_cols, 0.0);
+        let mut out_matrix = Array2::<f64>::from_shape_vec((NUM_BANDS, num_cols), buffer)
+            .expect("spectrogram buffer length matches NUM_BANDS * num_cols");
         let window_size_f = window.size as f64;
         // Per-band filter energy for one frame, filled by the fused (vectorised, AVX2-across-bands)
         // gammatone kernel — no per-frame filtered `Array2`, no per-frame reset.
         let mut energy = [0.0f64; NUM_BANDS];
 
-        for (index, frame) in time_domain_signal
-            .windows(window.size)
-            .into_iter()
-            .step_by(hop_size)
-            .enumerate()
-        {
-            self.filter_bank.filter_frame_energy_into(
-                frame
-                    .as_slice()
-                    .expect("Failed to convert audio frame to slice"),
-                &mut energy,
-            );
+        for (index, frame) in time_domain_signal.windows(window.size).step_by(hop_size).enumerate() {
+            self.filter_bank.filter_frame_energy_into(frame, &mut energy);
 
             // RMS straight into the output column: `sqrt(Σ y4² / window)`. Bit-identical to
             // apply_filter → square → mean_axis → sqrt (same left-to-right Σ, same divide, sqrt).
@@ -89,11 +112,13 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
             }
         }
 
-        Ok(Spectrogram::new(out_matrix, self.center_freqs.clone()))
+        out.data = out_matrix;
+        // Reuse the destination's `Vec` capacity rather than cloning a fresh one per build.
+        out.center_freq_bands.clear();
+        out.center_freq_bands.extend_from_slice(&self.center_freqs);
+        Ok(())
     }
-}
 
-impl<const NUM_BANDS: usize> GammatoneSpectrogramBuilder<NUM_BANDS> {
     const SPEECH_MODE_MAX_FREQ: u32 = 8000;
 
     /// Creates a new gammatone spectrogram builder with the given gammatone filterbank.

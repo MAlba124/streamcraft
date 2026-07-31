@@ -1,4 +1,4 @@
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2};
 
 use crate::{
     analysis_window::AnalysisWindow, audio_signal::AudioSignal, visqol_error::VisqolError,
@@ -15,10 +15,14 @@ pub trait PatchCreator {
         window: &AnalysisWindow,
     ) -> Result<Vec<usize>, VisqolError>;
 
-    /// Given a spectrogram and the corresponding indices, this function performs the segmentation and returns each patch in a vector of 2-dimensional arrays.
-    fn create_patches_from_indices(
+    /// Given a spectrogram and the corresponding indices, this function performs the segmentation and returns each patch as a zero-copy view into the spectrogram.
+    ///
+    /// Views, not owned copies: a patch is a column range of the reference spectrogram, and every
+    /// consumer (the NSIM measure and the 2-D convolution) is generic over storage — so copying each
+    /// one out cost a heap `Array2` per reference patch for nothing.
+    fn create_patches_from_indices<'a>(
         &self,
-        spectrogram: &Array2<f64>,
+        spectrogram: &'a Array2<f64>,
         patch_indices: &[usize],
-    ) -> Vec<Array2<f64>>;
+    ) -> Vec<ArrayView2<'a, f64>>;
 }

@@ -2,7 +2,7 @@ use crate::{
     analysis_window::AnalysisWindow, audio_signal::AudioSignal, patch_creator::PatchCreator,
     visqol_error::VisqolError,
 };
-use ndarray::{s, Array2};
+use ndarray::{s, Array2, ArrayView2};
 
 /// Creates patches from a spectrogram by segmenting it into equally-sized matrices.
 pub struct ImagePatchCreator {
@@ -19,21 +19,15 @@ impl PatchCreator for ImagePatchCreator {
         self.create_ref_patch_indices_from_spectrogram(spectrogram)
     }
 
-    fn create_patches_from_indices(
+    fn create_patches_from_indices<'a>(
         &self,
-        spectrogram: &Array2<f64>,
+        spectrogram: &'a Array2<f64>,
         patch_indices: &[usize],
-    ) -> Vec<Array2<f64>> {
-        let mut end_col: usize;
-
-        let mut patches = Vec::<Array2<f64>>::new();
-
-        let mut patch: Array2<f64>;
-
+    ) -> Vec<ArrayView2<'a, f64>> {
+        let mut patches = Vec::with_capacity(patch_indices.len());
         for start_col in patch_indices {
-            end_col = start_col + self.patch_size;
-            patch = spectrogram.slice(s![.., *start_col..end_col]).to_owned();
-            patches.push(patch);
+            let end_col = start_col + self.patch_size;
+            patches.push(spectrogram.slice(s![.., *start_col..end_col]));
         }
         patches
     }

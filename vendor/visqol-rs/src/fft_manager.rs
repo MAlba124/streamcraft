@@ -45,15 +45,14 @@ impl FftManager {
     }
 
     /// Zero-pads `time_channel` if necessary, transforms its contents into the frequency domain and stores it in `freq_channel`
-    pub fn freq_from_time_domain(
-        &mut self,
-        time_channel: &mut Vec<f64>,
-        freq_channel: &mut [Complex64],
-    ) {
+    ///
+    /// `time_channel` is borrowed **shared**: the zero-padding happens in the thread-local complex
+    /// staging buffer rather than by resizing the caller's `Vec`, so callers can pass a short signal
+    /// (or a borrowed slice) directly instead of first copying it into a padded owned `Vec`. Padding
+    /// with `0.0` before staging and staging before padding with `Complex64::zero()` write the same
+    /// `(0, 0)` elements, so the transform input is bit-identical.
+    pub fn freq_from_time_domain(&mut self, time_channel: &[f64], freq_channel: &mut [Complex64]) {
         let real_to_complex = PLANNER.with(|p| p.borrow_mut().plan_fft_forward(self.fft_size));
-        if time_channel.len() != self.fft_size {
-            time_channel.resize(self.fft_size, 0.0f64);
-        }
         // Reused thread-local buffers rather than a fresh `Vec` per transform. `complex_time_domain`
         // stages `time_channel` as real-valued complex (`re = x, im = 0` — the exact
         // `float_vec_to_real_valued_complex_vec`); the scratch is sized by the plan.
@@ -61,6 +60,7 @@ impl FftManager {
             let mut complex_time_domain = cb.borrow_mut();
             complex_time_domain.clear();
             complex_time_domain.extend(time_channel.iter().map(|&x| Complex64::new(x, 0.0)));
+            complex_time_domain.resize(self.fft_size, Complex64::zero());
             FFT_SCRATCH.with(|sb| {
                 let mut scratch_buffer = sb.borrow_mut();
                 scratch_buffer.clear();
@@ -75,10 +75,15 @@ impl FftManager {
     }
 
     /// Zero-pads `freq_channel` if necessary, transforms its contents into the time domain and stores it in `time_channel`
+    ///
+    /// `time_channel` is a pre-sized slice that receives the leading `time_channel.len()` real
+    /// parts. (It used to be a `&mut Vec` that was cleared and extended with all `fft_size` real
+    /// parts, of which every caller then read only the first `samples_per_channel` — same values,
+    /// no growth.)
     pub fn time_from_freq_domain(
         &mut self,
         freq_channel: &mut [Complex64],
-        time_channel: &mut Vec<f64>,
+        time_channel: &mut [f64],
     ) {
         let complex_to_real = PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(self.fft_size));
 
@@ -100,8 +105,9 @@ impl FftManager {
                     &mut scratch_buffer[..],
                 );
             });
-            time_channel.clear();
-            time_channel.extend(complex_td.iter().map(|c| c.re));
+            for (out, c) in time_channel.iter_mut().zip(complex_td.iter()) {
+                *out = c.re;
+            }
         });
     }
 

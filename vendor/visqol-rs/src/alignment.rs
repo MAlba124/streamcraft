@@ -2,87 +2,119 @@ use crate::audio_signal::AudioSignal;
 use crate::envelope;
 use crate::xcorr;
 use ndarray::Array1;
-use ndarray::{concatenate, s, Axis};
+use profluens_core::memory::Arena;
+use std::mem::align_of;
 
-/// Creates copy of `deg_signal` which is time-aligned to `ref_signal` by either zero-padding the beginning and truncating at the end or truncating the signal at the beginning.
-/// Returns a copy of the reference signal, a copy of the aligned degraded signal and the delay between the signals.
-pub fn align_and_truncate(
-    ref_signal: &AudioSignal,
-    deg_signal: &AudioSignal,
-) -> Option<(AudioSignal, AudioSignal, f64)> {
-    let (aligned_deg_signal, lag) = globally_align(ref_signal, deg_signal)?;
+/// Time-aligns `deg_samples` to `ref_samples` — zero-padding the beginning and truncating the end,
+/// or truncating the beginning — and writes the aligned pair into `out_ref`/`out_deg`, returning the
+/// delay between the signals in seconds.
+///
+/// The destinations are caller-owned and only cleared (never reallocated once grown), so the
+/// fine-realignment loop can reuse one pair across every patch; `out`/`scratch` back the envelope +
+/// cross-correlation buffers (see [`globally_align_into`]).
+pub fn align_and_truncate_into(
+    ref_samples: &[f64],
+    deg_samples: &[f64],
+    sample_rate: u32,
+    out_ref: &mut Vec<f64>,
+    out_deg: &mut Vec<f64>,
+    out: &Arena,
+    scratch: &mut Arena,
+) -> Option<f64> {
+    let lag =
+        globally_align_into(ref_samples, deg_samples, sample_rate, out_deg, out, scratch)?;
 
-    let mut new_ref_matrix = ref_signal.data_matrix.clone();
-    let mut new_deg_matrix = aligned_deg_signal.data_matrix;
-
-    match new_ref_matrix.len().cmp(&new_deg_matrix.len()) {
+    out_ref.clear();
+    match ref_samples.len().cmp(&out_deg.len()) {
         std::cmp::Ordering::Less => {
             // For positive lag, the beginning of ref is now padded with zeros, so
             // that amount should be truncated.
-            new_ref_matrix = new_ref_matrix
-                .slice(s![
-                    (lag * ref_signal.sample_rate as f64) as usize..ref_signal.len()
-                ])
-                .to_owned();
-            new_deg_matrix = new_deg_matrix
-                .slice(s![
-                    (lag * deg_signal.sample_rate as f64) as usize..ref_signal.len()
-                ])
-                .to_owned();
+            let start = (lag * sample_rate as f64) as usize;
+            out_ref.extend_from_slice(&ref_samples[start..ref_samples.len()]);
+            // `deg[start..ref_len]` — truncate the tail first, then shift the head off.
+            out_deg.truncate(ref_samples.len());
+            out_deg.drain(..start);
         }
         std::cmp::Ordering::Greater => {
-            new_ref_matrix = new_ref_matrix.slice(s![..new_deg_matrix.len()]).to_owned();
+            out_ref.extend_from_slice(&ref_samples[..out_deg.len()]);
         }
-        _ => (),
+        std::cmp::Ordering::Equal => out_ref.extend_from_slice(ref_samples),
     }
-    Some((
-        AudioSignal::new(new_ref_matrix.as_slice()?, ref_signal.sample_rate),
-        AudioSignal::new(new_deg_matrix.as_slice()?, deg_signal.sample_rate),
-        lag,
-    ))
+    Some(lag)
 }
 
 /// Aligns a degraded signal to the reference signal, truncating them to
 /// be the same length.
+///
+/// The two envelopes must both be live for the cross-correlation, so they are carved from `out`;
+/// everything else is transform scratch, carved from `scratch` and reclaimed between the three
+/// phases. (`scratch` is reset here, not by the caller, so the reset discipline lives next to the
+/// allocations it reclaims.)
+pub fn globally_align_into(
+    ref_samples: &[f64],
+    deg_samples: &[f64],
+    sample_rate: u32,
+    out_deg: &mut Vec<f64>,
+    out: &Arena,
+    scratch: &mut Arena,
+) -> Option<f64> {
+    // A bump arena reuses chunks across `reset` only while the *next* phase's allocations still fit
+    // the chunks it already holds — and the cross-correlation's buffers are about twice the
+    // envelope's, so the three phases below would otherwise each grow their own set (~360 MiB of
+    // chunks for a 30 s clip, where the largest single phase needs ~230). Force one chunk sized for
+    // that largest phase up front by carving and immediately dropping it; every phase then fits in
+    // it and the resets genuinely recycle. Purely a sizing hint: if it is short the arena just grows.
+    //
+    // The dominating phase is the cross-correlation — two `fft_points`-long complex spectra (the
+    // product overwrites one of them) plus one real output, i.e. `2*16 + 8` bytes per point.
+    let longest = ref_samples.len().max(deg_samples.len()).max(1);
+    let hint = 40 * crate::math_utils::next_pow_two(2 * longest - 1);
+    scratch.reset();
+    let _ = scratch.alloc(hint, align_of::<num::complex::Complex64>());
+
+    scratch.reset();
+    let ref_upper_env = envelope::calculate_upper_env(ref_samples, out, &*scratch)?;
+    scratch.reset();
+    let deg_upper_env = envelope::calculate_upper_env(deg_samples, out, &*scratch)?;
+    scratch.reset();
+
+    let best_lag = xcorr::calculate_best_lag(ref_upper_env, deg_upper_env, &*scratch)?;
+
+    out_deg.clear();
+    if best_lag == 0 || best_lag.abs() > (ref_samples.len() / 2) as i64 {
+        // If signals are correlated already, return deg signal and 0.
+        out_deg.extend_from_slice(deg_samples);
+        Some(0.0f64)
+    } else if best_lag < 0 {
+        out_deg.extend_from_slice(&deg_samples[best_lag.unsigned_abs() as usize..]);
+        Some(best_lag as f64 / sample_rate as f64)
+    } else {
+        // Zero-pad the degraded signal's start by the lag.
+        out_deg.resize(best_lag as usize, 0.0);
+        out_deg.extend_from_slice(deg_samples);
+        Some(best_lag as f64 / sample_rate as f64)
+    }
+}
+
+/// [`globally_align_into`] returning an owned [`AudioSignal`] — for the one whole-signal alignment,
+/// whose result has to outlive every arena in play.
 pub fn globally_align(
     ref_signal: &AudioSignal,
     deg_signal: &AudioSignal,
+    out: &Arena,
+    scratch: &mut Arena,
 ) -> Option<(AudioSignal, f64)> {
-    let ref_upper_env = envelope::calculate_upper_env(&ref_signal.data_matrix)?;
-    let deg_upper_env = envelope::calculate_upper_env(&deg_signal.data_matrix)?;
-
-    let best_lag = xcorr::calculate_best_lag(ref_upper_env.as_slice()?, deg_upper_env.as_slice()?)?;
-
-    if best_lag == 0 || best_lag.abs() > (ref_signal.data_matrix.len() / 2) as i64 {
-        // If signals are correlated already, return deg signal and 0.
-        let new_deg_signal =
-            AudioSignal::new(deg_signal.data_matrix.as_slice()?, deg_signal.sample_rate);
-
-        Some((new_deg_signal, 0.0f64))
-    } else {
-        let mut new_deg_matrix = deg_signal.data_matrix.clone();
-        // align degraded matrix
-        if best_lag < 0 {
-            new_deg_matrix = new_deg_matrix
-                .slice(s![
-                    best_lag.unsigned_abs() as usize..deg_signal.data_matrix.len()
-                ])
-                .to_owned();
-        } else {
-            let zeros = Array1::<f64>::zeros(best_lag as usize);
-            new_deg_matrix = concatenate(Axis(0), &[zeros.view(), new_deg_matrix.view()])
-                .expect("Failed to zero pad degraded matrix!");
-        }
-
-        let new_deg_signal = AudioSignal::new(
-            new_deg_matrix
-                .as_slice()
-                .expect("Failed to create AudioSignal from slice!"),
-            deg_signal.sample_rate,
-        );
-        Some((
-            new_deg_signal,
-            (best_lag as f64 / deg_signal.sample_rate as f64),
-        ))
-    }
+    let mut aligned = Vec::new();
+    let lag = globally_align_into(
+        ref_signal.data_matrix.as_slice()?,
+        deg_signal.data_matrix.as_slice()?,
+        deg_signal.sample_rate,
+        &mut aligned,
+        out,
+        scratch,
+    )?;
+    Some((
+        AudioSignal { data_matrix: Array1::from_vec(aligned), sample_rate: deg_signal.sample_rate },
+        lag,
+    ))
 }

@@ -18,6 +18,16 @@ impl Spectrogram {
         }
     }
 
+    /// An empty spectrogram, to be filled (and refilled) by
+    /// [`GammatoneSpectrogramBuilder::build_into`](crate::gammatone_spectrogram_builder::GammatoneSpectrogramBuilder::build_into).
+    /// Both buffers keep whatever capacity a previous build gave them.
+    pub fn empty() -> Self {
+        Self {
+            data: Array2::zeros((0, 0)),
+            center_freq_bands: Vec::new(),
+        }
+    }
+
     /// Converts the spectrogram from linear scale to dB scale
     pub fn convert_to_db(&mut self) {
         let sample_to_db = |element: f64| {

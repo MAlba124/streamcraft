@@ -41,11 +41,11 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
         ref_signal.sample_rate as usize,
     );
 
-    let mut ref_patches =
+    let ref_patches =
         patch_creator.create_patches_from_indices(&ref_spectrogram.data, &ref_patch_indices);
 
     let mut sim_match_info = selector.find_most_optimal_deg_patches(
-        &mut ref_patches,
+        &ref_patches,
         &mut ref_patch_indices,
         &deg_spectrogram.data,
         frame_duration,

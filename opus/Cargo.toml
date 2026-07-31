@@ -57,3 +57,8 @@ required-features = ["libopus"]
 [[example]]
 name = "transcode"
 required-features = ["qa"]
+
+# Steady-state allocation audit for one ViSQOL comparison (the `--target` search's per-point cost).
+[[example]]
+name = "visqol_alloc_check"
+required-features = ["qa"]

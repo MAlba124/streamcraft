@@ -89,8 +89,18 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
         deg_signal: &mut AudioSignal,
         arena: &mut Arena,
     ) -> Result<SimilarityResult, Box<dyn Error>> {
-        let (mut deg_signal, _) = alignment::globally_align(ref_signal, deg_signal)
-            .ok_or(VisqolError::FailedToAlignSignals)?;
+        // The one whole-signal alignment gets its own arenas, dropped immediately after: its
+        // transforms are sized by the *full* signal (a 30 s clip needs a 4 M-point FFT, ~64 MiB per
+        // complex buffer), and a bump arena never shrinks — parking that on the caller's long-lived
+        // per-thread arena would pin hundreds of MiB for the rest of the search. The per-patch
+        // alignment inside `finely_align_and_recreate_patches` does use the caller's arena; its
+        // buffers are patch-sized and reused across all patches.
+        let (mut deg_signal, _) = {
+            let out = Arena::default();
+            let mut scratch = Arena::default();
+            alignment::globally_align(ref_signal, deg_signal, &out, &mut scratch)
+                .ok_or(VisqolError::FailedToAlignSignals)?
+        };
 
         let window = AnalysisWindow::new(
             ref_signal.sample_rate,

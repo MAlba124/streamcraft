@@ -2,16 +2,29 @@ use ndarray::{Array2, ArrayBase, ArrayViewMut2, Data, Ix2, Zip};
 use profluens_core::memory::Arena;
 use std::mem::{align_of, size_of};
 
+/// Carve an uninitialised `n`-element `T` slice from the bump `arena`. The backing bytes are reused
+/// arena memory (contents unspecified), so **every element must be written before it is read**.
+///
+/// `T` is restricted to the plain-old-data numeric types this crate carves (`f64`, `Complex64`):
+/// every bit pattern is a valid value, none has a `Drop`, so handing out a typed view over raw
+/// arena bytes is sound. Zero heap traffic on the steady-state path — the arena reuses its chunks
+/// across [`Arena::reset`], which the per-patch loops do.
+pub(crate) trait ArenaPod: Copy {}
+impl ArenaPod for f64 {}
+impl ArenaPod for num::complex::Complex64 {}
+
+pub(crate) fn arena_slice<T: ArenaPod>(arena: &Arena, n: usize) -> &mut [T] {
+    let bytes = arena.alloc(n * size_of::<T>(), align_of::<T>());
+    // SAFETY: `bytes` is exactly `n * size_of::<T>()` bytes, `align_of::<T>()`-aligned; `T: ArenaPod`
+    // has no invalid bit patterns and no `Drop`, and callers write every element before use.
+    unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<T>(), n) }
+}
+
 /// Carve an uninitialised `r × c` row-major `f64` matrix from the bump `arena` as a mutable view.
-/// The backing bytes are reused arena memory (contents unspecified), so **every element must be
-/// written (or the whole view `fill`ed) before it is read**. Zero heap traffic on the steady-state
-/// path — the arena reuses its chunks across [`Arena::reset`], which the per-patch NSIM loop does.
+/// See [`arena_slice`] — every element must be written (or the whole view `fill`ed) before it is
+/// read.
 pub(crate) fn arena_mat(arena: &Arena, r: usize, c: usize) -> ArrayViewMut2<'_, f64> {
-    let n = r * c;
-    let bytes = arena.alloc(n * size_of::<f64>(), align_of::<f64>());
-    // SAFETY: `bytes` is exactly `n * size_of::<f64>()` bytes, `align_of::<f64>()`-aligned; every
-    // bit pattern is a valid (possibly-NaN) `f64`, and callers write every element before use.
-    let data = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f64>(), n) };
+    let data = arena_slice::<f64>(arena, r * c);
     ArrayViewMut2::from_shape((r, c), data).expect("arena_mat: slice length matches r*c")
 }
 
