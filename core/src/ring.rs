@@ -493,6 +493,37 @@ impl<T> Consumer<T> {
             drop(guard);
         }
     }
+
+    /// [`pop`](Self::pop) with a deadline: the same blocking wait, but it also gives
+    /// up once `timeout` elapses. `None` therefore means *either* "timed out" or
+    /// "closed and drained" — tell them apart with [`is_closed`](Self::is_closed)
+    /// plus [`is_empty`](Self::is_empty), exactly as the non-blocking path does.
+    ///
+    /// The scheduler uses this for a head element that has asked to be re-run by a
+    /// running time ([`Ctx::wake_at`](crate::ctx::Ctx::wake_at)): the untimed `pop`
+    /// wakes only on a push, which strands data that ripens with the *clock*.
+    pub fn pop_timeout(&self, timeout: std::time::Duration) -> Option<T> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(v) = self.try_pop() {
+                return Some(v);
+            }
+            if self.inner.closed.load(Ordering::Acquire) {
+                return self.try_pop();
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return None; // deadline reached (a zero timeout degrades to try_pop)
+            };
+            let mut guard = self.inner.gate.lock().unwrap();
+            self.inner.consumer_waiting.store(true, Ordering::Relaxed);
+            fence(Ordering::SeqCst); // pairs with the producer's push fence
+            if self.inner.is_empty() && !self.inner.closed.load(Ordering::Acquire) {
+                guard = self.inner.cvar.wait_timeout(guard, left).unwrap().0;
+            }
+            self.inner.consumer_waiting.store(false, Ordering::Relaxed);
+            drop(guard);
+        }
+    }
 }
 
 impl<T> Drop for Producer<T> {
@@ -554,6 +585,33 @@ mod tests {
         });
         producer.join().unwrap();
         consumer.join().unwrap();
+    }
+
+    #[test]
+    fn timed_pop_gives_up_and_still_sees_a_late_push_and_a_close() {
+        let (p, c) = spsc::<usize>(4);
+        // Empty and open: the wait runs out and reports nothing, without
+        // consuming the ring's ability to deliver later.
+        let at = std::time::Instant::now();
+        assert_eq!(c.pop_timeout(std::time::Duration::from_millis(30)), None);
+        assert!(at.elapsed() >= std::time::Duration::from_millis(25), "it actually waited");
+        assert!(!c.is_closed(), "a timeout is not a close");
+
+        // A push landing mid-wait wakes it, exactly like the untimed `pop`.
+        let pusher = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            p.push(7).expect("consumer alive");
+            // Dropping the producer here closes the ring.
+        });
+        let at = std::time::Instant::now();
+        assert_eq!(c.pop_timeout(std::time::Duration::from_secs(10)), Some(7));
+        assert!(at.elapsed() < std::time::Duration::from_secs(5), "woke on the push, not the timeout");
+        pusher.join().unwrap();
+
+        // Closed and drained: `None` immediately, and `is_closed` is what tells
+        // this apart from the timeout above.
+        assert_eq!(c.pop_timeout(std::time::Duration::from_secs(10)), None);
+        assert!(c.is_closed());
     }
 
     #[test]

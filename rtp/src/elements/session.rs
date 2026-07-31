@@ -216,6 +216,30 @@ impl RtpSession {
         }
         true
     }
+
+    /// Book the next crank on the clock (spec: Scheduling — `Ctx::wake_at`).
+    ///
+    /// A held packet is released by the *passage of time*: the head of a gap waits
+    /// out [`SESSION_LATENCY`] before the missing sequence numbers are declared lost
+    /// (RFC 3550 §6.4.1). Nothing else brings the element back — with its input
+    /// drained the group parks blocking on the upstream ring, which only a datagram
+    /// wakes, and a live RTP source is *routinely* quiet: the tail of a stream, the
+    /// end of a talkspurt, a burst loss that takes the rest of the burst with it. The
+    /// packets behind the gap then sit here until the next datagram, however many
+    /// seconds away that is (or forever, if the stream is over) instead of the 100 ms
+    /// the buffer promised. Book the wake-up and the deadline fires on its own.
+    fn arm_wakeup(&self, ctx: &mut Ctx) {
+        for stream in &self.streams {
+            if stream.pending.is_some() {
+                // Not waiting on the clock but on an output slot: come back as soon
+                // as the scheduler will have us (it paces the retry on its idle tick).
+                let now = ctx.now();
+                ctx.wake_at(now);
+            } else if let Some(at) = stream.jitter.next_deadline_ns() {
+                ctx.wake_at(Timestamp::from_nanos(at));
+            }
+        }
+    }
 }
 
 impl Element for RtpSession {
@@ -278,6 +302,7 @@ impl Element for RtpSession {
         ctx.recycle_input(batch);
 
         self.emit_ready(ctx);
+        self.arm_wakeup(ctx);
         Ok(Flow::Ok)
     }
 

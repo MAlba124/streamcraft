@@ -223,6 +223,10 @@ pub struct Ctx {
     /// when idle) and the element pull-reads via [`prop`](Self::prop). `None` outside a
     /// run / for elements declaring no props — zero cost.
     props: Option<(&'static [crate::element::PropDesc], Arc<PropTable>)>,
+    /// A running time this element asked to be re-run by ([`wake_at`](Self::wake_at)),
+    /// consumed by the scheduler each pass. [`Timestamp::NONE`] = no request, which is
+    /// the whole cost for every element that never arms one.
+    wake_at: Timestamp,
 }
 
 impl Ctx {
@@ -270,6 +274,7 @@ impl Ctx {
             trace: None,
             pause: None,
             linked_src_pads: Vec::new(),
+            wake_at: Timestamp::NONE,
         }
     }
 
@@ -638,6 +643,32 @@ impl Ctx {
                 crate::clock::TickedOutcome::Reached | crate::clock::TickedOutcome::Tick => {}
             }
         }
+    }
+
+    /// Ask the scheduler to run this element again by running time `running`, **even if
+    /// no input arrives** — for state that ripens with the *clock* rather than with data.
+    ///
+    /// A group whose head has drained its input parks *blocking* on its upstream ring, so
+    /// nothing but a push wakes it; an element holding data it will release on a deadline
+    /// (an `rtpsession` jitter buffer waiting out a gap, RFC 3550 §6.4.1) is stranded for
+    /// as long as its source stays quiet — which for a live source between bursts is
+    /// unbounded. Arming a wake bounds that park at the deadline instead.
+    ///
+    /// This is *not* [`wait_until`](Self::wait_until): it does not block, so the element
+    /// returns at once and keeps consuming input right up to the deadline. Consumed by
+    /// the scheduler each pass, so re-arm it from every `process()` that still holds
+    /// something; the earliest of several requests in one pass wins. A deadline already
+    /// past means "run me again promptly" — the pass still parks on the group's coarse
+    /// idle tick, so an unreachable deadline degrades to that rate, never to a spin.
+    pub fn wake_at(&mut self, running: Timestamp) {
+        self.wake_at = self.wake_at.min(running);
+    }
+
+    /// Take this element's pending wake-up request (scheduler hook; see
+    /// [`wake_at`](Self::wake_at)).
+    pub(crate) fn take_wake_at(&mut self) -> Option<Timestamp> {
+        let at = std::mem::replace(&mut self.wake_at, Timestamp::NONE);
+        at.is_some().then_some(at)
     }
 
     /// [`wait_until`](Self::wait_until) with a **pump callback**: `pump` is invoked once per

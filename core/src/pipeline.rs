@@ -2927,7 +2927,10 @@ fn run_group(
             }
         }
 
-        // A. Feed the head from upstream.
+        // A. Feed the head from upstream. Consume any wake-up the head armed last pass
+        // first, so it is spent whichever feed path runs (only the blocking one can
+        // park past a deadline; the others already re-crank on the idle tick).
+        let head_wake_at = if is_source { None } else { ctxs[0].take_wake_at() };
         if fan_in {
             // Aggregator: poll every upstream ring non-blockingly, feeding each into its
             // own sink pad and marking a pad closed when its ring closes (so a muxer can
@@ -2966,8 +2969,22 @@ fn run_group(
                 && ctxs[0].inbox_empty()
                 && reactor.is_idle();
             if !closed && head_idle {
-                // Nothing to do but wait for input — block (no busy spin).
-                match up.pop() {
+                // Nothing to do but wait for input — block (no busy spin). Unless the
+                // element asked to be re-run by a running time (`ctx.wake_at`): it is
+                // holding state that ripens on the *clock*, and an untimed park wakes
+                // only on a push, so a source that has gone quiet strands it for good
+                // (an `rtpsession` jitter buffer waiting out a gap is the case). Bound
+                // the park at the deadline; the pass that follows is what releases it.
+                let popped = match head_wake_at {
+                    // An unclocked pipeline reads `now()` as NONE: the remaining time
+                    // is then zero and this degrades to a poll plus the idle tick.
+                    Some(at) => {
+                        let left = at.saturating_sub(ctxs[0].now()).nanos().unwrap_or(0);
+                        up.pop_timeout(std::time::Duration::from_nanos(left))
+                    }
+                    None => up.pop(),
+                };
+                match popped {
                     Some(mut batch) if batch.seek_gen >= seek_gen => {
                         counters[0].record_in(batch.len() as u64, batch.total_bytes());
                         if let Some(t) = batch.pushed_at.take() {
@@ -2979,7 +2996,14 @@ fn run_group(
                         progressed = true;
                     }
                     Some(_) => {} // stale pre-seek data: drop (buffers recycle)
-                    None => upstream_closed = true,
+                    // Either the producer is gone and drained, or a timed park expired
+                    // — the same test the non-blocking branch below uses tells them
+                    // apart (an untimed `pop` only ever returns `None` for the former).
+                    None => {
+                        if up.is_closed() && up.is_empty() {
+                            upstream_closed = true;
+                        }
+                    }
                 }
             } else {
                 // Backlog cap (the ring-fed twin of the inline gate): stop popping while
