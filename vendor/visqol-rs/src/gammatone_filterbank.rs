@@ -151,9 +151,11 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
     pub fn filter_frame_energy_into(&self, input: &[f64], energy: &mut [f64; NUM_BANDS]) {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("avx2") {
-                // SAFETY: gated on runtime AVX2 detection; the body is plain safe Rust (no
-                // intrinsics) — `target_feature` only lets the autovectoriser use 256-bit lanes.
+            // SAFETY: gated on runtime AVX2 detection *and* on the coefficient vectors being sized
+            // — unlike the crate's other `_avx2` wrappers (which only let the autovectoriser widen
+            // safe Rust), this one is hand-written intrinsics whose four-wide loads have no bounds
+            // check. `energy` is `[f64; NUM_BANDS]` and every store is at `band + 4 <= NUM_BANDS`.
+            if std::is_x86_feature_detected!("avx2") && self.coefficients_are_sized() {
                 unsafe { self.filter_frame_energy_avx2(input, energy) };
                 return;
             }
@@ -161,10 +163,149 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
         self.filter_frame_energy_kernel(input, energy);
     }
 
+    /// Every coefficient vector holds at least `NUM_BANDS` entries — the invariant
+    /// [`set_filter_coefficients`](Self::set_filter_coefficients) establishes, and the precondition
+    /// of the unchecked loads in [`filter_frame_energy_avx2`](Self::filter_frame_energy_avx2). False
+    /// before it has run, in which case the checked kernel takes over and panics exactly as it
+    /// always did.
+    #[cfg(target_arch = "x86_64")]
+    fn coefficients_are_sized(&self) -> bool {
+        [
+            &self.filter_coeff_a0,
+            &self.filter_coeff_a11,
+            &self.filter_coeff_a12,
+            &self.filter_coeff_a13,
+            &self.filter_coeff_a14,
+            &self.filter_coeff_a2,
+            &self.filter_coeff_b1,
+            &self.filter_coeff_b2,
+            &self.filter_coeff_gain,
+        ]
+        .iter()
+        .all(|coefficients| coefficients.len() >= NUM_BANDS)
+    }
+
+    /// The per-frame energy cascade in explicit AVX2 intrinsics, blocked four bands at a time.
+    ///
+    /// The autovectorised [`filter_frame_energy_kernel`](Self::filter_frame_energy_kernel) runs the
+    /// band loop innermost over `[f64; NUM_BANDS]` state, which vectorises cleanly but makes nine
+    /// full-width arrays live across it — 72 AVX2 registers' worth against the sixteen the ISA has.
+    /// Every section's state was therefore stored to and reloaded from the stack on *every sample*:
+    /// 183 stack-touching `vmov`s against 38 vector arithmetic instructions. Blocking the bands so
+    /// one block's state fits in registers is not expressible in safe Rust here — written that way
+    /// LLVM refuses to keep `[f64; 4]` locals in registers across the sample loop and rebuilds them
+    /// with `vunpcklpd`/`vinsertf128` instead, which measured 45% *worse*. With intrinsics the state
+    /// is register-resident by construction: the same 38 arithmetic instructions against 6 stack
+    /// accesses.
+    ///
+    /// Deliberately no FMA (`_mm256_fmadd_pd`), though this CPU has it: fusing would round once
+    /// where the scalar reference rounds twice, and the energies must stay bit-for-bit equal to
+    /// `apply_filter` (asserted by `frame_energy_matches_apply_filter` for both band counts).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn filter_frame_energy_avx2(&self, input: &[f64], energy: &mut [f64; NUM_BANDS]) {
-        self.filter_frame_energy_kernel(input, energy);
+        use std::arch::x86_64::*;
+
+        let mut band = 0;
+        while band + 4 <= NUM_BANDS {
+            let ld = |src: &[f64]| unsafe { _mm256_loadu_pd(src.as_ptr().add(band)) };
+            let g = ld(&self.filter_coeff_gain);
+            let a0 = ld(&self.filter_coeff_a0);
+            let a2 = ld(&self.filter_coeff_a2);
+            let n10 = _mm256_div_pd(a0, g);
+            let n11 = _mm256_div_pd(ld(&self.filter_coeff_a11), g);
+            let n12 = _mm256_div_pd(a2, g);
+            let a12 = ld(&self.filter_coeff_a12);
+            let a13 = ld(&self.filter_coeff_a13);
+            let a14 = ld(&self.filter_coeff_a14);
+            let b1 = ld(&self.filter_coeff_b1);
+            let b2 = ld(&self.filter_coeff_b2);
+
+            let z = _mm256_setzero_pd();
+            let (mut z10, mut z11) = (z, z);
+            let (mut z20, mut z21) = (z, z);
+            let (mut z30, mut z31) = (z, z);
+            let (mut z40, mut z41) = (z, z);
+            let mut acc = z;
+
+            for &x in input {
+                let xv = _mm256_set1_pd(x);
+
+                let y1 = _mm256_add_pd(_mm256_mul_pd(n10, xv), z10);
+                z10 = _mm256_sub_pd(
+                    _mm256_add_pd(_mm256_mul_pd(n11, xv), z11),
+                    _mm256_mul_pd(b1, y1),
+                );
+                z11 = _mm256_sub_pd(_mm256_mul_pd(n12, xv), _mm256_mul_pd(b2, y1));
+
+                let y2 = _mm256_add_pd(_mm256_mul_pd(a0, y1), z20);
+                z20 = _mm256_sub_pd(
+                    _mm256_add_pd(_mm256_mul_pd(a12, y1), z21),
+                    _mm256_mul_pd(b1, y2),
+                );
+                z21 = _mm256_sub_pd(_mm256_mul_pd(a2, y1), _mm256_mul_pd(b2, y2));
+
+                let y3 = _mm256_add_pd(_mm256_mul_pd(a0, y2), z30);
+                z30 = _mm256_sub_pd(
+                    _mm256_add_pd(_mm256_mul_pd(a13, y2), z31),
+                    _mm256_mul_pd(b1, y3),
+                );
+                z31 = _mm256_sub_pd(_mm256_mul_pd(a2, y2), _mm256_mul_pd(b2, y3));
+
+                let y4 = _mm256_add_pd(_mm256_mul_pd(a0, y3), z40);
+                z40 = _mm256_sub_pd(
+                    _mm256_add_pd(_mm256_mul_pd(a14, y3), z41),
+                    _mm256_mul_pd(b1, y4),
+                );
+                z41 = _mm256_sub_pd(_mm256_mul_pd(a2, y3), _mm256_mul_pd(b2, y4));
+
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(y4, y4));
+            }
+            _mm256_storeu_pd(energy.as_mut_ptr().add(band), acc);
+            band += 4;
+        }
+        if band < NUM_BANDS {
+            self.filter_frame_energy_tail(input, energy, band);
+        }
+    }
+
+    /// Scalar remainder for a band count that is not a multiple of four (speech mode has 21).
+    #[cfg(target_arch = "x86_64")]
+    fn filter_frame_energy_tail(&self, input: &[f64], energy: &mut [f64; NUM_BANDS], from: usize) {
+        for band in from..NUM_BANDS {
+            let g = self.filter_coeff_gain[band];
+            let (n10, n11, n12) = (
+                self.filter_coeff_a0[band] / g,
+                self.filter_coeff_a11[band] / g,
+                self.filter_coeff_a2[band] / g,
+            );
+            let (a0, a2) = (self.filter_coeff_a0[band], self.filter_coeff_a2[band]);
+            let (a12, a13, a14) = (
+                self.filter_coeff_a12[band],
+                self.filter_coeff_a13[band],
+                self.filter_coeff_a14[band],
+            );
+            let (b1, b2) = (self.filter_coeff_b1[band], self.filter_coeff_b2[band]);
+            let (mut z10, mut z11, mut z20, mut z21) = (0.0, 0.0, 0.0, 0.0);
+            let (mut z30, mut z31, mut z40, mut z41) = (0.0, 0.0, 0.0, 0.0);
+            let mut acc = 0.0;
+            for &x in input {
+                let y1 = n10 * x + z10;
+                z10 = n11 * x + z11 - b1 * y1;
+                z11 = n12 * x - b2 * y1;
+                let y2 = a0 * y1 + z20;
+                z20 = a12 * y1 + z21 - b1 * y2;
+                z21 = a2 * y1 - b2 * y2;
+                let y3 = a0 * y2 + z30;
+                z30 = a13 * y2 + z31 - b1 * y3;
+                z31 = a2 * y2 - b2 * y3;
+                let y4 = a0 * y3 + z40;
+                z40 = a14 * y3 + z41 - b1 * y4;
+                z41 = a2 * y3 - b2 * y4;
+                acc += y4 * y4;
+            }
+            energy[band] = acc;
+        }
     }
 
     #[inline(always)]
@@ -279,10 +420,17 @@ mod tests {
 
     /// The fused (vectorised, AVX2-across-bands) energy kernel must equal `apply_filter` followed by
     /// a per-band sum of squares — bit-for-bit, since the spectrogram RMS is derived from it.
+    ///
+    /// Run for both band counts ViSQOL configures: 32 (audio) exercises whole 4-band vectors only,
+    /// 21 (speech) also exercises the scalar tail the vector loop leaves behind.
     #[test]
     fn frame_energy_matches_apply_filter() {
+        check_frame_energy::<32>();
+        check_frame_energy::<21>();
+    }
+
+    fn check_frame_energy<const NUM_BANDS: usize>() {
         let fs = 48000;
-        const NUM_BANDS: usize = 32;
         let min_freq = 50.0f64;
         let (mut filter_coeffs, _) = equivalent_rectangular_bandwidth::make_filters::<NUM_BANDS>(
             fs,
@@ -311,7 +459,10 @@ mod tests {
         fb.filter_frame_energy_into(&signal, &mut energy);
 
         for b in 0..NUM_BANDS {
-            assert_eq!(energy[b], reference[b], "band {b} energy differs from apply_filter");
+            assert_eq!(
+                energy[b], reference[b],
+                "{NUM_BANDS} bands: band {b} energy differs from apply_filter"
+            );
         }
     }
 }

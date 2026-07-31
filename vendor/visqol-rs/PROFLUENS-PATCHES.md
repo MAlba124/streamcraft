@@ -354,3 +354,53 @@ instruction-lean (−20%) but latency/bandwidth bound, so more would take restru
 the input with clamped indices instead of materialising the padded matrix. The gammatone is bounded
 by the metric itself: ViSQOL's 75%-overlapped frames each filter from zero state, so every sample is
 filtered four times, and that is not removable without changing scores.
+
+## Hand-written AVX2 for the gammatone kernel — `gammatone_filterbank.rs`
+
+**Why.** With the convolution work done, the gammatone filterbank was 38.8% of cycles — the single
+largest item. Disassembling it (`objdump` around `filter_frame_energy_avx2`) answered the "is there
+anything left for SIMD" question directly: the loop **is** fully 256-bit (242 `ymm` operands against
+24 `xmm`), but **183 of its instructions touch `%rsp` against 38 vector arithmetic ones**, and
+`perf annotate` put the hot samples on `vmovupd …(%rsp,%rcx,1)`.
+
+The cause is the loop order. The band loop is innermost over `[f64; NUM_BANDS]` state, which is what
+makes it vectorise — but it also makes nine full-width arrays live across it, 72 AVX2 registers'
+worth against the sixteen the ISA has. Every section's state was stored to and reloaded from the
+stack on *every sample*.
+
+**What did not work.** Blocking the bands in safe Rust — sample loop innermost, `[f64; 4]` locals for
+one block's state — measured **45.7% more instructions and 43% more cycles**. LLVM will not keep
+those locals in registers across the sample loop; it rebuilds the vectors each iteration with
+`vunpcklpd`/`vinsertf128`. The structure is not expressible in safe Rust here.
+
+**The change.** `filter_frame_energy_avx2` is now hand-written intrinsics with that band-blocked
+structure: four bands per `__m256d`, the eight cascade-state vectors and the accumulator held in
+registers for the whole frame. Same operations in the same order, and **deliberately no
+`_mm256_fmadd_pd`** though this CPU has FMA — fusing would round once where the scalar reference
+rounds twice, and the energies must stay bit-for-bit equal to `apply_filter`. The autovectorised
+kernel remains as the non-x86 fallback and the reference. Band counts that are not a multiple of four
+(speech mode has 21) finish in a scalar tail.
+
+Soundness: the four-wide coefficient loads have no bounds check, so the dispatch is gated on
+`coefficients_are_sized()` as well as on AVX2 — before `set_filter_coefficients` has run the vectors
+are empty, and that case falls through to the checked kernel, which panics as it always did.
+
+**Result.** Stack accesses in the kernel **183 → 6** against the same 38 arithmetic instructions.
+
+| | instructions | cycles |
+|---|---|---|
+| before | 45.95 G | ~20.2 G |
+| **after** | **41.64 G** (−9.4%) | **~19.2 G** (−5%) |
+
+Seven of seven interleaved paired runs favoured it. The 15-point parallel search is now under 1 s.
+
+**Verification.** MOS-LQO bit-identical across the nine-point 6–96 kbps sweep; `transcode --target
+4.5` byte-identical; `frame_energy_matches_apply_filter` now asserts bit-exactness against the
+reference for **both** band counts (32 exercises whole vectors, 21 also the scalar tail); tests 38
+pass / same 11 pre-existing failures.
+
+**What is left.** The kernel is now arithmetic- and dependency-bound: four cascaded biquads make a
+serial chain of roughly eight dependent FP operations per sample per band, and only the (independent)
+band blocks give the out-of-order engine anything to overlap. Beyond this the remaining levers all
+change results — FMA, `f32`, or exploiting the fact that ViSQOL's 75%-overlapped frames filter every
+sample four times from zero state.
