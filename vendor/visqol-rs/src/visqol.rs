@@ -3,7 +3,7 @@ use crate::{
     comparison_patches_selector::ComparisonPatchesSelector,
     gammatone_spectrogram_builder::GammatoneSpectrogramBuilder, patch_creator::PatchCreator,
     patch_similarity_comparator::PatchSimilarityResult, similarity_result::SimilarityResult,
-    similarity_to_quality_mapper::SimilarityToQualityMapper,
+    similarity_to_quality_mapper::SimilarityToQualityMapper, spectrogram::Spectrogram,
     spectrogram_builder::SpectrogramBuilder,
 };
 use ndarray::Array1;
@@ -13,9 +13,11 @@ use std::error::Error;
 /// Perform a comparison on two audio signals. Their similarity is calculated
 /// and converted to a quality score using the given similarity to quality
 /// mapper.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_similarity<const NUM_BANDS: usize>(
     ref_signal: &mut AudioSignal,
     deg_signal: &mut AudioSignal,
+    reference: Option<&Spectrogram>,
     spect_builder: &mut GammatoneSpectrogramBuilder<NUM_BANDS>,
     window: &AnalysisWindow,
     patch_creator: &dyn PatchCreator,
@@ -27,7 +29,15 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
     /////////////////// Stage 1: Preprocessing ///////////////////
     let deg_signal_scaled =
         audio_utils::scale_to_match_sound_pressure_level(ref_signal, deg_signal);
-    let mut ref_spectrogram = spect_builder.build(ref_signal, window)?;
+    // The reference's gammatone spectrogram depends on nothing but the reference, so a caller
+    // scoring many candidates against one reference (a bitrate search does 15) can hand in a
+    // prebuilt one — see [`VisqolManager::build_reference`]. It is cloned rather than borrowed
+    // because `prepare_spectrograms_for_comparison` below rescales it against *this* degraded
+    // signal. Identical values either way; this only skips recomputing them.
+    let mut ref_spectrogram = match reference {
+        Some(prebuilt) => prebuilt.clone(),
+        None => spect_builder.build(ref_signal, window)?,
+    };
     let mut deg_spectrogram = spect_builder.build(&deg_signal_scaled, window)?;
 
     audio_utils::prepare_spectrograms_for_comparison(&mut ref_spectrogram, &mut deg_spectrogram);

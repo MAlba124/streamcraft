@@ -404,3 +404,34 @@ serial chain of roughly eight dependent FP operations per sample per band, and o
 band blocks give the out-of-order engine anything to overlap. Beyond this the remaining levers all
 change results — FMA, `f32`, or exploiting the fact that ViSQOL's 75%-overlapped frames filter every
 sample four times from zero state.
+
+## Reference reuse across a search — `visqol_manager.rs`, `visqol.rs`
+
+**Why.** The remaining levers inside a single comparison were all sub-5% or not bit-identical. But a
+quality search does not run one comparison — it scores **fifteen candidates against the same
+reference**, and rebuilt the reference's share of the work for every one of them. The reference's
+gammatone spectrogram is ~27% of a comparison's filterbank work and depends on nothing but the
+reference; only the dB conversion and floor-raising that follow depend on the candidate.
+
+**The change.** `VisqolManager::build_reference` produces that spectrogram on its own, and
+`compute_results_against` takes an `Option<&Spectrogram>` instead of always rebuilding it (with
+`compute_results` the `None` wrapper, so existing callers are untouched). It has to be *shared*, not
+thread-local: with fifteen points over twelve workers each thread scores barely more than one point,
+so per-thread caching would recover almost nothing — built once before the parallel section and lent
+out as `&Spectrogram` (plain data, so it crosses threads freely), fourteen of the fifteen builds go
+away. Each comparison clones it before `prepare_spectrograms_for_comparison` rescales it against its
+own candidate.
+
+`opus/examples/transcode.rs` builds it once per sweep; `visqol_mos` gained the parameter and the
+signal construction moved into a shared `to_signal` helper.
+
+**Result** — a full `transcode --target 4.5`, interleaved runs (this measures the *whole* tool, FLAC
+decode and fifteen Opus encodes included, so ViSQOL's own share improved by more):
+
+| | instructions | cycles |
+|---|---|---|
+| before | 32.57 G | ~30.52 G |
+| **after** | **28.11 G** (−13.7%) | **~26.53 G** (−13.1%) |
+
+Three of three paired runs. The output `.opus` is byte-identical and the rate-distortion table is
+unchanged — the values are the same, they are simply not recomputed fifteen times.

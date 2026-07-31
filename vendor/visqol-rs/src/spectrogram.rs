@@ -2,6 +2,7 @@ use crate::math_utils::{max_of, min_of};
 use ndarray::{Array2, Axis};
 
 /// Contains the spectral representation of audio data
+#[derive(Clone)]
 pub struct Spectrogram {
     /// Spectrogram data, rows signify center frequencies, columns signify time
     pub data: Array2<f64>,

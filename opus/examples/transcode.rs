@@ -209,6 +209,13 @@ fn sweep(
     cx: u8,
 ) -> (Vec<(u32, f64, f64)>, usize, std::time::Duration) {
     ensure_model(); // write the ViSQOL model once, before the parallel section
+    // Every grid point scores a different candidate against the *same* reference, and the
+    // reference's gammatone spectrogram is ~27% of a comparison's filterbank work. Build it once
+    // here and lend it to every worker — it is plain data, so `&Spectrogram` crosses threads
+    // freely, and each comparison copies it before rescaling against its own candidate. Identical
+    // scores; the work simply is not repeated fifteen times.
+    let reference = build_reference(orig, channels);
+    let reference = reference.as_ref();
 
     // Each bitrate probe (encode → decode → ViSQOL score) is independent, so evaluate the whole grid
     // in parallel across cores.
@@ -241,7 +248,7 @@ fn sweep(
                         }
                         let k = grid_ref[i];
                         let (recon, actual) = enc_dec(pcm, orig, channels, k, cx);
-                        let q = visqol_mos(orig, &recon, channels);
+                        let q = visqol_mos(orig, &recon, channels, reference);
                         // Live progress: points complete out of order across threads, so just count
                         // finished ones. eprint! locks stderr, so concurrent updates don't interleave.
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -355,36 +362,55 @@ fn recommend(pcm: &[u8], orig: &[i16], channels: usize, cx: u8) -> u32 {
 /// and have ViSQOL read it back: blocking disk I/O on `/tmp` across every search thread. The signals
 /// are built here exactly as `load_as_mono` would (channel 0, i16→f64 as `x / 32767`), so the score
 /// is identical.
-fn visqol_mos(reference: &[i16], test: &[i16], channels: usize) -> f64 {
-    use visqol_rs::audio_signal::AudioSignal;
-    use visqol_rs::constants::{DEFAULT_WINDOW_SIZE, NUM_BANDS_AUDIO};
-    use visqol_rs::variant::Variant;
-    use visqol_rs::visqol_manager::VisqolManager;
+fn visqol_mos(
+    reference: &[i16],
+    test: &[i16],
+    channels: usize,
+    prebuilt: Option<&visqol_rs::spectrogram::Spectrogram>,
+) -> f64 {
+    let mut ref_sig = to_signal(reference, channels);
+    let mut deg_sig = to_signal(test, channels);
 
-    let cap = RATE as usize * 30;
-    let to_signal = |pcm: &[i16]| {
-        let samples: Vec<f64> = pcm
-            .iter()
-            .step_by(channels)
-            .take(cap)
-            .map(|&x| x as f64 / 32767.0)
-            .collect();
-        AudioSignal::new(&samples, RATE)
-    };
-    let mut ref_sig = to_signal(reference);
-    let mut deg_sig = to_signal(test);
-
-    let mut v = VisqolManager::<NUM_BANDS_AUDIO>::new(
-        Variant::Fullband { model_path: MODEL_PATH.to_string() },
-        DEFAULT_WINDOW_SIZE,
-    );
+    let mut v = new_manager();
     // Profluens owns the bump arena; ViSQOL borrows it for the per-patch NSIM/convolution scratch
     // (reset between patches). One arena per call — each parallel-search thread has its own
     // (`Arena` is `!Sync`); its chunks are reused across every patch of this comparison.
     let mut arena = profluens_core::memory::Arena::default();
-    v.compute_results(&mut ref_sig, &mut deg_sig, &mut arena)
+    v.compute_results_against(&mut ref_sig, prebuilt, &mut deg_sig, &mut arena)
         .map(|r| r.moslqo)
         .unwrap_or(1.0)
+}
+
+/// The reference signal's gammatone spectrogram, built once for a whole sweep — see
+/// [`visqol_rs::visqol_manager::VisqolManager::build_reference`]. `None` on failure, which just
+/// puts each comparison back to building its own.
+fn build_reference(
+    reference: &[i16],
+    channels: usize,
+) -> Option<visqol_rs::spectrogram::Spectrogram> {
+    let signal = to_signal(reference, channels);
+    let mut v = new_manager();
+    let window = v.analysis_window(signal.sample_rate);
+    v.build_reference(&signal, &window).ok()
+}
+
+/// The mono `AudioSignal` ViSQOL scores: channel 0, first 30 s, `x / 32767` — exactly what
+/// `audio_utils::load_as_mono` would produce from a WAV of the same samples.
+fn to_signal(pcm: &[i16], channels: usize) -> visqol_rs::audio_signal::AudioSignal {
+    let cap = RATE as usize * 30;
+    let samples: Vec<f64> =
+        pcm.iter().step_by(channels).take(cap).map(|&x| x as f64 / 32767.0).collect();
+    visqol_rs::audio_signal::AudioSignal::new(&samples, RATE)
+}
+
+fn new_manager() -> visqol_rs::visqol_manager::VisqolManager<{ visqol_rs::constants::NUM_BANDS_AUDIO }>
+{
+    use visqol_rs::constants::DEFAULT_WINDOW_SIZE;
+    use visqol_rs::variant::Variant;
+    visqol_rs::visqol_manager::VisqolManager::new(
+        Variant::Fullband { model_path: MODEL_PATH.to_string() },
+        DEFAULT_WINDOW_SIZE,
+    )
 }
 
 /// Bundled ViSQOL audio SVR model, spilled to this path once (visqol-rs takes a file path).

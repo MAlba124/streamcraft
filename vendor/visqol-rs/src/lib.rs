@@ -50,7 +50,7 @@ mod rms_vad;
 mod signal_filter;
 pub mod similarity_result;
 mod similarity_to_quality_mapper;
-mod spectrogram;
+pub mod spectrogram;
 mod spectrogram_builder;
 mod speech_similarity_to_quality_mapper;
 mod support_vector_regression_model;

@@ -14,6 +14,8 @@ use crate::{
     neurogram_similiarity_index_measure::NeurogramSimiliarityIndexMeasure,
     patch_creator::PatchCreator,
     similarity_result::SimilarityResult,
+    spectrogram::Spectrogram,
+    spectrogram_builder::SpectrogramBuilder,
     similarity_to_quality_mapper::SimilarityToQualityMapper,
     speech_similarity_to_quality_mapper::SpeechSimilarityToQualityMapper,
     svr_similarity_to_quality_mapper::SvrSimilarityToQualityMapper,
@@ -83,9 +85,43 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
         self.compute_results(&mut ref_signal, &mut deg_signal, arena)
     }
 
+    /// Build the reference signal's gammatone spectrogram on its own.
+    ///
+    /// This is the one substantial piece of a comparison that depends only on the reference — a
+    /// bitrate search scores 15 candidates against the same reference and rebuilt it for every one,
+    /// which is ~27% of all the filterbank work in a comparison. Build it once, share it (it is
+    /// plain data, so `&Spectrogram` crosses threads freely) and pass it to
+    /// [`compute_results_against`](Self::compute_results_against). The scores are unchanged — the
+    /// values are identical, they are simply not recomputed.
+    pub fn build_reference(
+        &mut self,
+        ref_signal: &AudioSignal,
+        window: &AnalysisWindow,
+    ) -> Result<Spectrogram, VisqolError> {
+        self.spectrogram_builder.build(ref_signal, window)
+    }
+
+    /// The [`AnalysisWindow`] a comparison uses, so a caller can build a reference spectrogram that
+    /// matches (see [`build_reference`](Self::build_reference)).
+    pub fn analysis_window(&self, sample_rate: u32) -> AnalysisWindow {
+        AnalysisWindow::new(sample_rate, constants::OVERLAP, constants::WINDOW_DURATION)
+    }
+
     pub fn compute_results(
         &mut self,
         ref_signal: &mut AudioSignal,
+        deg_signal: &mut AudioSignal,
+        arena: &mut Arena,
+    ) -> Result<SimilarityResult, Box<dyn Error>> {
+        self.compute_results_against(ref_signal, None, deg_signal, arena)
+    }
+
+    /// [`compute_results`](Self::compute_results) with the reference's spectrogram supplied rather
+    /// than rebuilt — see [`build_reference`](Self::build_reference). `None` rebuilds it.
+    pub fn compute_results_against(
+        &mut self,
+        ref_signal: &mut AudioSignal,
+        reference: Option<&Spectrogram>,
         deg_signal: &mut AudioSignal,
         arena: &mut Arena,
     ) -> Result<SimilarityResult, Box<dyn Error>> {
@@ -111,6 +147,7 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
         visqol::calculate_similarity(
             ref_signal,
             &mut deg_signal,
+            reference,
             &mut self.spectrogram_builder, // this does not need to be self
             &window,
             self.patch_creator.as_mut(),
