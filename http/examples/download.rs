@@ -4,6 +4,10 @@
 //! (`http://` or `https://` — TLS is rustls on graviola, roots from the system
 //! CA bundle.)
 
+// App `main()` setup (reading back the downloaded file to report its size) — the
+// exception `clippy.toml` names. The element itself is held to the rule.
+#![allow(clippy::disallowed_methods)]
+
 use pf_http::HttpSrc;
 use profluens_core::pipeline::Pipeline;
 use profluens_elements::io::FileSink;

@@ -13,6 +13,10 @@
 //! - plaintext decrypted alongside the response head is not lost;
 //! - TLS records reassemble across trickled reactor reads.
 
+// The test server is app-side code (blocking socket writes, heap fixtures) — the
+// exception `clippy.toml` names for tests. The element under test is held to the rule.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;

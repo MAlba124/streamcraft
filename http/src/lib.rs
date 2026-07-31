@@ -13,4 +13,4 @@
 mod httpsrc;
 mod tls;
 
-pub use httpsrc::HttpSrc;
+pub use httpsrc::{HttpInfo, HttpSrc};

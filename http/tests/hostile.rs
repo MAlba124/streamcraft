@@ -10,6 +10,10 @@
 //! Hermetic, same shape as `download.rs`: a `std::net::TcpListener` on
 //! `127.0.0.1:0` serving one canned response from a background thread.
 
+// The test server is app-side code (blocking socket writes, heap fixtures) — the
+// exception `clippy.toml` names for tests. The element under test is held to the rule.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver};
