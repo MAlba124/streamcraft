@@ -19,6 +19,16 @@
 //! - [`OggFlacDeframe`] — the FLAC-in-Ogg de-framer element: reconstructs a native FLAC
 //!   byte stream from an Ogg-mapped one (`filesrc ! oggdemux ! oggflacdeframe ! flacdec`),
 //!   per the xiph "Ogg Mapping for FLAC" (`spec/ogg-flac-mapping.md`).
+//! - [`tags`] — the metadata blocks, off the bit-decode path: [`tags::parse`] into an owned
+//!   [`FlacTags`], [`tags::parse_into`] straight into a
+//!   [`TagSink`](profluens_core::event::TagSink) with zero copies, and [`tags::stream_info`]
+//!   for the `STREAMINFO` properties (§8.2). The last two are what a **file scanner** wants:
+//!   rate/channels/bits/duration and the tags from a header read, with no decoder built.
+//!   [`tags::seek_table`] and [`tags::audio_start`] add what a **player** wants: the `SEEKTABLE`
+//!   index (§8.5) as `(sample, byte offset)` pairs, and the file offset those offsets are
+//!   relative to — an exact time→byte map, from the same header read.
+//!   [`tags::StreamInfo`] is the container-level view of those properties and is deliberately
+//!   *not* re-exported at the crate root, where [`StreamInfo`] is the decoder's full block.
 //!
 //! ## Encoder scope (correctness first, then speed)
 //! - STREAMINFO metadata block (§8.2); frame + subframe headers (§9.1, §9.2).

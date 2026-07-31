@@ -120,6 +120,13 @@ pub struct FlacDec {
     pending: Vec<i64>,
     /// How many of `pending` have already been emitted.
     pending_pos: usize,
+    /// Sample rate and channel count from STREAMINFO, known once the header is decoded —
+    /// the two numbers the PTS is derived from. Zero until then.
+    rate: u32,
+    channels: usize,
+    /// Interchannel samples emitted so far: the stream position, and hence the timestamp,
+    /// of the next buffer. Re-based to the seek target on `FlushStart`.
+    samples_emitted: u64,
 }
 
 impl FlacDec {
@@ -155,12 +162,28 @@ impl FlacDec {
                 n += bytes;
             }
             buf.memory.set_len(n);
+            buf.pts = self.pts_now();
+            self.samples_emitted += ((end - self.pending_pos) / self.channels.max(1)) as u64;
+            buf.duration = self.pts_now().saturating_sub(buf.pts);
             ctx.out(PadId(1)).push(buf);
             self.pending_pos = end;
         }
         self.pending.clear();
         self.pending_pos = 0;
         Ok(true)
+    }
+
+    /// PTS for the current `samples_emitted`, on the sample grid from a zero base (the same
+    /// convention `wavparse` and `mp3dec` use for an elementary audio stream: a stream with
+    /// no container has no timestamps of its own, so its position *is* its time).
+    /// `NONE` until STREAMINFO has been decoded and the rate is known.
+    fn pts_now(&self) -> Timestamp {
+        if self.rate == 0 {
+            return Timestamp::NONE;
+        }
+        Timestamp::from_nanos(
+            (u128::from(self.samples_emitted) * 1_000_000_000 / u128::from(self.rate)) as u64,
+        )
     }
 
     /// Announce the runtime `audio/raw` format once, from STREAMINFO (spec: dynamic caps).
@@ -174,6 +197,8 @@ impl FlacDec {
             .info()
             .ok_or(Error::Todo("flacdec: frame decoded without streaminfo"))?;
         self.bytes_per_sample = (info.bits_per_sample as usize).div_ceil(8);
+        self.rate = info.sample_rate;
+        self.channels = info.channels as usize;
         ctx.announce_format(
             PadId(1),
             FAMILY,
@@ -227,6 +252,9 @@ impl Element for FlacDec {
         self.bytes_per_sample = 0;
         self.pending.clear();
         self.pending_pos = 0;
+        self.rate = 0;
+        self.channels = 0;
+        self.samples_emitted = 0;
         Ok(())
     }
 
@@ -278,6 +306,20 @@ impl Element for FlacDec {
             self.dec.seek_reset();
             self.pending.clear();
             self.pending_pos = 0;
+            // …and re-base the sample counter the PTS is derived from. A FLAC frame header
+            // does carry a sample number, but the streaming decoder does not surface it,
+            // and in any case the seek target is the position the *pipeline* rebased its
+            // running time to — so taking it from there is what keeps buffer timestamps and
+            // running time telling the same story. Without this the post-seek audio is
+            // stamped with pre-seek times and appears to jump backwards. The source reads
+            // `to_byte` from the same target; the decoder, which owns this stream's time
+            // base, reads `to_time`.
+            if let Some(t) = ctx.seek_target() {
+                if let (Some(ns), true) = (t.to_time.nanos(), self.rate > 0) {
+                    self.samples_emitted =
+                        (u128::from(ns) * u128::from(self.rate) / 1_000_000_000) as u64;
+                }
+            }
             return Ok(());
         }
         if matches!(event, Event::Eos) {
@@ -305,5 +347,8 @@ impl Element for FlacDec {
         self.bytes_per_sample = 0;
         self.pending.clear();
         self.pending_pos = 0;
+        self.rate = 0;
+        self.channels = 0;
+        self.samples_emitted = 0;
     }
 }
