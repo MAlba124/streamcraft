@@ -67,6 +67,14 @@ const SRC: PadId = PadId(1);
 /// accumulation before decoding.
 const SEG_END: u8 = 0x80;
 
+/// Hard cap on the reassembly accumulator. A Display Set is bounded in practice — a full-width
+/// 1920×1080 caption's RLE is tens of KB, and [`crate::pgs`] refuses objects above 8192² pixels
+/// anyway — but the reassembly loop is driven purely by "an END segment arrived" and "the PTS
+/// changed". A crafted track whose Blocks all share one PTS and never terminate would otherwise
+/// grow this `Vec` without bound until the process dies. 8 MiB is ~100× the largest legitimate
+/// Display Set; past it the accumulation is dropped like any other malformed framing.
+const MAX_ACCUM: usize = 8 * 1024 * 1024;
+
 /// The sink accepts the PGS family the demuxer announces plus the `bytes` escape (a raw PGS
 /// byte peer, e.g. a `.sup` reader stripped of its headers upstream). The src emits
 /// `subtitle/bitmap`, also `bytes`-compatible so a byte sink can tap it.
@@ -221,6 +229,14 @@ impl Element for PgsDec {
                 self.accum_dur = buf.duration;
                 self.accumulating = true;
             }
+            // Bound the reassembly before appending: an untrusted track whose Blocks share a
+            // PTS and never emit an END would otherwise grow this without limit (see MAX_ACCUM).
+            if self.accum.len().saturating_add(data.len()) > MAX_ACCUM {
+                log!(&*ctx, Level::Warn, "pgs_drop", reason = "display set exceeds the reassembly cap");
+                self.dropped += 1;
+                self.reset_accum();
+                continue;
+            }
             self.accum.extend_from_slice(data);
             // A Display Set closes with an END segment. In the common case (one Block fits one
             // pool slot) this is the last byte of this very buffer, so we decode immediately.
@@ -232,9 +248,15 @@ impl Element for PgsDec {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // On end-of-stream, decode whatever partial set remains (best-effort), then reset.
-        if matches!(event, Event::Eos) {
-            self.flush_set(ctx);
+        match event {
+            // On end-of-stream, decode whatever partial set remains (best-effort), then reset.
+            Event::Eos => self.flush_set(ctx),
+            // A flush (seek) invalidates a half-accumulated Display Set: its remaining segments
+            // are on the far side of the seek and will never arrive. Dropping the bytes here
+            // stops them being glued onto the first post-seek Block and warned-and-dropped as
+            // one garbage set (spec: flush/seek — reset stream state on FlushStart).
+            Event::FlushStart => self.reset_accum(),
+            _ => {}
         }
         Ok(())
     }
