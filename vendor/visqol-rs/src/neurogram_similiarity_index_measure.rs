@@ -43,6 +43,16 @@ fn band_std_dev<S: Data<Elem = f64>>(map: &ArrayBase<S, Ix2>) -> BandValues {
     })
 }
 
+/// The reference-only half of an NSIM similarity map — see
+/// [`NeurogramSimiliarityIndexMeasure::prepare_reference`]. Borrows the arena it was carved from.
+pub struct ReferenceParts<'a> {
+    mu_ref: ArrayViewMut2<'a, f64>,
+    ref_mu_squared: ArrayViewMut2<'a, f64>,
+    sigma_ref_squared: ArrayViewMut2<'a, f64>,
+    rows: usize,
+    cols: usize,
+}
+
 /// The fixed NSIM 3×3 smoothing window.
 fn nsim_window() -> Array2<f64> {
     arr2(&[
@@ -82,36 +92,95 @@ impl NeurogramSimiliarityIndexMeasure {
         Sr: Data<Elem = f64>,
         Sd: Data<Elem = f64>,
     {
+        let reference = self.prepare_reference(ref_patch, arena);
+        self.compute_sim_map_against(&reference, ref_patch, deg_patch, arena)
+    }
+
+    /// The part of the similarity map that depends on **nothing but the reference patch**: two of
+    /// the five convolutions and the element-wise work around them.
+    ///
+    /// The alignment slide loop scores one reference patch against every offset in the search window
+    /// — about 1300 of them for a 30 s clip — and recomputed all of this identically each time.
+    /// Hoisting it out of that loop is a pure loop-invariant lift: same inputs, same operations, so
+    /// the map is bit-identical. Everything here lives in `arena`, which the caller must therefore
+    /// keep alive (and not reset) for as long as it scores candidates against this patch.
+    pub fn prepare_reference<'a, Sr>(
+        &self,
+        ref_patch: &ArrayBase<Sr, Ix2>,
+        arena: &'a Arena,
+    ) -> ReferenceParts<'a>
+    where
+        Sr: Data<Elem = f64>,
+    {
+        let (rows, cols) = ref_patch.dim();
+
+        let mut ref_neuro_sq = arena_mat(arena, rows, cols);
+        Zip::from(&mut ref_neuro_sq).and(ref_patch).for_each(|out, &r| *out = r * r);
+
+        let mu_ref = perform_valid_2d_conv_with_boundary(&self.window, ref_patch, arena);
+        let conv2_ref_neuro_squared =
+            perform_valid_2d_conv_with_boundary(&self.window, &ref_neuro_sq, arena);
+
+        let mut ref_mu_squared = arena_mat(arena, rows, cols);
+        let mut sigma_ref_squared = arena_mat(arena, rows, cols);
+        {
+            let mu_r = as_slice(&mu_ref);
+            let conv_ref_sq = as_slice(&conv2_ref_neuro_squared);
+            let ref_mu_sq = as_slice_mut(&mut ref_mu_squared);
+            let sigma_ref_sq = as_slice_mut(&mut sigma_ref_squared);
+            for i in 0..rows * cols {
+                ref_mu_sq[i] = mu_r[i] * mu_r[i];
+                sigma_ref_sq[i] = conv_ref_sq[i] - ref_mu_sq[i];
+            }
+        }
+        ReferenceParts { mu_ref, ref_mu_squared, sigma_ref_squared, rows, cols }
+    }
+
+    /// The rest of the similarity map, given [`prepare_reference`](Self::prepare_reference)'s output:
+    /// the three convolutions that read the degraded patch, and two fused element-wise passes.
+    ///
+    /// Every intermediate is carved from the caller-owned bump arena rather than the heap, so this is
+    /// allocation-free. The element-wise work is fused into passes separated by the convolutions —
+    /// the only stages with a cross-element dependency. Written one operation at a time it is
+    /// seventeen passes over the patch, each carving its own arena matrix and paying ndarray's
+    /// per-`Zip` overhead for ~640 elements; the intermediates that exist only to carry a value to
+    /// the next line are locals here. Element-wise stages are independent per element, so fusing
+    /// leaves each element's own sequence of `f64` operations exactly as it was.
+    pub fn compute_sim_map_against<'a, Sr, Sd>(
+        &self,
+        reference: &ReferenceParts<'_>,
+        ref_patch: &ArrayBase<Sr, Ix2>,
+        deg_patch: &ArrayBase<Sd, Ix2>,
+        arena: &'a Arena,
+    ) -> ArrayViewMut2<'a, f64>
+    where
+        Sr: Data<Elem = f64>,
+        Sd: Data<Elem = f64>,
+    {
         let window = &self.window;
 
         let k = [0.01, 0.03];
         let c1 = (k[0] * self.intensity_range).powf(2.0);
         let c3 = (k[1] * self.intensity_range).powf(2.0) / 2.0;
 
-        let (rows, cols) = ref_patch.dim();
+        let (rows, cols) = (reference.rows, reference.cols);
 
-        // ---- Pass 1: the three raw-patch products, all of them convolution inputs. `Zip` rather
-        // than slices because a reference patch may be a strided column window of the spectrogram.
-        let mut ref_neuro_sq = arena_mat(arena, rows, cols);
+        // ---- Pass 1: the two remaining raw-patch products, both convolution inputs. `Zip` rather
+        // than slices because a patch may be a strided column window of the spectrogram.
         let mut deg_neuro_sq = arena_mat(arena, rows, cols);
         let mut ref_neuro_deg = arena_mat(arena, rows, cols);
-        Zip::from(&mut ref_neuro_sq)
-            .and(&mut deg_neuro_sq)
+        Zip::from(&mut deg_neuro_sq)
             .and(&mut ref_neuro_deg)
             .and(ref_patch)
             .and(deg_patch)
-            .for_each(|ref_sq, deg_sq, ref_deg, &r, &d| {
-                *ref_sq = r * r;
+            .for_each(|deg_sq, ref_deg, &r, &d| {
                 *deg_sq = d * d;
                 *ref_deg = r * d;
             });
 
-        // ---- The five convolutions. A `valid` 3×3 convolution of a `+1` zero-padded matrix has the
-        // input's own shape, so every matrix here is `rows × cols`.
-        let mu_ref = perform_valid_2d_conv_with_boundary(window, ref_patch, arena);
+        // ---- The three convolutions the reference's two do not cover. A `valid` 3×3 convolution of
+        // a `+1` zero-padded matrix has the input's own shape, so every matrix here is `rows × cols`.
         let mu_deg = perform_valid_2d_conv_with_boundary(window, deg_patch, arena);
-        let conv2_ref_neuro_squared =
-            perform_valid_2d_conv_with_boundary(window, &ref_neuro_sq, arena);
         let conv2_deg_neuro_squared =
             perform_valid_2d_conv_with_boundary(window, &deg_neuro_sq, arena);
         let conv2_ref_neuro_deg =
@@ -119,19 +188,17 @@ impl NeurogramSimiliarityIndexMeasure {
 
         // ---- Pass 2: the mu products and the intensity term. From here on every operand is an
         // arena matrix, i.e. contiguous, so the passes are plain slice loops.
-        let mut ref_mu_squared = arena_mat(arena, rows, cols);
         let mut deg_mu_squared = arena_mat(arena, rows, cols);
         let mut mu_r_mu_d = arena_mat(arena, rows, cols);
         // The intensity term is also where the final map lands (pass 3 finishes in place).
         let mut sim_map = arena_mat(arena, rows, cols);
         {
-            let (mu_r, mu_d) = (as_slice(&mu_ref), as_slice(&mu_deg));
-            let ref_mu_sq = as_slice_mut(&mut ref_mu_squared);
+            let (mu_r, mu_d) = (as_slice(&reference.mu_ref), as_slice(&mu_deg));
+            let ref_mu_sq = as_slice(&reference.ref_mu_squared);
             let deg_mu_sq = as_slice_mut(&mut deg_mu_squared);
             let mu_rd = as_slice_mut(&mut mu_r_mu_d);
             let intensity = as_slice_mut(&mut sim_map);
             for i in 0..rows * cols {
-                ref_mu_sq[i] = mu_r[i] * mu_r[i];
                 deg_mu_sq[i] = mu_d[i] * mu_d[i];
                 mu_rd[i] = mu_r[i] * mu_d[i];
                 // `&mu_r_mu_d * 2.0 + c1` over `&ref_mu_squared + &deg_mu_squared + c1`
@@ -141,22 +208,20 @@ impl NeurogramSimiliarityIndexMeasure {
             }
         }
 
-        // ---- Pass 3: the sigmas, the structure term, and the product with the intensity.
+        // ---- Pass 3: the remaining sigmas, the structure term, and the product with the intensity.
         {
-            let conv_ref_sq = as_slice(&conv2_ref_neuro_squared);
             let conv_deg_sq = as_slice(&conv2_deg_neuro_squared);
             let conv_ref_deg = as_slice(&conv2_ref_neuro_deg);
-            let ref_mu_sq = as_slice(&ref_mu_squared);
+            let sigma_ref_sq = as_slice(&reference.sigma_ref_squared);
             let deg_mu_sq = as_slice(&deg_mu_squared);
             let mu_rd = as_slice(&mu_r_mu_d);
             let out = as_slice_mut(&mut sim_map);
             for i in 0..rows * cols {
-                let sigma_ref_squared = conv_ref_sq[i] - ref_mu_sq[i];
                 let sigma_deg_squared = conv_deg_sq[i] - deg_mu_sq[i];
                 let sigma_r_d = conv_ref_deg[i] - mu_rd[i];
 
                 let numerator = sigma_r_d + c3;
-                let denominator = sigma_ref_squared * sigma_deg_squared;
+                let denominator = sigma_ref_sq[i] * sigma_deg_squared;
                 // Avoid nans
                 let denominator =
                     if denominator < 0.0 { c3 } else { denominator.sqrt() + c3 };
@@ -185,7 +250,25 @@ impl NeurogramSimiliarityIndexMeasure {
         Sr: Data<Elem = f64>,
         Sd: Data<Elem = f64>,
     {
-        let sim_map = self.compute_sim_map(ref_patch, deg_patch, arena);
+        let reference = self.prepare_reference(ref_patch, arena);
+        self.measure_similarity_score_against(&reference, ref_patch, deg_patch, arena)
+    }
+
+    /// [`measure_similarity_score`](Self::measure_similarity_score) with the reference patch's half
+    /// of the map already computed — what the slide loop uses, since it holds the reference patch
+    /// fixed across every offset. See [`prepare_reference`](Self::prepare_reference).
+    pub fn measure_similarity_score_against<Sr, Sd>(
+        &self,
+        reference: &ReferenceParts<'_>,
+        ref_patch: &ArrayBase<Sr, Ix2>,
+        deg_patch: &ArrayBase<Sd, Ix2>,
+        arena: &Arena,
+    ) -> f64
+    where
+        Sr: Data<Elem = f64>,
+        Sd: Data<Elem = f64>,
+    {
+        let sim_map = self.compute_sim_map_against(reference, ref_patch, deg_patch, arena);
         let (nrows, ncols) = sim_map.dim();
         let ncols_f = ncols as f64;
         // `sim_map.row(i).sum()` sums the contiguous row left-to-right, exactly as

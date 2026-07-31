@@ -435,3 +435,36 @@ decode and fifteen Opus encodes included, so ViSQOL's own share improved by more
 
 Three of three paired runs. The output `.opus` is byte-identical and the rate-distortion table is
 unchanged — the values are the same, they are simply not recomputed fifteen times.
+
+## The slide loop recomputed the reference half of every NSIM map — `neurogram_similiarity_index_measure.rs`
+
+**Why.** The alignment slide loop scores **one** reference patch against every offset in the search
+window — about 1300 of them for a 30 s clip, ~95 K NSIM evaluations per comparison. Of the five
+convolutions and the element-wise work in `compute_sim_map`, **two convolutions and their surrounding
+arithmetic read nothing but the reference patch**: `mu_ref`, `ref_mu_squared`, and
+`sigma_ref_squared = conv(ref²) − mu_ref²`. All of it was recomputed, identically, for every offset.
+
+**The change.** `compute_sim_map` splits into `prepare_reference` (the reference-only half) and
+`compute_sim_map_against` (the three convolutions that touch the degraded patch, plus two fused
+element-wise passes). The slide loop calls `prepare_reference` once per reference patch and
+`measure_similarity_score_against` per offset. `compute_sim_map` is now just the two called back to
+back, so the full-measure path is unchanged and there is one implementation of each stage.
+
+The reference parts must outlive the per-offset `arena.reset()`, so they get their own arena, reset
+once per reference patch — two extra chunk allocations per comparison (51 → 53), settling
+immediately since every patch is the same size.
+
+This is a loop-invariant lift, nothing more: same inputs, same operations, so every score is
+bit-identical.
+
+**Result** (interleaved, two 30 s comparisons):
+
+| | instructions | cycles |
+|---|---|---|
+| before | 41.64 G | ~19.21 G |
+| **after** | **34.36 G** (−17.5%) | **~16.83 G** (−12.4%) |
+
+Four of four paired runs. Combined with the shared reference spectrogram above, a full
+`transcode --target 4.5` goes **32.57 G → 26.15 G instructions (−19.7%)** and its 15-point sweep
+1.4 s → 837 ms, with a byte-identical `.opus`. MOS-LQO bit-identical across the nine-point sweep;
+tests 38 pass / same 11 pre-existing failures.

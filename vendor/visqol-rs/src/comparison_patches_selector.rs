@@ -7,7 +7,7 @@ use crate::{
     analysis_window::AnalysisWindow,
     audio_signal::AudioSignal,
     audio_utils,
-    neurogram_similiarity_index_measure::NeurogramSimiliarityIndexMeasure,
+    neurogram_similiarity_index_measure::{NeurogramSimiliarityIndexMeasure, ReferenceParts},
     patch_similarity_comparator::{BandValues, PatchSimilarityComparator, PatchSimilarityResult},
     spectrogram::Spectrogram,
     visqol_error::VisqolError,
@@ -68,10 +68,17 @@ impl ComparisonPatchesSelector {
         // slide offset is a (usually zero-copy) window into `spectrogram_data`, built on demand
         // inside the slide loop — the old pre-built `Vec<Array2>` of every column `to_owned`ed the
         // whole spectrogram ~ncols times (the largest remaining allocator, ~210K/song).
+        // A second arena for the per-*patch* NSIM invariants (see `prepare_reference`): `arena` is
+        // reset per slide offset, so anything that must outlive the offsets needs its own. Reset
+        // once per reference patch, so it settles at one patch's worth of scratch.
+        let mut ref_arena = Arena::default();
         for (index, ref_patch) in ref_patches.iter().enumerate() {
+            ref_arena.reset();
+            let reference = self.sim_comparator.prepare_reference(ref_patch, &ref_arena);
             self.find_most_optimal_deg_patch(
                 spectrogram_data,
                 ref_patch,
+                &reference,
                 &mut cumulative_similarity_dp,
                 &mut backtrace,
                 dp_stride,
@@ -164,6 +171,7 @@ impl ComparisonPatchesSelector {
         &self,
         spectrogram_data: &Array2<f64>,
         ref_patch: &ArrayView2<f64>,
+        reference: &ReferenceParts<'_>,
         cumulative_similarity_dp: &mut [f64],
         backtrace: &mut [usize],
         dp_stride: usize,
@@ -196,7 +204,8 @@ impl ComparisonPatchesSelector {
             // O(patches × window) loop, so it dominates the allocation win.
             arena.reset();
             // Scalar-only: this loop uses nothing but the score, so skip the full measure's per-band
-            // result `Vec`s. The degraded candidate patch `[start, end)` is a zero-copy view into the
+            // result `Vec`s, and the reference patch's half of the NSIM map is hoisted out of the
+            // loop entirely (`prepare_reference` above) — it is the same for every offset. The degraded candidate patch `[start, end)` is a zero-copy view into the
             // spectrogram in the common case; the last few offsets spill past the end and need
             // zero-padding, which is carved from the arena. With the arena scratch the loop is
             // allocation-free.
@@ -204,12 +213,20 @@ impl ComparisonPatchesSelector {
             let end = start + patch_width;
             sim_similarity = if end <= spectrogram_data.ncols() {
                 let deg_view = spectrogram_data.slice(s![.., start..end]);
-                self.sim_comparator
-                    .measure_similarity_score(&*ref_patch, &deg_view, &*arena)
+                self.sim_comparator.measure_similarity_score_against(
+                    reference,
+                    &*ref_patch,
+                    &deg_view,
+                    &*arena,
+                )
             } else {
                 let deg_patch = Self::build_degraded_patch(spectrogram_data, start, end, &*arena);
-                self.sim_comparator
-                    .measure_similarity_score(&*ref_patch, &deg_patch, &*arena)
+                self.sim_comparator.measure_similarity_score_against(
+                    reference,
+                    &*ref_patch,
+                    &deg_patch,
+                    &*arena,
+                )
             };
             let mut past_slide_offset = -1;
             let mut highest_sim = f64::MIN;
@@ -462,7 +479,7 @@ mod tests {
     use super::*;
     use crate::{
         audio_signal::AudioSignal, image_patch_creator::ImagePatchCreator,
-        neurogram_similiarity_index_measure::NeurogramSimiliarityIndexMeasure,
+        neurogram_similiarity_index_measure::{NeurogramSimiliarityIndexMeasure, ReferenceParts},
         patch_creator::PatchCreator,
     };
     use ndarray::{arr2, Array1, Array2};
