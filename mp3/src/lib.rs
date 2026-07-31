@@ -46,10 +46,24 @@
 //! - **Stale crate-level doc.** `oxideav-mp3`'s own `lib.rs` header still reads
 //!   "clean-room rebuild in progress" and carries a dead `Error::NotImplemented`; the
 //!   decoder is in fact complete and tested (its README and module docs are accurate).
+//!
+//! ## Metadata and probing
+//!
+//! MP3 keeps its metadata outside the elementary stream, so the tag and duration readers
+//! are plain functions over a byte window rather than element state: [`id3`] parses
+//! ID3v2 (v2.2/v2.3/v2.4), ID3v1 and APEv2 into a
+//! [`TagSink`](profluens_core::event::TagSink), and [`props`] derives duration, rate,
+//! channels and bitrate from the first frame's header and its Xing/Info or VBRI payload —
+//! without decoding a sample. Both are IO-free, pipeline-free and allocation-free (they
+//! borrow, or write into a caller-supplied [`Arena`](profluens_core::memory::Arena)), so a
+//! standalone scanner and [`Mp3Dec`] can share them.
 
+pub mod id3;
 pub mod mp3dec;
+pub mod props;
 
 pub use mp3dec::Mp3Dec;
+pub use props::{probe_props, AudioProps, XingToc};
 
 use profluens_core::element::Element;
 use profluens_core::registry::Registry;

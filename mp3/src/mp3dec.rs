@@ -140,9 +140,12 @@ static DESC: ElementDesc = ElementDesc {
 /// `None` when the header is present but the full tag is not yet buffered (wait for
 /// more bytes before deciding).
 ///
-/// ID3v2 header (id3.org, ID3v2.4 §3.1): `"ID3"`, 2 version bytes, 1 flags byte, then
-/// a 4-byte **synchsafe** size (each byte holds 7 bits; the high bit is always 0 so the
-/// size can never contain a false syncword). Bit 4 of the flags marks a 10-byte footer.
+/// The header layout itself lives in [`crate::id3::v2_total_len`] — one implementation,
+/// shared with the tag parser (ID3v2.4 §3.1: `"ID3"`, 2 version bytes, 1 flags byte, then
+/// a 4-byte **synchsafe** size, plus 10 more when the flags mark a footer). This wrapper
+/// adds only the *streaming* tri-state the framer needs on top of it. A header that is
+/// present but whose size is not synchsafe (§6.2) is not a tag: `v2_total_len` rejects it
+/// and the bytes go to the framer as audio.
 fn id3v2_len(buf: &[u8]) -> Option<usize> {
     // A leading `"ID3"` magic marks a tag. If the buffer is still a strict prefix of
     // that magic, we can't yet tell tag-from-audio — wait for more bytes.
@@ -160,18 +163,14 @@ fn id3v2_len(buf: &[u8]) -> Option<usize> {
     if buf.len() < 10 {
         return None; // header itself not fully buffered yet
     }
-    let flags = buf[5];
-    let synchsafe = |b: u8| u32::from(b & 0x7F);
-    let size = (synchsafe(buf[6]) << 21)
-        | (synchsafe(buf[7]) << 14)
-        | (synchsafe(buf[8]) << 7)
-        | synchsafe(buf[9]);
-    let footer = if flags & 0x10 != 0 { 10 } else { 0 };
-    Some(10 + size as usize + footer)
+    Some(crate::id3::v2_total_len(buf).unwrap_or(0))
 }
 
 /// The result of trying to frame the next MPEG audio frame out of a byte buffer.
-enum Framed {
+///
+/// `pub(crate)` so [`crate::props`] probes with the *same* framer the decoder runs on:
+/// one definition of "the first frame", not a second header parser that could disagree.
+pub(crate) enum Framed {
     /// A whole frame occupies `buf[offset..offset + len]` (junk before `offset` is
     /// skippable). Ready to decode.
     Frame { offset: usize, len: usize, header: Mp3FrameHeader },
@@ -194,7 +193,7 @@ enum Framed {
 /// frames line up (the next frame's syncword falls exactly at `offset + len`), the
 /// standard resync heuristic that rejects a chance `FF Ex` byte pair inside audio data;
 /// at end-of-buffer a single complete frame is accepted so the stream tail still decodes.
-fn next_frame(buf: &[u8]) -> Framed {
+pub(crate) fn next_frame(buf: &[u8]) -> Framed {
     let mut i = 0usize;
     while i + 4 <= buf.len() {
         // Cheap 11-bit frame-sync pre-filter (0xFF, then top 3 bits of byte 1 set),
@@ -555,6 +554,21 @@ impl Element for Mp3Dec {
                 self.buf.clear();
                 self.pending.clear();
                 self.pending_pos = 0;
+                // …and re-base the sample counter the PTS is derived from. An MP3 frame
+                // carries no timestamp — its position in the stream *is* its timestamp —
+                // so a decoder that keeps counting from where it was interrupted stamps
+                // the post-seek audio with pre-seek times, and every consumer that reads
+                // `pts` (a muxer, a video sink synchronising to this audio, a test) sees
+                // the stream jump backwards. The seek target is the only place the new
+                // position exists, which is exactly what `seek_target` is for: the source
+                // reads `to_byte` from it, and the decoder — the element that owns this
+                // stream's time base — reads `to_time`.
+                if let Some(t) = ctx.seek_target() {
+                    if let (Some(ns), true) = (t.to_time.nanos(), self.rate > 0) {
+                        self.samples_emitted =
+                            (u128::from(ns) * u128::from(self.rate) / 1_000_000_000) as u64;
+                    }
+                }
             }
             // End of stream: flush the carry and every remaining whole frame through the
             // unbounded pool, so the tail is emitted even if we were backpressured here.
