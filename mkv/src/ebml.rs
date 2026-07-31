@@ -98,6 +98,45 @@ pub const DURATION: &[u8] = &[0x44, 0x89];
     // Void (RFC 8794 §11.3.2) — reserved dead space. The writer emits one where the
     // SeekHead will go and overwrites it at finalize (the single back-patch).
     pub const VOID: &[u8] = &[0xEC];
+
+    // Tags (RFC 9559 §5.1.8) — the metadata tree: Tags → Tag → Targets (which logical
+    // level the tag describes) + SimpleTag (the name/value pairs, themselves nestable).
+    // Read by `crate::tags`; the muxer does not emit them.
+    pub const TAGS: &[u8] = &[0x12, 0x54, 0xC3, 0x67];
+    pub const TAG: &[u8] = &[0x73, 0x73];
+    pub const TARGETS: &[u8] = &[0x63, 0xC0];
+    /// `Targets\TargetTypeValue` (§5.1.8.1.1.1): the logical level this tag describes —
+    /// 70 COLLECTION, 60 EDITION, 50 ALBUM, 40 PART, 30 TRACK, 20 SUBTRACK, 10 SHOT.
+    /// **Default 50** when absent, and higher values contain lower ones.
+    pub const TARGET_TYPE_VALUE: &[u8] = &[0x68, 0xCA];
+    pub const TARGET_TYPE: &[u8] = &[0x63, 0xCA];
+    /// `Targets\TagTrackUID` (§5.1.8.1.1.3), default 0 = "every track in the Segment".
+    pub const TAG_TRACK_UID: &[u8] = &[0x63, 0xC5];
+    /// `Targets\TagEditionUID` / `TagChapterUID` / `TagAttachmentUID` (§5.1.8.1.1.4–6) —
+    /// each default 0. A non-zero value scopes the tag to one edition/chapter/attachment
+    /// rather than to the Segment, which is what `crate::tags` filters on.
+    pub const TAG_EDITION_UID: &[u8] = &[0x63, 0xC9];
+    pub const TAG_CHAPTER_UID: &[u8] = &[0x63, 0xC4];
+    pub const TAG_ATTACHMENT_UID: &[u8] = &[0x63, 0xC6];
+    pub const SIMPLE_TAG: &[u8] = &[0x67, 0xC8];
+    pub const TAG_NAME: &[u8] = &[0x45, 0xA3];
+    pub const TAG_LANGUAGE: &[u8] = &[0x44, 0x7A];
+    pub const TAG_LANGUAGE_BCP47: &[u8] = &[0x44, 0x7B];
+    pub const TAG_DEFAULT: &[u8] = &[0x44, 0x84];
+    pub const TAG_STRING: &[u8] = &[0x44, 0x87];
+    pub const TAG_BINARY: &[u8] = &[0x44, 0x85];
+
+    // Attachments (RFC 9559 §5.1.7) — arbitrary files carried in the Segment. Cover art
+    // is one by convention: an AttachedFile whose FileName is `cover.*` (see `crate::tags`).
+    pub const ATTACHMENTS: &[u8] = &[0x19, 0x41, 0xA4, 0x69];
+    pub const ATTACHED_FILE: &[u8] = &[0x61, 0xA7];
+    pub const FILE_DESCRIPTION: &[u8] = &[0x46, 0x7E];
+    pub const FILE_NAME: &[u8] = &[0x46, 0x6E];
+    /// `AttachedFile\FileMediaType` (§5.1.7.1.3) — the media type (RFC 6838). Named
+    /// `FileMimeType` before RFC 9559 renamed it; the ID is unchanged.
+    pub const FILE_MEDIA_TYPE: &[u8] = &[0x46, 0x60];
+    pub const FILE_DATA: &[u8] = &[0x46, 0x5C];
+    pub const FILE_UID: &[u8] = &[0x46, 0xAE];
 }
 
 /// The fixed width, in octets, of a back-patched size (spec `§sizing`). An 8-octet size

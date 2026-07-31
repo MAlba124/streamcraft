@@ -633,7 +633,7 @@ impl MatroskaReader {
 /// and nonzero (a zero scale would divide by zero — the default is kept), and `Duration` in
 /// **ticks** (RFC 9559 §5.1.2: a 4- or 8-octet float) if present. Other children
 /// (MuxingApp, WritingApp, …) are skipped.
-fn parse_info(data: &[u8]) -> Result<(Option<u64>, Option<f64>), ReadError> {
+pub(crate) fn parse_info(data: &[u8]) -> Result<(Option<u64>, Option<f64>), ReadError> {
     let mut at = 0;
     let mut scale = None;
     let mut duration_ticks = None;
@@ -1271,7 +1271,7 @@ fn cue_track_positions_cluster(data: &[u8]) -> Option<u64> {
 /// Read an EBML unsigned integer from its big-endian octets (RFC 8794 §7.1). An empty slice
 /// is `0` (a zero-length uint is legal). Saturates at `u64` for over-long input rather than
 /// panicking.
-fn read_uint(data: &[u8]) -> u64 {
+pub(crate) fn read_uint(data: &[u8]) -> u64 {
     let mut v = 0u64;
     for &b in data.iter().take(8) {
         v = (v << 8) | b as u64;

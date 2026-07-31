@@ -111,6 +111,10 @@ what the muxer writes.
 
 IDs are grouped in `ebml.rs::id` exactly in this order.
 
+The **read** side covers more than the muxer writes: `SeekHead`/`Cues`/`Void` (seeking),
+`Video\\Colour` (colorimetry), `BlockGroup`+`Block` (the non-Simple block form), `Info\\Duration`,
+and the two metadata trees below. Those IDs live in `ebml.rs::id` too, after the muxer's.
+
 ### SimpleBlock body (Matroska `basics`/`block_structure`)  {#simpleblock}
 
 A `SimpleBlock` (ID `0xA3`) is a binary element whose *data* is a self-describing block —
@@ -129,6 +133,62 @@ would overflow (and, for a track-0 keyframe, opportunistically). With the defaul
 `TimestampScale = 1_000_000` (1 ms/tick) that window is ±32.767 s.
 
 ---
+
+## Tags and Attachments — the read-only metadata trees  {#tags}
+
+Parsed by `tags.rs` for the scanner (`pf-tags`); the muxer emits neither. Sources: RFC 9559
+§5.1.7 (Attachments) and §5.1.8 (Tags), plus the [MatroskaTags] name registry the RFC defers to
+for what the names *mean*.
+
+    1254C367  Tags                         [m]  \\Segment\\Tags
+      7373    Tag                          [m]  (one metadata descriptor)
+        63C0  Targets                      [m]  (what this Tag describes)
+          68CA TargetTypeValue             uint (default 50; see the level table below)
+          63CA TargetType                  str  (informational label: "ALBUM", "TRACK", …)
+          63C5 TagTrackUID                 uint (default 0 = every track)
+          63C9 TagEditionUID               uint (default 0 = not edition-scoped)
+          63C4 TagChapterUID               uint (default 0 = not chapter-scoped)
+          63C6 TagAttachmentUID            uint (default 0 = not attachment-scoped)
+        67C8  SimpleTag                    [m]  (the name/value pair — nestable, see below)
+          45A3 TagName                     utf8 (upper-case by convention)
+          447A TagLanguage                 str  (default "und")
+          447B TagLanguageBCP47            str
+          4484 TagDefault                  uint (default 1)
+          4487 TagString                   utf8 (the value)
+          4485 TagBinary                   bin  (a binary value instead)
+          67C8 SimpleTag                   [m]  (nested — qualifies its parent)
+
+    1941A469  Attachments                  [m]  \\Segment\\Attachments
+      61A7    AttachedFile                 [m]
+        467E  FileDescription              utf8
+        466E  FileName                     utf8 ("cover.*" by the cover-art convention)
+        4660  FileMediaType                str  (RFC 6838; called FileMimeType pre-RFC 9559)
+        465C  FileData                     bin  (the bytes — sliced, never copied)
+        46AE  FileUID                      uint
+
+### TargetTypeValue levels (RFC 9559 §5.1.8.1.1.1, Table 33)
+
+| value | label | what it describes |
+|---|---|---|
+| 70 | COLLECTION | the highest level tags can describe |
+| 60 | EDITION / ISSUE / VOLUME / SEASON | a group of lower levels |
+| 50 | **ALBUM** / MOVIE / EPISODE | the common grouping level — **the default** |
+| 40 | PART / SESSION | a logical part of an album or episode |
+| 30 | TRACK / SONG / CHAPTER | the common parts of an album or movie |
+| 20 | SUBTRACK / MOVEMENT / SCENE | a part *of a track* |
+| 10 | SHOT | the lowest level |
+
+Higher values contain lower ones. `tags.rs` emits levels **≥ 30** and drops 20/10 (they describe
+a fragment of the recording, not the recording), along with any Tag pinned to a chapter, edition
+or attachment UID. `TagTrackUID` is *not* a disqualifier — it says which track a tag applies to.
+
+### Cover art
+
+Matroska has no cover-art element. The convention ([MatroskaTags], "Cover Art") is an
+`AttachedFile` named `cover.*`, with `small_cover.*` for a thumbnail and `_land`/`_port`
+orientation suffixes on the stem. `tags.rs` emits every `image/*` attachment as a picture and
+orders the convention-matching ones first, so a file that named its art `folder.jpg` is not
+silently dropped.
 
 ## `A_FLAC` codec mapping (Matroska `codec_specs`; RFC 9639 §10.2)
 

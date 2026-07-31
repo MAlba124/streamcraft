@@ -91,6 +91,7 @@ pub mod ebml;
 pub mod element;
 pub mod mux_multi;
 pub mod reader;
+pub mod tags;
 pub mod writer;
 
 pub use codec::{family_for, nal_head_from_config, Reframer, ReframeError};
