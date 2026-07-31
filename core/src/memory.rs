@@ -1007,6 +1007,46 @@ mod tests {
         drop(slots);
     }
 
+    /// The cap is a *concurrent* claim — "the cap check and the `outstanding` bump happen under the
+    /// free-list lock, so concurrent acquirers can never collectively exceed `max_slots`"
+    /// ([`Pool::try_acquire`]). Only the single-threaded half of that was asserted
+    /// (`bounded_pool_backpressure`); the multi-threaded half, which is the one the doc comment
+    /// actually claims, was not.
+    ///
+    /// It is worth its own test because the failure is silent. An `outstanding` that drifts above
+    /// the true occupancy does not crash: it just makes `try_acquire` return `None` forever, which
+    /// downstream looks like a producer that mysteriously stops — the exact shape of the mid-movie
+    /// playback freeze. Assert both halves directly: no more than `max_slots` buffers ever live at
+    /// once, and the counter returns to exactly zero afterwards.
+    #[test]
+    fn pool_cap_holds_under_concurrent_acquirers() {
+        const SLOTS: u32 = 4;
+        let pool = Pool::bounded(64, SLOTS);
+        let live = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let pool = pool.clone();
+                let live = &live;
+                s.spawn(move || {
+                    for _ in 0..5000 {
+                        let Some(m) = pool.try_acquire() else { continue };
+                        let n = live.fetch_add(1, Ordering::AcqRel) + 1;
+                        assert!(n <= SLOTS, "{n} slots live at once with a cap of {SLOTS}");
+                        live.fetch_sub(1, Ordering::AcqRel);
+                        drop(m);
+                    }
+                });
+            }
+        });
+        assert_eq!(pool.stats().outstanding, 0, "every slot came back");
+        assert_eq!(pool.free_slots(), SLOTS, "full headroom restored");
+        // Still functional, and still capped, after the storm.
+        let held: Vec<Memory> =
+            (0..SLOTS).map(|_| pool.try_acquire().expect("slot free")).collect();
+        assert!(pool.try_acquire().is_none(), "cap still enforced after the storm");
+        drop(held);
+    }
+
     /// Copy-on-write of a *small* buffer must not consume a pool slot.
     ///
     /// The CoW path re-requests by the existing **backing** size, and the size classes round that
