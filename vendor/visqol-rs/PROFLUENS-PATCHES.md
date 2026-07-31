@@ -261,3 +261,49 @@ call site.
 padding), `rustfft` 9%, ndarray `Zip`/`map_inplace` 11.5%. A real-input (r2c/c2r) cross-correlation
 would take roughly half the remaining 9% and shrink the scratch chunk from `40·F` to ~`24·F` bytes,
 but needs a new dependency and is genuinely not bit-identical — held.
+
+## NSIM convolution round — dead padding memset, row copies, fused passes
+
+**Why.** With the envelope FFTs gone the profile was gammatone 36.5%, NSIM convolution 27.6% (kernel
+plus its padding), ndarray `Zip`/`map_inplace` 11.5%, `rustfft` 9%. The middle two are the NSIM core,
+which runs five convolutions and seventeen element-wise passes per patch comparison — inside the
+O(patches × window) alignment slide loop.
+
+**The changes**, all bit-identical by construction:
+
+1. **The padding zero-fill is dead work.** `copy_matrix_within_padding` memset the whole padded
+   matrix, but `add_matrix_boundary` then writes *every* padded cell — the row loop covers the whole
+   first and last row, the column loop the whole first and last column (re-writing the four corners,
+   which is what makes them well-defined). Nothing reads a padded cell before it is assigned.
+   Confirmed by filling with `NaN` instead and getting a bit-identical MOS. `add_matrix_boundary` now
+   skips the fill; the `pub` zero-padding form keeps it (its test asserts zeros).
+2. **The padded copy is row-at-a-time** (`copy_from_slice` when both rows are contiguous, which is
+   the common case — most convolution inputs are the previous stage's `arena_mat`), instead of an
+   element-by-element `[(i, j)]` loop through ndarray's indexing.
+3. **`compute_sim_map`'s element-wise work is fused into three passes** separated by the
+   convolutions, which are the only stages with a cross-element dependency. Nine of the intermediate
+   matrices existed only to carry a value to the next line and are now locals; the intensity term and
+   the final map share one buffer. Element-wise stages are independent per element, so fusing leaves
+   each element's own sequence of `f64` operations exactly as it was.
+
+**Result** (`perf stat`, two 30 s comparisons, the two builds run **interleaved** — this box drifts
+several percent with thermal state, so sequential before/after runs overstate a win by ~10%):
+
+| | instructions | cycles |
+|---|---|---|
+| before | 60.51 G | ~21.81 G |
+| **after** | **57.54 G** (−4.9%) | **~21.30 G** (−2.3%) |
+
+`memset` leaves the profile entirely; ndarray `Zip` drops 11.5% → 2.5%; the padding helper
+3.7% → 1.8%. The cycle win is smaller than the profile shares suggest because what these passes
+freed is mostly memory bandwidth the convolution kernel was not waiting on.
+
+**Verification.** MOS-LQO bit-identical across the 6–96 kbps sweep; `transcode --target 4.5`
+byte-identical; in-crate tests 38 pass / same 11 pre-existing `test_data` failures.
+
+**Profile after**: gammatone 39.7%, NSIM convolution kernel 24.7%, `rustfft` ~9%, everything else
+below 3%. Both leaders are already structure-of-arrays and AVX2 — the gammatone keeps every
+coefficient and every filter state as a `[f64; NUM_BANDS]` lane per band, and the convolution
+vectorises along the contiguous frame axis — so further gains there need an algorithmic change, not a
+layout one. (The 3×3 NSIM window is *not* separable — a separable rewrite would need
+`w[0][1] = 0.08367` where the actual value is `0.08383` — so the 9→6 MAC form would shift scores.)

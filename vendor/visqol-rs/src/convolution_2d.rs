@@ -1,4 +1,4 @@
-use ndarray::{Array2, ArrayBase, ArrayViewMut2, Data, Ix2, Zip};
+use ndarray::{Array2, ArrayBase, ArrayViewMut2, Data, Ix2};
 use profluens_core::memory::Arena;
 use std::mem::{align_of, size_of};
 
@@ -28,39 +28,15 @@ pub(crate) fn arena_mat(arena: &Arena, r: usize, c: usize) -> ArrayViewMut2<'_, 
     ArrayViewMut2::from_shape((r, c), data).expect("arena_mat: slice length matches r*c")
 }
 
-/// `out[i] = op(a[i], b[i])` into a fresh arena matrix — the allocation-free analogue of ndarray's
-/// `&a <op> &b` (which mints a heap `Array2` per call). `a` and `b` may be any storage (owned,
-/// arena view, …) and must share `a`'s shape. Same per-element op in the same order as the
-/// operator form, so the result is bit-identical.
-pub(crate) fn binop_into<'a, S1, S2>(
-    arena: &'a Arena,
-    a: &ArrayBase<S1, Ix2>,
-    b: &ArrayBase<S2, Ix2>,
-    op: impl Fn(f64, f64) -> f64,
-) -> ArrayViewMut2<'a, f64>
-where
-    S1: Data<Elem = f64>,
-    S2: Data<Elem = f64>,
-{
-    let (r, c) = a.dim();
-    let mut out = arena_mat(arena, r, c);
-    Zip::from(&mut out).and(a).and(b).for_each(|o, &x, &y| *o = op(x, y));
-    out
+/// The backing slice of an [`arena_mat`] — for fused element-wise passes, which are plain loops over
+/// contiguous memory rather than per-operation `Zip`s.
+pub(crate) fn as_slice<S: Data<Elem = f64>>(matrix: &ArrayBase<S, Ix2>) -> &[f64] {
+    matrix.as_slice().expect("arena matrices are standard-layout contiguous")
 }
 
-/// `out[i] = op(a[i])` into a fresh arena matrix — the arena analogue of `a.mapv(op)` / `&a <op> s`.
-pub(crate) fn map_into<'a, S>(
-    arena: &'a Arena,
-    a: &ArrayBase<S, Ix2>,
-    op: impl Fn(f64) -> f64,
-) -> ArrayViewMut2<'a, f64>
-where
-    S: Data<Elem = f64>,
-{
-    let (r, c) = a.dim();
-    let mut out = arena_mat(arena, r, c);
-    Zip::from(&mut out).and(a).for_each(|o, &x| *o = op(x));
-    out
+/// [`as_slice`], mutably.
+pub(crate) fn as_slice_mut<'a>(matrix: &'a mut ArrayViewMut2<'_, f64>) -> &'a mut [f64] {
+    matrix.as_slice_mut().expect("arena matrices are standard-layout contiguous")
 }
 
 /// Computes the convolution of `input_matrix` with `fir_filter`, writing the result into a fresh
@@ -233,7 +209,13 @@ pub fn add_matrix_boundary<'a, S>(
 where
     S: Data<Elem = f64>,
 {
-    let mut output_matrix = copy_matrix_within_padding(input_matrix, 1, 1, 1, 1, arena);
+    // `false`: the zero fill would be dead work here. The two loops below write *every* padded cell
+    // — the row loop covers the whole first and last row, the column loop the whole first and last
+    // column (re-writing the four corners, which is what makes them well-defined) — so no padded
+    // cell is read before it is assigned. This runs five times per NSIM call inside the
+    // O(patches × window) alignment loop, and the memset was ~2% of a comparison's cycles.
+    // Verified by filling with NaN instead: the MOS came out bit-identical.
+    let mut output_matrix = copy_within_padding(input_matrix, 1, 1, 1, 1, arena, false);
 
     for i in 0..output_matrix.ncols() {
         output_matrix.row_mut(0)[i] = output_matrix.row(1)[i];
@@ -250,6 +232,7 @@ where
 }
 
 /// Returns a copy of `input_matrix` (in the arena) which is zero-padded by the specified amounts.
+#[cfg(test)]
 pub fn copy_matrix_within_padding<'a, S>(
     input_matrix: &ArrayBase<S, Ix2>,
     row_prepad_amount: usize,
@@ -261,20 +244,57 @@ pub fn copy_matrix_within_padding<'a, S>(
 where
     S: Data<Elem = f64>,
 {
+    copy_within_padding(
+        input_matrix,
+        row_prepad_amount,
+        row_postpad_amount,
+        col_prepad_amount,
+        col_postpad_amount,
+        arena,
+        true,
+    )
+}
+
+/// [`copy_matrix_within_padding`], with `zero_padding` telling it whether the padding ring actually
+/// has to be zeroed — the caller may be about to overwrite all of it (see [`add_matrix_boundary`]),
+/// and arena memory is uninitialised either way.
+fn copy_within_padding<'a, S>(
+    input_matrix: &ArrayBase<S, Ix2>,
+    row_prepad_amount: usize,
+    row_postpad_amount: usize,
+    col_prepad_amount: usize,
+    col_postpad_amount: usize,
+    arena: &'a Arena,
+    zero_padding: bool,
+) -> ArrayViewMut2<'a, f64>
+where
+    S: Data<Elem = f64>,
+{
+    let (rows, cols) = (input_matrix.nrows(), input_matrix.ncols());
     let mut output_matrix = arena_mat(
         arena,
-        row_prepad_amount + input_matrix.nrows() + row_postpad_amount,
-        col_prepad_amount + input_matrix.ncols() + col_postpad_amount,
+        row_prepad_amount + rows + row_postpad_amount,
+        col_prepad_amount + cols + col_postpad_amount,
     );
-    // Arena memory is uninitialised; the original allocated `Array2::zeros`, and `add_matrix_boundary`
-    // reads the padding ring (as 0) before overwriting it — so zero the whole matrix first to stay
-    // bit-identical.
-    output_matrix.fill(0.0);
+    if zero_padding {
+        output_matrix.fill(0.0);
+    }
 
-    for row_i in 0..input_matrix.nrows() {
-        for col_i in 0..input_matrix.ncols() {
-            output_matrix[(row_i + row_prepad_amount, col_i + col_prepad_amount)] =
-                input_matrix[(row_i, col_i)];
+    // Row at a time. `copy_from_slice` when both rows are contiguous — the common case, since most
+    // convolution inputs are `arena_mat`s (the previous stage's output); a reference patch is a
+    // strided column window of the spectrogram and falls back to the element loop.
+    for row_i in 0..rows {
+        let src = input_matrix.row(row_i);
+        let mut dst = output_matrix.row_mut(row_i + row_prepad_amount);
+        let dst = &mut dst.as_slice_mut().expect("arena_mat rows are contiguous")
+            [col_prepad_amount..col_prepad_amount + cols];
+        match src.as_slice() {
+            Some(src) => dst.copy_from_slice(src),
+            None => {
+                for (out, &x) in dst.iter_mut().zip(src.iter()) {
+                    *out = x;
+                }
+            }
         }
     }
     output_matrix

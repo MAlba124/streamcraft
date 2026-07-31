@@ -1,8 +1,10 @@
-use crate::convolution_2d::{binop_into, map_into, perform_valid_2d_conv_with_boundary};
+use crate::convolution_2d::{
+    arena_mat, as_slice, as_slice_mut, perform_valid_2d_conv_with_boundary,
+};
 use crate::patch_similarity_comparator::{
     BandValues, PatchSimilarityComparator, PatchSimilarityResult,
 };
-use ndarray::{arr2, Array2, ArrayBase, ArrayViewMut2, Data, Ix2};
+use ndarray::{arr2, Array2, ArrayBase, ArrayViewMut2, Data, Ix2, Zip};
 use profluens_core::memory::Arena;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
@@ -58,9 +60,16 @@ impl NeurogramSimiliarityIndexMeasure {
 
     /// Shared NSIM core: compute the per-element similarity map into the `arena`. Both entry points
     /// need this — only the final per-band reduction differs. Every intermediate matrix is carved
-    /// from the caller-owned bump arena (see [`arena_mat`] et al.) rather than the heap: the per-op
+    /// from the caller-owned bump arena (see [`arena_mat`]) rather than the heap: the per-op
     /// `&a * &b` result arrays become writes into reused arena memory, so this is allocation-free.
-    /// The per-element ops and their order are unchanged, so the map is bit-identical.
+    ///
+    /// The element-wise work is **fused into three passes** separated by the convolutions — the only
+    /// stages with a cross-element dependency. Written out one operation at a time it is seventeen
+    /// passes over the patch, each carving its own arena matrix and paying ndarray's per-`Zip`
+    /// overhead for ~640 elements; nine of those matrices exist only to carry a value to the next
+    /// line and become locals here. Element-wise stages are independent per element, so fusing them
+    /// leaves each element's own sequence of `f64` operations exactly as it was — the map stays
+    /// bit-identical.
     ///
     /// [`arena_mat`]: crate::convolution_2d::arena_mat
     fn compute_sim_map<'a, Sr, Sd>(
@@ -79,59 +88,83 @@ impl NeurogramSimiliarityIndexMeasure {
         let c1 = (k[0] * self.intensity_range).powf(2.0);
         let c3 = (k[1] * self.intensity_range).powf(2.0) / 2.0;
 
-        // Compute mu
+        let (rows, cols) = ref_patch.dim();
+
+        // ---- Pass 1: the three raw-patch products, all of them convolution inputs. `Zip` rather
+        // than slices because a reference patch may be a strided column window of the spectrogram.
+        let mut ref_neuro_sq = arena_mat(arena, rows, cols);
+        let mut deg_neuro_sq = arena_mat(arena, rows, cols);
+        let mut ref_neuro_deg = arena_mat(arena, rows, cols);
+        Zip::from(&mut ref_neuro_sq)
+            .and(&mut deg_neuro_sq)
+            .and(&mut ref_neuro_deg)
+            .and(ref_patch)
+            .and(deg_patch)
+            .for_each(|ref_sq, deg_sq, ref_deg, &r, &d| {
+                *ref_sq = r * r;
+                *deg_sq = d * d;
+                *ref_deg = r * d;
+            });
+
+        // ---- The five convolutions. A `valid` 3×3 convolution of a `+1` zero-padded matrix has the
+        // input's own shape, so every matrix here is `rows × cols`.
         let mu_ref = perform_valid_2d_conv_with_boundary(window, ref_patch, arena);
         let mu_deg = perform_valid_2d_conv_with_boundary(window, deg_patch, arena);
-
-        let ref_mu_squared = binop_into(arena, &mu_ref, &mu_ref, |a, b| a * b);
-        let deg_mu_squared = binop_into(arena, &mu_deg, &mu_deg, |a, b| a * b);
-        let mu_r_mu_d = binop_into(arena, &mu_ref, &mu_deg, |a, b| a * b);
-
-        let ref_neuro_sq = binop_into(arena, ref_patch, ref_patch, |a, b| a * b);
-        let deg_neuro_sq = binop_into(arena, deg_patch, deg_patch, |a, b| a * b);
-
-        // Compute sigmas
         let conv2_ref_neuro_squared =
             perform_valid_2d_conv_with_boundary(window, &ref_neuro_sq, arena);
-        let sigma_ref_squared =
-            binop_into(arena, &conv2_ref_neuro_squared, &ref_mu_squared, |a, b| a - b);
-
         let conv2_deg_neuro_squared =
             perform_valid_2d_conv_with_boundary(window, &deg_neuro_sq, arena);
-        let sigma_deg_squared =
-            binop_into(arena, &conv2_deg_neuro_squared, &deg_mu_squared, |a, b| a - b);
-
-        let ref_neuro_deg = binop_into(arena, ref_patch, deg_patch, |a, b| a * b);
         let conv2_ref_neuro_deg =
             perform_valid_2d_conv_with_boundary(window, &ref_neuro_deg, arena);
 
-        let sigma_r_d = binop_into(arena, &conv2_ref_neuro_deg, &mu_r_mu_d, |a, b| a - b);
-
-        // Compute intensity: `&mu_r_mu_d * 2.0 + c1` and `&ref_mu_squared + &deg_mu_squared + c1`
-        let intensity_numerator = map_into(arena, &mu_r_mu_d, |x| x * 2.0 + c1);
-        let intensity_denominator =
-            binop_into(arena, &ref_mu_squared, &deg_mu_squared, |a, b| a + b + c1);
-
-        let intensity =
-            binop_into(arena, &intensity_numerator, &intensity_denominator, |a, b| a / b);
-
-        // Compute structure
-        let structure_numerator = map_into(arena, &sigma_r_d, |x| x + c3);
-        let mut structure_denominator =
-            binop_into(arena, &sigma_ref_squared, &sigma_deg_squared, |a, b| a * b);
-
-        // Avoid nans
-        structure_denominator.map_inplace(|element| {
-            *element = if *element < 0.0 {
-                c3
-            } else {
-                element.sqrt() + c3
+        // ---- Pass 2: the mu products and the intensity term. From here on every operand is an
+        // arena matrix, i.e. contiguous, so the passes are plain slice loops.
+        let mut ref_mu_squared = arena_mat(arena, rows, cols);
+        let mut deg_mu_squared = arena_mat(arena, rows, cols);
+        let mut mu_r_mu_d = arena_mat(arena, rows, cols);
+        // The intensity term is also where the final map lands (pass 3 finishes in place).
+        let mut sim_map = arena_mat(arena, rows, cols);
+        {
+            let (mu_r, mu_d) = (as_slice(&mu_ref), as_slice(&mu_deg));
+            let ref_mu_sq = as_slice_mut(&mut ref_mu_squared);
+            let deg_mu_sq = as_slice_mut(&mut deg_mu_squared);
+            let mu_rd = as_slice_mut(&mut mu_r_mu_d);
+            let intensity = as_slice_mut(&mut sim_map);
+            for i in 0..rows * cols {
+                ref_mu_sq[i] = mu_r[i] * mu_r[i];
+                deg_mu_sq[i] = mu_d[i] * mu_d[i];
+                mu_rd[i] = mu_r[i] * mu_d[i];
+                // `&mu_r_mu_d * 2.0 + c1` over `&ref_mu_squared + &deg_mu_squared + c1`
+                let numerator = mu_rd[i] * 2.0 + c1;
+                let denominator = ref_mu_sq[i] + deg_mu_sq[i] + c1;
+                intensity[i] = numerator / denominator;
             }
-        });
+        }
 
-        let structure =
-            binop_into(arena, &structure_numerator, &structure_denominator, |a, b| a / b);
-        binop_into(arena, &intensity, &structure, |a, b| a * b)
+        // ---- Pass 3: the sigmas, the structure term, and the product with the intensity.
+        {
+            let conv_ref_sq = as_slice(&conv2_ref_neuro_squared);
+            let conv_deg_sq = as_slice(&conv2_deg_neuro_squared);
+            let conv_ref_deg = as_slice(&conv2_ref_neuro_deg);
+            let ref_mu_sq = as_slice(&ref_mu_squared);
+            let deg_mu_sq = as_slice(&deg_mu_squared);
+            let mu_rd = as_slice(&mu_r_mu_d);
+            let out = as_slice_mut(&mut sim_map);
+            for i in 0..rows * cols {
+                let sigma_ref_squared = conv_ref_sq[i] - ref_mu_sq[i];
+                let sigma_deg_squared = conv_deg_sq[i] - deg_mu_sq[i];
+                let sigma_r_d = conv_ref_deg[i] - mu_rd[i];
+
+                let numerator = sigma_r_d + c3;
+                let denominator = sigma_ref_squared * sigma_deg_squared;
+                // Avoid nans
+                let denominator =
+                    if denominator < 0.0 { c3 } else { denominator.sqrt() + c3 };
+
+                out[i] *= numerator / denominator;
+            }
+        }
+        sim_map
     }
 
     /// Just the scalar similarity — the only field the O(patches × window) alignment slide loop
