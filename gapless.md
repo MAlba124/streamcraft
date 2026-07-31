@@ -121,13 +121,25 @@ Position and volume fall out naturally:
 Existing single-owner sink mode stays as the default constructor — NVR, pfplay
 and every current pipeline are untouched; `with_output` is opt-in.
 
-## Independent fixes surfaced by the audit (do regardless)
+## Independent fixes surfaced by the audit — DONE 2026-07-31
 
-1. `audioconvert`/`audioresample`/`audiodownmix`: handle `Event::FlushStart`
-   (clear `carry`) — today a seek can prepend stale partial-frame bytes,
-   misaligning the interleave until resync.
-2. The sink silently no-ops a second `FormatChange` — post a `Warning` so a
-   mid-stream format change is at least loud.
+1. ~~glue FlushStart handlers~~ — LANDED (commit 9d3324f: carry cleared,
+   resampler delay lines reset, WavParse cursor rebased). If you are reading
+   this while chasing a seek bug: the glue is no longer the suspect.
+2. ~~loud format-relatch~~ — LANDED (same commit: once-per-change Warning).
+3. ~~mid-file seek ended the track~~ — LANDED. The seek bug the note above
+   disclaims was the **scheduler**, not the glue: `run_group` left its loop for
+   good the moment its head reached end of stream, and the seek-generation check
+   that revives a stream lives inside that loop. A player fills its buffers in a
+   few hundred ms and then plays for minutes, so by the time anyone seeked, the
+   only thread that could re-read the file was gone — the flush still reached the
+   sink, which discarded its staged audio, saw its upstream ring closed, and
+   declared EOS. End of stream now travels **in band** (`Batch::eos`) and a
+   finished non-terminal group parks alive instead of exiting; terminal groups
+   still exit at their terminus, and that exit cascades the retirement back up
+   the graph, so termination is unchanged in shape. Regression tests:
+   `play/tests/canonical_seek.rs`; the engine's inverted pin is now
+   `robustness.rs::a_seek_is_followed_by_the_rest_of_the_track`.
 
 ## Open questions for review
 

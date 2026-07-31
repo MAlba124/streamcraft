@@ -49,6 +49,24 @@ pub struct Batch {
     /// on the consuming side for ring residency. `None` when tracing is off (the
     /// untraced hot path never reads a clock for it).
     pub(crate) pushed_at: Option<std::time::Instant>,
+    /// End of stream, **in band** (spec: flush/seek — a seek must be able to revive a
+    /// stream that has already ended).
+    ///
+    /// A producing group used to signal EOS by *exiting*, which dropped its ring and
+    /// closed it. That made "this file has been read to the end" and "this thread will
+    /// never run again" the same event — and the seek-generation check that revives a
+    /// stream lives inside the loop that thread just left, so every seek issued after
+    /// the source finished reading was silently dropped and the track simply ended.
+    /// A player reads a whole track into its buffers seconds (or minutes) before the
+    /// device has played it, so that was most of the track.
+    ///
+    /// Carrying the end of stream *as data* instead separates the two: the consumer
+    /// learns the stream ended when it pops this batch, while the producer stays alive,
+    /// parked, still watching the seek generation. A seek then finds a thread that can
+    /// re-read, and the consumer's own flush clears the `upstream_closed` this raised.
+    /// Ring closure keeps its original meaning — the consumer is *gone* — which is what
+    /// finally lets a parked producer exit.
+    pub eos: bool,
 }
 
 impl Batch {
@@ -67,6 +85,7 @@ impl Batch {
             events: Vec::new(),
             seek_gen: 0,
             pushed_at: None,
+            eos: false,
         }
     }
 
@@ -88,6 +107,9 @@ impl Batch {
         self.reset_columns();
         self.events.clear();
         self.pushed_at = None;
+        // Shells are recycled through the return ring; an end-of-stream mark left on one
+        // would end the *next* stream the moment it was reused.
+        self.eos = false;
     }
 
     /// Clear the data columns (not the events), resetting the drain cursor. Remaining

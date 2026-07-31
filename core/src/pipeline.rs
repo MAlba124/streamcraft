@@ -2804,6 +2804,15 @@ fn run_group(
     let mut source_eos = false;
     let mut upstream_closed = false;
     let mut eos_next = 0usize;
+    // This group's stream has ended and its consumers have been told, in band. The thread
+    // stays alive and parked so a seek can still revive it (spec: flush/seek); cleared by
+    // the seek-generation check below, which is the revival.
+    let mut ended = false;
+    // Per-upstream-pad latch for the in-band end-of-stream mark, which arrives exactly
+    // once. Only a fan-in head reads it (it is what lets an aggregator stop waiting on a
+    // finished pad while the others still run); a linear head keeps the same answer in
+    // `upstream_closed`. Sized once, never per pass.
+    let mut pad_stream_ended = vec![false; upstream.len()];
     // The seek generation this group has flushed up to. A `SeekHandle::seek` bumps the
     // shared generation; observing the change here drives the out-of-band flush.
     let mut seek_gen = seek.gen.load(Ordering::Acquire);
@@ -2846,10 +2855,33 @@ fn run_group(
                 c.discard_buffers();
             }
             // A seek revives a stream that may already have ended: forget prior EOS.
+            // `ended` is the one that matters for a *finished* source — clearing it puts
+            // the group back to work reading from the new offset, which is the whole point
+            // of keeping the thread alive past its own end of stream.
             source_eos = false;
             upstream_closed = false;
             eos_next = 0;
+            ended = false;
+            pad_stream_ended.iter_mut().for_each(|p| *p = false);
+            for c in ctxs.iter_mut() {
+                c.clear_pads_closed();
+            }
             seek_gen = cur_gen;
+        }
+
+        // Parked at the end of this group's stream. Every element has had its EOS and the
+        // consumers hold the in-band mark, so there is no pass left to run — re-entering
+        // `process()` after EOS is neither useful nor something elements are written to
+        // expect. Only three things can change from here: a seek (cleared `ended` above), a
+        // stop (checked at the loop top), or the consumers going away, which means nothing
+        // will ever read this group's output again and no seek could change that.
+        if ended {
+            if downstream.iter().all(|(_, d, _)| d.is_closed()) {
+                crate::log!(&ctxs[0], Level::Trace, "group_done", is_source = is_source);
+                break Ok(());
+            }
+            pause.park_idle(idle_epoch);
+            continue;
         }
 
         let mut progressed = false;
@@ -2911,6 +2943,11 @@ fn run_group(
                     source_eos = false;
                     upstream_closed = false;
                     eos_next = 0;
+                    ended = false;
+                    pad_stream_ended.iter_mut().for_each(|p| *p = false);
+                    for c in ctxs.iter_mut() {
+                        c.clear_pads_closed();
+                    }
                     seek_gen = seek.gen.load(Ordering::Acquire);
                     // Fall through: a re-prime pass runs while paused.
                 }
@@ -2937,12 +2974,25 @@ fn run_group(
             // stop waiting for it). An efficient multi-ring park is a follow-up; the
             // yield-on-no-progress net at the loop's end covers the idle case for now.
             let mut all_closed = true;
-            for (pad, cons, shell_tx) in &upstream {
+            for (i, (pad, cons, shell_tx)) in upstream.iter().enumerate() {
                 while let Some(mut batch) = cons.try_pop() {
                     if batch.seek_gen < seek_gen {
                         continue; // stale pre-seek data (buffers recycle on drop)
                     }
-                    counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    // End of stream, in band (spec: flush/seek): the producing group has
+                    // finished but is still alive and seekable, so its ring stays open.
+                    // Latched per pad because it arrives exactly once; a seek clears the
+                    // latch along with the rest of the EOS bookkeeping.
+                    if batch.eos {
+                        pad_stream_ended[i] = true;
+                    }
+                    // A pure end-of-stream mark carries no buffers. Don't count it as a
+                    // batch: the producer's own `record_out` skips empty output, so
+                    // counting it here would make `batches_in` exceed `batches_out` and
+                    // read as the ring having *split* a batch (spec: Taps).
+                    if !batch.is_empty() {
+                        counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    }
                     if let Some(t) = batch.pushed_at.take() {
                         counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
                     }
@@ -2953,7 +3003,7 @@ fn run_group(
                     let _ = shell_tx.try_push(batch);
                     progressed = true;
                 }
-                if cons.is_closed() {
+                if cons.is_closed() || pad_stream_ended[i] {
                     ctxs[0].set_pad_closed(*pad);
                 } else {
                     all_closed = false;
@@ -2968,7 +3018,14 @@ fn run_group(
                 && !ctxs[0].input_has_events()
                 && ctxs[0].inbox_empty()
                 && reactor.is_idle();
-            if !closed && head_idle {
+            // `upstream_closed` is in this test because the end of stream now arrives *in
+            // band*, on a ring whose producer stays alive and parked so that a seek can
+            // still revive it (spec: flush/seek). Blocking here on a stream that has
+            // already ended would wait for a push that is never coming: the producer is
+            // deliberately not gone, so the ring never closes and `pop()` never returns.
+            // Once the mark has been seen there is nothing left to wait for — fall through
+            // to the non-blocking path, which polls and lets the pass reach its terminus.
+            if !closed && !upstream_closed && head_idle {
                 // Nothing to do but wait for input — block (no busy spin). Unless the
                 // element asked to be re-run by a running time (`ctx.wake_at`): it is
                 // holding state that ripens on the *clock*, and an untimed park wakes
@@ -2986,7 +3043,13 @@ fn run_group(
                 };
                 match popped {
                     Some(mut batch) if batch.seek_gen >= seek_gen => {
-                        counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                        // End of stream, in band — see the fan-in branch above.
+                        if batch.eos {
+                            upstream_closed = true;
+                        }
+                        if !batch.is_empty() {
+                            counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                        }
                         if let Some(t) = batch.pushed_at.take() {
                             counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
                         }
@@ -3016,7 +3079,13 @@ fn run_group(
                     if batch.seek_gen < seek_gen {
                         continue; // stale pre-seek data (buffers recycle on drop)
                     }
-                    counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    // End of stream, in band — see the fan-in branch above.
+                    if batch.eos {
+                        upstream_closed = true;
+                    }
+                    if !batch.is_empty() {
+                        counters[0].record_in(batch.len() as u64, batch.total_bytes());
+                    }
                     if let Some(t) = batch.pushed_at.take() {
                         counters[0].queue_ns.record(t.elapsed().as_nanos() as u64);
                     }
@@ -3319,10 +3388,62 @@ fn run_group(
                 eos_next += 1;
                 continue;
             }
-            // Stamped on the group's head element (spec: Debuggability). Gated out at
-            // zero cost unless Trace is enabled, so it never touches the hot path.
-            crate::log!(&ctxs[0], Level::Trace, "group_done", is_source = is_source);
-            break Ok(());
+            // Every element has had its EOS. Tell the consumers **in band** (spec:
+            // flush/seek), then stay alive: this group's stream has ended, but the
+            // pipeline's has not, and only a live thread can service a seek.
+            //
+            // Exiting here is what the old code did, and it is why a mid-file seek used
+            // to end the track. Exiting drops `downstream`, which closes the ring — so
+            // "the file has been read to the end" and "this thread is gone forever" were
+            // the same event. They are not the same thing at all: a player reads a whole
+            // track into its buffers within a few hundred milliseconds and then spends
+            // minutes playing it out, and for every one of those minutes the seek
+            // generation check at the top of this loop was the only thing that could
+            // re-read the file from a new offset — running on a thread that had already
+            // left the loop. The seek reached the sink, which dutifully flushed and
+            // discarded its staged audio, found its upstream ring closed and empty, and
+            // declared end of stream. `run()` returned `Ok(())` and the music stopped.
+            //
+            // So the end of stream travels as data and the thread parks. What finally
+            // releases it is the consumer *going away*: a terminal group (one with no
+            // downstream) still exits at its own terminus exactly as before, dropping the
+            // ring consumers it held, which closes those rings and cascades the exit back
+            // up the graph. Termination is therefore unchanged in shape — it is just
+            // driven from the end of the pipeline rather than from the source.
+            //
+            // Nothing downstream to tell: this group ends the graph, so its exit is what
+            // starts that cascade.
+            if downstream.is_empty() {
+                // Stamped on the group's head element (spec: Debuggability). Gated out at
+                // zero cost unless Trace is enabled, so it never touches the hot path.
+                crate::log!(&ctxs[0], Level::Trace, "group_done", is_source = is_source);
+                break Ok(());
+            }
+            for (src_pad, down, _) in &downstream {
+                let mut out = ctxs[m - 1].take_output(*src_pad);
+                out.seek_gen = seek_gen;
+                out.eos = true;
+                // `try_push` in a loop rather than the blocking `push` used for data: on a
+                // **leaky** ring (the live-source policy) a full `push` *drops* the batch
+                // and reports success, and this is the one batch that must never be
+                // dropped — the consumer would wait for a mark that never arrives.
+                loop {
+                    let epoch = pause.idle_epoch();
+                    match down.try_push(out) {
+                        Ok(()) => break,
+                        Err(v) => {
+                            if down.is_closed() {
+                                break 'group Ok(()); // this downstream is gone
+                            }
+                            out = v;
+                            pause.park_idle(epoch); // wait for the consumer to make room
+                        }
+                    }
+                }
+            }
+            pause.bump_idle(); // the mark is work for a parked consumer
+            ended = true;
+            continue;
         }
 
         last_progressed = progressed;
@@ -3388,9 +3509,16 @@ fn run_group(
         elements[i].stop(&mut ctxs[i]);
     }
     drop(downstream);
+    // Drop the upstream consumers *before* the wake, not at the end of scope. Closing
+    // those rings is what retires the producing groups: since a finished group now parks
+    // instead of exiting (so a seek can still revive it), the consumer going away is its
+    // only remaining exit condition, and it is watching for exactly this. Waking first and
+    // dropping afterwards would leave it parked until the next coarse tick.
+    drop(upstream);
     // A closing ring is work for its consumer (the EOS path). The ring drop wakes
     // a pop-blocked consumer itself; this wakes a gate-parked one (a fan-in head
-    // whose other pads are still open, a head holding a backlog).
+    // whose other pads are still open, a head holding a backlog), and a producer
+    // parked past its own end of stream.
     pause.bump_idle();
     result
 }

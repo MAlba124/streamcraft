@@ -1013,6 +1013,17 @@ impl Ctx {
         self.pad_eos[i] = true;
     }
 
+    /// Un-close every sink pad (scheduler hook, seek path — spec: flush/seek).
+    ///
+    /// A seek revives a stream that may already have ended, so a pad marked closed
+    /// because its upstream reached end of stream is about to receive data again. Leaving
+    /// the mark set would tell an aggregator to stop waiting for a pad that is once more
+    /// live, and it would never recover — the mark is only ever set, never cleared, for
+    /// the whole of a run.
+    pub(crate) fn clear_pads_closed(&mut self) {
+        self.pad_eos.iter_mut().for_each(|p| *p = false);
+    }
+
     /// The element's IO outbox, handed to `Reactor::submit` which *drains* it — the
     /// vec (and its capacity) stays here, so per-pass submission allocates nothing
     /// (ZERO-COPY.md stage 4.2).
