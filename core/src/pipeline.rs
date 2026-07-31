@@ -92,7 +92,12 @@ pub struct RunReport {
 /// (spec: milestone 2 — cancellation; hard-interrupting a blocked reactor/clock wait
 /// is a follow-up).
 #[derive(Clone)]
-pub struct StopHandle(Arc<AtomicBool>);
+pub struct StopHandle {
+    stop: Arc<AtomicBool>,
+    /// The idle eventcount, so [`stop`](Self::stop) can wake parked groups at once instead of
+    /// leaving them to notice on the next 10 ms backstop tick.
+    wake: Arc<PauseShared>,
+}
 
 /// The shared pause transport (spec: Clocking — "pause is a clock op, not a
 /// state"). Pausing freezes **running time**: the resume re-bases `base_time`
@@ -415,11 +420,18 @@ impl PauseHandle {
 
 impl StopHandle {
     pub fn stop(&self) {
-        self.0.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+        // Wake the parked groups rather than letting them find out on the next backstop tick.
+        // `park_idle` already re-checks `stop` under the lock and `park_while_paused` checks it on
+        // entry, so this only removes latency — measured 9.8 ms to return from `run()` when idle,
+        // and 60 ms when paused (bounded by the 100 ms pause tick). The internal failure path
+        // already did exactly this; the public handle had simply never been given it.
+        self.wake.bump_idle();
+        self.wake.cond.notify_all();
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.stop.load(Ordering::Acquire)
     }
 }
 
@@ -712,7 +724,7 @@ impl Pipeline {
     /// A handle to stop this pipeline from another thread (or a signal handler)
     /// while `run()` is blocking.
     pub fn stop_handle(&self) -> StopHandle {
-        StopHandle(Arc::clone(&self.stop))
+        StopHandle { stop: Arc::clone(&self.stop), wake: Arc::clone(&self.pause) }
     }
 
     /// Pause/resume control usable from any thread while `run()` blocks (spec:
@@ -2700,6 +2712,28 @@ fn run_group(
         }
 
         let mut progressed = false;
+
+        // Resume is **edge-triggered here**, not only inside the gate below. A group can be
+        // anywhere when the resume lands — blocked in `up.pop()`, inside a long `process()`, or
+        // falling through the gate on a `Tick` — and in every one of those the gate is simply
+        // skipped on the next pass, because `is_paused()` is already false by then. Delivering
+        // `Resumed` solely from the `ParkWake::Resumed` arm therefore dropped it, and left
+        // `paused_announced` stuck `true` so the *next* `Event::Paused` was suppressed as well.
+        // Measured before this: 30 pause/resume cycles on a sink with an 8 ms `process()`
+        // delivered 1 `Paused` and 0 `Resumed`.
+        //
+        // That is a hang, not a hiccup: `pipewire`'s sink latches `playback.paused` off exactly
+        // this pair and returns early from `process()` while it is set, so a dropped `Resumed`
+        // left the audio device paused for good. Keyed on `paused_announced`, so `Resumed` is
+        // delivered exactly once per delivered `Paused` no matter which park observed the change.
+        if paused_announced && !pause.is_paused() {
+            for i in 0..m {
+                if let Err(e) = elements[i].event(&mut ctxs[i], &Event::Resumed) {
+                    break 'group Err(e);
+                }
+            }
+            paused_announced = false;
+        }
 
         // Pause gate (spec: Clocking — pause is a clock op): notify every element
         // once per pause (a device sink holds its hardware on `Paused`), then park.
