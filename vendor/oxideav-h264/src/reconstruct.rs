@@ -3493,9 +3493,13 @@ fn process_partition<R: RefPicProvider>(
     let part_abs_x = mb_px + part.x as i32;
     let part_abs_y = mb_py + part.y as i32;
 
-    // Allocate partition-sized scratch buffers.
-    let mut l0_buf = vec![0i32; (w as usize) * (h as usize)];
-    let mut l1_buf = vec![0i32; (w as usize) * (h as usize)];
+    // Partition-sized scratch. §7.4.5 bounds a luma partition at 16x16, so a
+    // fixed 256-sample array covers every legal shape — no heap traffic.
+    let np = (w as usize) * (h as usize);
+    let mut l0_arr = [0i32; 256];
+    let mut l1_arr = [0i32; 256];
+    let l0_buf = &mut l0_arr[..np];
+    let l1_buf = &mut l1_arr[..np];
     let has_l0 = matches!(
         part.mode,
         PartMode::L0Only | PartMode::BiPred | PartMode::Direct
@@ -3521,7 +3525,7 @@ fn process_partition<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            &mut l0_buf,
+            &mut *l0_buf,
         )?;
     }
     if has_l1 {
@@ -3540,7 +3544,7 @@ fn process_partition<R: RefPicProvider>(
             w,
             h,
             bit_depth_y,
-            &mut l1_buf,
+            &mut *l1_buf,
         )?;
     }
 
@@ -3643,10 +3647,11 @@ fn process_partition<R: RefPicProvider>(
     // §8.4.2.3.3 — implicit bipred: apply eq. 8-276 with
     // `logWD = 5`, offsets = 0, and POC-derived weights.
     if let Some((w0, w1, log2_wd)) = implicit_weights {
-        let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+        let mut scratch_arr = [0i32; 256];
+        let scratch = &mut scratch_arr[..np];
         weighted_pred_explicit(
-            Some(l0_buf.as_slice()),
-            Some(l1_buf.as_slice()),
+            Some(&*l0_buf),
+            Some(&*l1_buf),
             w as usize,
             w,
             h,
@@ -3661,7 +3666,7 @@ fn process_partition<R: RefPicProvider>(
             },
             log2_wd,
             bit_depth_y,
-            &mut scratch,
+            &mut *scratch,
             w as usize,
         );
         for py in 0..h as usize {
@@ -3680,14 +3685,15 @@ fn process_partition<R: RefPicProvider>(
             let w_l1 = luma_weight_entry(pwt, 1, part.ref_idx_l1, log2_wd);
             // Scratch partition-sized buffer so we can use the spec's
             // dst/dst_stride API directly.
-            let mut scratch = vec![0i32; (w as usize) * (h as usize)];
+            let mut scratch_arr = [0i32; 256];
+            let scratch = &mut scratch_arr[..np];
             let l0_opt = if matches!(mode, BiPredMode::L0Only | BiPredMode::Bipred) {
-                Some(l0_buf.as_slice())
+                Some(&*l0_buf)
             } else {
                 None
             };
             let l1_opt = if matches!(mode, BiPredMode::L1Only | BiPredMode::Bipred) {
-                Some(l1_buf.as_slice())
+                Some(&*l1_buf)
             } else {
                 None
             };
@@ -3702,7 +3708,7 @@ fn process_partition<R: RefPicProvider>(
                 w_l1,
                 log2_wd,
                 bit_depth_y,
-                &mut scratch,
+                &mut *scratch,
                 w as usize,
             );
             // Copy back into pred_luma at partition-local position.

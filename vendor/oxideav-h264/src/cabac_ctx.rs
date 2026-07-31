@@ -50,7 +50,7 @@ fn ctx17_trace_enabled() -> bool {
 }
 
 #[inline]
-fn dbg_emit(syntax: &str, bins_used: u64, extra: &str) {
+fn dbg_emit(syntax: &str, bins_used: u64, extra: core::fmt::Arguments<'_>) {
     if dbg_enabled() {
         eprintln!("[CABAC] {syntax} bins={bins_used} {extra}");
     }
@@ -3203,7 +3203,7 @@ pub fn decode_coeff_abs_level_minus1(
         dbg_emit(
             "coeff_abs_level_minus1",
             dec.bin_count() - start_bins,
-            &format!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} val=0"),
+            format_args!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} val=0"),
         );
         return Ok(0);
     }
@@ -3223,7 +3223,7 @@ pub fn decode_coeff_abs_level_minus1(
             dbg_emit(
                 "coeff_abs_level_minus1",
                 dec.bin_count() - start_bins,
-                &format!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} val={prefix_val}"),
+                format_args!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} val={prefix_val}"),
             );
             return Ok(prefix_val);
         }
@@ -3260,7 +3260,7 @@ pub fn decode_coeff_abs_level_minus1(
     dbg_emit(
         "coeff_abs_level_minus1",
         dec.bin_count() - start_bins,
-        &format!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} ESCAPE k={k} val={val}"),
+        format_args!("eq1={num_decoded_eq_1} gt1={num_decoded_gt_1} ESCAPE k={k} val={val}"),
     );
     Ok(val)
 }
