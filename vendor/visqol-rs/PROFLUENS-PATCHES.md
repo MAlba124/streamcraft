@@ -307,3 +307,36 @@ coefficient and every filter state as a `[f64; NUM_BANDS]` lane per band, and th
 vectorises along the contiguous frame axis — so further gains there need an algorithmic change, not a
 layout one. (The 3×3 NSIM window is *not* separable — a separable rewrite would need
 `w[0][1] = 0.08367` where the actual value is `0.08383` — so the 9→6 MAC form would shift scores.)
+
+## Specialised 3×3 convolution kernel — `convolution_2d.rs`
+
+**Why.** After the round above the convolution kernel was 24.7% of cycles, running at roughly
+1 flop/cycle — about a tenth of what AVX2 can retire. The generic kernel walks the filter backwards
+through `filter[filter_index]` with `filter_index.saturating_sub(1)`: a serial scalar chain, a load
+per tap, and an `(f_row + o_row) * i_c_c` multiply per tap.
+
+**The change.** The NSIM smoothing window is fixed at 3×3, so every convolution in the hot path is
+3×3. `conv2d_valid_3x3` specialises it: the nine taps are hoisted into a `[f64; 9]` indexed by a
+constant once the (constant-bound) loops unroll, and the three source-row bases are computed once per
+output row. The generic kernel stays for any other filter shape. The accumulation order — `f_col`
+outer, `f_row` inner, taps from `filter[8]` down to `filter[0]` — is exactly the generic kernel's, so
+the sums are bit-identical.
+
+**Result** (interleaved runs, two 30 s comparisons):
+
+| | instructions | cycles |
+|---|---|---|
+| before | 57.54 G | ~21.49 G |
+| **after** | **45.95 G** (−20.1%) | **~19.74 G** (−8.1%) |
+
+Five of five paired runs favoured the specialisation. Across the whole convolution round
+(`aa9314a` → here): **instructions −24.1%, cycles −9.9%**; the 15-point parallel search 1.2 s → 1.0 s.
+
+**Verification.** MOS-LQO bit-identical across the nine-point 6–96 kbps sweep; `transcode --target
+4.5` byte-identical; tests 38 pass / same 11 pre-existing failures.
+
+**A measurement note for future rounds.** This box drifts several percent with thermal state, enough
+to invent or hide a win of this size. Compare builds **interleaved** (`for i in 1..n { run A; run B }`)
+and read `cycles:u`, not wall time; `instructions:u` is deterministic to 8 significant figures and is
+the better signal when the two disagree. A sequential before/after measurement of the previous round
+reported −12.7% cycles where the interleaved figure is −2.3%.

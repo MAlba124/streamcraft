@@ -130,6 +130,66 @@ unsafe fn conv2d_valid_avx2(
     conv2d_valid_kernel(padded, i_c_c, filter, f_r_c, f_c_c, o_r_c, o_c_c, out);
 }
 
+/// The 3×3 case of [`conv2d_valid_kernel`] — which is every convolution in the NSIM hot path, since
+/// the smoothing window is fixed at 3×3.
+///
+/// Specialising it lets the nine taps live in registers instead of being reloaded through a
+/// `filter_index` that walks backwards with a `saturating_sub` (a serial scalar chain the vectoriser
+/// has to work around), and computes the three source-row bases once per output row instead of a
+/// multiply per tap. The accumulation order — `f_col` outer, `f_row` inner, taps from `filter[8]`
+/// down to `filter[0]` — is exactly the generic kernel's, so the sums are bit-identical.
+#[inline(always)]
+fn conv2d_valid_3x3(
+    padded: &[f64],
+    i_c_c: usize,
+    filter: &[f64],
+    o_r_c: usize,
+    o_c_c: usize,
+    out: &mut [f64],
+) {
+    const LANES: usize = 4;
+    // Taps in accumulation order, so the unrolled loops below index this with a constant.
+    let taps: [f64; 9] = [
+        filter[8], filter[7], filter[6], filter[5], filter[4], filter[3], filter[2], filter[1],
+        filter[0],
+    ];
+    for o_row in 0..o_r_c {
+        let rows = [o_row * i_c_c, (o_row + 1) * i_c_c, (o_row + 2) * i_c_c];
+        let out_row = &mut out[o_row * o_c_c..o_row * o_c_c + o_c_c];
+        let mut o_col = 0;
+        while o_col + LANES <= o_c_c {
+            let mut sum = [0.0f64; LANES];
+            let mut tap = 0;
+            for f_col in 0..3 {
+                for row_base in rows {
+                    let base = row_base + f_col + o_col;
+                    let p = &padded[base..base + LANES];
+                    let fv = taps[tap];
+                    for k in 0..LANES {
+                        sum[k] += p[k] * fv;
+                    }
+                    tap += 1;
+                }
+            }
+            out_row[o_col..o_col + LANES].copy_from_slice(&sum);
+            o_col += LANES;
+        }
+        // Remainder columns — identical scalar accumulation.
+        while o_col < o_c_c {
+            let mut sum = 0.0f64;
+            let mut tap = 0;
+            for f_col in 0..3 {
+                for row_base in rows {
+                    sum += padded[row_base + f_col + o_col] * taps[tap];
+                    tap += 1;
+                }
+            }
+            out_row[o_col] = sum;
+            o_col += 1;
+        }
+    }
+}
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn conv2d_valid_kernel(
@@ -142,6 +202,10 @@ fn conv2d_valid_kernel(
     o_c_c: usize,
     out: &mut [f64],
 ) {
+    if f_r_c == 3 && f_c_c == 3 {
+        conv2d_valid_3x3(padded, i_c_c, filter, o_r_c, o_c_c, out);
+        return;
+    }
     let filter_size = f_r_c * f_c_c;
     for o_row in 0..o_r_c {
         let out_row = &mut out[o_row * o_c_c..o_row * o_c_c + o_c_c];
