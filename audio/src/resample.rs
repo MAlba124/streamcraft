@@ -36,6 +36,28 @@
 //! bandwidth and the stop-band kills the images/aliases. It is scaled by `L` for the
 //! interpolation gain (a decimator keeps 1 in `L` of the up-sampled samples, so the retained
 //! energy needs the `L`× lift to leave the pass-band at unity).
+//!
+//! # How the dot product is arranged
+//!
+//! That per-output dot product is the whole cost of the element, so its memory layout is chosen
+//! for it rather than for the maths:
+//!
+//! * Branch coefficients are stored **reversed** (oldest tap first), so the convolution walks the
+//!   coefficients and the delay line in the *same* forward direction — two unit-stride streams a
+//!   SIMD loop can load directly, instead of one forward and one backward walk.
+//! * Each branch is **zero-padded** to a multiple of [`LANES`], so there is no scalar tail; the
+//!   pad multiplies real (already-buffered) history samples by `0.0`, so it changes nothing.
+//! * The sum is carried in [`LANES`] independent accumulators and reduced by a fixed-shape
+//!   binary tree. A single `f32` accumulator makes the loop a serial `addss` chain — one 4-cycle
+//!   FP add per tap, with nothing else to issue — which is what the naive form was bound by.
+//!   Splitting it reassociates the sum (see [`dot`]) and *improves* the error bound.
+//! * The number of outputs a batch will produce is computed in closed form up front, so the
+//!   output `Vec` is reserved exactly once and the loop is counted rather than re-testing the
+//!   delay-line length, and the per-output `phase / L` and `phase % L` become a compare and a
+//!   subtract instead of a hardware `div`.
+//!
+//! The whole output loop is compiled twice on x86-64 — once for the baseline SSE2 the workspace
+//! targets, once behind a runtime AVX2 check for 256-bit lanes.
 
 /// Zeroth-order modified Bessel function `I₀(x)`, for the Kaiser window. A short power-series
 /// (`Σ (x²/4)^k / (k!)²`) — converges fast for the small `x` a Kaiser β implies, and needs no
@@ -57,9 +79,19 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// A designed prototype low-pass, decomposed into `L` polyphase branches. `phases[p]` holds the
-/// `taps_per_phase` coefficients of branch `p`, innermost-tap first (so it dots directly against
-/// the most-recent-first history window). Immutable after [`design`](PolyphaseFilter::design).
+/// SIMD block width of the per-output dot product, in `f32` lanes. Every polyphase branch is
+/// zero-padded up to a multiple of this (see [`PolyphaseFilter::stride`]) so the convolution is a
+/// whole number of blocks — no scalar tail to special-case — and the kernel carries `LANES`
+/// independent partial sums, which is what breaks the serial `addss` dependency chain that
+/// otherwise costs ~9 cycles per tap. 16 lanes maps onto 2 × 256-bit accumulators with AVX2 and
+/// 4 × 128-bit on the baseline SSE2 build, both enough in-flight adds to saturate the FP ports.
+/// Every filter length this crate designs (`taps_per_phase = 2·half_taps`, `half_taps` ∈ 8..48)
+/// is already a multiple of 16, so the padding is normally zero-cost.
+const LANES: usize = 16;
+
+/// A designed prototype low-pass, decomposed into `L` polyphase branches. Branch `p` holds the
+/// `taps_per_phase` coefficients that the resampler dots against a window of input history.
+/// Immutable after [`design`](PolyphaseFilter::design).
 #[derive(Clone, Debug)]
 pub struct PolyphaseFilter {
     /// Upsampling factor `L` (interpolation ratio numerator).
@@ -68,9 +100,20 @@ pub struct PolyphaseFilter {
     pub m: usize,
     /// Taps per polyphase branch (the per-output multiply count).
     pub taps_per_phase: usize,
-    /// `L` branches × `taps_per_phase` coefficients, row-major in one contiguous buffer
-    /// (`phases[p * taps_per_phase + k]`). Flat (not `Vec<Vec>`) so `design` and `clone` are a
-    /// single allocation each, not `L`.
+    /// Storage pitch of one branch inside [`phases`](Self::phases): `taps_per_phase` rounded up
+    /// to a multiple of [`LANES`]. Also the length of the history window each output reads.
+    stride: usize,
+    /// `L` branches × `stride` coefficients, row-major in one contiguous buffer
+    /// (`phases[p * stride + j]`). Flat (not `Vec<Vec>`) so `design` and `clone` are a single
+    /// allocation each, not `L`.
+    ///
+    /// Within a branch the coefficients are stored **oldest-tap first** and **front-padded with
+    /// zeros**: `phases[p*stride + (stride-1-k)] == proto[p + k*L]` for `k < taps_per_phase`, and
+    /// the leading `stride - taps_per_phase` entries are `0.0`. Two consequences, both for the
+    /// hot loop: the dot product walks *both* arrays forward with unit stride (SIMD-loadable),
+    /// and the zero pad multiplies real, already-buffered history samples, so it contributes
+    /// exactly `0.0` and needs no tail loop. The delay line is seeded with `stride − 1` warm-up
+    /// zeros to cover the widened window.
     phases: Vec<f32>,
 }
 
@@ -120,17 +163,19 @@ impl PolyphaseFilter {
             *tap = (sinc * w * l as f64) as f32;
         }
 
-        // Scatter into `L` branches. Branch p, tap k := proto[p + k*L]; the innermost tap
-        // (k=0, nearest the interpolation instant) comes first so it dots a most-recent-first
-        // history window with no index arithmetic in the hot loop.
-        let mut phases = vec![0f32; taps_per_phase * l];
+        // Scatter into `L` branches. Branch p, tap k := proto[p + k*L], written *reversed* into
+        // the branch row (`stride-1-k`) and front-padded with zeros — see the `phases` field docs:
+        // the hot loop then walks coefficients and history in the same forward direction, which
+        // is what lets the dot product be a plain contiguous SIMD block loop.
+        let stride = taps_per_phase.next_multiple_of(LANES);
+        let mut phases = vec![0f32; stride * l];
         for p in 0..l {
             for k in 0..taps_per_phase {
-                phases[p * taps_per_phase + k] = proto[p + k * l];
+                phases[p * stride + (stride - 1 - k)] = proto[p + k * l];
             }
         }
 
-        PolyphaseFilter { l, m, taps_per_phase, phases }
+        PolyphaseFilter { l, m, taps_per_phase, stride, phases }
     }
 
     /// Total prototype length (all branches), `taps_per_phase · L`.
@@ -139,16 +184,51 @@ impl PolyphaseFilter {
     }
 
     /// The full designed prototype low-pass coefficients (branches re-interleaved), useful for
-    /// verifying the impulse response. `proto[p + k·L] == phases[p·taps_per_phase + k]`.
+    /// verifying the impulse response. `proto[p + k·L] == phases[p·stride + (stride−1−k)]`.
     pub fn prototype(&self) -> Vec<f32> {
         let mut proto = vec![0f32; self.prototype_len()];
         for p in 0..self.l {
             for k in 0..self.taps_per_phase {
-                proto[p + k * self.l] = self.phases[p * self.taps_per_phase + k];
+                proto[p + k * self.l] = self.phases[p * self.stride + (self.stride - 1 - k)];
             }
         }
         proto
     }
+}
+
+/// One output sample: `Σ_j c[j]·h[j]` over `LANES`-wide blocks, with `LANES` independent partial
+/// sums reduced by a fixed-shape binary tree.
+///
+/// `c.len() == h.len()` and both are an exact multiple of [`LANES`] (guaranteed by the branch
+/// stride), so this is a bounds-check-free loop over `&[f32; LANES]` chunks that the autovectoriser
+/// turns into packed multiply/add — 2 × `vmulps`/`vaddps` per block under AVX2, 4 × `mulps`/`addps`
+/// on baseline SSE2.
+///
+/// The block/tree summation order differs from a left-to-right scalar accumulation, so results are
+/// not bit-identical to a naive serial dot; pairwise summation has a strictly *smaller* error bound
+/// (`O(log n)·ε` rather than `O(n)·ε`), so this is the more accurate of the two. No `mul_add`: FMA
+/// would change rounding again for no throughput gain here (the loop is port-bound, not
+/// latency-bound, once the accumulators are split).
+#[inline(always)]
+fn dot(c: &[f32], h: &[f32]) -> f32 {
+    let (cb, _) = c.as_chunks::<LANES>();
+    let (hb, _) = h.as_chunks::<LANES>();
+    let mut acc = [0f32; LANES];
+    for (cc, hh) in cb.iter().zip(hb) {
+        for i in 0..LANES {
+            acc[i] += cc[i] * hh[i];
+        }
+    }
+    // Fixed-shape pairwise reduction (16 → 8 → 4 → 2 → 1); deterministic regardless of ISA.
+    let mut a8 = [0f32; 8];
+    for i in 0..8 {
+        a8[i] = acc[i] + acc[i + 8];
+    }
+    let mut a4 = [0f32; 4];
+    for i in 0..4 {
+        a4[i] = a8[i] + a8[i + 4];
+    }
+    (a4[0] + a4[2]) + (a4[1] + a4[3])
 }
 
 /// Streaming single-channel resampler state: a designed [`PolyphaseFilter`] plus the delay line
@@ -176,10 +256,11 @@ pub struct ChannelResampler {
 
 impl ChannelResampler {
     /// A streaming resampler from the given [`PolyphaseFilter`]. The delay line is pre-seeded
-    /// with `taps_per_phase − 1` zeros so the very first outputs are well-defined (a leading
-    /// transient, standard for causal FIR resampling).
+    /// with `stride − 1` zeros so the very first outputs are well-defined (a leading transient,
+    /// standard for causal FIR resampling). `stride ≥ taps_per_phase`; the extra warm-up samples
+    /// line up under the branch's zero pad and contribute nothing.
     pub fn new(filter: PolyphaseFilter) -> ChannelResampler {
-        let warmup = filter.taps_per_phase.saturating_sub(1);
+        let warmup = filter.stride.saturating_sub(1);
         ChannelResampler {
             filter,
             history: vec![0f32; warmup],
@@ -205,43 +286,50 @@ impl ChannelResampler {
     pub fn process<A: std::alloc::Allocator>(&mut self, input: &[f32], out: &mut Vec<f32, A>) -> usize {
         let l = self.filter.l;
         let m = self.filter.m;
-        let tpp = self.filter.taps_per_phase;
+        let stride = self.filter.stride;
+        self.history.reserve(input.len());
         self.history.extend_from_slice(input);
         self.consumed += input.len() as u64;
 
-        let before = out.len();
-        // Produce while the base index has `tpp` samples of history behind it (indices
-        // `in_pos-(tpp-1)..=in_pos` all present). `in_pos` is an index into `history`.
-        while self.in_pos < self.history.len() {
-            let branch = &self.filter.phases[self.phase * tpp..self.phase * tpp + tpp];
-            // Dot the branch against history[in_pos], history[in_pos-1], … (most-recent-first).
-            let mut acc = 0f32;
-            // `in_pos >= tpp-1` always holds here (seeded warm-up), so the window is in range.
-            let base = self.in_pos;
-            for (k, &c) in branch.iter().enumerate() {
-                acc += c * self.history[base - k];
-            }
-            out.push(acc);
+        // How many outputs this batch yields, in closed form. The loop condition is
+        // `in_pos < history.len()`, and after `n` outputs `in_pos = in_pos0 + (phase0 + n·M)/L`,
+        // so the first blocked output is `n = ceil((D·L − phase0) / M)` with `D = len − in_pos0`.
+        // Computing it up front buys an exact `reserve` (one allocation instead of a doubling
+        // ladder, and none at all in the steady state) and a counted loop with no per-output
+        // reload of `history.len()`.
+        let d = self.history.len().saturating_sub(self.in_pos);
+        let n_out = if d == 0 { 0 } else { (d * l - self.phase).div_ceil(m) };
+        out.reserve(n_out);
 
-            // Advance to the next output: m -> m+1 means (m·M) grows by M, so phase += M and
-            // the base input index steps by the integer part of the phase overflow.
-            let ph = self.phase + m;
-            self.in_pos += ph / l;
-            self.phase = ph % l;
+        {
+            let phases = &self.filter.phases[..];
+            let hist = &self.history[..];
+            let state = (self.in_pos, self.phase);
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            let (pos, phase) = if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: gated on runtime AVX2 detection; the body is plain safe Rust (no
+                // intrinsics) — `target_feature` only lets the autovectoriser use 256-bit lanes.
+                unsafe { run_avx2(phases, stride, l, m, hist, state, n_out, out) }
+            } else {
+                run_scalar(phases, stride, l, m, hist, state, n_out, out)
+            };
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            let (pos, phase) = run_scalar(phases, stride, l, m, hist, state, n_out, out);
+            self.in_pos = pos;
+            self.phase = phase;
         }
 
-        // Trim consumed history: keep the `tpp-1` samples before `in_pos` (the delay line the
+        // Trim consumed history: keep the `stride-1` samples before `in_pos` (the delay line the
         // next output still needs), and rebase `in_pos` to the new front. `in_pos` points one
-        // past the last usable input, so the retained tail starts at `in_pos-(tpp-1)`.
-        let keep_from = self.in_pos.saturating_sub(tpp - 1);
+        // past the last usable input, so the retained tail starts at `in_pos-(stride-1)`.
+        let keep_from = self.in_pos.saturating_sub(stride - 1);
         if keep_from > 0 {
             self.history.drain(..keep_from);
             self.in_pos -= keep_from;
         }
 
-        let n = out.len() - before;
-        self.produced += n as u64;
-        n
+        self.produced += n_out as u64;
+        n_out
     }
 
     /// Total input samples fed so far.
@@ -253,6 +341,66 @@ impl ChannelResampler {
     pub fn produced(&self) -> u64 {
         self.produced
     }
+}
+
+/// The output loop: `n_out` band-limited samples appended to `out`, advancing `(in_pos, phase)`.
+/// Split out of [`ChannelResampler::process`] so the whole loop — dot product *and* horizontal
+/// reduction — can be compiled once per instruction set (see [`run_avx2`]).
+///
+/// `state` is `(in_pos, phase)` on entry; the return is the same pair on exit. The caller
+/// guarantees `in_pos ≥ stride−1` and `in_pos + (phase + (n_out−1)·M)/L < hist.len()`, so both
+/// slices below are in range — one bounds check per output, hoisted out of the tap loop.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn run_scalar<A: std::alloc::Allocator>(
+    phases: &[f32],
+    stride: usize,
+    l: usize,
+    m: usize,
+    hist: &[f32],
+    state: (usize, usize),
+    n_out: usize,
+    out: &mut Vec<f32, A>,
+) -> (usize, usize) {
+    let (mut pos, mut phase) = state;
+    // `phase + M` never exceeds `L + M`, so the per-output `/L` and `%L` of the original
+    // formulation are one predictable compare-and-subtract on the pre-split quotient/remainder
+    // of M — integer-identical, but without a 20-plus-cycle hardware `div` per output sample.
+    let (m_div_l, m_mod_l) = (m / l, m % l);
+    for _ in 0..n_out {
+        let c = &phases[phase * stride..][..stride];
+        let h = &hist[pos + 1 - stride..][..stride];
+        out.push(dot(c, h));
+
+        let mut ph = phase + m_mod_l;
+        let mut step = m_div_l;
+        if ph >= l {
+            ph -= l;
+            step += 1;
+        }
+        phase = ph;
+        pos += step;
+    }
+    (pos, phase)
+}
+
+/// [`run_scalar`] recompiled with 256-bit lanes available. The workspace builds for baseline
+/// x86-64 (SSE2), so this is the only way the convolution sees `vmulps`/`vaddps` on `ymm`;
+/// `avx2` deliberately does **not** pull in `fma`, which would change the rounding of every tap.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_avx2<A: std::alloc::Allocator>(
+    phases: &[f32],
+    stride: usize,
+    l: usize,
+    m: usize,
+    hist: &[f32],
+    state: (usize, usize),
+    n_out: usize,
+    out: &mut Vec<f32, A>,
+) -> (usize, usize) {
+    run_scalar(phases, stride, l, m, hist, state, n_out, out)
 }
 
 /// Euclid's gcd for the rate reduction.
@@ -493,6 +641,106 @@ mod tests {
             assert!(
                 diff <= 2,
                 "len {inr}->{outr}: got {got}, expect ~{expect} (diff {diff})"
+            );
+        }
+    }
+
+    /// The pre-SIMD reference: one output sample as a strictly left-to-right scalar accumulation
+    /// over the branch, innermost tap first, exactly as [`ChannelResampler::process`] computed it
+    /// before the dot product was blocked into [`LANES`] partial sums. Kept so the numerical cost
+    /// of that reassociation stays measured rather than assumed.
+    /// `f64 == true` gives the (effectively exact) ground truth against which both `f32` orderings
+    /// are scored.
+    fn reference_resample(filt: &PolyphaseFilter, input: &[f32], exact: bool) -> Vec<f32> {
+        let (l, m, tpp) = (filt.l, filt.m, filt.taps_per_phase);
+        let proto = filt.prototype();
+        // The old layout: branch p, tap k := proto[p + k*L], innermost-tap first.
+        let branch: Vec<Vec<f32>> =
+            (0..l).map(|p| (0..tpp).map(|k| proto[p + k * l]).collect()).collect();
+
+        let mut hist = vec![0f32; tpp - 1];
+        hist.extend_from_slice(input);
+        let (mut pos, mut phase) = (tpp - 1, 0usize);
+        let mut out = Vec::new();
+        while pos < hist.len() {
+            if exact {
+                let mut acc = 0f64;
+                for (k, &c) in branch[phase].iter().enumerate() {
+                    acc += c as f64 * hist[pos - k] as f64;
+                }
+                out.push(acc as f32);
+            } else {
+                let mut acc = 0f32;
+                for (k, &c) in branch[phase].iter().enumerate() {
+                    acc += c * hist[pos - k];
+                }
+                out.push(acc);
+            }
+            let ph = phase + m;
+            pos += ph / l;
+            phase = ph % l;
+        }
+        out
+    }
+
+    /// Max |Δ| and SNR (dB) of `got` against `want`.
+    fn diff_stats(got: &[f32], want: &[f32]) -> (f64, f64) {
+        let (mut max_abs, mut sig, mut err) = (0f64, 0f64, 0f64);
+        for (a, b) in got.iter().zip(want) {
+            let d = (*a as f64) - (*b as f64);
+            max_abs = max_abs.max(d.abs());
+            sig += (*b as f64) * (*b as f64);
+            err += d * d;
+        }
+        (max_abs, 10.0 * (sig / err.max(f64::MIN_POSITIVE)).log10())
+    }
+
+    /// (Test 5) The blocked/SIMD dot product reassociates the tap sum, so it is deliberately
+    /// **not** bit-identical to the old left-to-right accumulation. Score *both* orderings against
+    /// an exact `f64` evaluation of the same convolution: the blocked form must be at least as
+    /// close to the truth as the serial one (pairwise summation has an `O(log n)·ε` error bound
+    /// where a serial chain has `O(n)·ε`), and its deviation from the old output must sit below
+    /// the quantisation floor of the PCM depths the pipeline emits.
+    #[test]
+    fn simd_dot_matches_serial_reference() {
+        // A broadband, full-scale-ish signal — worst case for cancellation in the tap sum.
+        let n = 40_000usize;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = (state >> 40) as f32 / 8_388_608.0 - 0.125;
+                let tone = 0.8 * (2.0 * PI * 997.0 * i as f64 / 44_100.0).sin() as f32;
+                (tone + noise).clamp(-1.0, 1.0)
+            })
+            .collect();
+
+        for (inr, outr, ht) in [(44_100u32, 48_000u32, 32usize), (48_000, 44_100, 32), (48_000, 24_000, 16)] {
+            let filt = PolyphaseFilter::design(inr, outr, ht, 9.0);
+            let serial = reference_resample(&filt, &input, false);
+            let exact = reference_resample(&filt, &input, true);
+            let mut got = Vec::new();
+            ChannelResampler::new(filt).process(&input, &mut got);
+            assert_eq!(got.len(), serial.len(), "{inr}->{outr}: output count must be unchanged");
+
+            let (d_max, d_snr) = diff_stats(&got, &serial); // new vs old
+            let (n_max, n_snr) = diff_stats(&got, &exact); // new vs truth
+            let (s_max, s_snr) = diff_stats(&serial, &exact); // old vs truth
+            println!(
+                "{inr}->{outr}  blocked-vs-serial: max|Δ| {d_max:.2e}, SNR {d_snr:.1} dB  |  \
+                 vs exact f64 — blocked: max|Δ| {n_max:.2e}, SNR {n_snr:.1} dB; \
+                 serial: max|Δ| {s_max:.2e}, SNR {s_snr:.1} dB"
+            );
+            // The reassociation stays ~1 f32 ULP of a full-scale sample — three orders below the
+            // 5.96e-8 LSB of 24-bit PCM's float image, i.e. inaudible at any depth we emit.
+            assert!(d_max < 2e-6, "{inr}->{outr}: blocked-vs-serial max |Δ| {d_max:e} too large");
+            assert!(d_snr > 130.0, "{inr}->{outr}: blocked-vs-serial SNR {d_snr} dB too low");
+            // And the new ordering is the *more* accurate of the two against ground truth.
+            assert!(
+                n_snr >= s_snr,
+                "{inr}->{outr}: blocked SNR {n_snr} dB must beat serial {s_snr} dB vs exact f64"
             );
         }
     }

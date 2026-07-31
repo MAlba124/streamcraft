@@ -23,11 +23,20 @@
 //!
 //! # Performance
 //!
-//! Conversion is one linear pass over the samples with a per-format-pair closure chosen
-//! once, up front — no per-sample matching on the format. The identity conversion
-//! (`from == to`, same channels) is a pure `memcpy`. Callers stream in whole interchannel
-//! frames; the element wrapper ([`crate::convert_element::AudioConvert`]) handles chunking
-//! and any partial-frame carry.
+//! Conversion is one linear pass over the samples. The `(from, to)` pair is resolved **once,
+//! before the loop**, into a specialised instance of [`convert_pair`] — a 5 × 5 match whose
+//! arms pass both formats as literals and both sample widths as const generics, so every
+//! per-sample format match, depth-dependent shift, and slice bound folds away at compile time
+//! and the loop autovectorises. (Resolving the formats *inside* the loop, as this file used to,
+//! made the compiler emit a jump table indexed per sample; the honest cost was an indirect
+//! branch and a re-derived shift for every sample of every buffer.) [`downmix_to_stereo`] and
+//! the stereo→mono half of [`remap_channels`] are structured the same way, layout included.
+//! On x86-64 each dispatch tree is also compiled a second time behind a runtime AVX2 check,
+//! because the workspace targets baseline SSE2.
+//!
+//! The identity conversion (`from == to`, same channels) is a pure `memcpy`. Callers stream in
+//! whole interchannel frames; the element wrapper ([`crate::convert_element::AudioConvert`])
+//! handles chunking and any partial-frame carry.
 
 use crate::format::SampleFormat;
 
@@ -175,12 +184,89 @@ fn convert_sample(from: SampleFormat, to: SampleFormat, src: &[u8], dst: &mut [u
     }
 }
 
+/// The per-pair inner loop, with **both** sample widths as const generics and both formats as
+/// call-site literals. Marked `#[inline(always)]` and reached only from [`dispatch_pair`]'s
+/// 5 × 5 match, so every instance sees `from`/`to` as constants: the format matches inside
+/// [`convert_sample`] fold away entirely, leaving straight-line shift/convert code over
+/// fixed-size `[u8; N]` chunks with no bounds checks and no per-sample branch.
+///
+/// This is what the module docs always claimed ("a per-format-pair closure chosen once, up
+/// front") but did not get: with the formats as runtime values the compiler built a *jump
+/// table indexed per sample* instead, so every sample paid an indirect branch plus the
+/// depth-dependent shift arithmetic. Purely a restructuring — the arithmetic per sample is
+/// unchanged, so output is bit-identical.
+#[inline(always)]
+fn convert_pair<const IN: usize, const OUT: usize>(
+    from: SampleFormat,
+    to: SampleFormat,
+    input: &[u8],
+    output: &mut [u8],
+) {
+    let (src, _) = input.as_chunks::<IN>();
+    let (dst, _) = output.as_chunks_mut::<OUT>();
+    for (s, d) in src.iter().zip(dst) {
+        convert_sample(from, to, s, d);
+    }
+}
+
+/// Expand the 5 target formats for one *fixed* source format. Paired with the outer `match`
+/// in [`dispatch_pair`] this is the full 5 × 5 specialisation.
+macro_rules! by_target {
+    ($from:path, $to:expr, $inp:expr, $outp:expr) => {
+        match $to {
+            SampleFormat::U8 => {
+                convert_pair::<{ $from.bytes() }, 1>($from, SampleFormat::U8, $inp, $outp)
+            }
+            SampleFormat::S16 => {
+                convert_pair::<{ $from.bytes() }, 2>($from, SampleFormat::S16, $inp, $outp)
+            }
+            SampleFormat::S24 => {
+                convert_pair::<{ $from.bytes() }, 3>($from, SampleFormat::S24, $inp, $outp)
+            }
+            SampleFormat::S32 => {
+                convert_pair::<{ $from.bytes() }, 4>($from, SampleFormat::S32, $inp, $outp)
+            }
+            SampleFormat::F32 => {
+                convert_pair::<{ $from.bytes() }, 4>($from, SampleFormat::F32, $inp, $outp)
+            }
+        }
+    };
+}
+
+/// Select and run the specialised loop for `(from, to)`. `#[inline(always)]` so the AVX2
+/// wrapper below recompiles the whole 5 × 5 tree with 256-bit lanes available.
+#[inline(always)]
+fn dispatch_pair(from: SampleFormat, to: SampleFormat, input: &[u8], output: &mut [u8]) {
+    match from {
+        SampleFormat::U8 => by_target!(SampleFormat::U8, to, input, output),
+        SampleFormat::S16 => by_target!(SampleFormat::S16, to, input, output),
+        SampleFormat::S24 => by_target!(SampleFormat::S24, to, input, output),
+        SampleFormat::S32 => by_target!(SampleFormat::S32, to, input, output),
+        SampleFormat::F32 => by_target!(SampleFormat::F32, to, input, output),
+    }
+}
+
+/// [`dispatch_pair`] recompiled with 256-bit lanes. The workspace builds for baseline x86-64
+/// (SSE2), so without this the widen/narrow loops top out at 128-bit `xmm`. No `fma` — the
+/// float paths must keep their exact multiply-then-round.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn dispatch_pair_avx2(
+    from: SampleFormat,
+    to: SampleFormat,
+    input: &[u8],
+    output: &mut [u8],
+) {
+    dispatch_pair(from, to, input, output);
+}
+
 /// Convert interleaved PCM `input` (format `from`, `channels` channels) into `to`, writing
 /// to `output`. Channel count is preserved. Returns the number of **bytes** written, or
 /// `None` if `input` is not a whole number of interchannel frames or `output` is too small.
 ///
-/// This is the workhorse: one pass, no allocation, no per-sample format branching (the
-/// branch on `(from, to)` is hoisted out of the loop by the closure the compiler inlines).
+/// This is the workhorse: one pass, no allocation, and no per-sample format branching — the
+/// `(from, to)` pair is resolved once, up front, into a specialised loop (see
+/// [`convert_pair`]).
 pub fn convert_interleaved(
     from: SampleFormat,
     to: SampleFormat,
@@ -206,13 +292,17 @@ pub fn convert_interleaved(
         return Some(input.len());
     }
 
-    let mut si = 0usize;
-    let mut di = 0usize;
-    for _ in 0..samples {
-        convert_sample(from, to, &input[si..si + in_bps], &mut output[di..di + out_bps]);
-        si += in_bps;
-        di += out_bps;
+    // Trim to exactly the sample count so the specialised loop's `as_chunks` pairing runs to
+    // the end of both slices.
+    let output = &mut output[..out_len];
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: gated on runtime AVX2 detection; the body is plain safe Rust (no intrinsics)
+        // — `target_feature` only lets the autovectoriser use 256-bit lanes.
+        unsafe { dispatch_pair_avx2(from, to, input, output) };
+        return Some(out_len);
     }
+    dispatch_pair(from, to, input, output);
     Some(out_len)
 }
 
@@ -285,35 +375,55 @@ pub fn remap_channels(
         }
         // Mono -> stereo: copy the sole channel into both output channels.
         (1, 2) => {
-            for f in 0..frames {
-                let s = &input[f * bps..f * bps + bps];
-                let d = f * 2 * bps;
-                output[d..d + bps].copy_from_slice(s);
-                output[d + bps..d + 2 * bps].copy_from_slice(s);
+            for (s, d) in input
+                .chunks_exact(bps)
+                .zip(output[..out_len].chunks_exact_mut(2 * bps))
+                .take(frames)
+            {
+                let (dl, dr) = d.split_at_mut(bps);
+                dl.copy_from_slice(s);
+                dr.copy_from_slice(s);
             }
             Some(out_len)
         }
         // Stereo -> mono: average L and R at 32-bit scale (float for F32), then re-encode.
+        // Format-dispatched once, up front (see `convert_pair`) so the per-sample match folds.
         (2, 1) => {
-            for f in 0..frames {
-                let base = f * 2 * bps;
-                let l = &input[base..base + bps];
-                let r = &input[base + bps..base + 2 * bps];
-                let d = &mut output[f * bps..f * bps + bps];
-                if fmt.is_float() {
-                    let avg = (decode_f32(l) + decode_f32(r)) * 0.5;
-                    d[..4].copy_from_slice(&avg.to_le_bytes());
-                } else {
-                    // Average at 32-bit scale (round to nearest), then narrow back.
-                    let a = decode_i32_scale32(fmt, l) as i64;
-                    let b = decode_i32_scale32(fmt, r) as i64;
-                    let avg = ((a + b) / 2) as i32;
-                    encode_i32_scale32(fmt, avg, d);
-                }
+            let output = &mut output[..out_len];
+            match fmt {
+                SampleFormat::U8 => stereo_to_mono::<1>(fmt, frames, input, output),
+                SampleFormat::S16 => stereo_to_mono::<2>(fmt, frames, input, output),
+                SampleFormat::S24 => stereo_to_mono::<3>(fmt, frames, input, output),
+                SampleFormat::S32 => stereo_to_mono::<4>(fmt, frames, input, output),
+                SampleFormat::F32 => stereo_to_mono::<4>(fmt, frames, input, output),
             }
             Some(out_len)
         }
         _ => None,
+    }
+}
+
+/// The stereo→mono average for one *fixed* sample format. Same arithmetic as the original
+/// per-sample form — bit-identical, just with the format resolved before the loop.
+#[inline(always)]
+fn stereo_to_mono<const BPS: usize>(
+    fmt: SampleFormat,
+    frames: usize,
+    input: &[u8],
+    output: &mut [u8],
+) {
+    for (fr, d) in input.chunks_exact(2 * BPS).zip(output.chunks_exact_mut(BPS)).take(frames) {
+        let (l, r) = fr.split_at(BPS);
+        if fmt.is_float() {
+            let avg = (decode_f32(l) + decode_f32(r)) * 0.5;
+            d[..4].copy_from_slice(&avg.to_le_bytes());
+        } else {
+            // Average at 32-bit scale (round to nearest), then narrow back.
+            let a = decode_i32_scale32(fmt, l) as i64;
+            let b = decode_i32_scale32(fmt, r) as i64;
+            let avg = ((a + b) / 2) as i32;
+            encode_i32_scale32(fmt, avg, d);
+        }
     }
 }
 
@@ -368,64 +478,133 @@ pub fn downmix_to_stereo(
         return None;
     }
 
-    // Read channel `c` of frame `f` as a float in the canonical [-1, 1) domain (integer
-    // formats are lifted to 32-bit scale first, exactly as the sample-format converter does).
-    let sample = |input: &[u8], f: usize, c: usize| -> f32 {
-        let b = &input[f * in_stride + c * bps..][..bps];
-        if fmt.is_float() {
-            decode_f32(b)
-        } else {
-            decode_i32_scale32(fmt, b) as f32 / 2_147_483_648.0
-        }
-    };
-    // Write a downmixed float sample back into output channel `oc` of frame `f`, clamped.
-    let put = |output: &mut [u8], f: usize, oc: usize, v: f32| {
-        let d = &mut output[(f * 2 + oc) * bps..][..bps];
-        if fmt.is_float() {
-            d.copy_from_slice(&v.clamp(-1.0, 1.0).to_le_bytes());
-        } else {
-            // Back to 32-bit scale, clamp, and narrow to the target depth via the shared
-            // encoder (which rounds + clamps per format).
-            let scaled = (v * 2_147_483_648.0).clamp(i32::MIN as f32, i32::MAX as f32);
-            encode_i32_scale32(fmt, scaled as i32, d);
-        }
-    };
-
-    for f in 0..frames {
-        let (lo, ro) = match in_channels {
-            // L R C — BS.775 §3: centre at −3 dB into both fronts.
-            3 => {
-                let (l, r, c) = (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2));
-                (l + M3DB * c, r + M3DB * c)
-            }
-            // L R Ls Rs (quad) — surrounds at −3 dB into the same-side front.
-            4 => {
-                let (l, r, ls, rs) =
-                    (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2), sample(input, f, 3));
-                (l + M3DB * ls, r + M3DB * rs)
-            }
-            // L R C Ls Rs (5.0) and L R C LFE Ls Rs (5.1): centre + same-side surround at
-            // −3 dB; LFE (index 3, present only for 5.1) is dropped per BS.775.
-            5 | 6 => {
-                let (ls_i, rs_i) = if in_channels == 6 { (4, 5) } else { (3, 4) };
-                let (l, r, c) = (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2));
-                let (ls, rs) = (sample(input, f, ls_i), sample(input, f, rs_i));
-                (l + M3DB * (c + ls), r + M3DB * (c + rs))
-            }
-            // L R C LFE Ls Rs Lb Rb (7.1): both surround pairs fold to their side; LFE dropped.
-            8 => {
-                let (l, r, c) = (sample(input, f, 0), sample(input, f, 1), sample(input, f, 2));
-                let (ls, rs, lb, rb) =
-                    (sample(input, f, 4), sample(input, f, 5), sample(input, f, 6), sample(input, f, 7));
-                (l + M3DB * (c + ls + lb), r + M3DB * (c + rs + rb))
-            }
-            // Unknown layout: pass the first two channels through unmodified.
-            _ => (sample(input, f, 0), sample(input, f, 1)),
-        };
-        put(output, f, 0, lo);
-        put(output, f, 1, ro);
+    let output = &mut output[..out_len];
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: gated on runtime AVX2 detection; the body is plain safe Rust (no intrinsics)
+        // — `target_feature` only lets the autovectoriser use 256-bit lanes.
+        unsafe { downmix_dispatch_avx2(fmt, in_channels, frames, input, output) };
+        return Some(out_len);
     }
+    downmix_dispatch(fmt, in_channels, frames, input, output);
     Some(out_len)
+}
+
+/// Read channel `c` of a frame slice as a float in the canonical [−1, 1) domain (integer formats
+/// are lifted to 32-bit scale first, exactly as the sample-format converter does). `fmt` is a
+/// call-site literal, so the format match folds away.
+#[inline(always)]
+fn downmix_get(fmt: SampleFormat, b: &[u8]) -> f32 {
+    if fmt.is_float() {
+        decode_f32(b)
+    } else {
+        decode_i32_scale32(fmt, b) as f32 / 2_147_483_648.0
+    }
+}
+
+/// Write a downmixed float sample back into one output channel, clamped.
+#[inline(always)]
+fn downmix_put(fmt: SampleFormat, v: f32, d: &mut [u8]) {
+    if fmt.is_float() {
+        d[..4].copy_from_slice(&v.clamp(-1.0, 1.0).to_le_bytes());
+    } else {
+        // Back to 32-bit scale, clamp, and narrow to the target depth via the shared encoder
+        // (which rounds + clamps per format).
+        let scaled = (v * 2_147_483_648.0).clamp(i32::MIN as f32, i32::MAX as f32);
+        encode_i32_scale32(fmt, scaled as i32, d);
+    }
+}
+
+/// The BS.775 fold for one *fixed* sample format, layout-dispatched **once** rather than per
+/// frame. `BPS` and the per-arm channel count are compile-time constants, so each arm becomes a
+/// straight-line body over a fixed-size frame with no bounds checks, no per-sample format match,
+/// and no per-frame layout branch. Same arithmetic as before, in the same order — bit-identical.
+#[inline(always)]
+fn downmix_fmt<const BPS: usize>(
+    fmt: SampleFormat,
+    in_channels: usize,
+    frames: usize,
+    input: &[u8],
+    output: &mut [u8],
+) {
+    /// One layout: `$nch` input channels, `$mix` the BS.775 matrix over the decoded frame.
+    macro_rules! fold {
+        ($nch:expr, $mix:expr) => {{
+            const NCH: usize = $nch;
+            let mix = $mix;
+            for (fr, dst) in
+                input.chunks_exact(BPS * NCH).zip(output.chunks_exact_mut(2 * BPS)).take(frames)
+            {
+                let mut s = [0f32; NCH];
+                for (c, sc) in s.iter_mut().enumerate() {
+                    *sc = downmix_get(fmt, &fr[c * BPS..][..BPS]);
+                }
+                let (lo, ro) = mix(&s);
+                let (dl, dr) = dst.split_at_mut(BPS);
+                downmix_put(fmt, lo, dl);
+                downmix_put(fmt, ro, dr);
+            }
+        }};
+    }
+
+    match in_channels {
+        // L R C — BS.775 §3: centre at −3 dB into both fronts.
+        3 => fold!(3, |s: &[f32; 3]| (s[0] + M3DB * s[2], s[1] + M3DB * s[2])),
+        // L R Ls Rs (quad) — surrounds at −3 dB into the same-side front.
+        4 => fold!(4, |s: &[f32; 4]| (s[0] + M3DB * s[2], s[1] + M3DB * s[3])),
+        // L R C Ls Rs (5.0): centre + same-side surround at −3 dB.
+        5 => fold!(5, |s: &[f32; 5]| (s[0] + M3DB * (s[2] + s[3]), s[1] + M3DB * (s[2] + s[4]))),
+        // L R C LFE Ls Rs (5.1): as 5.0, with the LFE (index 3) dropped per BS.775.
+        6 => fold!(6, |s: &[f32; 6]| (s[0] + M3DB * (s[2] + s[4]), s[1] + M3DB * (s[2] + s[5]))),
+        // L R C LFE Ls Rs Lb Rb (7.1): both surround pairs fold to their side; LFE dropped.
+        8 => fold!(8, |s: &[f32; 8]| {
+            (s[0] + M3DB * (s[2] + s[4] + s[6]), s[1] + M3DB * (s[2] + s[5] + s[7]))
+        }),
+        // Unknown layout: pass the first two channels through unmodified. Rare, and the stride
+        // is not a constant here, so it keeps the plain indexed form.
+        n => {
+            let in_stride = BPS * n;
+            for (fr, dst) in
+                input.chunks_exact(in_stride).zip(output.chunks_exact_mut(2 * BPS)).take(frames)
+            {
+                let (lo, ro) = (downmix_get(fmt, &fr[..BPS]), downmix_get(fmt, &fr[BPS..][..BPS]));
+                let (dl, dr) = dst.split_at_mut(BPS);
+                downmix_put(fmt, lo, dl);
+                downmix_put(fmt, ro, dr);
+            }
+        }
+    }
+}
+
+/// Resolve the sample format once, up front, into a [`downmix_fmt`] instantiation.
+#[inline(always)]
+fn downmix_dispatch(
+    fmt: SampleFormat,
+    in_channels: usize,
+    frames: usize,
+    input: &[u8],
+    output: &mut [u8],
+) {
+    match fmt {
+        SampleFormat::U8 => downmix_fmt::<1>(fmt, in_channels, frames, input, output),
+        SampleFormat::S16 => downmix_fmt::<2>(fmt, in_channels, frames, input, output),
+        SampleFormat::S24 => downmix_fmt::<3>(fmt, in_channels, frames, input, output),
+        SampleFormat::S32 => downmix_fmt::<4>(fmt, in_channels, frames, input, output),
+        SampleFormat::F32 => downmix_fmt::<4>(fmt, in_channels, frames, input, output),
+    }
+}
+
+/// [`downmix_dispatch`] recompiled with 256-bit lanes (the workspace targets baseline SSE2).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn downmix_dispatch_avx2(
+    fmt: SampleFormat,
+    in_channels: usize,
+    frames: usize,
+    input: &[u8],
+    output: &mut [u8],
+) {
+    downmix_dispatch(fmt, in_channels, frames, input, output);
 }
 
 #[cfg(test)]
@@ -884,6 +1063,150 @@ mod tests {
         downmix_to_stereo(SampleFormat::S16, 6, &input, &mut out).unwrap();
         assert_eq!(i16::from_le_bytes([out[0], out[1]]), i16::MAX); // clamped, not wrapped
         assert_eq!(i16::from_le_bytes([out[2], out[3]]), i16::MAX);
+    }
+
+    // --- the format-dispatch hoist is bit-exact ---------------------------------------
+
+    /// Deterministic pseudo-random bytes (xorshift64), for exhaustive differential testing.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 29) as u8
+            })
+            .collect()
+    }
+
+    /// The pre-hoist form of [`convert_interleaved`]: `(from, to)` re-matched per sample.
+    fn reference_convert(from: SampleFormat, to: SampleFormat, input: &[u8]) -> Vec<u8> {
+        let (ib, ob) = (from.bytes(), to.bytes());
+        let mut out = vec![0u8; (input.len() / ib) * ob];
+        let (mut si, mut di) = (0usize, 0usize);
+        for _ in 0..input.len() / ib {
+            convert_sample(from, to, &input[si..si + ib], &mut out[di..di + ob]);
+            si += ib;
+            di += ob;
+        }
+        out
+    }
+
+    /// (Regression) Resolving `(from, to)` into a specialised loop instead of re-matching every
+    /// sample is a pure restructuring: byte-for-byte identical output for every format pair over
+    /// a broad random input, including the float paths where the rounding is easiest to perturb.
+    #[test]
+    fn dispatch_hoist_is_byte_exact_for_every_pair() {
+        let src = noise(48_000);
+        for from in ALL_FORMATS {
+            for to in ALL_FORMATS {
+                let n = (src.len() / (from.bytes() * 2)) * from.bytes() * 2; // whole stereo frames
+                let got = convert_interleaved_vec(from, to, 2, &src[..n]).unwrap();
+                let want = if from == to {
+                    src[..n].to_vec()
+                } else {
+                    reference_convert(from, to, &src[..n])
+                };
+                assert_eq!(got, want, "{from:?}->{to:?} must be byte-identical after the hoist");
+            }
+        }
+    }
+
+    /// The pre-hoist form of [`downmix_to_stereo`]: `fmt` re-matched per sample and the layout
+    /// re-matched per frame.
+    fn reference_downmix(fmt: SampleFormat, in_channels: usize, input: &[u8]) -> Vec<u8> {
+        let bps = fmt.bytes();
+        let in_stride = bps * in_channels;
+        let frames = input.len() / in_stride;
+        let mut output = vec![0u8; frames * bps * 2];
+        let sample = |f: usize, c: usize| -> f32 {
+            let b = &input[f * in_stride + c * bps..][..bps];
+            if fmt.is_float() {
+                decode_f32(b)
+            } else {
+                decode_i32_scale32(fmt, b) as f32 / 2_147_483_648.0
+            }
+        };
+        for f in 0..frames {
+            let (lo, ro) = match in_channels {
+                3 => (sample(f, 0) + M3DB * sample(f, 2), sample(f, 1) + M3DB * sample(f, 2)),
+                4 => (sample(f, 0) + M3DB * sample(f, 2), sample(f, 1) + M3DB * sample(f, 3)),
+                5 | 6 => {
+                    let (ls_i, rs_i) = if in_channels == 6 { (4, 5) } else { (3, 4) };
+                    let c = sample(f, 2);
+                    (
+                        sample(f, 0) + M3DB * (c + sample(f, ls_i)),
+                        sample(f, 1) + M3DB * (c + sample(f, rs_i)),
+                    )
+                }
+                8 => {
+                    let c = sample(f, 2);
+                    (
+                        sample(f, 0) + M3DB * (c + sample(f, 4) + sample(f, 6)),
+                        sample(f, 1) + M3DB * (c + sample(f, 5) + sample(f, 7)),
+                    )
+                }
+                _ => (sample(f, 0), sample(f, 1)),
+            };
+            for (oc, v) in [lo, ro].into_iter().enumerate() {
+                let d = &mut output[(f * 2 + oc) * bps..][..bps];
+                if fmt.is_float() {
+                    d[..4].copy_from_slice(&v.clamp(-1.0, 1.0).to_le_bytes());
+                } else {
+                    let scaled = (v * 2_147_483_648.0).clamp(i32::MIN as f32, i32::MAX as f32);
+                    encode_i32_scale32(fmt, scaled as i32, d);
+                }
+            }
+        }
+        output
+    }
+
+    /// (Regression) Same for the BS.775 fold and the stereo→mono average: every supported format
+    /// × every layout (including the 7-channel fallback) is byte-identical to the pre-hoist code.
+    #[test]
+    fn downmix_and_remap_hoists_are_byte_exact() {
+        let src = noise(60_000);
+        for fmt in ALL_FORMATS {
+            for ch in [3usize, 4, 5, 6, 7, 8] {
+                let stride = fmt.bytes() * ch;
+                let n = (src.len() / stride) * stride;
+                let mut got = vec![0u8; (n / stride) * fmt.bytes() * 2];
+                downmix_to_stereo(fmt, ch, &src[..n], &mut got).unwrap();
+                assert_eq!(
+                    got,
+                    reference_downmix(fmt, ch, &src[..n]),
+                    "downmix {fmt:?} {ch}ch must be byte-identical after the hoist"
+                );
+            }
+            // Stereo -> mono, and mono -> stereo.
+            let stride = fmt.bytes() * 2;
+            let n = (src.len() / stride) * stride;
+            let mut mono = vec![0u8; n / 2];
+            remap_channels(fmt, 2, 1, &src[..n], &mut mono).unwrap();
+            let mut want = vec![0u8; n / 2];
+            for (f, d) in want.chunks_exact_mut(fmt.bytes()).enumerate() {
+                let base = f * stride;
+                let (l, r) =
+                    (&src[base..][..fmt.bytes()], &src[base + fmt.bytes()..][..fmt.bytes()]);
+                if fmt.is_float() {
+                    d.copy_from_slice(&((decode_f32(l) + decode_f32(r)) * 0.5).to_le_bytes());
+                } else {
+                    let a = decode_i32_scale32(fmt, l) as i64;
+                    let b = decode_i32_scale32(fmt, r) as i64;
+                    encode_i32_scale32(fmt, ((a + b) / 2) as i32, d);
+                }
+            }
+            assert_eq!(mono, want, "stereo->mono {fmt:?} must be byte-identical");
+
+            let mut stereo = vec![0u8; n * 2];
+            remap_channels(fmt, 1, 2, &src[..n], &mut stereo).unwrap();
+            for (f, d) in stereo.chunks_exact(stride).enumerate() {
+                let s = &src[f * fmt.bytes()..][..fmt.bytes()];
+                assert_eq!(&d[..fmt.bytes()], s, "mono->stereo L at {f}");
+                assert_eq!(&d[fmt.bytes()..], s, "mono->stereo R at {f}");
+            }
+        }
     }
 
     /// An unknown channel count > 2 passes the first two channels through unmodified.
