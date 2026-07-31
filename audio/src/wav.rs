@@ -11,7 +11,7 @@
 //! caps propagation.
 
 use profluens_core::batch::Inputs;
-use profluens_core::ctx::Ctx;
+use profluens_core::ctx::{Ctx, SeekTarget};
 use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
 };
@@ -213,7 +213,10 @@ pub struct WavParse {
     header: Option<WavHeader>,
     /// Bytes accumulated while the header is still incomplete (dropped once parsed).
     acc: Vec<u8>,
-    /// PCM bytes emitted so far, to honour `data_len` and stop at the payload's end.
+    /// How far into the `data` chunk the next incoming byte sits, so `data_len` can be honoured
+    /// and trailing post-`data` chunks dropped. A **position**, not a running total: a seek
+    /// re-derives it from the seek target (see [`WavParse::rebase_on_flush`]) rather than
+    /// letting it accumulate across passes over the file.
     data_emitted: u64,
 }
 
@@ -225,6 +228,41 @@ impl WavParse {
     /// The parsed audio format, available once the header has been seen.
     pub fn format(&self) -> Option<AudioFormat> {
         self.header.as_ref().map(|h| h.format)
+    }
+
+    /// Re-derive the payload cursor after a flush (spec: flush/seek).
+    ///
+    /// `data_emitted` clamps output to the declared `data_len`, so it has to mean "how far into
+    /// the `data` chunk we are", not "how many bytes this element has ever pushed". A seek moves
+    /// the source's read head without this element seeing the jump, so left alone the counter
+    /// becomes the *sum* over every pass across the file: after enough seeks it exceeds
+    /// `data_len`, `remaining` saturates to zero, and `emit_data` silently truncates the rest of
+    /// the stream — audio simply stops, with no error anywhere.
+    ///
+    /// The target's `to_byte` is a **file** offset — the very offset `filesrc` resumes reading
+    /// at, read verbatim by both elements from the same [`SeekTarget`] — so the payload position
+    /// is that offset taken relative to the start of the `data` chunk body. Three cases:
+    ///
+    /// * `to_byte` at or past `data_offset`: the ordinary mid-payload seek. The parsed header
+    ///   stands and the cursor becomes `to_byte - data_offset`, so the remaining budget is
+    ///   exactly the payload still ahead of the new read head.
+    /// * `to_byte` *before* `data_offset` — which is how "back to the start" is spelled when the
+    ///   seek index maps time 0 to file byte 0. The bytes about to arrive are the RIFF header
+    ///   again, not PCM, so the parsed header is dropped and re-parsed rather than emitted as
+    ///   audio.
+    /// * no seek target: a flush that is not a seek, or one delivered before any seek was
+    ///   recorded. There is nothing better to infer than the start of the payload — which is
+    ///   also the one direction that can never truncate.
+    fn rebase_on_flush(&mut self, target: Option<SeekTarget>) {
+        self.acc.clear();
+        self.data_emitted = 0;
+        let (Some(t), Some(h)) = (target, self.header.as_ref()) else { return };
+        let data_offset = h.data_offset as u64;
+        if t.to_byte >= data_offset {
+            self.data_emitted = t.to_byte - data_offset;
+        } else {
+            self.header = None;
+        }
     }
 
     /// Emit `bytes` as PCM on the src pad, clamped to the declared `data_len` (so trailing
@@ -300,7 +338,14 @@ impl Element for WavParse {
         Ok(Flow::Ok)
     }
 
-    fn event(&mut self, _ctx: &mut Ctx, _event: &Event) -> Result<(), Error> {
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        if matches!(event, Event::FlushStart) {
+            // Seek (spec: flush/seek): the byte cursor has to follow the source's new read
+            // head, or the `data_len` clamp starts eating the stream. The source reads
+            // `to_byte` from the same target to decide where to resume; this element reads it
+            // to decide where in the payload those bytes land.
+            self.rebase_on_flush(ctx.seek_target());
+        }
         Ok(())
     }
 
@@ -403,5 +448,84 @@ mod tests {
         let mut wav = wav_header(&fmt, 0);
         wav[34] = 12; // overwrite bits-per-sample field
         assert!(matches!(parse_wav_header(&wav), Err(WavError::Unsupported { bits: 12, .. })));
+    }
+
+    // --- Flush / seek: the payload cursor ---------------------------------------------
+    //
+    // A `SeekTarget` cannot be installed on a `Ctx` from outside `profluens-core`
+    // (`Ctx::set_seek` is `pub(crate)`), so the resolved target is threaded through
+    // `rebase_on_flush` and exercised directly here. The harness test in `tests/wavparse.rs`
+    // covers the no-target path end to end.
+
+    /// A `WavParse` that has already parsed a header, with `emitted` payload bytes behind it.
+    fn parsed(data_offset: usize, data_len: u64, emitted: u64) -> WavParse {
+        let mut w = WavParse::new();
+        w.header = Some(WavHeader {
+            format: AudioFormat::new(48_000, 2, SampleFormat::S16),
+            data_offset,
+            data_len: Some(data_len),
+        });
+        w.data_emitted = emitted;
+        w
+    }
+
+    #[test]
+    fn flush_rebases_the_payload_cursor_onto_the_seek_target() {
+        // `to_byte` is a file offset — the same one filesrc resumes reading at — so the payload
+        // cursor is that offset taken relative to the start of the data chunk body.
+        let mut w = parsed(44, 1_000, 900);
+        w.rebase_on_flush(Some(SeekTarget {
+            to_byte: 44 + 400,
+            to_time: Timestamp::from_secs(1),
+        }));
+        assert_eq!(w.data_emitted, 400, "cursor = to_byte - data_offset");
+        assert!(w.format().is_some(), "a mid-payload seek keeps the parsed header");
+    }
+
+    #[test]
+    fn repeated_flushes_do_not_accumulate_the_cursor() {
+        // The bug this guards: `data_emitted` used to be a running total, so N seeks summed N
+        // passes over the file, `remaining` saturated to zero, and output stopped mid-stream
+        // with nothing on the bus to explain it.
+        let mut w = parsed(44, 1_000, 0);
+        for pass in 0..10 {
+            w.data_emitted += 900; // most of a pass over the payload
+            w.rebase_on_flush(Some(SeekTarget { to_byte: 44, to_time: Timestamp::ZERO }));
+            assert_eq!(w.data_emitted, 0, "pass {pass}: a seek to the payload start consumed 0");
+        }
+        // The clamp still has the whole payload available after ten seeks.
+        let remaining = w.header.unwrap().data_len.unwrap() - w.data_emitted;
+        assert_eq!(remaining, 1_000, "the full data chunk is still playable");
+    }
+
+    #[test]
+    fn flush_before_the_data_chunk_re_parses_the_header() {
+        // "Back to the start" spelled as file byte 0: the bytes about to arrive are the RIFF
+        // header again, so it must be re-parsed rather than emitted as audio.
+        let mut w = parsed(44, 1_000, 500);
+        w.rebase_on_flush(Some(SeekTarget { to_byte: 0, to_time: Timestamp::ZERO }));
+        assert_eq!(w.data_emitted, 0);
+        assert!(w.format().is_none(), "the header must be re-parsed from the incoming bytes");
+    }
+
+    #[test]
+    fn flush_without_a_seek_target_rewinds_to_the_payload_start() {
+        let mut w = parsed(44, 1_000, 900);
+        w.rebase_on_flush(None);
+        assert_eq!(
+            w.data_emitted, 0,
+            "no target: rewind — the one direction that cannot truncate"
+        );
+        assert!(w.format().is_some(), "a plain flush does not invalidate the header");
+    }
+
+    #[test]
+    fn flush_past_the_payload_end_yields_no_output_rather_than_wrapping() {
+        // A seek past the end: the clamp must saturate to "nothing left", not underflow.
+        let mut w = parsed(44, 1_000, 0);
+        w.rebase_on_flush(Some(SeekTarget { to_byte: 44 + 5_000, to_time: Timestamp::ZERO }));
+        assert_eq!(w.data_emitted, 5_000);
+        let total = w.header.unwrap().data_len.unwrap();
+        assert_eq!(total.saturating_sub(w.data_emitted), 0, "nothing left to emit");
     }
 }

@@ -6,7 +6,9 @@
 //! the pipeline interns at link time. [`SampleFormat::caps_name`] is the single source of
 //! truth for those categorical names, so offers, WAV parsing, and views never drift.
 
-use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, ValueDesc};
+use profluens_core::ctx::Ctx;
+use profluens_core::format::{ConstraintDesc, FieldDesc, OfferDesc, Value, ValueDesc};
+use profluens_core::id::PadId;
 
 /// The negotiation family for uncompressed interleaved PCM.
 pub const FAMILY: &str = "audio/raw";
@@ -119,6 +121,57 @@ impl AudioFormat {
     pub const fn bits_per_sample(self) -> u32 {
         self.format.bits()
     }
+}
+
+/// `48000 Hz 2 ch s16` — the compact spelling used in bus messages and logs, so a diagnostic
+/// reads as caps rather than as a struct dump.
+impl std::fmt::Display for AudioFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} Hz {} ch {}",
+            self.sample_rate,
+            self.channels,
+            self.format.caps_name()
+        )
+    }
+}
+
+/// The `audio/raw` format currently fixed on `pad`, as a concrete [`AudioFormat`] — or `None`
+/// when the pad carries no format yet, or one whose `rate`/`channels`/`sample` do not all
+/// resolve (a partly-open edge, or a `sample` id with no name in the vocabulary).
+///
+/// Every field is read **by name** through the shared
+/// [`Vocabulary`](profluens_core::format::Vocabulary): `ctx.field_id(..)` resolves the field id
+/// and `ctx.value_name(..)` reverses the interned `sample` id back to a caps name — the
+/// consumer-side pattern `audioconvert`/`audioresample`/`flacdec` all follow. Read-only and
+/// side-effect free, so an element can ask "what is on my sink *now*?" independently of what it
+/// has already latched (that is how the glue elements detect a mid-stream format change).
+pub fn negotiated_audio_format(ctx: &Ctx, pad: PadId) -> Option<AudioFormat> {
+    let fixed = ctx.negotiated(pad)?;
+    let int_field = |name: &str| -> Option<i64> {
+        ctx.field_id(name)
+            .and_then(|id| fixed.get(id))
+            .and_then(|v| match v {
+                Value::Int(n) => Some(n),
+                _ => None,
+            })
+    };
+    let (rate, channels) = (int_field(FIELD_RATE)?, int_field(FIELD_CHANNELS)?);
+    // Bounds as well as sign: the caps algebra carries `i64`, an `AudioFormat` carries
+    // `u32`/`u16`, and a hostile or buggy upstream must not wrap into a plausible-looking rate.
+    if rate <= 0 || channels <= 0 || rate > u32::MAX as i64 || channels > u16::MAX as i64 {
+        return None;
+    }
+    let sample = ctx
+        .field_id(FIELD_SAMPLE)
+        .and_then(|id| fixed.get(id))
+        .and_then(|v| match v {
+            Value::Id(vid) => ctx.value_name(vid),
+            _ => None,
+        })
+        .and_then(SampleFormat::from_caps_name)?;
+    Some(AudioFormat::new(rate as u32, channels as u16, sample))
 }
 
 // --- The `audio/raw` negotiation offer ------------------------------------------------

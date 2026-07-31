@@ -26,6 +26,7 @@
 //! byte (the announcement still fires, so downstream sees the format).
 
 use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
@@ -37,7 +38,10 @@ use profluens_core::id::PadId;
 use profluens_core::time::Timestamp;
 
 use crate::convert::{convert_interleaved, converted_len};
-use crate::format::{AudioFormat, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
+use crate::format::{
+    negotiated_audio_format, AudioFormat, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE,
+    FIELD_SAMPLE,
+};
 
 const SINK: PadId = PadId(0);
 const SRC: PadId = PadId(1);
@@ -138,6 +142,10 @@ pub struct AudioConvert {
     /// even before a full input format is pinned. Once all three fields resolve, `input` is
     /// set and this is redundant.
     partial_in: Option<(u32, u16)>,
+    /// The mid-stream format this element has already complained about, so the warning is
+    /// posted once per *distinct* change rather than on every `FormatChange` an upstream
+    /// repeats — see [`warn_if_relatched`](AudioConvert::warn_if_relatched).
+    warned_relatch: Option<AudioFormat>,
 }
 
 impl AudioConvert {
@@ -171,6 +179,7 @@ impl AudioConvert {
             carry: Vec::new(),
             scratch: Vec::new(),
             partial_in: None,
+            warned_relatch: None,
         }
     }
 
@@ -345,11 +354,28 @@ impl Element for AudioConvert {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // An upstream's runtime format announcement arrives as a FormatChange on our sink
-        // (spec: dynamic caps). The pipeline updates `ctx.negotiated(sink)` *before* calling
-        // us, so the fresh concrete format is already on the sink pad either way — a
-        // FormatChange re-arms inference, and any other event is a cheap no-op once learned.
-        if matches!(event, Event::FormatChange(_)) || self.input.is_none() {
+        match event {
+            // Seek (spec: flush/seek). `carry` holds the tail of a *pre-seek* interchannel
+            // frame. Keeping it would prepend those bytes to the first post-seek buffer, so
+            // every following sample sits a part-frame late in the interleave — on a stereo
+            // stream that is a permanent L/R swap, on a 5.1 one a channel rotation, and it
+            // never resyncs because the offset is carried forward, not corrected. Conversion
+            // itself is memoryless (each sample maps independently), so there is no filter
+            // state to drop besides this. The learned input format deliberately survives: a
+            // seek moves the read head, it does not change what the upstream is sending.
+            Event::FlushStart => self.carry.clear(),
+            // An upstream's runtime format announcement arrives as a FormatChange on our sink
+            // (spec: dynamic caps). The pipeline updates `ctx.negotiated(sink)` *before*
+            // calling us, so the fresh concrete format is already on the sink pad — a
+            // FormatChange re-arms inference (a no-op once learned) and, when it disagrees
+            // with what we latched, earns a bus warning.
+            Event::FormatChange(_) => {
+                self.learn_from_sink(ctx);
+                self.warn_if_relatched(ctx);
+            }
+            _ => {}
+        }
+        if self.input.is_none() {
             self.learn_from_sink(ctx);
         }
         Ok(())
@@ -416,5 +442,41 @@ impl AudioConvert {
             // partial so output_format reports the negotiated stream; input stays unset.
             None => self.partial_in = Some((rate as u32, channels as u16)),
         }
+    }
+
+    /// Complain on the bus when the sink's negotiated format has moved away from the one this
+    /// element latched.
+    ///
+    /// [`learn_from_sink`](Self::learn_from_sink) pins the input format at the *first*
+    /// negotiation and short-circuits ever after, so a mid-stream change is **ignored**: later
+    /// buffers keep being read as the latched format, which turns into wrong sample widths,
+    /// wrong channel counts, and garbage audio with nothing on the bus to explain it. Actually
+    /// re-latching means draining the carry, re-announcing downstream and re-fixating the whole
+    /// tail of the graph — gapless-playback work that has its own design and is deliberately
+    /// not attempted here. So the contract is: keep the old format, but say so, loudly.
+    ///
+    /// Posted once per *distinct* format (an upstream that re-announces the same caps is
+    /// silent after the first message) and only from the event path, so it can never fire
+    /// per buffer.
+    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
+        let Some(latched) = self.input else { return };
+        let Some(offered) = negotiated_audio_format(ctx, SINK) else { return };
+        if offered == latched || self.warned_relatch == Some(offered) {
+            return;
+        }
+        self.warned_relatch = Some(offered);
+        let element = ctx.element();
+        ctx.post(BusMessage::Warning {
+            element,
+            error: Error::Element {
+                element,
+                message: format!(
+                    "audioconvert: ignoring a mid-stream input format change ({latched} -> \
+                     {offered}); this element latches its input format at the first negotiation \
+                     and keeps reading every later buffer as the latched one. Rebuild the branch \
+                     (or insert a fresh audioconvert) to follow the change."
+                ),
+            },
+        });
     }
 }

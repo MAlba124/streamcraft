@@ -19,6 +19,7 @@
 //! through byte-for-byte (the announcement still fires so downstream sees the format).
 
 use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
@@ -30,7 +31,10 @@ use profluens_core::id::PadId;
 use profluens_core::time::Timestamp;
 
 use crate::convert::downmix_to_stereo;
-use crate::format::{SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
+use crate::format::{
+    negotiated_audio_format, AudioFormat, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE,
+    FIELD_SAMPLE,
+};
 
 const SINK: PadId = PadId(0);
 const SRC: PadId = PadId(1);
@@ -94,6 +98,9 @@ pub struct AudioDownmix {
     carry: Vec<u8>,
     /// Reused downmix output buffer, so steady state does not allocate.
     scratch: Vec<u8>,
+    /// The mid-stream format this element has already complained about, so the warning is
+    /// posted once per *distinct* change — see [`warn_if_relatched`](AudioDownmix::warn_if_relatched).
+    warned_relatch: Option<AudioFormat>,
 }
 
 impl AudioDownmix {
@@ -144,6 +151,43 @@ impl AudioDownmix {
         if let Some(fmt) = sample {
             self.set_input(rate as u32, channels as u16, fmt);
         }
+    }
+
+    /// Complain on the bus when the sink's negotiated format has moved away from the one this
+    /// element latched.
+    ///
+    /// [`learn_from_sink`](Self::learn_from_sink) pins the input format at the *first*
+    /// negotiation and short-circuits ever after, so a mid-stream change is **ignored** — and
+    /// here the ignored field that matters most is `channels`: the fold reads frames at the
+    /// latched stride and applies the BS.775 matrix for the latched channel count, so a stream
+    /// that grows or shrinks its channel count mid-way is folded with the wrong matrix at the
+    /// wrong stride. Following the change means re-announcing downstream and re-fixating the
+    /// tail of the graph — gapless-playback work with its own design, deliberately not
+    /// attempted here. So the contract is: keep the old format, but say so, loudly.
+    ///
+    /// Posted once per *distinct* format, and only from the event path, so it can never fire
+    /// per buffer.
+    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
+        let Some((rate, channels, sample)) = self.input else { return };
+        let latched = AudioFormat::new(rate, channels, sample);
+        let Some(offered) = negotiated_audio_format(ctx, SINK) else { return };
+        if offered == latched || self.warned_relatch == Some(offered) {
+            return;
+        }
+        self.warned_relatch = Some(offered);
+        let element = ctx.element();
+        ctx.post(BusMessage::Warning {
+            element,
+            error: Error::Element {
+                element,
+                message: format!(
+                    "audiodownmix: ignoring a mid-stream input format change ({latched} -> \
+                     {offered}); the fold matrix and frame stride are fixed at the first \
+                     negotiation and every later buffer is still folded as the latched format. \
+                     Rebuild the branch (or insert a fresh audiodownmix) to follow the change."
+                ),
+            },
+        });
     }
 
     /// Announce the stereo output format (same rate, `channels = 2`, same sample) on the src
@@ -249,7 +293,22 @@ impl Element for AudioDownmix {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        if matches!(event, Event::FormatChange(_)) || self.input.is_none() {
+        match event {
+            // Seek (spec: flush/seek). `carry` holds the tail of a *pre-seek* interchannel
+            // frame; prepending it to the first post-seek buffer shifts every later sample by
+            // part of a frame, so the fold reads the wrong channel into every matrix position
+            // and never resyncs. The fold itself is memoryless (one output frame per input
+            // frame, no history), so there is nothing else a seek invalidates — and the learned
+            // format deliberately survives: a seek moves the read head, it does not change what
+            // the upstream is sending.
+            Event::FlushStart => self.carry.clear(),
+            Event::FormatChange(_) => {
+                self.learn_from_sink(ctx);
+                self.warn_if_relatched(ctx);
+            }
+            _ => {}
+        }
+        if self.input.is_none() {
             self.learn_from_sink(ctx);
         }
         Ok(())

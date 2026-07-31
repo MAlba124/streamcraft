@@ -28,6 +28,7 @@
 //! the target, PCM passes through byte-for-byte (the announcement still fires).
 
 use profluens_core::batch::Inputs;
+use profluens_core::bus::BusMessage;
 use profluens_core::ctx::Ctx;
 use profluens_core::element::{
     Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, PropDesc, SchedHint,
@@ -39,7 +40,10 @@ use profluens_core::id::PadId;
 use profluens_core::time::Timestamp;
 
 use crate::convert::convert_interleaved_vec;
-use crate::format::{AudioFormat, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE};
+use crate::format::{
+    negotiated_audio_format, AudioFormat, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE,
+    FIELD_SAMPLE,
+};
 use crate::resample::{ChannelResampler, PolyphaseFilter};
 
 const SINK: PadId = PadId(0);
@@ -131,6 +135,17 @@ struct Engine {
     nch: usize,
 }
 
+impl Engine {
+    /// Drop the audio held in every channel's delay line (spec: flush/seek) — see
+    /// [`ChannelResampler::reset`] for why a streaming FIR must forget across a seek. The
+    /// filter design and all buffer capacities survive, so this allocates nothing.
+    fn reset(&mut self) {
+        for ch in &mut self.channels {
+            ch.reset();
+        }
+    }
+}
+
 /// Resamples interleaved PCM to a fixed target sample **rate**, preserving channels and sample
 /// format. Construct with [`AudioResample::new`] (input format inferred from caps).
 pub struct AudioResample {
@@ -151,6 +166,9 @@ pub struct AudioResample {
     /// The `(rate, channels)` recovered from caps when the sample format is not yet resolvable —
     /// so [`output_format`](AudioResample::output_format) reports the negotiated stream early.
     partial_in: Option<(u32, u16)>,
+    /// The mid-stream format this element has already complained about, so the warning is
+    /// posted once per *distinct* change — see [`warn_if_relatched`](AudioResample::warn_if_relatched).
+    warned_relatch: Option<AudioFormat>,
 }
 
 impl AudioResample {
@@ -170,6 +188,7 @@ impl AudioResample {
             in_stride: 0,
             carry: Vec::new(),
             partial_in: None,
+            warned_relatch: None,
         }
     }
 
@@ -262,6 +281,41 @@ impl AudioResample {
             Some(fmt) => self.set_input(AudioFormat::new(rate as u32, channels as u16, fmt)),
             None => self.partial_in = Some((rate as u32, channels as u16)),
         }
+    }
+
+    /// Complain on the bus when the sink's negotiated format has moved away from the one this
+    /// element latched.
+    ///
+    /// [`learn_from_sink`](Self::learn_from_sink) pins the input format at the *first*
+    /// negotiation and short-circuits ever after, so a mid-stream change is **ignored**: the
+    /// filter was designed for the old input rate and the old channel count, and later buffers
+    /// keep being decoded as the old sample format. Following the change means redesigning the
+    /// filter, re-announcing downstream and re-fixating the tail of the graph — gapless-playback
+    /// work with its own design, deliberately not attempted here. So the contract is: keep the
+    /// old format, but say so, loudly.
+    ///
+    /// Posted once per *distinct* format, and only from the event path, so it can never fire
+    /// per buffer.
+    fn warn_if_relatched(&mut self, ctx: &mut Ctx) {
+        let Some(latched) = self.input else { return };
+        let Some(offered) = negotiated_audio_format(ctx, SINK) else { return };
+        if offered == latched || self.warned_relatch == Some(offered) {
+            return;
+        }
+        self.warned_relatch = Some(offered);
+        let element = ctx.element();
+        ctx.post(BusMessage::Warning {
+            element,
+            error: Error::Element {
+                element,
+                message: format!(
+                    "audioresample: ignoring a mid-stream input format change ({latched} -> \
+                     {offered}); the polyphase filter is designed once for the latched input and \
+                     every later buffer is still resampled as the latched format. Rebuild the \
+                     branch (or insert a fresh audioresample) to follow the change."
+                ),
+            },
+        });
     }
 
     /// Announce the output `audio/raw` (channels + sample from the input, `rate` = target) on the
@@ -420,10 +474,36 @@ impl Element for AudioResample {
     }
 
     fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
-        // A runtime format announcement arrives as a FormatChange on our sink; the pipeline
-        // updates `ctx.negotiated(sink)` before calling us, so the concrete format is already
-        // there. Re-arm inference on a FormatChange; a no-op once learned.
-        if matches!(event, Event::FormatChange(_)) || self.input.is_none() {
+        match event {
+            // Seek (spec: flush/seek). Two kinds of state are pre-seek audio and both go:
+            //
+            // * `carry`, the tail of a partial interchannel frame. Prepending it to the first
+            //   post-seek buffer shifts every later sample by part of a frame, permanently
+            //   rotating the channel lanes (a stereo stream comes out L/R swapped).
+            // * the per-channel FIR delay lines. A streaming resampler convolves each output
+            //   across the buffer boundary *by design*, so without this the first filter
+            //   length of post-seek output is a blend of audio from both sides of the seek —
+            //   an audible smear exactly at the point the listener asked for a clean cut.
+            //
+            // The filter design and the learned format both survive: a seek moves the read
+            // head, it does not change the stream's rate, channels or sample format.
+            Event::FlushStart => {
+                self.carry.clear();
+                if let Some(engine) = self.engine.as_mut() {
+                    engine.reset();
+                }
+            }
+            // A runtime format announcement arrives as a FormatChange on our sink; the pipeline
+            // updates `ctx.negotiated(sink)` before calling us, so the concrete format is
+            // already there. Re-arm inference (a no-op once learned), and warn when the new
+            // format disagrees with what we latched.
+            Event::FormatChange(_) => {
+                self.learn_from_sink(ctx);
+                self.warn_if_relatched(ctx);
+            }
+            _ => {}
+        }
+        if self.input.is_none() {
             self.learn_from_sink(ctx);
         }
         Ok(())

@@ -276,6 +276,27 @@ impl ChannelResampler {
         &self.filter
     }
 
+    /// Forget every sample seen so far and return to the just-constructed state: the delay line
+    /// re-seeded with warm-up zeros, the phase and input cursor back at their origins, both
+    /// counters back at zero. The (immutable, expensive) filter design is kept, and the delay
+    /// line keeps its capacity, so this allocates nothing.
+    ///
+    /// This is the **seek** reset (spec: flush/seek). A streaming FIR is stateful by
+    /// construction: `history` holds the last `taps_per_phase − 1` inputs precisely so the next
+    /// output can convolve across the buffer boundary. After a seek those samples are audio from
+    /// somewhere else entirely, and convolving them with the post-seek input smears one side of
+    /// the seek into the other for a filter length. Re-seeding with zeros costs the same short
+    /// leading transient a fresh stream has, which is the correct behaviour at a discontinuity.
+    pub fn reset(&mut self) {
+        let warmup = self.filter.stride.saturating_sub(1);
+        self.history.clear();
+        self.history.resize(warmup, 0.0);
+        self.phase = 0;
+        self.in_pos = warmup;
+        self.consumed = 0;
+        self.produced = 0;
+    }
+
     /// Feed `input` samples and append every output sample now computable to `out`. State is
     /// retained, so calling this repeatedly on consecutive chunks yields exactly the same
     /// samples as one call on the concatenation (proven in the streaming test). Returns the

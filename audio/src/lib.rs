@@ -13,9 +13,11 @@ pub mod convert;
 pub mod convert_element;
 pub mod downmix_element;
 pub mod format;
+pub mod gain;
 pub mod quality;
 pub mod resample;
 pub mod resample_element;
+pub mod stretch;
 pub mod wav;
 
 pub use convert::{
@@ -23,11 +25,13 @@ pub use convert::{
 };
 pub use convert_element::AudioConvert;
 pub use downmix_element::AudioDownmix;
+pub use gain::{AudioGain, GAIN_MAX, GAIN_MIN, RAMP_MS};
 pub use resample::{gcd, output_len, ChannelResampler, PolyphaseFilter};
 pub use resample_element::AudioResample;
+pub use stretch::{AudioStretch, StretchPosition, RATE_MAX, RATE_MIN};
 pub use format::{
-    AudioFormat, AudioFrameRef, SampleFormat, FAMILY, FIELD_CHANNELS, FIELD_RATE, FIELD_SAMPLE,
-    RAW_ANY_OFFER,
+    negotiated_audio_format, AudioFormat, AudioFrameRef, SampleFormat, FAMILY, FIELD_CHANNELS,
+    FIELD_RATE, FIELD_SAMPLE, RAW_ANY_OFFER,
 };
 pub use wav::{parse_wav_header, write_pcm_wav, WavError, WavHeader, WavParse};
 
@@ -38,10 +42,14 @@ use profluens_core::registry::Registry;
 /// `parse("… ! wavparse ! audioconvert format=s16 ! …")`). Typed `use` + constructor
 /// stays primary. `wavparse` is config-free; `audioconvert` reads its target `format`
 /// prop and `audioresample` its target `rate` prop in `start()` (defaults S16 / 48 kHz).
+/// `audiostretch` reads its (live) `rate` prop the same way, defaulting to 1.0 — bypass, and
+/// `audiogain` its (live) `gain`/`mute` props, defaulting to unity — the copy-free fast path.
 /// Descriptors are `&'static`, taken from a throwaway default instance.
 pub fn register(registry: &mut Registry) {
     registry.register(WavParse::new().desc());
     registry.register(AudioConvert::new(SampleFormat::S16).desc());
     registry.register(AudioResample::new(48_000).desc());
     registry.register(AudioDownmix::new().desc());
+    registry.register(AudioStretch::new(1.0).desc());
+    registry.register(AudioGain::new(1.0).desc());
 }
