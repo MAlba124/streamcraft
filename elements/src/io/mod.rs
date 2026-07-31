@@ -8,10 +8,12 @@
 
 mod filesink;
 mod filesrc;
+mod growingfilesrc;
 #[cfg(feature = "io-uring")]
 mod uring;
 
 pub use filesink::FileSink;
 pub use filesrc::FileSrc;
+pub use growingfilesrc::{FrontierHandle, GrowingFileSrc};
 #[cfg(feature = "io-uring")]
 pub use uring::IoUringReactor;

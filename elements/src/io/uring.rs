@@ -213,6 +213,17 @@ impl Watermark {
         }
     }
 
+    /// Recycle for a new file: forget the origin and any pending ranges, but **keep the
+    /// heap's allocation**. `BinaryHeap::clear` empties without freeing, whereas dropping
+    /// the watermark and building a `default()` one hands the next completion a
+    /// capacity-0 heap — and its first `push` is then a 64-byte allocation *per file*.
+    /// That is the whole cost of re-registering a slot, and a tag scan re-registers once
+    /// per file (spec: performance #1 — no steady-state heap traffic).
+    fn recycle(&mut self) {
+        self.contig = None;
+        self.done.clear();
+    }
+
     /// Merge a completed range; returns the newly-contiguous `(from, to)` span
     /// if the watermark advanced.
     fn complete(&mut self, start: u64, end: u64) -> Option<(u64, u64)> {
@@ -513,6 +524,15 @@ impl Reactor for IoUringReactor {
         // Registered files stream: double the readahead window up front
         // (`man 2 posix_fadvise`; best-effort — advice).
         let _ = fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
+        // Registering under an id that already holds a file *replaces* it — that is how a
+        // caller closes one (the previous `File` drops with `prev` below). Its watermark
+        // heaps are recycled rather than dropped: see `Watermark::recycle`.
+        let (mut read_wm, mut write_wm) = match self.files.remove(&element.0) {
+            Some(prev) => (prev.read_wm, prev.write_wm),
+            None => (Watermark::default(), Watermark::default()),
+        };
+        read_wm.recycle();
+        write_wm.recycle();
         self.files.insert(
             element.0,
             UringFile {
@@ -520,8 +540,8 @@ impl Reactor for IoUringReactor {
                 hygiene: StreamHygiene::new(),
                 read_submit_end: 0,
                 write_submit_end: 0,
-                read_wm: Watermark::default(),
-                write_wm: Watermark::default(),
+                read_wm,
+                write_wm,
             },
         );
     }
