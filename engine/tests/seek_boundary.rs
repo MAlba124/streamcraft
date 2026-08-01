@@ -604,6 +604,66 @@ fn a_queued_track_still_opening_when_the_current_one_ends_still_plays() {
     );
 }
 
+/// **Seeking the instant a track becomes seekable must work.**
+///
+/// This is the application's most common seek by far and it had nothing to do with boundaries:
+/// `play_now(track)` followed by `seek(saved_position)` — restoring a resume point, "play from
+/// here", an MPRIS `OpenUri` + `SetPosition`. The app waits for `is_playing()` and then seeks,
+/// which is exactly what its documentation invites.
+///
+/// It killed the track. `Shared::install` marks the slot `Live` — so `is_playing()` is true and
+/// `Engine::seek` acts — while `run()` on the other thread is still linking and negotiating and
+/// the decoder has not read a byte. The seek re-points the source at a mid-file offset, and a
+/// FLAC decoder that has never parsed a header then tries to read `fLaC` out of mid-stream bytes
+/// and fails hard: `Resource("flacdec: BadMagic")`, pipeline dead, an error toast in the app, and
+/// the queue advancing off a track the user just asked for.
+///
+/// The window was a handful of milliseconds idle and wider under load — which is precisely the
+/// shape of a bug that is invisible in tests and constant in real use. Fixed by making
+/// `Shared::build` honour the invariant it already documents: it does not return until the
+/// decoder has actually delivered audio to the sink, so a track that is announced as playing is
+/// genuinely ready to be seeked.
+///
+/// (The decoder's own fragility is real too and is `flac/`'s to fix — a resync that has no
+/// header should ask for more bytes, not report file corruption. This test pins the engine's
+/// half: never hand out a track that cannot survive the very next call.)
+#[test]
+fn a_seek_the_instant_a_track_starts_does_not_kill_it() {
+    let a = marker_track("sb_early_a.flac", A_SECS, Which::A);
+
+    // One process, many attempts: the window is a few milliseconds, so a single try proves
+    // little. Historically this reproduced on roughly three quarters of attempts.
+    for attempt in 0..12 {
+        let mut rig = Rig::new();
+        rig.engine.play_now(Track::file(&a));
+        // Exactly what the application does — no sleep, no settling.
+        assert!(rig.settle(|r| r.engine.is_playing()), "attempt {attempt}: A never started");
+        rig.engine.seek(Duration::from_secs(3));
+
+        // The seek landed if audio from 3 s in arrives *without* three seconds having been
+        // played to get there. Both halves matter: reaching 3 s alone would also happen if the
+        // seek were dropped and the track simply played on, and the recording legitimately
+        // contains the pre-seek moment before the flush reached the device.
+        let arrived = rig.settle(|r| {
+            marks(&r.cap.captured()).iter().any(|x| x.at >= Duration::from_millis(2_500))
+                || !r.errors().is_empty()
+        });
+        assert!(
+            rig.errors().is_empty(),
+            "attempt {attempt}: seeking the instant the track started reported {:?}",
+            rig.errors()
+        );
+        assert!(arrived, "attempt {attempt}: the seek to 3 s never produced any audio from 3 s");
+
+        let played = frames_to_dur(rig.cap.captured().len() / STRIDE);
+        assert!(
+            played < Duration::from_millis(2_000),
+            "attempt {attempt}: reached 3 s only after playing {played:?} of audio — the seek \
+             was silently dropped and the track played from the start"
+        );
+    }
+}
+
 /// The marker scheme itself, so a failure in the tests above is never ambiguous about whether
 /// the *measurement* is sound. Plays A alone from the start and checks that the recording
 /// decodes as A throughout, with a staircase that advances monotonically to the end.

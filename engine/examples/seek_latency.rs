@@ -142,8 +142,47 @@ fn main() -> Result<(), String> {
         }
     }
 
-    engine.stop();
     summarise(&audible);
+
+    // The other reported bug, checked by ear against a real device: seeking to the very end of a
+    // track that has one queued behind it used to skip straight to the next song. It must now
+    // play the last quarter-second and *then* advance. The deterministic proof of this is
+    // `tests/seek_boundary.rs`, which counts the tail frame by frame off a labelled recording;
+    // this is the same claim where a listener can hear it.
+    if queued.is_some() {
+        println!("\n--- seeking to the end with a track queued ---");
+        println!("listen: you should hear the tail of this track, then the next one begin.");
+        std::thread::sleep(SETTLE);
+        let at = Instant::now();
+        engine.seek(duration);
+        let mut changed = None;
+        while at.elapsed() < Duration::from_secs(5) {
+            for ev in engine.poll_events() {
+                match ev {
+                    EngineEvent::TrackChanged if changed.is_none() => changed = Some(at.elapsed()),
+                    EngineEvent::Error { message } => eprintln!("engine error: {message}"),
+                    _ => {}
+                }
+            }
+            if changed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        match changed {
+            Some(d) => println!(
+                "advanced to the queued track {:.0} ms after the seek \
+                 (the tail is still in the ring when this fires — detach happens without \
+                 draining, which is what makes the boundary gapless)",
+                d.as_secs_f64() * 1000.0
+            ),
+            None => println!("!! the queue never advanced within 5 s"),
+        }
+        // Let the tail and the first moments of the next track actually reach the speakers.
+        std::thread::sleep(Duration::from_millis(1_500));
+    }
+
+    engine.stop();
     Ok(())
 }
 

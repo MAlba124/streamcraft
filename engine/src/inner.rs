@@ -149,6 +149,16 @@ pub(crate) const JOIN_GRACE: Duration = Duration::from_millis(500);
 /// in [`Shared::install`].
 pub(crate) const WORKER_PATIENCE: Duration = Duration::from_secs(3);
 
+/// How long [`Shared::build`] waits for a freshly spawned track to actually decode something
+/// before it announces it as playing.
+///
+/// This is the readiness bound, not an expectation: a local file reaches the sink in a few
+/// milliseconds. Exceeding it means the track is announced slightly early — exactly the old
+/// behaviour — so the failure mode is a return to the previous risk rather than a stall. A file
+/// that never decodes at all (a stalled download, a broken stream) waits this out once and then
+/// fails or plays on its own terms.
+const PREROLL_PATIENCE: Duration = Duration::from_millis(500);
+
 /// How close to the end of a track a seek is allowed to land — the **near-end clamp** (see
 /// [`Shared::seek`]).
 ///
@@ -515,6 +525,23 @@ impl Shared {
             })
             .map_err(|e| format!("{label}: cannot spawn a playback thread: {e}"))?;
 
+        // Wait for the track to become genuinely pre-rolled — see the doc above, which has
+        // always claimed this and until now did not deliver it. `run()` is on another thread and
+        // still linking, negotiating and starting elements; a track announced before its decoder
+        // has produced anything cannot survive the first thing the application does with it:
+        //
+        // * a seek issued before `run_group` samples the seek generation is **silently dropped**,
+        //   so "play from my saved position" plays from the beginning instead — which is exactly
+        //   the hazard applications work around with a deferred-seek queue of their own;
+        // * a seek issued a moment later re-points the source mid-file while the decoder has not
+        //   read its header, and a FLAC decoder then reads `fLaC` out of mid-stream bytes and
+        //   fails the whole pipeline.
+        //
+        // Both are the same defect: the engine announced a track that was not ready. The wait is
+        // free of the public API — `build` only ever runs on the blocking worker thread — and
+        // bounded, so a pathological source degrades to the old behaviour rather than hanging.
+        wait_until(PREROLL_PATIENCE, || gate.has_staged());
+
         Ok(Box::new(Live {
             seq,
             label,
@@ -616,23 +643,26 @@ impl Shared {
 
     /// A runner's `run()` returned.
     fn on_finished(self: &Arc<Self>, seq: u64, result: Result<(), Error>, errors: Vec<String>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Not in either slot: this track was already retired (stopped, replaced, cleared), and
+        // its teardown is somebody else's business — **including anything it has to complain
+        // about on the way out**. A pipeline being torn down mid-unwind reports all sorts of
+        // things, and reporting them to the application meant a `stop()` or a `play_now()` could
+        // raise an error about a track the user had already navigated away from. Worse, the
+        // label came from the slot, so a retired track's message had none: applications showed a
+        // toast beginning with a bare colon and naming no file. Checking the slot *first* is
+        // what makes every message that does get through attributable.
+        let Some(slot) = st.slot_of(seq) else { return };
         for message in errors {
             self.emit(EngineEvent::Error { message });
         }
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = st.slot_of(seq);
         if let Err(e) = result {
-            let label = slot
-                .and_then(|i| match &st.slots[i] {
-                    Slot::Live(l) => Some(l.label.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let label = match &st.slots[slot] {
+                Slot::Live(l) => l.label.clone(),
+                _ => String::new(),
+            };
             self.emit(EngineEvent::Error { message: format!("{label}: playback failed: {e:?}") });
         }
-        // Not in either slot: this track was already retired (stopped, replaced, cleared), and
-        // its teardown is somebody else's business.
-        let Some(slot) = slot else { return };
         if self.shutdown.load(Ordering::Acquire) {
             return;
         }

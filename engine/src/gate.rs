@@ -70,6 +70,17 @@ struct GateShared {
     /// abandoned track's audio in the ring to be played as the *next* track's first half second.
     /// Counting the events here is that proof, at a cost of one relaxed store per seek.
     flushes: AtomicU64,
+    /// How many passes have arrived at this sink carrying audio — **whether or not the gate let
+    /// them through**.
+    ///
+    /// This is what "pre-rolled" actually means, and the engine waits for it before announcing a
+    /// track. A pipeline that has merely been *spawned* is not ready for anything: `run()` is
+    /// still linking, negotiating and starting elements on its own thread, and a seek issued in
+    /// that window is either silently dropped (the group has not yet sampled the seek
+    /// generation) or lands on a decoder that has not read its header yet and kills the track.
+    /// One relaxed store per pass buys the invariant that a track the engine calls playing can
+    /// survive the very next call made against it.
+    staged: AtomicU64,
 }
 
 /// The engine's half of a track's gate. Cloneable, and safe to drive from any thread.
@@ -78,13 +89,23 @@ pub(crate) struct Gate(Arc<GateShared>);
 
 impl Gate {
     pub(crate) fn closed() -> Gate {
-        Gate(Arc::new(GateShared { open: AtomicBool::new(false), flushes: AtomicU64::new(0) }))
+        Gate(Arc::new(GateShared {
+            open: AtomicBool::new(false),
+            flushes: AtomicU64::new(0),
+            staged: AtomicU64::new(0),
+        }))
     }
 
     /// How many flushes this track's sink has completed. Compare a reading taken before a seek
     /// with later readings to know the flush has landed.
     pub(crate) fn flushes(&self) -> u64 {
         self.0.flushes.load(Ordering::Acquire)
+    }
+
+    /// Whether audio has reached this track's sink yet — the real "pre-rolled" test. See
+    /// `GateShared::staged`.
+    pub(crate) fn has_staged(&self) -> bool {
+        self.0.staged.load(Ordering::Acquire) > 0
     }
 
     /// Let the track through. `Release` pairs with the sink thread's `Acquire`, so the pass that
@@ -107,6 +128,11 @@ impl Gate {
     /// Record that a `FlushStart` has been fully handled by the sink.
     fn note_flush(&self) {
         self.0.flushes.fetch_add(1, Ordering::Release);
+    }
+
+    /// Record that a pass carrying audio reached the sink. See `GateShared::staged`.
+    fn note_staged(&self) {
+        self.0.staged.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -140,6 +166,12 @@ impl Element for TrackSink {
     }
 
     fn process(&mut self, ctx: &mut Ctx, inputs: Inputs<'_>) -> Result<Flow, Error> {
+        if !inputs.is_empty() {
+            // Before the gate, deliberately: a pre-rolled track is held back precisely so that
+            // it *has* decoded ahead, and the engine's readiness wait must see that. Cheap
+            // (`is_empty` consumes nothing) and off the sample path.
+            self.gate.note_staged();
+        }
         if !self.gate.is_open() {
             // Consume nothing: the input stays staged and is picked up by the first pass after
             // the gate opens, exactly as the sink's own pause path does. Returning here is what
