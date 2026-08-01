@@ -238,6 +238,21 @@ impl Engine {
     /// position, and rebasing to the request while content resumes earlier would leave the
     /// pipeline permanently behind its own clock.
     ///
+    /// # Seeking to the end
+    ///
+    /// The target is **clamped to a quarter of a second before the end** when the track declares
+    /// a duration. Seeking to (or past) the duration therefore means *play the last quarter
+    /// second, then advance* — it is not an error, is not ignored, and does not skip.
+    ///
+    /// Without the clamp it did skip, and legitimately: an end-of-file target resolves to an
+    /// end-of-file byte, the source reads nothing, and the pipeline reaches end of stream at
+    /// once, so the queue advances exactly as it does at a natural boundary. What the user asked
+    /// for was to hear the end of the track, so that is what this delivers. A track shorter than
+    /// the epsilon clamps to zero and plays in full.
+    ///
+    /// The policy is the engine's, not [`SeekIndex`](profluens_core::pipeline::SeekIndex)'s,
+    /// which still resolves precisely what it is asked to.
+    ///
     /// Seeking during a gapless handoff is allowed and safe, with one documented consequence:
     /// the output ring is a single byte stream, so a seek issued in the instant after the
     /// previous track detached but before its tail has played out drops that tail too. The user

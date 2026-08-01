@@ -21,6 +21,11 @@
 //! down in the same critical section (`advance_locked`), so the queue can never hold a
 //! track with nothing in front of it.
 //!
+//! **A slot index is not a build's identity** — the sequence number is. `advance_locked` shifts a
+//! `Building` marker from slot 1 to slot 0, so a build in flight can change slots while it is
+//! opening; everything that looks a build up does so with [`State::awaiting`]. See its docs for
+//! what going by the index instead cost.
+//!
 //! # The transitions
 //!
 //! ```text
@@ -144,6 +149,16 @@ pub(crate) const JOIN_GRACE: Duration = Duration::from_millis(500);
 /// in [`Shared::install`].
 pub(crate) const WORKER_PATIENCE: Duration = Duration::from_secs(3);
 
+/// How close to the end of a track a seek is allowed to land — the **near-end clamp** (see
+/// [`Shared::seek`]).
+///
+/// Long enough that the landing is unmistakably audible rather than a click, short enough that
+/// "seek to the end" still means the end. A quarter of a second is roughly the shortest interval
+/// a listener reliably hears as a piece of music rather than an artefact, and it is half the
+/// output ring, so the clamped tail is typically already buffered when the boundary is
+/// announced.
+pub(crate) const TAIL_EPSILON: Duration = Duration::from_millis(250);
+
 // --- the pieces --------------------------------------------------------------------------
 
 /// Which event a slot-0 install should announce.
@@ -259,11 +274,31 @@ impl State {
     fn slot_of(&self, seq: u64) -> Option<usize> {
         (0..2).find(|&i| matches!(&self.slots[i], Slot::Live(l) if l.seq == seq))
     }
+
+    /// Which slot is waiting on the build with this sequence number, and how that slot wants it
+    /// announced.
+    ///
+    /// **The sequence number is a build's identity; the slot index is not.** A queued track
+    /// whose build is still in flight is *moved* into slot 0 by [`Shared::advance_locked`] when
+    /// the current track ends — that is exactly what re-labelling a `Building` marker
+    /// `Announce::Changed` there is for. A build that looked itself up by the index it was
+    /// posted with therefore found a slot that had moved on, concluded it had been superseded,
+    /// and threw itself away — leaving slot 0 marked `Building` for ever, with `queue_len()`
+    /// stuck at 1 and neither `TrackChanged` nor `TrackEnded` ever emitted again. Looking up by
+    /// `seq` is what lets the build follow its track.
+    fn awaiting(&self, seq: u64) -> Option<(usize, Announce)> {
+        (0..2).find_map(|i| match &self.slots[i] {
+            Slot::Building { seq: s, announce } if *s == seq => Some((i, *announce)),
+            _ => None,
+        })
+    }
 }
 
 /// Work posted to the build worker.
 enum Job {
-    Build { slot: usize, seq: u64, track: Track },
+    /// Open `track` for whichever slot is holding `seq` **when the build finishes** — see
+    /// [`State::awaiting`]; the slot can change underneath a build in flight.
+    Build { seq: u64, track: Track },
     Retire { live: Box<Live>, mode: Retire },
 }
 
@@ -390,14 +425,14 @@ impl Shared {
             let Some(job) = job else { break };
             match job {
                 Job::Retire { live, mode } => self.retire(*live, mode),
-                Job::Build { slot, seq, track } => {
-                    // Skip a build whose slot has already moved on. This is what makes a burst
+                Job::Build { seq, track } => {
+                    // Skip a build no slot is waiting for any more. This is what makes a burst
                     // of `play_now` calls cheap: every superseded job costs one atomic-free
                     // slot read instead of a full probe + head walk + preroll.
-                    if self.slot_awaits(slot, seq) {
+                    if self.still_wanted(seq) {
                         match self.build(seq, track) {
-                            Ok(live) => self.install(slot, seq, live),
-                            Err(msg) => self.build_failed(slot, seq, msg),
+                            Ok(live) => self.install(seq, live),
+                            Err(msg) => self.build_failed(seq, msg),
                         }
                     }
                 }
@@ -407,12 +442,13 @@ impl Shared {
         self.reap();
     }
 
-    fn slot_awaits(&self, slot: usize, seq: u64) -> bool {
+    /// Is any slot still waiting for this build? Checked before paying for the open.
+    fn still_wanted(&self, seq: u64) -> bool {
         if self.shutdown.load(Ordering::Acquire) {
             return false;
         }
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        matches!(&st.slots[slot], Slot::Building { seq: s, .. } if *s == seq)
+        st.awaiting(seq).is_some()
     }
 
     // --- building -------------------------------------------------------------------------
@@ -498,15 +534,16 @@ impl Shared {
         }))
     }
 
-    /// Place a freshly built track, or throw it away if its slot moved on while it was opening.
-    fn install(self: &Arc<Self>, slot: usize, seq: u64, live: Box<Live>) {
+    /// Place a freshly built track in whichever slot is still waiting for it, or throw it away
+    /// if nothing is any more. The slot is looked up by sequence number, not remembered from the
+    /// post — the queue can have advanced onto this very build while it was opening (see
+    /// [`State::awaiting`]).
+    fn install(self: &Arc<Self>, seq: u64, live: Box<Live>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let announce = match &st.slots[slot] {
-            Slot::Building { seq: s, announce } if *s == seq => Some(*announce),
-            _ => None,
-        };
         // Superseded while we were opening it, or the engine is going away: throw it out.
-        let Some(announce) = announce.filter(|_| !self.shutdown.load(Ordering::Acquire)) else {
+        let Some((slot, announce)) =
+            st.awaiting(seq).filter(|_| !self.shutdown.load(Ordering::Acquire))
+        else {
             drop(st);
             self.retire(*live, Retire::Quiet);
             return;
@@ -522,13 +559,13 @@ impl Shared {
         st.slots[slot] = Slot::Live(live);
     }
 
-    fn build_failed(self: &Arc<Self>, slot: usize, seq: u64, msg: String) {
+    fn build_failed(self: &Arc<Self>, seq: u64, msg: String) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = matches!(&st.slots[slot], Slot::Building { seq: s, .. } if *s == seq);
+        let ours = st.awaiting(seq);
         self.emit(EngineEvent::Error { message: msg });
-        if !ours {
-            return; // superseded: the slot already belongs to someone else
-        }
+        let Some((slot, _)) = ours else {
+            return; // superseded: no slot is waiting for this build any more
+        };
         st.slots[slot] = Slot::Empty;
         if slot == 0 {
             // The track that was to become current never existed. Promote the queue rather than
@@ -733,7 +770,7 @@ impl Shared {
             taken
         };
         self.retire_all(taken);
-        self.post(Job::Build { slot: 0, seq, track });
+        self.post(Job::Build { seq, track });
     }
 
     pub(crate) fn enqueue(self: &Arc<Self>, track: Track) -> Result<(), EngineError> {
@@ -741,7 +778,7 @@ impl Shared {
             return Err(EngineError::Shutdown);
         }
         let seq = self.seq();
-        let slot = {
+        {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if !st.slots[1].is_empty() {
                 return Err(EngineError::AlreadyQueued);
@@ -751,9 +788,8 @@ impl Shared {
             // behind nothing.
             let slot = usize::from(!st.slots[0].is_empty());
             st.slots[slot] = Slot::Building { seq, announce: Announce::Started };
-            slot
-        };
-        self.post(Job::Build { slot, seq, track });
+        }
+        self.post(Job::Build { seq, track });
         Ok(())
     }
 
@@ -828,17 +864,46 @@ impl Shared {
         self.user_paused.load(Ordering::Acquire)
     }
 
+    /// Seek the current track, with the **near-end clamp** applied.
+    ///
+    /// # The clamp, and why it lives here
+    ///
+    /// A seek target is resolved into a byte offset through the track's index. For a container
+    /// with no cue table — a FLAC, so most of a music library — that is a proportional estimate,
+    /// so a target at the duration resolves to a byte at the end of the file. The source then
+    /// reads nothing, the pipeline EOSes immediately, and the boundary machinery correctly does
+    /// what it does at any end of stream: it advances the queue. Every layer behaved, and the
+    /// user heard their track vanish and the next one start.
+    ///
+    /// So the target is clamped to `duration - TAIL_EPSILON` whenever the duration is known.
+    /// **Seeking to (or past) the end means "play the last quarter-second, then advance"** —
+    /// audible, and the obvious reading of dragging a scrubber to the far right. Past the
+    /// duration is not an error and not ignored: it is the same gesture, and it lands in the
+    /// same place. A track shorter than the epsilon clamps to zero, which is the same policy
+    /// taken to its limit — you hear the whole thing.
+    ///
+    /// It belongs to the engine and not to `SeekIndex`. The index answers a mechanical question
+    /// ("which byte is this time") and is used by the introspection server and by seeking code
+    /// that means exactly what it asks for; this is a *user interface* policy about what a
+    /// gesture ought to sound like, and the engine is the layer that owns those.
     pub(crate) fn seek(&self, to: Duration) {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Slot::Live(live) = &st.slots[0] else { return };
-        let ns = u64::try_from(to.as_nanos()).unwrap_or(u64::MAX);
-        let target = Timestamp::from_nanos(ns);
         let duration = live.duration.unwrap_or(Timestamp::NONE);
+        let mut ns = u64::try_from(to.as_nanos()).unwrap_or(u64::MAX);
+        if let Some(end) = duration.nanos() {
+            ns = ns.min(end.saturating_sub(TAIL_EPSILON.as_nanos() as u64));
+        }
+        let target = Timestamp::from_nanos(ns);
         // Seek to the *resolved* cue, never the request: the index floors to the preceding
         // resume-safe position, and rebasing running time to the request while content resumes
         // earlier leaves the pipeline permanently behind its own clock.
         if let Some((byte, landed)) = live.index.resolve(target, duration) {
             live.seek.seek(byte, landed);
+            // Diagnostics only, and free unless armed: the generation is published, so every
+            // millisecond after this belongs to the pipeline and the device, not to us. See
+            // `pf_pipewire::probe` and `examples/seek_latency.rs`.
+            pf_pipewire::probe::mark(pf_pipewire::probe::Stage::Dispatched);
         }
     }
 
