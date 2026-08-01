@@ -13,7 +13,13 @@ name = "pf_player_engine"
 # Transport handles (pause/seek/stop/props), the bus, `Timestamp`, `Element`.
 profluens-core = { path = "../core" }
 # The per-track pipeline: `Player::open_canonical` + the canonical f32/48k/2ch chain.
-pf-play = { path = "../play" }
+#
+# `default-features = false` drops pf-play's `video` feature (and its `mimalloc`, which only
+# ever applied to the `pfplay` binary anyway). A music player has no window: every track is
+# opened with `SinkChoice::Drop` for video, so a video-bearing container's video pads take the
+# `bytes` drop sink and its audio plays — the same outcome as before, without linking the
+# system `libva` or compiling six video codecs. See pf-play's crate docs, "The `video` feature".
+pf-play = { path = "../play", default-features = false }
 # The shared audio output and the producer sink that attaches to it.
 pf-pipewire = { path = "../pipewire" }
 # `FrontierHandle`, re-exported so a caller driving a progressive download does not
