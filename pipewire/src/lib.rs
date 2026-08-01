@@ -17,8 +17,13 @@
 //! [`native`] is the from-scratch native-protocol client (no libpipewire) that will replace
 //! the `libpipewire` binding below — see its module docs for the migration plan.
 
+//! [`probe`] is the seek-latency diagnostic: one timestamp per layer between a seek being
+//! issued and the first re-primed sample being pulled by the device callback. Off (and
+//! effectively free) unless a caller arms it.
+
 pub mod native;
 pub mod out;
+pub mod probe;
 mod pw_backend;
 mod ring;
 mod sink;

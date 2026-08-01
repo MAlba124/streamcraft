@@ -140,6 +140,12 @@ impl Producer {
         // Release: publish the new tail *after* the slot writes above, so a consumer that
         // Acquire-loads this tail is guaranteed to see the bytes.
         self.inner.tail.0.store(tail.wrapping_add(n), Ordering::Release);
+        // Diagnostics only, and only after a flush has been published: this is the instant the
+        // re-primed pipeline delivered its first post-seek PCM (see `crate::probe`).
+        crate::probe::mark_after(
+            crate::probe::Stage::FirstWrite,
+            crate::probe::Stage::FlushPublished,
+        );
         n
     }
 
@@ -188,6 +194,7 @@ impl Producer {
         let tail = self.inner.tail.0.load(Ordering::Relaxed); // we own tail
         self.inner.flush_to.store(tail, Ordering::Release);
         self.inner.flush_gen.fetch_add(1, Ordering::Release);
+        crate::probe::mark(crate::probe::Stage::FlushPublished);
     }
 
     /// End-of-stream: block until the consumer has played out every buffered byte (or the sink
@@ -227,6 +234,9 @@ impl Consumer {
                 self.inner.head.0.store(ft, Ordering::Release);
             }
             self.inner.seen_flush_gen.0.store(g, Ordering::Relaxed);
+            // Diagnostics only (see `crate::probe`): the instant the stale audio became
+            // unreachable, measured on the thread that actually made it so.
+            crate::probe::mark(crate::probe::Stage::FlushApplied);
         }
 
         let head = self.inner.head.0.load(Ordering::Relaxed); // we own head
@@ -234,6 +244,12 @@ impl Consumer {
         let avail = tail.wrapping_sub(head);
         let n = avail.min(out.len());
         if n > 0 {
+            // Diagnostics only: the first real bytes pulled past a flush point — the *audible*
+            // end of the seek, and the only stage measured on the device thread itself.
+            crate::probe::mark_after(
+                crate::probe::Stage::FirstPull,
+                crate::probe::Stage::FlushApplied,
+            );
             // [head, head+n) is initialized and published by the producer; it can't advance
             // into this region because it stops at `head`, so we read it without atomics.
             let start = head & self.inner.mask;
