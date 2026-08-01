@@ -82,6 +82,17 @@ pub use profluens_elements::io::FrontierHandle;
 /// render, and the configuration used by [`Engine::new`].
 pub use pf_pipewire::{AudioOut, AudioOutConfig, AudioOutHandle, CanonicalFormat};
 
+/// The seek-latency probe, so an application can time its **own** seeks without depending on
+/// `pf-pipewire` directly.
+///
+/// [`Engine::seek`] records the dispatch stage; the sink and the device callback fill in the
+/// rest by themselves. Arm it immediately before a seek and read
+/// [`probe::report`](pf_pipewire::probe::report) once
+/// [`Stage::FirstPull`](pf_pipewire::probe::Stage::FirstPull) lands — that stage is the
+/// audible instant, and the only one the application cannot observe any other way. Free until
+/// armed. `examples/seek_latency.rs` is a worked example.
+pub use pf_pipewire::probe;
+
 use inner::Shared;
 
 /// A gapless track queue over one audio output.
