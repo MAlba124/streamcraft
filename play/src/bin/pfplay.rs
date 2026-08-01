@@ -216,6 +216,9 @@ fn install_stdin_controls(player: &mut Player) {
     let index = player.seek_index().clone();
     let duration = player.duration().unwrap_or(Timestamp::NONE);
     // Mirror the pause state into the window HUD (if any) so its glyph tracks stdin pauses too.
+    // There is no window — and no `player_control` — in an audio-only (`--no-default-features`)
+    // build, so the mirror simply is not wired there.
+    #[cfg(feature = "video")]
     let control = player.player_control();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -228,6 +231,7 @@ fn install_stdin_controls(player: &mut Player) {
             match line.trim() {
                 "p" => {
                     let paused = pause.toggle();
+                    #[cfg(feature = "video")]
                     if let Some(c) = &control {
                         c.set_paused(paused);
                     }
@@ -271,6 +275,7 @@ fn install_stdin_controls(player: &mut Player) {
 /// window) into the same pause/seek/stop handles, and publish duration + pause state back for
 /// the HUD. No-op unless `PF_PRESENT`'s `waylandvideosink` is in use. Polls at ~33 Hz; the
 /// thread dies with the process (none is joined).
+#[cfg(feature = "video")]
 fn install_window_controls(player: &mut Player) {
     let Some(control) = player.player_control() else {
         return;
@@ -307,3 +312,8 @@ fn install_window_controls(player: &mut Player) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     });
 }
+
+/// An audio-only build has no video window to take clicks from, so there is no window
+/// transport to install.
+#[cfg(not(feature = "video"))]
+fn install_window_controls(_player: &mut Player) {}

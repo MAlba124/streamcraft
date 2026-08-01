@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use profluens_core::pipeline::{Pipeline, SeekIndex};
 use profluens_core::time::Timestamp;
-use crate::autoplug::{self, AudioTarget, SinkChoice, TrackOutcome, Wiring};
+use crate::autoplug::{self, AudioTarget, SinkChoice, TrackOutcome, Wiring, ZeroCopyChannel};
 use crate::chain::{ChainHandles, ChainSpec};
 use crate::probe::{self, Kind};
 use crate::source::SourceSpec;
@@ -102,10 +102,13 @@ impl Player {
     /// frame-slot sink imports. Falls back to the readback External path (reported via
     /// [`video_zerocopy`](Self::video_zerocopy)) when the codec is software-only or no VA
     /// device is present. The caller shares `channel` with its EGL sink.
+    ///
+    /// Without the `video` feature [`ZeroCopyChannel`] is uninhabited, so this entry point
+    /// keeps its signature but is uncallable — there is no VA-API to export a surface from.
     pub fn open_zerocopy(
         path: &str,
         policy: SinkPolicy,
-        channel: std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>,
+        channel: std::sync::Arc<ZeroCopyChannel>,
     ) -> Result<Player, String> {
         Self::open_inner(
             SourceSpec::path(path),
@@ -119,7 +122,7 @@ impl Player {
         mut source: SourceSpec,
         video: SinkChoice,
         audio: AudioTarget,
-        zc_channel: Option<std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
+        zc_channel: Option<std::sync::Arc<ZeroCopyChannel>>,
     ) -> Result<Player, String> {
         // Typefind. For a growing source this is the one blocking wait in the whole open: it
         // returns as soon as the (64-byte) prefix is readable — see `crate::source`, policy 1.
@@ -167,7 +170,7 @@ impl Player {
         file_len: u64,
         video: SinkChoice,
         audio: AudioTarget,
-        zc_channel: Option<&std::sync::Arc<pf_vaapi::gpuframe::GpuFrameChannel>>,
+        zc_channel: Option<&std::sync::Arc<ZeroCopyChannel>>,
     ) -> Result<(Wiring, SeekIndex, Option<u64>), String> {
         // COLD: one path copy per open. `source` is borrowed mutably below (`take_element`),
         // so the path cannot stay a borrow of it.
@@ -496,6 +499,10 @@ impl Player {
     /// The raw-wire presenter's window↔app control channel (`PF_PRESENT`), if the
     /// `waylandvideosink` is in use — the CLI drains its clicks into pause/seek and publishes
     /// duration/pause back for the HUD.
+    ///
+    /// Present only with the `video` feature: the presenter, and therefore the window this
+    /// controls, is part of the video stack.
+    #[cfg(feature = "video")]
     pub fn player_control(&self) -> Option<std::sync::Arc<pf_present::PlayerControl>> {
         self.wiring.player_control.clone()
     }
