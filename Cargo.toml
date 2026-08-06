@@ -1,37 +1,102 @@
-[package]
-name = "streamcraft"
-description = "General purpose data/multimedia pipeline framework"
-version = "0.0.1"
+[workspace]
+resolver = "2"
+exclude = [
+    # Vendored oxideav-h264 0.1.7 + the RefPicStore eviction fix (see
+    # vendor/oxideav-h264/PROFLUENS-PATCHES.md); wired via [patch.crates-io].
+    "vendor/oxideav-h264",
+    "vendor/oxideav-aac",
+    "vendor/oxideav-vp8",
+    # Vendored oxideav-vp9 0.0.12 + the frame-edge transform-block store clamp
+    # (vendor/oxideav-vp9/PROFLUENS-PATCHES.md); wired via [patch.crates-io].
+    "vendor/oxideav-vp9",
+    # Vendored oxideav-opus git master + the decode_packet_into no-alloc patch
+    # (vendor/oxideav-opus/PROFLUENS-PATCHES.md); a path dep from opus/Cargo.toml.
+    "vendor/oxideav-opus",
+    # Vendored visqol-rs 0.3.1 + the fused-gammatone-cascade speedup
+    # (vendor/visqol-rs/PROFLUENS-PATCHES.md); path dep from opus/Cargo.toml under the `qa` feature.
+    "vendor/visqol-rs",
+]
+members = [
+    "core",
+    "elements",
+    "http",
+    "aac",
+    "flac",
+    "ogg",
+    "mkv",
+    "audio",
+    "video",
+    "vp8",
+    "h264",
+    "h265",
+    "av1",
+    "vp9",
+    "scope",
+    "pipewire",
+    "opus",
+    "mp3",
+    "mp4",
+    "sdl3",
+    "present",
+    "vaapi",
+    "rtp",
+    "rtsp",
+    "launch",
+    "nvr",
+    "text",
+    "play",
+    "engine",
+    "player-ui",
+    "ac3",
+    "avi",
+    "mpeg4p2",
+    "libopus-sys",
+    "tags",
+]
+
+[workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/MAlba124/streamcraft"
-readme = "README.md"
+repository = "https://github.com/MAlba124/profluens"
 
-[lib]
-name = "streamcraft"
+[profile.release]
+# Thin LTO: the adopted decoders (oxideav-*) are allocation- and call-heavy;
+# cross-crate inlining buys real throughput on the playback path.
+lto = "thin"
+# Enough DWARF for profilers to symbolize release captures (heaptrack, perf,
+# simprof): function names + line tables, without the full-variable debuginfo
+# that balloons build time and binary size. Runtime cost: none.
+debug = "line-tables-only"
 
-[dependencies]
-crossbeam-channel = "0.5.12"
-libav = { path = "./libav" }
+[profile.bench]
+debug = true
 
-[features]
-default = ["elements-all"]
-# TEXT
-elements-text = []
-element-stdoutlog = ["elements-text"]
-element-texttestsrc = ["elements-text"]
-all-elements-text = ["element-stdoutlog", "element-texttestsrc"]
-# IO
-elements-io = []
-element-filesrc = ["elements-io"]
-all-elements-io = ["element-filesrc"]
-# CONVERSION
-elements-conversion = []
-element-bytes2text = ["elements-conversion"]
-all-elements-conversion = ["element-bytes2text"]
-# MISC
-elements-misc = []
-element-testsink = ["elements-misc"]
-element-testsrc = ["elements-misc"]
-all-elements-misc = ["element-testsink", "element-testsrc"]
-elements-all = ["all-elements-text", "all-elements-io", "all-elements-conversion", "all-elements-misc"]
+[patch.crates-io]
+# Upstream 0.1.7 leaks every reference picture: RefPicStore has insert() and no
+# eviction, so playback grows ~35 MB/s until OOM. Vendored with a minimal
+# retain_keys sweep (documented in vendor/oxideav-h264/PROFLUENS-PATCHES.md,
+# to be offered upstream).
+oxideav-h264 = { path = "vendor/oxideav-h264" }
+# Upstream 0.1.6 computes the IMDCT as a naive O(N²) sum with a libm cos()
+# per term (~40% of a playback process's CPU; audio couldn't hold realtime).
+# Vendored with a Chebyshev-recurrence patch (PROFLUENS-PATCHES.md).
+oxideav-aac = { path = "vendor/oxideav-aac" }
+# Upstream 0.2.6's bool decoder errors instead of feeding the implicit zero
+# bytes real encoders' partition tails rely on (libvpx bool_decoder_fill
+# semantics) — ~30% of Intel-iHD-encoded frames failed at the last macroblock.
+# Vendored with a bounded virtual-zero-padding patch (PROFLUENS-PATCHES.md).
+oxideav-vp8 = { path = "vendor/oxideav-vp8" }
+# Upstream 0.0.12 allocates CurrFrame at exactly (MiCols*8, MiRows*8) — i.e.
+# (maxX+1, maxY+1) — but the §8.5.1 / §8.6.2 store steps legally write a whole
+# transform block anchored at the last in-range sample, so a frame whose
+# MI-aligned height is not a multiple of the transform size panics on the
+# bottom superblock row (1280x720, 1920x1080, 640x360, 320x240 all crash).
+# Vendored with a store clamp (PROFLUENS-PATCHES.md).
+oxideav-vp9 = { path = "vendor/oxideav-vp9" }
+# Vendored oxideav-opus (vendor/oxideav-opus) calls oxideav-core APIs
+# (CodecInfo::payload_magic, RuntimeContext, register!) that only exist in core's git
+# master (0.1.34), not the published 0.1.x. Pin core to the same master rev. 0.1.34
+# satisfies every crate's `oxideav-core = "0.1"`, so mp3/vp8/vendored are unaffected
+# (verified: they build against it). Drop this once oxideav-opus + a matching core publish.
+oxideav-core = { git = "https://github.com/OxideAV/oxideav-core", rev = "052e281831d56699168a554ee7fed156a9a97a92" }

@@ -1,0 +1,64 @@
+[package]
+name = "pf-opus"
+description = "Opus (RFC 6716) codec plugin for profluens, backed by the pure-Rust oxideav-opus (git master — the working decoder+encoder the published 0.0.13 scaffold lacks)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_opus"
+
+[features]
+# `libopus` (default): the `OpusEnc` element encodes through the vendored reference **libopus** C
+# encoder (statically linked via libopus-sys) — reference-grade quality, allocation-free hot path.
+# Disable (`--no-default-features`) to fall back to the pure-Rust `oxideav-opus` CELT encoder.
+# `OpusDec` (decode) stays pure-Rust either way (conformant + alloc-free).
+default = ["libopus"]
+libopus = ["dep:libopus-sys"]
+# `qa`: the transcode-QA metric ViSQOL (MOS-LQO) for the quality-targeting tools. Optional and off
+# by default — pulls the pure-Rust `visqol-rs` (Apache-2.0) + its deps (ndarray/rustfft/ffsvm),
+# which take ~20 s to compile. Without it, the tools use the fast in-tree NMR metric.
+qa = ["libopus", "dep:visqol-rs"]
+
+[dependencies]
+profluens-core = { path = "../core" }
+# Statically-linked reference libopus (vendored C, cc-built) — the default `OpusEnc` backend.
+libopus-sys = { path = "../libopus-sys", optional = true }
+# Pure-Rust ViSQOL v3 (MOS-LQO perceptual metric) for the `qa` feature; audio-mode SVR model is
+# bundled at models/visqol_audio_model.txt. Vendored (vendor/visqol-rs/PROFLUENS-PATCHES.md) with a
+# fused-gammatone-cascade speedup — bit-identical output, no per-pass allocations.
+visqol-rs = { path = "../vendor/visqol-rs", optional = true }
+# Pure-Rust Opus, the one sanctioned kind of plugin dependency (like oxideav-mp3 for
+# pf-mp3): no build.rs, no unsafe, MIT, RFC 6716/7845-annotated. The *published* 0.0.13
+# is an "orphan-rebuild scaffold" that decodes real Opus to silence/noise (see src/lib.rs
+# history), so we vendor git master — the working clean-room decoder + encoder — with a
+# minimal `decode_packet_into` no-alloc patch (vendor/oxideav-opus/PROFLUENS-PATCHES.md).
+# Its only dependency is oxideav-core (no serde_json, unlike the other OxideAV crates).
+oxideav-opus = { path = "../vendor/oxideav-opus" }
+
+[dev-dependencies]
+# Conformance gate: decode RFC 6716 test vectors and cross-check an ffmpeg/libopus oracle.
+profluens-elements = { path = "../elements" }
+# Encoder validation (examples/encode_roundtrip): perceptual quality gate + Ogg-Opus framing so
+# ffmpeg can act as the external decode oracle.
+profluens-audio = { path = "../audio" }
+pf-ogg = { path = "../ogg" }
+# Transcode alloc measurement (examples/transcode_alloc_check): a real filesrc→flacdec→opusenc chain.
+pf-flac = { path = "../flac" }
+
+# The quality-search tool drives the libopus wrappers directly (encode-many/decode-many).
+[[example]]
+name = "quality_search"
+required-features = ["libopus"]
+
+# FLAC→Opus demo CLI with a ViSQOL-driven bitrate search. ViSQOL-only, so it requires `qa`
+# (which pulls the vendored visqol-rs and implies libopus).
+[[example]]
+name = "transcode"
+required-features = ["qa"]
+
+# Steady-state allocation audit for one ViSQOL comparison (the `--target` search's per-point cost).
+[[example]]
+name = "visqol_alloc_check"
+required-features = ["qa"]

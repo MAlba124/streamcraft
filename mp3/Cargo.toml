@@ -1,0 +1,24 @@
+[package]
+name = "pf-mp3"
+description = "MPEG-1/2 Audio Layer III (MP3) codec plugin for profluens, backed by the pure-Rust oxideav-mp3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_mp3"
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The one sanctioned kind of dependency for a plugin crate (like libpipewire for
+# pf-pipewire, oxideav-vp8 for pf-vp8): pure Rust, no build.rs, no unsafe, MIT. See
+# lib.rs for the adoption evidence (ffmpeg-oracle SNR gate) and the planned
+# nativization steps (decode-into-pool-memory, MPEG-2.5/free-format fix bump).
+oxideav-mp3 = { version = "0.1", default-features = false }
+# The shared `Packet` / `AudioFrame` / `Decoder` vocabulary oxideav-mp3's trait
+# decoder speaks; the element builds packets and reads frames through these types.
+oxideav-core = "0.1"
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

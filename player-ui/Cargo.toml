@@ -1,0 +1,49 @@
+[package]
+name = "pfplay-ui"
+description = "SDL3 immediate-mode GUI media player over pf-play — the profluens flagship front-end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pfplay_ui"
+
+[[bin]]
+name = "pfplay-ui"
+path = "src/bin/pfplay-ui.rs"
+
+[dependencies]
+# The framework: pipeline, the clock-paced wait, buffers, the tap/pause/seek/stop
+# handles the GUI drives, and the SeekIndex the timeline scrubs through.
+profluens-core = { path = "../core" }
+# Typed planar-video views (VideoFrameRef) for reading the decoded frame planes the
+# frame-slot sink copies out.
+profluens-video = { path = "../video" }
+# The seam: Player::open / video_out() / tracks() / transport handles. `External`
+# video means the controller adds no video sink and records the tap point instead.
+pf-play = { path = "../play" }
+# The zero-copy VA-API path: the GPU-frame descriptor + channel (`gpuframe`) the EGL
+# backend imports, and `video_decoder_zerocopy_for` to build the DMA-BUF-exporting decoder.
+# Capability-gated at runtime (no device / no EGL DMABUF import → the existing SDL_Renderer
+# readback path); building it in costs nothing when the hardware path is unavailable.
+pf-vaapi = { path = "../vaapi" }
+# The pure immediate-mode UI toolkit (Ui/widgets/DrawList/Font/arena/Input) — reused
+# verbatim; the video layer is added in a COPY of the backend logic inside this crate
+# (scope's Backend does not expose a video texture path, and we do not modify scope).
+profluens-scope = { path = "../scope" }
+# The one sanctioned FFI dependency, exactly as the sink and scope carry it: pure
+# auto-generated SDL3 bindings linked against system libSDL3 via pkg-config (spec:
+# windowing/graphics ride SDL3). All `unsafe` is confined to `src/backend.rs`.
+sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
+# The h264/hevc decoders churn malloc internally (see sdl3/examples/play_file.rs);
+# the binary swaps the global allocator for playback headroom, exactly like pfplay.
+# Only the binary uses it (`#[global_allocator]`); the library stays allocator-agnostic.
+# Gated behind the default `mimalloc` feature so `--no-default-features` builds with the
+# system allocator (heaptrack/valgrind cannot observe mimalloc allocations).
+mimalloc = { version = "0.1.52", optional = true }
+
+[features]
+default = ["mimalloc"]
+# Enables the mimalloc global allocator in the binary; disable for heaptrack/valgrind.
+mimalloc = ["dep:mimalloc"]

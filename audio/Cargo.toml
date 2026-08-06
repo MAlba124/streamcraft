@@ -1,0 +1,15 @@
+[package]
+name = "profluens-audio"
+description = "POD audio format descriptions and typed views over the opaque buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../core" }
+
+[dev-dependencies]
+# For the wavparse integration test and the wav -> flac milestone example.
+profluens-elements = { path = "../elements" }
+pf-flac = { path = "../flac" }

@@ -1,0 +1,41 @@
+[package]
+name = "profluens-core"
+description = "Dependency-free core: buffers, formats, topology, scheduler, clock, events, bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# One integration-test binary (spec: Testing). Disable cargo's per-file test
+# autodiscovery so only the declared `all` target below is built; it `mod`-includes the
+# sub-suites (`tests/introspect.rs`) rather than compiling each as its own binary.
+autotests = false
+
+[lib]
+name = "profluens_core"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+# Hand-rolled SPSC-ring microbench (spec: Performance doctrine — no criterion, core
+# stays dep-free). `harness = false` → the bench's own `main` is the harness.
+[[bench]]
+name = "ring_hop"
+harness = false
+
+# No dependencies. Ever. (profluens.md: Crate layout)
+[dependencies]
+
+# Dev-only, and only under `--cfg loom`: model-checks the lock-free ring core
+# (try_push/try_pop) across all interleavings. Real builds stay dependency-free.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[features]
+# Serve the introspection protocol (profluens.md: pf-scope). Zero cost unattached.
+introspect = []
+
+# `--cfg loom` is a custom cfg (set via RUSTFLAGS for the loom model tests in
+# ring.rs), not a Cargo feature — declare it so normal builds don't warn about it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

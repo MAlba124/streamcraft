@@ -1,0 +1,41 @@
+[package]
+name = "pf-sdl3"
+description = "SDL3 video sink (and, later, the scope UI backend) for profluens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_sdl3"
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The one sanctioned dependency: pure auto-generated SDL3 bindings (no logic —
+# the `ash`/`pipewire` pattern for plugin crates; spec: windowing/graphics ride
+# SDL3, "graphics sucks and we shouldn't waste time on it"). Links the system
+# libSDL3 via pkg-config — never `build-from-source` (this repo's toolchain
+# does not carry SDL's cmake/clang build).
+sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }
+profluens-video = { path = "../video" }
+# For the play examples: the container + decoder half of
+# `filesrc ! mkvdemux ! <dec> ! sdl3videosink`, plus the audio chain
+# (`aacdec ! pipewireaudiosink` — the A+V milestone; pipewire is dev-only,
+# the library itself stays free of native deps beyond SDL3).
+pf-aac = { path = "../aac" }
+pf-pipewire = { path = "../pipewire" }
+pf-mkv = { path = "../mkv" }
+pf-vp8 = { path = "../vp8" }
+pf-vp9 = { path = "../vp9" }
+pf-av1 = { path = "../av1" }
+pf-h264 = { path = "../h264" }
+pf-h265 = { path = "../h265" }
+# play_file prefers the VA-API hardware decoder when the probe says it exists.
+pf-vaapi = { path = "../vaapi" }
+# play_file's rtsp:// path: the client dance + the RTP receive chain.
+pf-rtp = { path = "../rtp" }
+pf-rtsp = { path = "../rtsp" }
+mimalloc = "0.1.52"

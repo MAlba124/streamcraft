@@ -1,0 +1,148 @@
+//! `tee` — one input stream fanned out to N output branches by refcount
+//! (spec: Scheduling — branching; the branching test's throwaway tee, promoted).
+//! Zero-copy: each branch receives the same [`Memory`] via a refcount bump, so
+//! a tee never allocates from any pool and never copies payload bytes. Events
+//! and buffer metadata (pts/flags) forward to every branch verbatim.
+//!
+//! Construction picks the branch count ([`Tee::new`], up to [`MAX_BRANCHES`]);
+//! only `src_0..src_{n-1}` are pushed to — the static pad table's spares stay
+//! silent (the `MkvMuxN` static-pad convention while dynamic sink/src growth
+//! is core-side pending work). Output pushed to an unlinked spare is dropped and
+//! counted by the scheduler (`elements/tests/unlinked.rs`), never accumulated.
+//!
+//! **What the branches must not do: mutate in place.** The tee itself is free, but
+//! the sharing it creates is not. [`Memory::as_mut_full`] is uniqueness-gated: on a
+//! shared buffer it copy-on-writes the **whole slot** and takes that copy from
+//! [`Pool::acquire_exact`], whose fallback — once the pool has no free slot, and
+//! `small_free` refuses a slot-sized request — is a fresh *unpooled* heap box. So the
+//! first branch that writes into what it received pays a full-slot `memcpy` plus a
+//! malloc/free per buffer, with no backpressure gating it. Measured on
+//! `testsrc ! tee(2) ! [mutating sink, testsink]` with a 2-slot pool:
+//! 1.7 allocations and ~55 KiB of malloc churn *per buffer* (447 MB over a 512 MiB
+//! stream), against a flat 0.00/buffer for the same graph with slots to spare.
+//! A branch that needs to modify its copy should allocate its own output and write
+//! into that, exactly as a transform element does.
+//!
+//! [`Memory`]: profluens_core::memory::Memory
+//! [`Memory::as_mut_full`]: profluens_core::memory::Memory::as_mut_full
+//! [`Pool::acquire_exact`]: profluens_core::memory::Pool::acquire_exact
+
+use profluens_core::batch::Inputs;
+use profluens_core::ctx::Ctx;
+use profluens_core::element::{
+    Direction, Element, ElementDesc, Flow, InputPolicy, LatencyDesc, PadDesc, SchedHint,
+};
+use profluens_core::error::Error;
+use profluens_core::event::Event;
+use profluens_core::format::OfferDesc;
+use profluens_core::id::PadId;
+use profluens_core::time::Timestamp;
+
+/// The static pad table's src pad budget.
+pub const MAX_BRANCHES: usize = 8;
+
+/// Format-agnostic: a tee forwards anything — the wildcard offer intersects
+/// any family (spec: Formats), and the branches' peers negotiate with whatever
+/// the upstream announces (`forward_format` rides the events).
+static OFFERS: [OfferDesc; 1] = [OfferDesc::wildcard()];
+
+const fn src_pad(name: &'static str) -> PadDesc {
+    PadDesc { name, direction: Direction::Src, offers: &OFFERS, dynamic: false, validate: None }
+}
+
+static PADS: [PadDesc; MAX_BRANCHES + 1] = [
+    PadDesc { name: "sink", direction: Direction::Sink, offers: &OFFERS, dynamic: false, validate: None },
+    src_pad("src_0"),
+    src_pad("src_1"),
+    src_pad("src_2"),
+    src_pad("src_3"),
+    src_pad("src_4"),
+    src_pad("src_5"),
+    src_pad("src_6"),
+    src_pad("src_7"),
+];
+
+static DESC: ElementDesc = ElementDesc {
+    name: "tee",
+    pads: &PADS,
+    props: &[],
+    // Active: a tee is a branch point — each src pad feeds its own downstream
+    // group (the branching-test lesson: inter-group branches come off a group
+    // tail, and an Active head is its own tail).
+    sched: SchedHint::Active,
+    inputs: InputPolicy::Single,
+    latency: LatencyDesc {
+        min: Timestamp::ZERO,
+        max: Timestamp::ZERO,
+        is_live: false,
+        jitter: Timestamp::ZERO,
+    },
+    make_default: None,
+};
+
+/// Fan one stream out to `n` branches, refcount-only.
+pub struct Tee {
+    n: usize,
+}
+
+impl Tee {
+    /// A tee feeding `src_0..src_{n-1}` (1 ≤ n ≤ [`MAX_BRANCHES`]).
+    pub fn new(n: usize) -> Tee {
+        assert!(
+            (1..=MAX_BRANCHES).contains(&n),
+            "tee supports 1..={MAX_BRANCHES} branches, got {n}"
+        );
+        Tee { n }
+    }
+}
+
+impl Element for Tee {
+    fn desc(&self) -> &'static ElementDesc {
+        &DESC
+    }
+    fn start(&mut self, _ctx: &mut Ctx) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn process(&mut self, ctx: &mut Ctx, mut inputs: Inputs<'_>) -> Result<Flow, Error> {
+        while let Some(buf) = inputs.pop() {
+            // Branches 1..n get refcount clones of the Memory; the original
+            // moves to branch 0 — n pushes, zero copies, zero allocs. `Buffer`
+            // itself is not `Clone` (device `sync` fences are single-owner), so
+            // the shell is rebuilt per branch; a device-synced buffer through a
+            // tee keeps its fence on branch 0 only (spec: Device memory — CPU
+            // buffers, the tee's use today, carry `sync: None` anyway).
+            for i in 1..self.n {
+                let copy = profluens_core::buffer::Buffer {
+                    memory: buf.memory.clone(),
+                    pts: buf.pts,
+                    dts: buf.dts,
+                    duration: buf.duration,
+                    flags: buf.flags,
+                    format: buf.format,
+                    sync: None,
+                };
+                ctx.out(PadId(i as u32 + 1)).push(copy);
+            }
+            ctx.out(PadId(1)).push(buf);
+        }
+        Ok(Flow::Ok)
+    }
+
+    fn event(&mut self, ctx: &mut Ctx, event: &Event) -> Result<(), Error> {
+        // A FormatChange terminates at this element — the scheduler re-fixates our sink pad and
+        // consumes the event — so a pure transport has to re-announce it onward, verbatim, or its
+        // downstream never re-fixates. `queue` has always done this; `tee` never did, while its own
+        // module doc claimed `forward_format` "rides the events". The result was silent corruption
+        // rather than a loud error: with a tee inserted, a source announcing 48 kHz into sinks that
+        // only accept 44.1 kHz ran to completion with zero bus errors and zero FormatChanges
+        // delivered, leaving both branches decoding the new format as the old one. Both branches
+        // need it — that is the whole point of a tee.
+        if let Event::FormatChange(f) = event {
+            ctx.forward_format(PadId(1), f.clone());
+            ctx.forward_format(PadId(2), f.clone());
+        }
+        Ok(())
+    }
+    fn stop(&mut self, _ctx: &mut Ctx) {}
+}

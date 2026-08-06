@@ -1,0 +1,34 @@
+[package]
+name = "pf-pipewire"
+description = "PipeWire audio sink plugin for profluens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The official PipeWire Rust bindings, used by the current `PipeWireAudioSink`. Being
+# replaced by the from-scratch native-protocol client in `src/native/` (see its module
+# docs) — this dependency goes away once the sink is ported onto it.
+pipewire = "0.8"
+# The native client speaks the daemon's wire protocol directly over the `pipewire-0` socket.
+# `libc` is only for the socket syscalls + `SCM_RIGHTS` fd passing (`sendmsg`/`recvmsg` with
+# control messages) that `std::os::unix` does not expose; no protocol logic lives in it.
+libc = "0.2"
+
+[dev-dependencies]
+# For the `play` example: filesrc ! flacdec ! pipewireaudiosink.
+pf-flac = { path = "../flac" }
+profluens-elements = { path = "../elements" }
+
+# Connect to the live daemon, complete the native handshake, print server info + registry
+# globals — validates `src/native/` against a real PipeWire server (no libpipewire).
+[[example]]
+name = "native_info"
+path = "examples/native_info.rs"
+
+# Play a sine tone through the from-scratch native ClientNode RT path (no libpipewire).
+[[example]]
+name = "native_tone"
+path = "examples/native_tone.rs"

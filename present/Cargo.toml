@@ -1,0 +1,30 @@
+[package]
+name = "pf-present"
+description = "Minimal raw-wire Wayland presenter for profluens — zero per-frame allocation, dmabuf video + software-rendered GUI subsurfaces (no libwayland, no SDL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_present"
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The zero-copy video sink consumes the VA-API decoder's `video/gpu` frames — the
+# GpuFrameChannel hand-off + the dmabuf geometry types live here. (The presenter *core*
+# — wire/conn/window/raster — stays free of it; only `sink` pulls it in.)
+pf-vaapi = { path = "../vaapi" }
+# The subtitle sink pad decodes pgsdec's `subtitle/bitmap` (straight-alpha RGBA + placement)
+# into its own overlay subsurface — no compositing onto the GPU frame needed.
+pf-text = { path = "../text" }
+# The Wayland wire protocol is spoken directly over the display socket to avoid
+# libwayland-client's per-message `wl_closure` heap allocation (the whole reason
+# this crate exists). `libc` is only for the socket syscalls + `SCM_RIGHTS` fd
+# passing (`sendmsg`/`recvmsg` with control messages) that `std::os::unix` does
+# not expose; no protocol logic lives in it.
+libc = "0.2"
+
+[[example]]
+name = "wl_spike"
+path = "examples/wl_spike.rs"

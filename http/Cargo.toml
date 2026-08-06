@@ -1,0 +1,33 @@
+[package]
+name = "pf-http"
+description = "Hand-written HTTP/1.1 source plugin for profluens (https via rustls + graviola)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_http"
+
+[dependencies]
+# TLS for `https://` only — the HTTP layer itself stays hand-written on std
+# networking (no HTTP crate). rustls with default features OFF so the aws-lc-rs
+# C/asm provider is never pulled in; the crypto is graviola (pure Rust, from the
+# rustls project), supplied per-config via `builder_with_provider`. Roots come
+# from the system CA bundle, parsed by our own PEM reader — no webpki-roots, no
+# rustls-native-certs, no other deps.
+rustls = { version = "0.23.42", default-features = false, features = ["std", "tls12"] }
+rustls-graviola = "0.4.0"
+# Kept a separate plugin so the TLS dependency never leaks into the framework
+# crates.
+profluens-core = { path = "../core" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }
+
+[features]
+default = []
+# Test-only: run the download integration tests against the hand-rolled io_uring
+# reactor (elements' `io-uring`), exercising the streaming `Recv` op (offset -1) on a
+# real socket fd. The library itself has no io_uring code — the reactor is injected.
+io-uring = ["profluens-elements/io-uring"]

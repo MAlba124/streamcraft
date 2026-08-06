@@ -1,0 +1,2930 @@
+//! Multi-frame VP8 keyframe encoder driver
+//! ([`Vp8KeyframeStreamEncoder`]).
+//!
+//! This module is the encoder-side counterpart of
+//! [`crate::state::Vp8DecoderState`]: it owns the per-stream state a
+//! sequence of VP8 frames needs (frame count, locked dimensions, the
+//! §9 three-slot reference-frame buffer) and exposes a single
+//! [`Vp8KeyframeStreamEncoder::encode_frame`] entry that turns one
+//! input I420 picture into one VP8 keyframe's bytes while updating
+//! that state.
+//!
+//! ## Scope
+//!
+//! Every emitted frame is a **key frame** — independently decodable, no
+//! cross-frame prediction. The reference-frame slot machinery is wired
+//! up because every key frame implicitly refreshes all three slots per
+//! RFC 6386 §9.7 / §9.8 (the `if (key_frame) … hdr->refresh_last = 1`
+//! body referenced in §19.2's header listing): a downstream decoder
+//! observing the emitted stream sees its `LAST`, `GOLDEN`, and `ALTREF`
+//! slots overwritten with the same picture after every frame.
+//! Maintaining the slots in the encoder mirrors that, so the eventual
+//! inter-encoder round drops in without further plumbing — it will
+//! just need to (a) flip the `key_frame` bit, (b) consult the slots
+//! for motion-compensation source pixels, and (c) honour the §9.7
+//! `refresh_*` / `copy_buffer_to_*` rules to decide which slot(s) the
+//! frame refreshes.
+//!
+//! Inter prediction itself, reference-frame selection (§16.2), per-MB
+//! motion vectors (§17), and motion compensation (§18) are
+//! intentionally out of scope for this round.
+//!
+//! ## Per-frame self-decode invariant
+//!
+//! Each emitted frame's bytes decode through the crate's own
+//! [`crate::state::Vp8DecoderState`] driver to within the §14 quantiser
+//! distortion of the input picture. The
+//! `encoder_keyframe_stream.rs` integration test pins this on a
+//! synthetic 5-frame sequence (different pattern per frame, mid
+//! quantiser, whole-frame PSNR ≥ 30 dB).
+//!
+//! ## Reference-slot lifecycle
+//!
+//! Internally the driver reuses [`crate::encoder::encode_keyframe_with_reconstruction`]
+//! so the *exact* post-§15 macroblock-aligned reconstruction the
+//! decoder will rebuild from the emitted bytes is available without a
+//! re-decode. After every successful `encode_frame` call the three
+//! [`crate::state::RefFrameSlot`]s are atomically replaced with a clone
+//! of that reconstruction, matching the
+//! [`crate::state::Vp8DecoderState::decode_key_frame`] update logic
+//! one-for-one.
+//!
+//! ## Reference
+//!
+//! * RFC 6386 §4 page 8 — "The first frame of a VP8 stream is always a
+//!   key frame".
+//! * RFC 6386 §9.1 / §19.2 — the `key_frame` bit + the keyframe-only
+//!   `start_code` `0x9d 0x01 0x2a` in the frame tag.
+//! * RFC 6386 §9.7 / §9.8 — `refresh_golden_frame`,
+//!   `refresh_alternate_frame`, `refresh_last`. For a key frame all
+//!   three are forced to 1 implicitly (the on-wire bits are
+//!   key-frame-suppressed; the listing in §19.2 only emits them on
+//!   `if (!key_frame)`).
+
+use crate::coded_header::TokenProbUpdates;
+use crate::encoder::{
+    encode_keyframe_with_reconstruction,
+    encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
+    encode_p_frame_multi_ref_with_fitted_token_prob_updates,
+    encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,
+    encode_p_frame_multi_ref_with_refresh_and_intra_pick,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
+    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
+};
+use crate::frame::KeyframePlanes;
+use crate::state::RefFrameSlot;
+
+/// Errors surfaced by [`Vp8KeyframeStreamEncoder::encode_frame`].
+///
+/// Wraps the per-frame [`EncodeError`] surface and adds the
+/// cross-frame-only failures (a dimensions change between frames,
+/// which the §9.1 keyframe-only-resize rule would technically allow
+/// for *another* key frame but which most container clients treat as
+/// a stream split — we reject it here to keep the contract explicit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEncodeError {
+    /// A frame after the first was supplied with different dimensions
+    /// than the first. The driver treats the dimensions as locked at
+    /// the first `encode_frame` call.
+    DimensionsChanged {
+        /// `(width, height)` of the first frame fed in.
+        first: (u32, u32),
+        /// `(width, height)` of the offending later frame.
+        got: (u32, u32),
+    },
+    /// The underlying per-frame encoder rejected the inputs (validator
+    /// failure or §13 token failure). Carries the underlying
+    /// [`EncodeError`].
+    Frame(EncodeError),
+    /// [`Vp8InterStreamEncoder::encode_p_frame_with_refresh`] was called
+    /// before the stream had emitted its first frame, so no `LAST`
+    /// reference is available. The caller should drive at least one
+    /// frame through the scheduler first.
+    NoLastReference,
+}
+
+impl core::fmt::Display for StreamEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StreamEncodeError::DimensionsChanged { first, got } => write!(
+                f,
+                "vp8 stream encode: frame dimensions {}x{} differ from \
+                 stream's first frame {}x{} (dimensions are locked at \
+                 the first encode_frame call)",
+                got.0, got.1, first.0, first.1
+            ),
+            StreamEncodeError::Frame(e) => write!(f, "vp8 stream encode: {e}"),
+            StreamEncodeError::NoLastReference => write!(
+                f,
+                "vp8 stream encode: encode_p_frame_with_refresh called before \
+                 the stream emitted its first frame (LAST reference slot is empty)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamEncodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StreamEncodeError::DimensionsChanged { .. } => None,
+            StreamEncodeError::Frame(e) => Some(e),
+            StreamEncodeError::NoLastReference => None,
+        }
+    }
+}
+
+impl From<EncodeError> for StreamEncodeError {
+    fn from(e: EncodeError) -> Self {
+        StreamEncodeError::Frame(e)
+    }
+}
+
+/// Multi-frame VP8 keyframe encoder driver.
+///
+/// One instance owns the cross-frame state of a single VP8 elementary
+/// stream: the frame counter, the locked-after-first-frame dimensions,
+/// and the §9 three-slot reference-frame buffer
+/// (`LAST` / `GOLDEN` / `ALTREF`).
+///
+/// All emitted frames are key frames this round. Each successful
+/// [`Self::encode_frame`] call:
+///
+/// 1. Validates that this frame's dimensions match the first frame's
+///    (or, on the first call, locks them in).
+/// 2. Calls [`encode_keyframe_with_reconstruction`] with the driver's
+///    [`KeyframeParams`].
+/// 3. Replaces all three reference slots with a clone of the
+///    macroblock-aligned post-§15 reconstruction (§9.7 / §9.8 keyframe
+///    refresh).
+/// 4. Increments the frame counter.
+/// 5. Returns the emitted bytes.
+///
+/// Construct with [`Self::new`] and drive with [`Self::encode_frame`].
+/// [`Self::frame_count`], [`Self::dimensions`], and the per-slot
+/// accessors [`Self::last`], [`Self::golden`], [`Self::altref`]
+/// expose the running state.
+#[derive(Debug, Clone)]
+pub struct Vp8KeyframeStreamEncoder {
+    params: KeyframeParams,
+    /// Visible dimensions of the first frame fed in. Locked after the
+    /// first successful `encode_frame` call; `None` before then.
+    dimensions: Option<(u32, u32)>,
+    /// Number of frames successfully encoded so far.
+    frame_count: u64,
+    /// `LAST` reference slot. `None` before the first frame; populated
+    /// (and replaced) on every successful `encode_frame` call.
+    last: Option<RefFrameSlot>,
+    /// `GOLDEN` reference slot. Same lifecycle as
+    /// [`Self::last`] this round (every key frame refreshes all three).
+    golden: Option<RefFrameSlot>,
+    /// `ALTREF` reference slot. Same lifecycle as [`Self::last`].
+    altref: Option<RefFrameSlot>,
+}
+
+impl Vp8KeyframeStreamEncoder {
+    /// Build a fresh stream encoder configured with the supplied
+    /// per-frame [`KeyframeParams`]. Same parameters are applied to
+    /// every encoded frame in this stream.
+    ///
+    /// The frame counter starts at 0 and all three reference slots
+    /// start as `None`. The dimensions are not locked until the first
+    /// `encode_frame` call.
+    pub fn new(params: KeyframeParams) -> Self {
+        Vp8KeyframeStreamEncoder {
+            params,
+            dimensions: None,
+            frame_count: 0,
+            last: None,
+            golden: None,
+            altref: None,
+        }
+    }
+
+    /// Encode one frame of the stream as a VP8 key frame.
+    ///
+    /// On the first call this also locks the stream's dimensions to
+    /// `frame`'s visible width/height. Every subsequent call must
+    /// supply a frame with the same dimensions; a mismatch is
+    /// surfaced as [`StreamEncodeError::DimensionsChanged`] and leaves
+    /// the encoder state unchanged.
+    ///
+    /// Returns the raw bytes of one VP8 elementary-stream frame
+    /// (`one packet = one frame`) ready to be fed to a container muxer
+    /// (e.g. IVF) or decoded directly through
+    /// [`crate::decode_vp8`] / [`crate::state::Vp8DecoderState::decode_frame`].
+    pub fn encode_frame(&mut self, frame: &I420Frame<'_>) -> Result<Vec<u8>, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let (bytes, planes) = encode_keyframe_with_reconstruction(frame, &self.params)?;
+
+        // §9.7 / §9.8 keyframe slot refresh — all three slots take a
+        // clone of the post-§15 macroblock-aligned reconstruction.
+        // Mirrors `Vp8DecoderState::decode_key_frame`'s slot installation.
+        let slot = RefFrameSlot::from_keyframe_planes(&planes);
+        self.last = Some(slot.clone());
+        self.golden = Some(slot.clone());
+        self.altref = Some(slot);
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(bytes)
+    }
+
+    /// Encode one frame of the stream as a VP8 key frame, with an
+    /// automatically-fitted §13.4 `token_prob_update()` payload per
+    /// [`crate::encoder::encode_keyframe_with_reconstruction_and_fitted_token_prob_updates`].
+    ///
+    /// Drop-in fitted companion to [`Self::encode_frame`]: same K/P
+    /// scheduling rules (every emitted frame is a key frame on this
+    /// driver), same dimension-lock semantics, same §9.7 / §9.8
+    /// three-slot refresh — only the bitstream differs (the fitter is
+    /// allowed to *shrink* the wire by overlaying observed-counts
+    /// probabilities on the §13.5 defaults, with the round-157 fitter's
+    /// safety guard that never *grows* the wire relative to the
+    /// caller-driven `None` baseline).
+    ///
+    /// The returned bytes always decode through
+    /// [`crate::state::Vp8DecoderState::decode_frame`] and every
+    /// compliant VP8 decoder; the §9 reference-frame slots are refreshed
+    /// with the matching reconstruction (the round-157 safety-guard
+    /// fall-back returns the **default-pass** planes alongside the
+    /// default-pass bytes, so the slot state stays consistent with the
+    /// wire on both fitter outcomes).
+    ///
+    /// Closes the round-157 / round-158 follow-up identified in
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    /// ("Out of round-158 scope: threading the fitter into
+    /// `Vp8KeyframeStreamEncoder` / `Vp8InterStreamEncoder`").
+    pub fn encode_frame_with_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<Vec<u8>, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let (bytes, planes) =
+            encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(frame, &self.params)?;
+
+        // §9.7 / §9.8 keyframe slot refresh — identical to
+        // `Self::encode_frame`: a key frame refreshes all three slots
+        // with the post-§15 reconstruction. The fitter's matching-planes
+        // guarantee means `planes` is the reconstruction that matches
+        // the emitted `bytes` regardless of which pass (default or
+        // fitted) won the safety-guard comparison.
+        let slot = RefFrameSlot::from_keyframe_planes(&planes);
+        self.last = Some(slot.clone());
+        self.golden = Some(slot.clone());
+        self.altref = Some(slot);
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(bytes)
+    }
+
+    /// Number of frames successfully encoded so far.
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Stream dimensions, locked at the first successful
+    /// `encode_frame` call. `None` before then.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.dimensions
+    }
+
+    /// Borrow the current `LAST` reference slot. `None` before the
+    /// first frame.
+    pub fn last(&self) -> Option<&RefFrameSlot> {
+        self.last.as_ref()
+    }
+
+    /// Borrow the current `GOLDEN` reference slot. `None` before the
+    /// first frame.
+    pub fn golden(&self) -> Option<&RefFrameSlot> {
+        self.golden.as_ref()
+    }
+
+    /// Borrow the current `ALTREF` reference slot. `None` before the
+    /// first frame.
+    pub fn altref(&self) -> Option<&RefFrameSlot> {
+        self.altref.as_ref()
+    }
+
+    /// Borrow the [`KeyframeParams`] applied to every frame this
+    /// stream emits.
+    pub fn params(&self) -> &KeyframeParams {
+        &self.params
+    }
+}
+
+// ───────────────── Multi-frame I + P stream driver (Phase 10) ────────────────
+//
+// `Vp8InterStreamEncoder` extends the keyframe driver by interleaving
+// ZERO_MV P-frames between key frames per a caller-specified keyframe
+// interval (or a per-frame force-keyframe flag). It uses
+// `encode_keyframe_with_reconstruction` for the K-frame path and
+// `encode_p_frame_zero_mv` for the P-frame path, and maintains the §9
+// three-slot reference-frame ladder one-for-one with
+// `Vp8DecoderState::decode_frame`:
+//
+//   * A keyframe replaces all three slots with the post-§15
+//     reconstruction (§9.7 / §9.8 — every refresh / copy bit is forced
+//     to 1 for a key frame).
+//   * A ZERO_MV P-frame replaces LAST only (§9.7 — the P-frame encoder
+//     emits `refresh_last = 1`, all other refresh / copy bits 0).
+//
+// Reference: RFC 6386 §9 (frame-header layout for K vs P), §9.7
+// (refresh ladder), §9.8 (`refresh_last` interpretation), §16
+// (interframe header), §17 (motion-vector layer), §18 (motion
+// compensation — ZERO_MV path is the §18 identity copy).
+
+/// Per-frame keyframe scheduling decision for
+/// [`Vp8InterStreamEncoder`].
+///
+/// Returned by [`Vp8InterStreamEncoder::next_frame_is_keyframe`] and by
+/// the [`EncodedStreamFrame::is_keyframe`] field of every encoded
+/// output; the caller can use it to confirm the K/P interleave the
+/// encoder picked agreed with its expectations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// VP8 key frame — independently decodable, refreshes all three
+    /// reference slots (§9.7 / §9.8).
+    Key,
+    /// VP8 inter frame coded as ZERO_MV against LAST — predicts from
+    /// the LAST reference at MV (0, 0) per §16.2 / §18, refreshes LAST
+    /// only (§9.7 inter refresh ladder).
+    InterZeroMv,
+}
+
+/// One frame emitted by [`Vp8InterStreamEncoder::encode_frame`].
+///
+/// Bundles the raw VP8 elementary-stream bytes with the K-vs-P
+/// classification and the running frame index, so the caller can sink
+/// the bytes into a container while logging or asserting the
+/// scheduling pattern.
+#[derive(Debug, Clone)]
+pub struct EncodedStreamFrame {
+    /// Raw VP8 elementary-stream bytes for this frame (one packet =
+    /// one frame). Suitable for IVF muxing or for
+    /// [`crate::state::Vp8DecoderState::decode_frame`].
+    pub bytes: Vec<u8>,
+    /// Whether the encoder coded this frame as a key frame or as a
+    /// ZERO_MV P-frame.
+    pub kind: FrameKind,
+    /// 0-based frame index inside this stream — equal to the encoder's
+    /// `frame_count()` at the moment this frame was emitted minus one.
+    pub frame_index: u64,
+}
+
+impl EncodedStreamFrame {
+    /// Convenience: `true` iff this frame was coded as a key frame.
+    pub fn is_keyframe(&self) -> bool {
+        matches!(self.kind, FrameKind::Key)
+    }
+}
+
+/// Multi-frame VP8 I + P stream encoder.
+///
+/// One instance drives a sequence of source I420 pictures into a VP8
+/// elementary stream of alternating key frames and ZERO_MV P-frames,
+/// owning every piece of cross-frame state the §9 / §16 layers need:
+///
+/// * the frame counter,
+/// * the locked-after-first-frame visible dimensions,
+/// * the §9 three-slot reference-frame buffer
+///   (`LAST` / `GOLDEN` / `ALTREF`),
+/// * the keyframe scheduling parameters (interval + per-call override).
+///
+/// ## Scheduling
+///
+/// The encoder picks K or P per frame using two inputs:
+///
+/// 1. A non-zero `keyframe_interval` configured at construction —
+///    every `keyframe_interval`th frame (0, K, 2K, 3K, …) is a key
+///    frame, the rest are ZERO_MV P-frames.
+/// 2. A per-call `force_keyframe` flag on
+///    [`Self::encode_frame_with_force`] — set to `true`, the next
+///    emitted frame is a key frame regardless of the interval, and
+///    the interval re-anchors to the forced index.
+///
+/// The first frame fed into a fresh encoder is **always** a key
+/// frame — there is no prior reference to predict from, matching
+/// [`crate::state::Vp8DecoderState`]'s rejection of an interframe with
+/// no prior key frame.
+///
+/// ## Reference-slot lifecycle
+///
+/// After every successful `encode_frame` call the three reference
+/// slots are updated to match what
+/// [`crate::state::Vp8DecoderState::decode_frame`] would do for the
+/// just-emitted frame:
+///
+/// * **Key frame** (§9.7 / §9.8) — all three slots are replaced with
+///   a clone of the post-§15 reconstruction.
+/// * **ZERO_MV P-frame** (§9.7) — `refresh_last = 1` only, so the LAST
+///   slot is replaced with the post-§15 reconstruction; GOLDEN and
+///   ALTREF are left untouched.
+///
+/// This mirrors the underlying [`encode_p_frame_zero_mv`] refresh
+/// ladder one-for-one.
+///
+/// ## Per-frame self-decode invariant
+///
+/// Every emitted frame's bytes are decodable through
+/// [`crate::state::Vp8DecoderState::decode_frame`], and a sequence of
+/// frames replays into the same per-frame pictures the encoder was
+/// fed (to within the §14 quantiser distortion). The
+/// `encoder_inter_stream.rs` integration test pins this on a synthetic
+/// 10-frame I420 sequence at keyframe interval 4, requiring per-frame
+/// PSNR ≥ 30 dB at a mid quantiser.
+///
+/// ## Scope (this round)
+///
+/// * Every P-frame is ZERO_MV from LAST — no motion search, no
+///   NEARESTMV / NEARMV / NEWMV / SPLITMV, no GOLDEN / ALTREF
+///   selection. Quality on natural content beyond slow translation is
+///   bounded by the §14 quantiser absorbing the residual.
+/// * The §9.5 partition count is whatever the caller put in
+///   [`KeyframeParams::nbr_of_dct_partitions`] for K-frames; P-frames
+///   stay single-partition this round (the underlying
+///   [`encode_p_frame_zero_mv`] hardwires 1).
+/// * Mid-stream resize is rejected with
+///   [`StreamEncodeError::DimensionsChanged`].
+#[derive(Debug, Clone)]
+pub struct Vp8InterStreamEncoder {
+    params: KeyframeParams,
+    keyframe_interval: u64,
+    dimensions: Option<(u32, u32)>,
+    frame_count: u64,
+    /// Frame index that received the most recent key frame. Used to
+    /// re-anchor the interval after a forced keyframe so the next
+    /// K-frame is `keyframe_interval` frames later, not always at a
+    /// multiple of `keyframe_interval` from the absolute start.
+    last_keyframe_index: Option<u64>,
+    last: Option<RefFrameSlot>,
+    golden: Option<RefFrameSlot>,
+    altref: Option<RefFrameSlot>,
+    /// Across-frame §9.4 `ref_frame_delta[]` state in the §20.6
+    /// `{CURRENT, LAST, GOLDEN, ALTREF}` order. Threaded into every
+    /// P-frame's [`oxideav_vp8::LoopFilterDeltas::effective`] call so
+    /// the encoder's §15 post-walk filter matches what the decoder
+    /// derives from the wire. Reset to `[0; 4]` on every key frame
+    /// (RFC 6386 §9.4 — key frames begin a fresh delta sequence).
+    carried_ref_deltas: [i16; 4],
+    /// Across-frame §9.4 `mode_delta[]` state in the §20.6 `{B_PRED,
+    /// ZERO_MV, OTHER_MV, SPLIT_MV}` order. Same lifecycle as
+    /// `carried_ref_deltas`.
+    carried_mode_deltas: [i16; 4],
+    /// Automatic §9.7 `refresh_golden_frame` cadence for the
+    /// scheduler-driven [`Self::encode_frame`] path. `0` disables the
+    /// automatic golden refresh (the historical behaviour — GOLDEN
+    /// stays frozen at the most-recent keyframe's reconstruction until
+    /// the next key frame). `N > 0` makes every `N`-th P-frame **after a
+    /// key frame** also set `refresh_golden_frame = 1`, so GOLDEN tracks
+    /// recent content for the inter MBs that match it better than LAST.
+    /// Counted in P-frames since the last key frame (a key frame already
+    /// refreshes every slot per §9.7, so it resets the count).
+    golden_interval: u64,
+    /// Number of P-frames emitted since the last key frame, used to
+    /// drive [`Self::golden_interval`]. Reset to `0` on every key frame.
+    p_frames_since_keyframe: u64,
+}
+
+impl Vp8InterStreamEncoder {
+    /// Build a fresh I + P stream encoder.
+    ///
+    /// `keyframe_interval` controls automatic keyframe scheduling:
+    ///
+    /// * `1` — every frame is a key frame (degenerates to the
+    ///   keyframe-only driver).
+    /// * `N > 1` — frames 0, N, 2N, 3N, … are key frames; frames in
+    ///   between are ZERO_MV P-frames.
+    /// * `0` — rejected; the keyframe interval must be at least 1 or
+    ///   the encoder would never emit a key frame.
+    ///
+    /// Returns `None` for `keyframe_interval == 0` to make the bad
+    /// configuration impossible-by-construction at the call site.
+    pub fn new(params: KeyframeParams, keyframe_interval: u64) -> Option<Self> {
+        if keyframe_interval == 0 {
+            return None;
+        }
+        Some(Vp8InterStreamEncoder {
+            params,
+            keyframe_interval,
+            dimensions: None,
+            frame_count: 0,
+            last_keyframe_index: None,
+            last: None,
+            golden: None,
+            altref: None,
+            carried_ref_deltas: [0; 4],
+            carried_mode_deltas: [0; 4],
+            golden_interval: 0,
+            p_frames_since_keyframe: 0,
+        })
+    }
+
+    /// Set the automatic §9.7 `refresh_golden_frame` cadence (builder
+    /// style) and return the modified encoder.
+    ///
+    /// With `golden_interval = N > 0`, the scheduler-driven
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] path
+    /// sets `refresh_golden_frame = 1` on every `N`-th P-frame measured
+    /// from the most-recent key frame (i.e. the `N`-th, `2N`-th, …
+    /// P-frame after each key frame). On those frames the current
+    /// reconstruction is written into the encoder's GOLDEN slot exactly
+    /// as the decoder will write its own — the §16.2 inter MBs of later
+    /// P-frames can then predict off a recent GOLDEN instead of one
+    /// frozen at the last key frame.
+    ///
+    /// `golden_interval = 0` (the default after [`Self::new`]) disables
+    /// the automatic refresh and reproduces the historical
+    /// `refresh_last`-only auto path byte-for-byte. Callers that want
+    /// full manual control over the §9.7 / §9.8 ladder keep using the
+    /// `encode_p_frame_with_refresh*` family, which is unaffected.
+    #[must_use]
+    pub fn with_golden_interval(mut self, golden_interval: u64) -> Self {
+        self.golden_interval = golden_interval;
+        self
+    }
+
+    /// The configured automatic §9.7 golden-refresh cadence (`0` =
+    /// disabled). See [`Self::with_golden_interval`].
+    pub fn golden_interval(&self) -> u64 {
+        self.golden_interval
+    }
+
+    /// Whether the next scheduler-driven P-frame would set
+    /// `refresh_golden_frame = 1` under the configured
+    /// [`Self::golden_interval`], **without** encoding anything.
+    ///
+    /// Always `false` when the automatic cadence is disabled
+    /// (`golden_interval == 0`) or when the next frame is a key frame
+    /// (key frames refresh every slot regardless). Otherwise `true`
+    /// exactly when this would be the `N`-th, `2N`-th, … P-frame after
+    /// the last key frame.
+    pub fn next_p_frame_refreshes_golden(&self) -> bool {
+        if self.golden_interval == 0 {
+            return false;
+        }
+        if self.next_frame_is_keyframe() == FrameKind::Key {
+            return false;
+        }
+        // This call would emit P-frame number `p_frames_since_keyframe
+        // + 1` since the last key frame.
+        (self.p_frames_since_keyframe + 1) % self.golden_interval == 0
+    }
+
+    /// Decide whether the next [`Self::encode_frame`] call would emit
+    /// a key frame, given the current frame index and the last forced
+    /// keyframe anchor — without actually encoding anything.
+    ///
+    /// Useful for a caller that wants to pre-roll metadata (IVF
+    /// keyframe markers, container random-access entries) before
+    /// handing the frame in. The decision is:
+    ///
+    /// * `FrameKind::Key` if no frame has been encoded yet (first
+    ///   frame must be a key frame), or if `frame_count -
+    ///   last_keyframe_index >= keyframe_interval`.
+    /// * `FrameKind::InterZeroMv` otherwise.
+    pub fn next_frame_is_keyframe(&self) -> FrameKind {
+        match self.last_keyframe_index {
+            None => FrameKind::Key,
+            Some(anchor) => {
+                if self
+                    .frame_count
+                    .saturating_sub(anchor)
+                    .ge(&self.keyframe_interval)
+                {
+                    FrameKind::Key
+                } else {
+                    FrameKind::InterZeroMv
+                }
+            }
+        }
+    }
+
+    /// Encode one frame of the stream using the configured keyframe
+    /// interval to pick K vs P.
+    ///
+    /// On the first call this also locks the stream's dimensions to
+    /// `frame`'s visible width/height. Every subsequent call must
+    /// supply a frame with the same dimensions; a mismatch is
+    /// surfaced as [`StreamEncodeError::DimensionsChanged`] and leaves
+    /// the encoder state unchanged.
+    ///
+    /// Returns the emitted bytes wrapped in an
+    /// [`EncodedStreamFrame`] so the caller knows which kind of frame
+    /// it received without re-parsing the §9.1 tag bit.
+    pub fn encode_frame(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_frame_with_force(frame, false)
+    }
+
+    /// Encode one frame of the stream, with an optional override that
+    /// forces it to be coded as a key frame regardless of the
+    /// configured interval.
+    ///
+    /// A `force_keyframe = true` call **also re-anchors the interval**:
+    /// after the forced K-frame at frame index `i`, the next automatic
+    /// keyframe lands at `i + keyframe_interval`, not at the original
+    /// multiple of `keyframe_interval` from the absolute start. This
+    /// keeps the inter-keyframe spacing predictable in the presence of
+    /// scene-cut overrides.
+    pub fn encode_frame_with_force(
+        &mut self,
+        frame: &I420Frame<'_>,
+        force_keyframe: bool,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let scheduled = self.next_frame_is_keyframe();
+        let must_be_key = scheduled == FrameKind::Key || force_keyframe;
+
+        // We can only emit a P-frame if we actually hold a LAST
+        // reference; otherwise we must promote to a key frame even
+        // though the scheduler said "P". (Belt-and-suspenders: the
+        // scheduler already returns Key for the first frame, so this
+        // arm is only ever taken if a future variant of the API lets
+        // the caller drop the slots externally.)
+        let emit_key = must_be_key || self.last.is_none();
+
+        // §9.7 automatic golden-refresh schedule: when a non-zero
+        // `golden_interval` is configured, the `N`-th P-frame after the
+        // last key frame also sets `refresh_golden_frame = 1` so GOLDEN
+        // tracks recent content rather than staying frozen at the most-
+        // recent key frame. The first scheduled refresh therefore lands
+        // when `p_frames_since_keyframe + 1` (this P-frame's index since
+        // the key frame) is a multiple of the interval.
+        let refresh_golden = !emit_key
+            && self.golden_interval != 0
+            && (self.p_frames_since_keyframe + 1) % self.golden_interval == 0;
+
+        let (bytes, planes, kind) = if emit_key {
+            let (b, p) = encode_keyframe_with_reconstruction(frame, &self.params)?;
+            (b, p, FrameKind::Key)
+        } else {
+            // Safe: `emit_key` is false ⇒ `self.last` is Some by the
+            // expression above. We pass all three §9 reference slots
+            // (`LAST` required, `GOLDEN` / `ALTREF` optional) to the
+            // multi-ref encoder so it can score each MB against every
+            // available reference and emit the §16.2 `ref_frame_tree`
+            // selector bits per MB.
+            //
+            // When `refresh_golden` is set the §9.7 wire ladder is
+            // `refresh_golden_frame = 1, refresh_last = 1` (everything
+            // else 0); otherwise it is the default `refresh_last = 1`
+            // only — byte-identical to the historical auto path. The
+            // matching `RefreshControls` is reproduced on the slot side
+            // below so the encoder's GOLDEN slot stays in lockstep with
+            // what the decoder writes from the wire.
+            let last_planes = ref_slot_to_keyframe_planes(
+                self.last.as_ref().expect("LAST slot present for P-frame"),
+            );
+            let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+            let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+            let (b, p) = if refresh_golden {
+                let refresh = RefreshControls {
+                    refresh_golden_frame: true,
+                    refresh_last: true,
+                    ..RefreshControls::default()
+                };
+                encode_p_frame_multi_ref_with_refresh(
+                    frame,
+                    &last_planes,
+                    golden_planes.as_ref(),
+                    altref_planes.as_ref(),
+                    &self.params,
+                    &refresh,
+                )?
+            } else {
+                encode_p_frame_multi_ref(
+                    frame,
+                    &last_planes,
+                    golden_planes.as_ref(),
+                    altref_planes.as_ref(),
+                    &self.params,
+                )?
+            };
+            (b, p, FrameKind::InterZeroMv)
+        };
+
+        let frame_index = self.frame_count;
+
+        // ---- Reference-slot update (§9.7) -----------------------------
+        let new_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        match kind {
+            FrameKind::Key => {
+                // §9.7 / §9.8 keyframe — every slot is refreshed with
+                // the same reconstruction.
+                self.last = Some(new_slot.clone());
+                self.golden = Some(new_slot.clone());
+                self.altref = Some(new_slot);
+                self.last_keyframe_index = Some(frame_index);
+                // §9.4 key frames begin a fresh delta sequence — clear
+                // the carried state so the next P-frame's effective
+                // deltas start from 0 (matching the decoder's behaviour
+                // after a key frame).
+                self.carried_ref_deltas = [0; 4];
+                self.carried_mode_deltas = [0; 4];
+                // §9.7 key frames reset the automatic golden-refresh
+                // cadence: every slot was just refreshed, so the count
+                // of P-frames since the last key frame restarts at 0.
+                self.p_frames_since_keyframe = 0;
+            }
+            FrameKind::InterZeroMv => {
+                // §9.7 inter refresh ladder. By default only LAST
+                // changes (refresh_last = 1, everything else 0). When
+                // the automatic golden-refresh schedule fired for this
+                // frame the wire carried `refresh_golden_frame = 1` as
+                // well, so GOLDEN takes the same current reconstruction
+                // — keeping the encoder slot in lockstep with the
+                // decoder's §9.7 write. ALTREF and the §20 copy_buffer_*
+                // paths stay untouched on this auto schedule. The §9.4
+                // carried-delta state stays unchanged (this path emits
+                // `loop_filter_adj_enable = 0`, so the effective deltas
+                // are all 0 and there is nothing fresh to carry).
+                if refresh_golden {
+                    self.golden = Some(new_slot.clone());
+                }
+                self.last = Some(new_slot);
+                self.p_frames_since_keyframe += 1;
+            }
+        }
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind,
+            frame_index,
+        })
+    }
+
+    /// Encode one frame using the configured keyframe interval to pick
+    /// K vs P, with the round-160 / round-161 §11 intra-within-inter
+    /// MB picker engaged on every P-frame.
+    ///
+    /// Drop-in `intra-pick` companion to [`Self::encode_frame`]: the
+    /// scheduling decision (K vs P) and the §9.7 reference-slot ladder
+    /// are identical to the non-intra-pick path; only the per-MB picker
+    /// changes. On every emitted P-frame the per-MB picker scores the
+    /// full §11.2 × §11.4 whole-block intra grid (4 luma × 4 chroma =
+    /// 16 candidates, `B_PRED` excluded) against the running in-frame
+    /// neighbours in addition to the §16 inter ladder, and picks
+    /// whichever of (best inter pick, J-best intra) wins on
+    /// `J + lambda * is_inter_mb-bit`. When the intra candidate wins
+    /// on at least one MB the §9.10 `prob_intra` byte drops below 255
+    /// and the §16.1 intra-mode-tree path emits on those MBs.
+    ///
+    /// K-frames go through the same
+    /// [`encode_keyframe_with_reconstruction`] path as
+    /// [`Self::encode_frame`] — the intra-pick flag only affects the
+    /// inter (P-frame) arm. The §9.4 carried-delta state, the §9.7
+    /// reference-slot rotation, and the dimensions-lock semantics are
+    /// unchanged.
+    ///
+    /// Wire compatibility: on any source where the round-161 picker
+    /// never selects an intra MB (e.g. a slow-translation flat
+    /// gradient where ZERO_MV already absorbs the residual), the
+    /// emitted bytes match [`Self::encode_frame`] modulo the
+    /// `prob_intra` byte's drop from 255 to 1 (≈ 6 extra bits ≈ 1
+    /// extra byte per P-frame). This is the same bound the bare
+    /// `encode_p_frame_multi_ref_with_intra_pick` entry-point already
+    /// pins under `tests/encoder_pframe_intra_pick.rs`.
+    pub fn encode_frame_with_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_frame_with_force_and_intra_pick(frame, false)
+    }
+
+    /// Encode one frame with the round-160 / round-161 intra-pick
+    /// engaged **and** an optional `force_keyframe` override that
+    /// re-anchors the keyframe interval, exactly mirroring
+    /// [`Self::encode_frame_with_force`].
+    ///
+    /// Companion to [`Self::encode_frame_with_intra_pick`]: the
+    /// `force_keyframe` semantics (re-anchoring the interval after a
+    /// forced K-frame at frame index `i` so the next automatic K-frame
+    /// lands at `i + keyframe_interval`) match
+    /// [`Self::encode_frame_with_force`] exactly. On the K-frame arm
+    /// the intra-pick flag is a no-op — every MB in a key frame is
+    /// intra by construction.
+    pub fn encode_frame_with_force_and_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+        force_keyframe: bool,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let scheduled = self.next_frame_is_keyframe();
+        let must_be_key = scheduled == FrameKind::Key || force_keyframe;
+        let emit_key = must_be_key || self.last.is_none();
+
+        let (bytes, planes, kind) = if emit_key {
+            let (b, p) = encode_keyframe_with_reconstruction(frame, &self.params)?;
+            (b, p, FrameKind::Key)
+        } else {
+            // Inter arm — same LAST/GOLDEN/ALTREF plane harvesting as
+            // `encode_frame_with_force`, but the per-MB picker is the
+            // round-160 / round-161 intra-within-inter widened
+            // candidate set.
+            let last_planes = ref_slot_to_keyframe_planes(
+                self.last.as_ref().expect("LAST slot present for P-frame"),
+            );
+            let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+            let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+            let (b, p) = encode_p_frame_multi_ref_with_intra_pick(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+            )?;
+            (b, p, FrameKind::InterZeroMv)
+        };
+
+        let frame_index = self.frame_count;
+
+        // ---- Reference-slot update (§9.7) — identical to
+        // `encode_frame_with_force`. The intra-pick flag does NOT
+        // affect the §9.7 ladder; `planes` is the reconstruction that
+        // matches `bytes` regardless of which per-MB pick won.
+        let new_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        match kind {
+            FrameKind::Key => {
+                self.last = Some(new_slot.clone());
+                self.golden = Some(new_slot.clone());
+                self.altref = Some(new_slot);
+                self.last_keyframe_index = Some(frame_index);
+                // §9.4 — key frames start a fresh delta sequence.
+                self.carried_ref_deltas = [0; 4];
+                self.carried_mode_deltas = [0; 4];
+            }
+            FrameKind::InterZeroMv => {
+                // §9.7 inter refresh ladder used by the multi-ref
+                // P-frame encoder's default `RefreshControls`:
+                // refresh_last = 1 only.
+                self.last = Some(new_slot);
+            }
+        }
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind,
+            frame_index,
+        })
+    }
+
+    /// Encode one frame using the configured keyframe interval to pick
+    /// K vs P, with an automatically-fitted §13.4 `token_prob_update()`
+    /// payload on every emitted frame.
+    ///
+    /// Drop-in fitted companion to [`Self::encode_frame`] / the K-frame
+    /// arm of [`Self::encode_frame_with_force`]: scheduling, dimension-
+    /// lock semantics, and the §9.7 reference-slot ladder are identical;
+    /// only the bitstream differs. Each emitted frame independently
+    /// runs the round-157 (keyframe) or round-158 (inter) two-pass
+    /// fitter — the §13.4 payload is decided per frame from that frame's
+    /// observed counts, never carried over to the next.
+    ///
+    /// Wire compatibility: on a frame where no §13.4 slot crosses the
+    /// fitter's saving threshold, the safety-guard fall-back returns
+    /// the bytes [`Self::encode_frame_with_force`] would have emitted
+    /// for the same kind of frame.
+    ///
+    /// **Carried-base assumption.** The inter fitter assumes the prior
+    /// key frame was emitted with the §13.5 defaults (i.e. an
+    /// `encode_keyframe`-equivalent base table). This entry-point is
+    /// the closure of that loop: K-frames go through
+    /// [`encode_keyframe_with_reconstruction_and_fitted_token_prob_updates`]
+    /// which itself emits a fitted-on-defaults wire — the decoder
+    /// rebuilds `coeff_probs[4][8][3][11]` from defaults overlaid with
+    /// the K-frame's payload, then the next P-frame's fitter again
+    /// overlays its own payload on top of the §13.5 defaults. This
+    /// matches what [`crate::state::Vp8DecoderState::decode_inter_frame`]
+    /// does (`overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`
+    /// where `self.coeff_probs` was reset to §13.5 defaults by the prior
+    /// key frame).
+    pub fn encode_frame_with_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_frame_with_force_and_fitted_token_prob_updates(frame, false)
+    }
+
+    /// Encode one frame, with an optional `force_keyframe` override and
+    /// the round-157 / round-158 fitter applied to every emitted frame.
+    ///
+    /// Companion to [`Self::encode_frame_with_force`] /
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`]. The
+    /// `force_keyframe` semantics (re-anchoring the interval) match
+    /// [`Self::encode_frame_with_force`] exactly.
+    pub fn encode_frame_with_force_and_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        force_keyframe: bool,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let scheduled = self.next_frame_is_keyframe();
+        let must_be_key = scheduled == FrameKind::Key || force_keyframe;
+        let emit_key = must_be_key || self.last.is_none();
+
+        let (bytes, planes, kind) = if emit_key {
+            let (b, p) = encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(
+                frame,
+                &self.params,
+            )?;
+            (b, p, FrameKind::Key)
+        } else {
+            // Mirrors the non-fitted arm exactly — same LAST/GOLDEN/ALTREF
+            // plane harvesting, same multi-ref picker, only the fitted
+            // inter entry-point swapped in.
+            let last_planes = ref_slot_to_keyframe_planes(
+                self.last.as_ref().expect("LAST slot present for P-frame"),
+            );
+            let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+            let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+            let (b, p) = encode_p_frame_multi_ref_with_fitted_token_prob_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+            )?;
+            (b, p, FrameKind::InterZeroMv)
+        };
+
+        let frame_index = self.frame_count;
+
+        // ---- Reference-slot update (§9.7) — identical to
+        // `encode_frame_with_force`. The fitter does NOT affect the
+        // §9.7 ladder; the fitter's matching-planes guarantee means
+        // `planes` is the reconstruction that matches `bytes` regardless
+        // of which pass won.
+        let new_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        match kind {
+            FrameKind::Key => {
+                self.last = Some(new_slot.clone());
+                self.golden = Some(new_slot.clone());
+                self.altref = Some(new_slot);
+                self.last_keyframe_index = Some(frame_index);
+                // §9.4 — key frames start a fresh delta sequence.
+                self.carried_ref_deltas = [0; 4];
+                self.carried_mode_deltas = [0; 4];
+            }
+            FrameKind::InterZeroMv => {
+                // §9.7 inter refresh ladder used by the multi-ref
+                // P-frame encoder's default `RefreshControls`:
+                // refresh_last = 1 only.
+                self.last = Some(new_slot);
+            }
+        }
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern.
+    ///
+    /// This is the slot-rotation companion to
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh`]: it
+    /// emits a P-frame whose header carries the requested `refresh`
+    /// bits and then evolves the driver's `LAST` / `GOLDEN` / `ALTREF`
+    /// slots per the §20 page-147 walk (`copy_arf → copy_gf →
+    /// refresh_gf → refresh_arf → refresh_last`), so the next
+    /// `encode_frame*` call sees the same slot trio the in-tree
+    /// decoder would after consuming the same wire.
+    ///
+    /// Pre-conditions:
+    ///
+    /// * A `LAST` slot must be present (the stream must have emitted at
+    ///   least one prior frame). If not, the call returns
+    ///   [`StreamEncodeError::NoLastReference`] — the caller should
+    ///   drive at least one frame through the scheduler
+    ///   ([`Self::encode_frame`] or [`Self::encode_frame_with_force`])
+    ///   first.
+    /// * Dimensions must match the stream's locked dimensions; a
+    ///   mismatch is surfaced as
+    ///   [`StreamEncodeError::DimensionsChanged`].
+    /// * `refresh` is forwarded to
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh`],
+    ///   which runs [`RefreshControls::validate`]; invalid
+    ///   `copy_buffer_to_*` selectors surface as
+    ///   [`EncodeError::InvalidCopyBufferSelector`] wrapped in
+    ///   [`StreamEncodeError::Frame`].
+    ///
+    /// The keyframe scheduler is **bypassed** by this entry-point: the
+    /// caller has asked for a specific refresh pattern, and forcing a
+    /// key frame here would lose it.
+    ///
+    /// The slot rotation runs after the bitstream is emitted, mirroring
+    /// the §20 page-147 ordering verbatim:
+    ///
+    /// 1. `copy_buffer_to_alternate` (1 = LAST → ALTREF, 2 = GOLDEN → ALTREF).
+    /// 2. `copy_buffer_to_golden` (1 = LAST → GOLDEN, 2 = ALTREF → GOLDEN).
+    /// 3. `refresh_golden_frame` (replace GOLDEN with current reconstruction).
+    /// 4. `refresh_alternate_frame` (replace ALTREF with current reconstruction).
+    /// 5. `refresh_last` (replace LAST with current reconstruction).
+    ///
+    /// `last_keyframe_index` is **not** touched (this is a P-frame).
+    pub fn encode_p_frame_with_refresh(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_p_frame_with_refresh_and_lf_deltas(frame, refresh, &LoopFilterDeltas::default())
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, with the round-160 / round-161
+    /// §11 intra-within-inter MB picker engaged.
+    ///
+    /// Combines [`Self::encode_p_frame_with_refresh`] (caller-driven
+    /// refresh ladder + stream-side slot rotation per §20 page-147)
+    /// with the round-161 picker. On every MB the picker scores the
+    /// full §11.2 × §11.4 whole-block intra grid (4 luma × 4 chroma)
+    /// against the running in-frame neighbours in addition to the §16
+    /// inter ladder, and picks whichever of (best inter, J-best intra)
+    /// wins on `J + lambda * is_inter_mb-bit`.
+    ///
+    /// Pre-conditions and slot-rotation mirror
+    /// [`Self::encode_p_frame_with_refresh`] exactly:
+    ///
+    /// * A `LAST` slot must be present —
+    ///   [`StreamEncodeError::NoLastReference`] otherwise.
+    /// * Dimensions must match the stream's locked dimensions —
+    ///   [`StreamEncodeError::DimensionsChanged`] otherwise.
+    /// * `refresh` is forwarded to
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_intra_pick`],
+    ///   which runs [`RefreshControls::validate`]; invalid selectors
+    ///   surface as [`EncodeError::InvalidCopyBufferSelector`] wrapped
+    ///   in [`StreamEncodeError::Frame`].
+    /// * The keyframe scheduler is **bypassed** (the caller is asking
+    ///   for a P-frame with a specific refresh).
+    ///
+    /// Slot-rotation runs after the bitstream is emitted, mirroring
+    /// the §20 page-147 walk (`copy_arf → copy_gf → refresh_gf →
+    /// refresh_arf → refresh_last`). `last_keyframe_index` is **not**
+    /// touched. The §9.4 carried-delta state is **not** updated this
+    /// round — the picker engages the round-160 inter path with
+    /// [`LoopFilterDeltas::default`] (matching the bare-encoder
+    /// `encode_p_frame_multi_ref_with_refresh_and_intra_pick`
+    /// signature), so the effective deltas resolve to `0` and there
+    /// is no fresh value to carry. Callers that need both intra-pick
+    /// AND §9.4 deltas should sit one round above this — the
+    /// composition fits naturally into the
+    /// `…_intra_pick_and_lf_deltas` companion that a follow-up round
+    /// will expose; this round's scope is exactly the intra-pick
+    /// thread, not the full Cartesian product.
+    pub fn encode_p_frame_with_refresh_and_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) = encode_p_frame_multi_ref_with_refresh_and_intra_pick(
+            frame,
+            &last_planes,
+            golden_planes.as_ref(),
+            altref_planes.as_ref(),
+            &self.params,
+            refresh,
+        )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas`: the
+        // intra-pick flag governs per-MB candidate scoring only and
+        // does NOT alter the §9.7 slot ladder. The §20 page-147 walk
+        // is `copy_arf → copy_gf → refresh_gf → refresh_arf →
+        // refresh_last`; the "copy" cases consult pre-refresh state,
+        // so capture the pre-rotation slots into temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern **and** a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter
+    /// delta layer.
+    ///
+    /// Companion to [`Self::encode_p_frame_with_refresh`] that exposes
+    /// the §9.4 `loop_filter_adj_enable` /
+    /// `mode_ref_lf_delta_update` + per-slot delta fields through
+    /// [`crate::encoder::LoopFilterDeltas`]. The stream encoder threads
+    /// the across-frame carried delta state per RFC 6386 §9.4 ("the
+    /// values from the previous frame are used, unless they are updated
+    /// in the current header") — the caller does not need to track it.
+    ///
+    /// Wire compatibility: passing
+    /// [`crate::encoder::LoopFilterDeltas::default`] (with
+    /// `enabled = false`) reproduces
+    /// [`Self::encode_p_frame_with_refresh`] byte-for-byte, including
+    /// when called repeatedly through the carried-state mechanism
+    /// (`enabled = false` resolves effective deltas to 0 regardless
+    /// of carried state).
+    ///
+    /// Slot-rotation and pre-conditions match
+    /// [`Self::encode_p_frame_with_refresh`].
+    pub fn encode_p_frame_with_refresh_and_lf_deltas(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) = crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas(
+            frame,
+            &last_planes,
+            golden_planes.as_ref(),
+            altref_planes.as_ref(),
+            &self.params,
+            refresh,
+            lf_deltas,
+            self.carried_ref_deltas,
+            self.carried_mode_deltas,
+        )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // The decoder updates its carried state with the effective
+        // values it just resolved (carried + present updates). Mirror
+        // that exactly so the next frame's effective deltas line up.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            // RFC 6386 §9.4: when adj is enabled, the carried state for
+            // the NEXT frame is what this frame's effective deltas
+            // resolved to (whether they came from updates or carry).
+            // When adj is DISABLED this frame, the spec keeps the
+            // carried state untouched — the disabled-this-frame case is
+            // not a "reset" event, it just means no delta is applied
+            // this frame; the deltas persist for whenever the next
+            // frame re-enables the feature.
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Mirror the §20 page-147 ordering exactly (the same walk the
+        // decoder runs in `Vp8DecoderState`):
+        //   copy_buffer_to_alternate → copy_buffer_to_golden →
+        //   refresh_golden_frame → refresh_alternate_frame →
+        //   refresh_last. The "copy" cases consult the slot state from
+        //   BEFORE the refresh writes, so we capture pre-state in
+        //   temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8 refresh
+    /// pattern, §9.4 `mb_lf_adjustments()` delta layer, **and** §13.4
+    /// `token_prob_update()` payload.
+    ///
+    /// Companion to [`Self::encode_p_frame_with_refresh_and_lf_deltas`]
+    /// that exposes the §13.4 per-position
+    /// `coeff_prob_update_flag` / `coeff_prob` sub-block through
+    /// [`crate::coded_header::TokenProbUpdates`]. The encoder writes the
+    /// replacement layer into the first-partition header and codes the
+    /// §13.3 residual tokens against the merged
+    /// `coeff_probs[4][8][3][11]` table (§13.5 defaults overlaid with
+    /// the caller's per-position values), exactly mirroring what the
+    /// decoder's `decode_inter_frame` rebuilds from the same wire.
+    ///
+    /// Wire compatibility: passing `token_updates = None` (or an
+    /// all-`None` array) reproduces
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] byte-for-byte
+    /// — every §13.4 flag is 0 and the §13.5 defaults stay in force.
+    ///
+    /// Slot-rotation and pre-conditions match
+    /// [`Self::encode_p_frame_with_refresh`].
+    ///
+    /// **Assumption on carried entropy state.** This entry-point assumes
+    /// the prior key frame was emitted with the §13.5 defaults (i.e.
+    /// either [`crate::encoder::encode_keyframe`] /
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`], or
+    /// [`crate::encoder::encode_keyframe_with_token_prob_updates`]
+    /// called with an all-`None` array). The standard stream entry-points
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] both
+    /// satisfy this since they go through
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`]. Mixing a
+    /// non-default-base keyframe with this entry-point is out of round-
+    /// 156 scope.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_token_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+        token_updates: Option<&TokenProbUpdates>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+                token_updates,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Same lifecycle rule as `encode_p_frame_with_refresh_and_lf_deltas`:
+        // adj-enabled frames update the carried state with this frame's
+        // effective deltas; adj-disabled frames leave it unchanged. The
+        // §13.4 token-prob layer does NOT affect the §9.4 delta carry.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas`: token-
+        // prob updates do NOT alter the §9.7 slot ladder (they govern
+        // residual coding only).
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter delta
+    /// layer, **and** the round-160 / round-161 §11 intra-within-inter
+    /// MB picker engaged.
+    ///
+    /// Composition of [`Self::encode_p_frame_with_refresh_and_lf_deltas`]
+    /// (round 151 §9.4 layer + across-frame carried-delta state) and
+    /// [`Self::encode_p_frame_with_refresh_and_intra_pick`] (round 162
+    /// stream thread of the round-160 / 161 picker). The round 162 next-
+    /// step ladder named exactly this composition — "compose the §9.4
+    /// `mb_lf_adjustments()` deltas with the intra-pick on the refresh
+    /// path (`encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`)"
+    /// — as the follow-up that would expose both knobs together. Round
+    /// 163 lands it.
+    ///
+    /// Internally calls
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`]
+    /// (the matching bare-encoder wrapper). The stream encoder threads
+    /// the across-frame carried delta state per RFC 6386 §9.4 ("the
+    /// values from the previous frame are used, unless they are updated
+    /// in the current header") — the caller does not need to track it;
+    /// the carry-update rule is identical to
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] (adj-enabled
+    /// frames write back the effective deltas; adj-disabled frames leave
+    /// the carry untouched). The intra-pick toggle does NOT affect the
+    /// §9.4 delta carry — it governs per-MB candidate scoring only.
+    ///
+    /// Wire compatibility:
+    ///
+    /// * Passing [`crate::encoder::LoopFilterDeltas::default`] (with
+    ///   `enabled = false`) reproduces
+    ///   [`Self::encode_p_frame_with_refresh_and_intra_pick`]
+    ///   byte-for-byte. The §9.4 layer is gated on `lf_deltas.enabled`
+    ///   exactly as on the non-intra-pick path.
+    /// * On a source where intra never beats inter the wire matches
+    ///   [`Self::encode_p_frame_with_refresh_and_lf_deltas`] modulo a
+    ///   ~6 bits ≈ 1 byte frame-constant difference at the §9.10
+    ///   `prob_intra` byte (sentinel `255` → fitted `1`), matching the
+    ///   bound documented on the bare-encoder intra-pick path.
+    ///
+    /// Pre-conditions, slot-rotation (§20 page-147 walk
+    /// `copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`),
+    /// and error surface (`NoLastReference`, `DimensionsChanged`) match
+    /// [`Self::encode_p_frame_with_refresh`] exactly. `last_keyframe_index`
+    /// is **not** touched.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas` /
+        // `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`:
+        // adj-enabled frames update the carried state with this frame's
+        // effective deltas; adj-disabled frames leave it unchanged. The
+        // §11 intra-pick toggle does NOT affect the §9.4 delta carry —
+        // it governs per-MB candidate scoring only.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Mirror the §20 page-147 ordering exactly (the same walk the
+        // decoder runs in `Vp8DecoderState` and the same walk every other
+        // refresh-aware entry-point on this struct runs):
+        //   copy_buffer_to_alternate → copy_buffer_to_golden →
+        //   refresh_golden_frame → refresh_alternate_frame →
+        //   refresh_last. The "copy" cases consult the slot state from
+        //   BEFORE the refresh writes, so we capture pre-state in
+        //   temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter delta
+    /// layer, **and** the round-157 / round-158 §13.4 token-prob
+    /// observed-counts fitter engaged.
+    ///
+    /// Round 158 landed the bare-encoder
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    /// (two-pass: encode with §13.5 defaults to collect observed branch
+    /// counts, run [`crate::encoder::fit_token_prob_updates`] to derive
+    /// a [`TokenProbUpdates`] payload that nets a positive bit saving,
+    /// then re-encode with that payload through
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`]
+    /// — with the `bytes_fitted <= bytes_default` safety guard). Round
+    /// 159 threaded the *scheduler-driven* fitter through
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`] /
+    /// [`Self::encode_frame_with_force_and_fitted_token_prob_updates`].
+    /// The round-158 entry-point itself flagged the gap that this
+    /// method closes:
+    ///
+    /// > *Out of round-158 scope: threading the fitter into
+    /// > `Vp8InterStreamEncoder`'s `encode_frame` ladder — the
+    /// > stream-driver method
+    /// > `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`
+    /// > stays on the caller-driven entry-point for now; a subsequent
+    /// > round adds the analogous `_with_fitted_token_prob_updates`
+    /// > stream method.*
+    ///
+    /// Round 164 lands that subsequent-round method on the **refresh +
+    /// lf-deltas** axis — i.e. composed with the caller-supplied §9.4
+    /// delta layer. The companion scheduler-driven fitter path
+    /// ([`Self::encode_frame_with_fitted_token_prob_updates`]) already
+    /// exists; this is the missing refresh-axis sibling.
+    ///
+    /// Internally calls
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`].
+    /// The stream encoder threads the across-frame carried delta state
+    /// per RFC 6386 §9.4 — the caller does not need to track it; the
+    /// carry-update rule is identical to
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] (adj-enabled
+    /// frames write back the effective deltas; adj-disabled frames
+    /// leave the carry untouched). The §13.4 fitter does NOT affect
+    /// the §9.4 delta carry — it governs residual-token coding only,
+    /// exactly as on the caller-driven token-updates sibling
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`].
+    ///
+    /// Wire compatibility:
+    ///
+    /// * Whenever the fitter's safety guard falls back (no slot crossed
+    ///   the saving threshold, **or** the fitted re-encode is larger
+    ///   than the default-encode wire), the returned bytes are the
+    ///   default-encode bytes, byte-equal to
+    ///   [`Self::encode_p_frame_with_refresh_and_lf_deltas`] on the
+    ///   same inputs.
+    /// * Whenever the fitter wins, the bytes are byte-equal to the
+    ///   bare-encoder composition
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    ///   on the same inputs. The bare-encoder's safety guard also
+    ///   ensures the wire is `<=` the default-encode wire on every
+    ///   frame — this property carries through unchanged to the
+    ///   stream driver.
+    ///
+    /// Pre-conditions, slot-rotation (§20 page-147 walk
+    /// `copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`),
+    /// and error surface (`NoLastReference`, `DimensionsChanged`) match
+    /// [`Self::encode_p_frame_with_refresh`] exactly. `last_keyframe_index`
+    /// is **not** touched.
+    ///
+    /// **Carried-base assumption.** Same as the round-158 bare-encoder
+    /// fitter: this method assumes the prior key frame was emitted
+    /// with the §13.5 defaults — i.e. either
+    /// [`crate::encoder::encode_keyframe`] /
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`], or
+    /// [`crate::encoder::encode_keyframe_with_token_prob_updates`]
+    /// called with an all-`None` array. The standard stream entry-points
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] both
+    /// satisfy this since they go through
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`]. Mixing
+    /// a fitted keyframe (e.g.
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`]) with this
+    /// entry-point is out of round-164 scope — same rule as the
+    /// round-156 caller-driven token-updates sibling.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas` /
+        // `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates` /
+        // `encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`:
+        // adj-enabled frames update the carried state with this frame's
+        // effective deltas; adj-disabled frames leave it unchanged. The
+        // §13.4 token-prob fitter does NOT affect the §9.4 delta carry —
+        // the fitter's bytes-vs-default safety guard does not interact
+        // with the loop-filter delta layer either way.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // §20 page-147 ordering — identical to every other refresh-aware
+        // entry-point. The fitter's pass-2 vs. pass-1 reconstruction
+        // choice is already resolved inside
+        // `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+        // (it returns matched `(bytes, planes)`), so the slot we hand
+        // forward matches what the decoder will reconstruct from
+        // `bytes`.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter delta
+    /// layer, the round-160 / round-161 §11 intra-within-inter MB
+    /// picker, **and** the round-157 / round-158 §13.4 token-prob
+    /// observed-counts fitter — all on the stream-driver path.
+    ///
+    /// Round 163 landed
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`]
+    /// (§11 picker on the refresh + §9.4 deltas axis) and round 164
+    /// landed
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    /// (§13.4 fitter on the refresh + §9.4 deltas axis). Each composed
+    /// individually with the lf-deltas axis but neither composed with
+    /// the other.
+    ///
+    /// Round 164's next-step ladder names this as item (5):
+    ///
+    /// > *(5) parallel fitter composition on the intra-pick + refresh +
+    /// > lf-deltas axis (combining r163 + r164 — the picker on the
+    /// > fitted refresh path).*
+    ///
+    /// Internally calls
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`]
+    /// — a two-pass encode that mirrors the round-158 fitter (pass 1
+    /// with the §13.5 defaults to collect observed branch counts; pass
+    /// 2 with the fitted [`crate::coded_header::TokenProbUpdates`]
+    /// payload), with the §11 intra picker engaged on **both** passes
+    /// so the recorded counts already reflect the intra/inter mix that
+    /// will reappear on pass 2. The pass-2 RD picker re-scores against
+    /// the merged probability table.
+    ///
+    /// The stream encoder threads the across-frame carried §9.4 delta
+    /// state per RFC 6386 §9.4 exactly as
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] /
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`] /
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]:
+    /// adj-enabled frames write back the effective deltas; adj-disabled
+    /// frames leave the carry untouched. Neither the §11 picker nor the
+    /// §13.4 fitter perturbs the §9.4 carry — both govern residual /
+    /// per-MB decisions only.
+    ///
+    /// Wire compatibility:
+    ///
+    /// * Whenever the fitter's safety guard falls back (no slot crossed
+    ///   the saving threshold, **or** the fitted re-encode is larger
+    ///   than the default-encode wire), the returned bytes are the
+    ///   default-encode bytes, byte-equal to
+    ///   [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`]
+    ///   on the same inputs. The pass-1 planes are also returned in the
+    ///   fallback so a streaming caller's next-frame LAST matches the
+    ///   decoder's reconstruction.
+    /// * Whenever the fitter wins, the bytes are byte-equal to the
+    ///   bare-encoder composition
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`]
+    ///   on the same inputs.
+    /// * In every case the wire is `<=` the
+    ///   [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`]
+    ///   default — the round-158 bare-encoder safety guard lifted into
+    ///   the stream driver.
+    ///
+    /// Pre-conditions, slot-rotation (§20 page-147 walk
+    /// `copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`),
+    /// and error surface (`NoLastReference`, `DimensionsChanged`) match
+    /// [`Self::encode_p_frame_with_refresh`] exactly. `last_keyframe_index`
+    /// is **not** touched.
+    ///
+    /// **Carried-base assumption.** Same as the round-158 bare-encoder
+    /// fitter: this method assumes the prior key frame was emitted with
+    /// the §13.5 defaults — i.e. either
+    /// [`crate::encoder::encode_keyframe`] /
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`], or
+    /// [`crate::encoder::encode_keyframe_with_token_prob_updates`]
+    /// called with an all-`None` array. The standard stream entry-points
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] both
+    /// satisfy this. Mixing a fitted keyframe (e.g.
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`]) with this
+    /// entry-point is out of round-165 scope — same rule as the
+    /// round-156 / round-164 caller-driven / fitted-token-updates
+    /// siblings.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Identical to every other refresh+lf-deltas sibling. Neither
+        // the §11 intra picker nor the §13.4 fitter perturbs the §9.4
+        // carry; both govern per-MB / residual decisions only.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // §20 page-147 ordering — identical to every other refresh-aware
+        // entry-point. The bare-encoder returns matched `(bytes, planes)`
+        // (pass-2 win or pass-1 fall-back), so the slot we hand forward
+        // matches what the decoder reconstructs from `bytes`.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Borrow the across-frame §9.4 `ref_frame_delta[]` carried state
+    /// (in `{CURRENT, LAST, GOLDEN, ALTREF}` order). Cleared to
+    /// `[0; 4]` on every key frame per RFC 6386 §9.4.
+    pub fn carried_ref_deltas(&self) -> [i16; 4] {
+        self.carried_ref_deltas
+    }
+
+    /// Borrow the across-frame §9.4 `mode_delta[]` carried state
+    /// (in `{B_PRED, ZERO_MV, OTHER_MV, SPLIT_MV}` order). Cleared
+    /// to `[0; 4]` on every key frame per RFC 6386 §9.4.
+    pub fn carried_mode_deltas(&self) -> [i16; 4] {
+        self.carried_mode_deltas
+    }
+
+    /// Number of frames successfully encoded so far.
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Stream dimensions, locked at the first successful
+    /// `encode_frame` call. `None` before then.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.dimensions
+    }
+
+    /// Configured keyframe interval.
+    pub fn keyframe_interval(&self) -> u64 {
+        self.keyframe_interval
+    }
+
+    /// 0-based frame index of the most recent key frame, or `None` if
+    /// no frame has been encoded yet.
+    pub fn last_keyframe_index(&self) -> Option<u64> {
+        self.last_keyframe_index
+    }
+
+    /// Borrow the current `LAST` reference slot. `None` before the
+    /// first frame.
+    pub fn last(&self) -> Option<&RefFrameSlot> {
+        self.last.as_ref()
+    }
+
+    /// Borrow the current `GOLDEN` reference slot. `None` before the
+    /// first frame.
+    pub fn golden(&self) -> Option<&RefFrameSlot> {
+        self.golden.as_ref()
+    }
+
+    /// Borrow the current `ALTREF` reference slot. `None` before the
+    /// first frame.
+    pub fn altref(&self) -> Option<&RefFrameSlot> {
+        self.altref.as_ref()
+    }
+
+    /// Borrow the [`KeyframeParams`] applied to every frame this
+    /// stream emits.
+    pub fn params(&self) -> &KeyframeParams {
+        &self.params
+    }
+}
+
+/// Borrow a [`RefFrameSlot`] back into the [`KeyframePlanes`] shape
+/// the P-frame encoder consumes as its `reference` argument.
+///
+/// The two structs hold the same fields (the §9 reference-frame buffer
+/// is the same shape as a freshly-reconstructed key frame's planes);
+/// this helper is just the field-by-field translation. We clone the
+/// plane buffers because `encode_p_frame_zero_mv` takes
+/// `&KeyframePlanes` and we don't want to leak the slot lifetime into
+/// the encoder's call.
+fn ref_slot_to_keyframe_planes(slot: &RefFrameSlot) -> KeyframePlanes {
+    KeyframePlanes {
+        y: slot.y.clone(),
+        u: slot.u.clone(),
+        v: slot.v.clone(),
+        y_stride: slot.y_stride,
+        uv_stride: slot.uv_stride,
+        mb_cols: slot.mb_cols,
+        mb_rows: slot.mb_rows,
+    }
+}
+
+// ───────────────────────── auto-altref (lagged) stream driver ─────────────────
+
+/// Configuration for [`Vp8AltrefStreamEncoder`].
+#[derive(Debug, Clone, Copy)]
+pub struct AltrefStreamConfig {
+    /// Per-frame encode parameters (§9.6 quantiser, §9.4 loop filter,
+    /// §13 trellis strength, …) applied to every emitted frame.
+    pub params: KeyframeParams,
+    /// Key-frame cadence in *source* frames: frame 0 and every
+    /// `keyframe_interval`-th source frame is coded as a key frame.
+    /// `0` keys only the first frame.
+    pub keyframe_interval: u64,
+    /// Lookahead group size in source frames (≥ 1). Each full group is
+    /// encoded together: one invisible ARNR altref anchor (built from
+    /// the whole group, aligned to its last frame) followed by the
+    /// group's visible frames. `1` degenerates to plain streaming (no
+    /// anchors — a single-frame group has nothing to look ahead at).
+    pub altref_window: usize,
+    /// Temporal-filter dial for the anchor synthesis (see
+    /// [`crate::arnr::ArnrConfig`]). `strength = 0` anchors on the raw
+    /// last frame of each group.
+    pub arnr: crate::arnr::ArnrConfig,
+    /// §9.7 copy-ladder GOLDEN promotion. When `true` (the default),
+    /// the **last** P-frame of every anchored group carries
+    /// `copy_buffer_to_golden = 2` (ALTREF → GOLDEN — two header bits,
+    /// no pixel data travels), so the next group's P-frames see a
+    /// *bracketing* reference pair: GOLDEN holds the previous group's
+    /// anchor while the fresh invisible update re-points ALTREF at the
+    /// next one. `false` leaves GOLDEN pinned at the most recent key
+    /// frame.
+    pub golden_promotion: bool,
+    /// Scene-cut detector threshold, in mean-absolute-luma-difference
+    /// per pixel against the previously pushed frame (`0.0..=255.0`).
+    /// When a pushed frame's MAD against its predecessor exceeds the
+    /// threshold, the in-progress group is closed **before** the frame
+    /// enters the buffer and the frame is coded as a key frame: an
+    /// anchor must not blend across a cut (per-block SAD rejection
+    /// already keeps foreign content out of the blend, but a
+    /// cross-scene group would still waste an anchor and chain
+    /// P-frames off dead references). `0.0` disables detection (the
+    /// pure count-based grouping). Default `40.0` — far above photo
+    /// noise / motion MAD, comfortably below a full scene change.
+    pub scene_cut_mad_threshold: f64,
+    /// §9.4 RD loop-filter auto-selection for **every** emitted frame
+    /// (key frames, invisible anchors, and P-frames): when `true`,
+    /// `params.loop_filter_level` / `sharpness_level` are ignored and
+    /// each frame's level / sharpness pair is chosen to minimise the
+    /// post-§15 visible-window SSD of the frame's own reconstruction
+    /// against its source (see
+    /// [`crate::encoder::KeyframeCodingOptions::auto_loop_filter`]).
+    /// Default `false` (the fixed-level round-384 behaviour).
+    pub auto_loop_filter: bool,
+    /// §13.4 in-header `token_prob_update()` emission, fitted per frame
+    /// to the observed §13.3 branch counts by the two-pass
+    /// [`crate::encoder::fit_token_prob_updates`] fitter, on **every**
+    /// emitted frame. The fitted pass only ships when it shrinks the
+    /// wire (never-grow guard), at the cost of a second encode pass per
+    /// frame. Default `false`.
+    pub fitted_token_prob_updates: bool,
+    /// §11 intra-within-inter picker on the visible P-frames: every MB
+    /// additionally scores the 16 whole-block `(y_mode, uv_mode)` intra
+    /// candidates against the best inter pick — insurance for occluded
+    /// / uncovered content the reference set cannot predict. The
+    /// invisible anchor always encodes with the picker on (it is the
+    /// round-383 `encode_invisible_altref_update` behaviour); this knob
+    /// extends it to the P-frames. Default `false`.
+    pub intra_pick: bool,
+    /// §9.3 / §10 segment-based adaptive quantisation on every **inter**
+    /// frame the driver emits (invisible anchors and visible P-frames):
+    /// per-MB variance classification, per-segment quantisers driving
+    /// the RD walk, and the full `update_segmentation()` header block
+    /// (see [`crate::encoder::InterSegmentationConfig`]). Key frames
+    /// keep the frame-wide quantiser (the keyframe AQ path is a
+    /// separate front door). Default `None`.
+    pub segmentation: Option<crate::encoder::InterSegmentationConfig>,
+}
+
+impl Default for AltrefStreamConfig {
+    /// Key the first frame only, 8-frame lookahead groups, default
+    /// ARNR strength, GOLDEN promotion on, scene-cut keying at MAD 40.
+    fn default() -> Self {
+        AltrefStreamConfig {
+            params: KeyframeParams::default(),
+            keyframe_interval: 0,
+            altref_window: 8,
+            arnr: crate::arnr::ArnrConfig::default(),
+            golden_promotion: true,
+            scene_cut_mad_threshold: 40.0,
+            auto_loop_filter: false,
+            fitted_token_prob_updates: false,
+            intra_pick: false,
+            segmentation: None,
+        }
+    }
+}
+
+/// Classification of one packet emitted by [`Vp8AltrefStreamEncoder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltrefPacketKind {
+    /// §9.1 key frame (visible; refreshes all three slots).
+    Key,
+    /// Invisible §9.7 altref-update frame (`show_frame = 0`,
+    /// `refresh_alternate_frame = 1`, `refresh_last = 0`). Not part of
+    /// the display sequence — a muxer stores it, a player never shows
+    /// it.
+    AltrefUpdate,
+    /// Visible §16 multi-reference P-frame (`refresh_last = 1`).
+    Inter,
+}
+
+/// One packet emitted by [`Vp8AltrefStreamEncoder`]. The stream emits
+/// **more packets than source frames** (one extra invisible anchor per
+/// lookahead group); `source_index` ties visible packets back to their
+/// source frame.
+#[derive(Debug, Clone)]
+pub struct AltrefStreamPacket {
+    /// Raw VP8 elementary-stream bytes (one packet = one frame; feed to
+    /// [`crate::state::Vp8DecoderState::decode_frame`] in emission
+    /// order).
+    pub bytes: Vec<u8>,
+    /// What the packet carries.
+    pub kind: AltrefPacketKind,
+    /// 0-based index of the source frame this packet displays, or
+    /// `None` for an invisible anchor (which displays nothing).
+    pub source_index: Option<u64>,
+}
+
+impl AltrefStreamPacket {
+    /// Convenience: `true` iff a player should display this packet's
+    /// decoded picture (mirrors the §9.1 `show_frame` bit on the wire).
+    pub fn is_visible(&self) -> bool {
+        self.source_index.is_some()
+    }
+}
+
+/// Owned tightly-packed copy of a source picture (the lookahead buffer
+/// element).
+#[derive(Debug, Clone)]
+struct OwnedI420 {
+    width: u32,
+    height: u32,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+impl OwnedI420 {
+    fn from_frame(frame: &I420Frame<'_>) -> Self {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut y = Vec::with_capacity(w * h);
+        for r in 0..h {
+            y.extend_from_slice(&frame.y[r * frame.y_stride..r * frame.y_stride + w]);
+        }
+        let mut u = Vec::with_capacity(cw * ch);
+        let mut v = Vec::with_capacity(cw * ch);
+        for r in 0..ch {
+            u.extend_from_slice(&frame.u[r * frame.uv_stride..r * frame.uv_stride + cw]);
+            v.extend_from_slice(&frame.v[r * frame.uv_stride..r * frame.uv_stride + cw]);
+        }
+        OwnedI420 {
+            width: frame.width,
+            height: frame.height,
+            y,
+            u,
+            v,
+        }
+    }
+
+    fn as_i420(&self) -> I420Frame<'_> {
+        I420Frame::packed(self.width, self.height, &self.y, &self.u, &self.v)
+    }
+}
+
+/// Lagged multi-frame VP8 encoder with **automatic invisible-altref
+/// management** — the B-frame-less GOLDEN / ALTREF pattern assembled
+/// from this round's building blocks:
+///
+/// 1. Source frames buffer into lookahead groups of
+///    [`AltrefStreamConfig::altref_window`] frames.
+/// 2. When a group completes, [`crate::arnr::build_arnr_altref`]
+///    synthesizes a noise-reduced anchor aligned to the group's **last**
+///    frame, and [`crate::encoder::encode_invisible_altref_update`]
+///    ships it as an invisible frame (§9.1 `show_frame = 0`, §9.7
+///    `refresh_alternate_frame = 1` / `refresh_last = 0`).
+/// 3. The group's frames then encode as visible multi-reference
+///    P-frames whose per-MB §16.2 `ref_frame` selector can predict from
+///    the anchor — forward prediction from a picture that is never
+///    displayed.
+///
+/// Because the pipeline is lagged, [`Self::push_frame`] returns zero or
+/// more packets per call and [`Self::finish`] drains the tail group.
+/// Packets must reach the decoder in emission order; visible packets
+/// map 1:1 onto source frames (`source_index`), invisible anchors carry
+/// `source_index = None`.
+///
+/// The encoder mirrors the §9.7 / §9.8 slot ladder exactly as
+/// [`crate::state::Vp8DecoderState`] applies it, so every packet
+/// self-decodes in pixel lockstep (pinned by
+/// `tests/encoder_altref_stream.rs`).
+#[derive(Debug, Clone)]
+pub struct Vp8AltrefStreamEncoder {
+    config: AltrefStreamConfig,
+    dimensions: Option<(u32, u32)>,
+    /// Lookahead buffer — the group being accumulated.
+    pending: Vec<OwnedI420>,
+    /// Source index of `pending[0]`.
+    pending_start: u64,
+    /// `true` when `pending[0]` entered on a detected scene cut, so
+    /// [`Self::flush_group`] must key it even off the scheduled
+    /// cadence.
+    pending_forced_key: bool,
+    /// Copy of the most recently pushed source frame — the scene-cut
+    /// detector's comparison baseline (spans group boundaries).
+    last_pushed: Option<OwnedI420>,
+    /// Total source frames pushed.
+    input_count: u64,
+    /// §9 reference slots (encoder-side mirror of the decoder's).
+    last: Option<KeyframePlanes>,
+    golden: Option<KeyframePlanes>,
+    altref: Option<KeyframePlanes>,
+}
+
+/// Mean absolute luma difference per pixel between the previous
+/// (packed) frame and the incoming (possibly strided) one — the
+/// scene-cut metric. Both frames are dimension-locked by the caller.
+fn luma_mad(prev: &OwnedI420, frame: &I420Frame<'_>) -> f64 {
+    let w = prev.width as usize;
+    let h = prev.height as usize;
+    let mut sad = 0u64;
+    for r in 0..h {
+        let a = &prev.y[r * w..r * w + w];
+        let b = &frame.y[r * frame.y_stride..r * frame.y_stride + w];
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            sad += u64::from(x.abs_diff(y));
+        }
+    }
+    sad as f64 / (w * h) as f64
+}
+
+impl Vp8AltrefStreamEncoder {
+    /// Build a fresh lagged encoder. Returns `None` when
+    /// `config.altref_window == 0` (a zero-frame lookahead group cannot
+    /// make progress).
+    pub fn new(config: AltrefStreamConfig) -> Option<Self> {
+        if config.altref_window == 0 {
+            return None;
+        }
+        Some(Vp8AltrefStreamEncoder {
+            config,
+            dimensions: None,
+            pending: Vec::new(),
+            pending_start: 0,
+            pending_forced_key: false,
+            last_pushed: None,
+            input_count: 0,
+            last: None,
+            golden: None,
+            altref: None,
+        })
+    }
+
+    /// The configuration this stream was built with.
+    pub fn config(&self) -> &AltrefStreamConfig {
+        &self.config
+    }
+
+    /// Total source frames pushed so far (buffered + encoded).
+    pub fn input_count(&self) -> u64 {
+        self.input_count
+    }
+
+    /// Source frames currently buffered awaiting their group to
+    /// complete (the current lag, `0..altref_window`).
+    pub fn buffered(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether source frame `index` is scheduled as a key frame.
+    fn is_key_index(&self, index: u64) -> bool {
+        index == 0
+            || (self.config.keyframe_interval > 0 && index % self.config.keyframe_interval == 0)
+    }
+
+    /// Feed one source frame; returns every packet the stream can emit
+    /// so far (empty while the lookahead group is still filling).
+    ///
+    /// Dimensions are locked at the first frame
+    /// ([`StreamEncodeError::DimensionsChanged`] otherwise). A frame
+    /// scheduled as a key frame closes the in-progress group early so
+    /// the key frame starts a fresh group.
+    pub fn push_frame(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<Vec<AltrefStreamPacket>, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            None => self.dimensions = Some(dims),
+            _ => {}
+        }
+        let mut out = Vec::new();
+        // Scene-cut detection: a frame whose luma MAD against its
+        // predecessor exceeds the configured threshold starts new
+        // content — close the running group *before* it (an anchor
+        // must not blend across the cut) and key it.
+        let scene_cut = self.config.scene_cut_mad_threshold > 0.0
+            && self
+                .last_pushed
+                .as_ref()
+                .is_some_and(|prev| luma_mad(prev, frame) > self.config.scene_cut_mad_threshold);
+        // A scheduled key frame closes the previous group early too:
+        // the anchor of a group must not look across a key frame (the
+        // key frame resets all three slots anyway).
+        if (scene_cut || self.is_key_index(self.input_count)) && !self.pending.is_empty() {
+            self.flush_group(&mut out)?;
+        }
+        if self.pending.is_empty() {
+            self.pending_start = self.input_count;
+            self.pending_forced_key = scene_cut;
+        }
+        self.pending.push(OwnedI420::from_frame(frame));
+        self.last_pushed = Some(self.pending.last().expect("just pushed").clone());
+        self.input_count += 1;
+        if self.pending.len() >= self.config.altref_window {
+            self.flush_group(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Drain the in-progress lookahead group (call once after the final
+    /// `push_frame`). Idempotent — a drained stream returns no packets.
+    pub fn finish(&mut self) -> Result<Vec<AltrefStreamPacket>, StreamEncodeError> {
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            self.flush_group(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Encode one completed lookahead group:
+    /// `[K?] [invisible anchor] [P …]`.
+    fn flush_group(&mut self, out: &mut Vec<AltrefStreamPacket>) -> Result<(), StreamEncodeError> {
+        let group = core::mem::take(&mut self.pending);
+        let start = self.pending_start;
+        let forced_key = core::mem::take(&mut self.pending_forced_key);
+        let mut first_p = 0usize;
+
+        // Per-frame feature toggles from the stream config. All-false
+        // reproduces the round-384 wire byte-for-byte (the coding-
+        // options front doors are pinned byte-identical to the
+        // dedicated entries this driver previously called).
+        let kf_options = crate::encoder::KeyframeCodingOptions {
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+        };
+        // The invisible anchor keeps the §11 intra picker hardwired on
+        // (the encode_invisible_altref_update behaviour).
+        let anchor_options = crate::encoder::InterCodingOptions {
+            intra_pick: true,
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+        };
+        let p_options = crate::encoder::InterCodingOptions {
+            intra_pick: self.config.intra_pick,
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+        };
+
+        // Key frame: scheduled, scene-cut-forced, or forced because
+        // the stream has no reference yet.
+        if self.is_key_index(start) || forced_key || self.last.is_none() {
+            let (bytes, recon) =
+                crate::encoder::encode_keyframe_with_reconstruction_and_coding_options(
+                    &group[0].as_i420(),
+                    &self.config.params,
+                    &kf_options,
+                )?;
+            self.last = Some(recon.clone());
+            self.golden = Some(recon.clone());
+            self.altref = Some(recon);
+            out.push(AltrefStreamPacket {
+                bytes,
+                kind: AltrefPacketKind::Key,
+                source_index: Some(start),
+            });
+            first_p = 1;
+        }
+
+        let p_count = group.len() - first_p;
+
+        // Invisible anchor: only worth shipping when the group has ≥ 2
+        // frames of lookahead context and at least one P-frame to use
+        // it (a single-frame group's anchor would just duplicate that
+        // frame's own encode).
+        let mut anchored = false;
+        if p_count > 0 && group.len() >= 2 {
+            let views: Vec<I420Frame<'_>> = group.iter().map(|f| f.as_i420()).collect();
+            let anchor = crate::arnr::build_arnr_altref(&views, views.len() - 1, &self.config.arnr)
+                .map_err(StreamEncodeError::Frame)?;
+            let last_planes = self.last.as_ref().expect("keyframe path ran");
+            let (bytes, alt_recon) = crate::encoder::encode_invisible_altref_update_full(
+                &anchor.as_i420(),
+                last_planes,
+                self.golden.as_ref(),
+                self.altref.as_ref(),
+                &self.config.params,
+                &anchor_options,
+                self.config.segmentation.as_ref(),
+            )?;
+            self.altref = Some(alt_recon);
+            anchored = true;
+            out.push(AltrefStreamPacket {
+                bytes,
+                kind: AltrefPacketKind::AltrefUpdate,
+                source_index: None,
+            });
+        }
+
+        // Visible P-frames — §9.7 `refresh_last = 1` ladder, per-MB
+        // LAST / GOLDEN / ALTREF selection. With `golden_promotion` on,
+        // the group's last P-frame additionally carries
+        // `copy_buffer_to_golden = 2`: per the §20 page-147 walk the
+        // copy is applied *before* `refresh_last` and reads the
+        // pre-refresh ALTREF (this group's anchor), so GOLDEN enters
+        // the next group holding the anchor at a cost of two header
+        // bits.
+        for (j, frame) in group.iter().enumerate().skip(first_p) {
+            let promote = self.config.golden_promotion && anchored && j == group.len() - 1;
+            let refresh = RefreshControls {
+                copy_buffer_to_golden: if promote { 2 } else { 0 },
+                ..RefreshControls::default()
+            };
+            let last_planes = self.last.as_ref().expect("keyframe path ran");
+            let (bytes, recon) = crate::encoder::encode_p_frame_options_and_segmentation(
+                &frame.as_i420(),
+                last_planes,
+                self.golden.as_ref(),
+                self.altref.as_ref(),
+                &self.config.params,
+                &refresh,
+                &p_options,
+                self.config.segmentation.as_ref(),
+            )?;
+            // Encoder-side slot mirror of the §20 page-147 walk:
+            // copy_gf (ALTREF → GOLDEN, pre-refresh state) precedes
+            // refresh_last.
+            if promote {
+                self.golden = self.altref.clone();
+            }
+            self.last = Some(recon);
+            out.push(AltrefStreamPacket {
+                bytes,
+                kind: AltrefPacketKind::Inter,
+                source_index: Some(start + j as u64),
+            });
+        }
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────── tests ────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Vp8DecoderState;
+
+    fn flat_frame(width: u32, height: u32, y: u8, u: u8, v: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let w = width as usize;
+        let h = height as usize;
+        let cw = width.div_ceil(2) as usize;
+        let ch = height.div_ceil(2) as usize;
+        (vec![y; w * h], vec![u; cw * ch], vec![v; cw * ch])
+    }
+
+    #[test]
+    fn fresh_stream_state() {
+        let enc = Vp8KeyframeStreamEncoder::new(KeyframeParams::default());
+        assert_eq!(enc.frame_count(), 0);
+        assert!(enc.dimensions().is_none());
+        assert!(enc.last().is_none());
+        assert!(enc.golden().is_none());
+        assert!(enc.altref().is_none());
+    }
+
+    #[test]
+    fn first_frame_locks_dimensions_and_populates_all_slots() {
+        let mut enc = Vp8KeyframeStreamEncoder::new(KeyframeParams::default());
+        let (y, u, v) = flat_frame(32, 32, 128, 128, 128);
+        let frame = I420Frame::packed(32, 32, &y, &u, &v);
+        let bytes = enc.encode_frame(&frame).expect("encode first frame");
+        assert!(!bytes.is_empty(), "frame bytes non-empty");
+        assert_eq!(enc.frame_count(), 1);
+        assert_eq!(enc.dimensions(), Some((32, 32)));
+        assert!(enc.last().is_some());
+        assert!(enc.golden().is_some());
+        assert!(enc.altref().is_some());
+        // §9.7 / §9.8: a keyframe refreshes all three slots with the
+        // same reconstruction.
+        let last = enc.last().unwrap();
+        let golden = enc.golden().unwrap();
+        let altref = enc.altref().unwrap();
+        assert_eq!(last.y, golden.y);
+        assert_eq!(last.y, altref.y);
+        assert_eq!(last.u, golden.u);
+        assert_eq!(last.v, altref.v);
+    }
+
+    #[test]
+    fn dimensions_change_rejected() {
+        let mut enc = Vp8KeyframeStreamEncoder::new(KeyframeParams::default());
+        let (y, u, v) = flat_frame(32, 32, 128, 128, 128);
+        let frame = I420Frame::packed(32, 32, &y, &u, &v);
+        enc.encode_frame(&frame).expect("first frame");
+        let (y2, u2, v2) = flat_frame(48, 48, 64, 200, 50);
+        let frame2 = I420Frame::packed(48, 48, &y2, &u2, &v2);
+        let err = enc
+            .encode_frame(&frame2)
+            .expect_err("differently-sized second frame");
+        assert!(matches!(
+            err,
+            StreamEncodeError::DimensionsChanged {
+                first: (32, 32),
+                got: (48, 48)
+            }
+        ));
+        // Failure must not advance the frame counter.
+        assert_eq!(enc.frame_count(), 1);
+    }
+
+    #[test]
+    fn three_frame_stream_decodes_through_state_driver() {
+        // Drive 3 trivial flat frames through the encoder, then replay
+        // the bytes through `Vp8DecoderState::decode_frame` and
+        // confirm each frame round-trips.
+        let mut enc = Vp8KeyframeStreamEncoder::new(KeyframeParams::default());
+        let pixels = [
+            (100u8, 110u8, 120u8),
+            (50u8, 200u8, 30u8),
+            (180u8, 80u8, 200u8),
+        ];
+        let mut frames_bytes = Vec::new();
+        for (y, u, v) in &pixels {
+            let (yp, up, vp) = flat_frame(32, 32, *y, *u, *v);
+            let frame = I420Frame::packed(32, 32, &yp, &up, &vp);
+            frames_bytes.push(enc.encode_frame(&frame).expect("encode"));
+        }
+        assert_eq!(enc.frame_count(), 3);
+
+        let mut dec = Vp8DecoderState::new();
+        for bytes in &frames_bytes {
+            let out = dec.decode_frame(bytes).expect("decode");
+            assert_eq!(out.width, 32);
+            assert_eq!(out.height, 32);
+        }
+    }
+
+    #[test]
+    fn inter_stream_rejects_zero_keyframe_interval() {
+        assert!(Vp8InterStreamEncoder::new(KeyframeParams::default(), 0).is_none());
+    }
+
+    #[test]
+    fn inter_stream_first_frame_is_always_key() {
+        let mut enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 4).expect("non-zero interval");
+        assert_eq!(enc.next_frame_is_keyframe(), FrameKind::Key);
+
+        let (y, u, v) = flat_frame(32, 32, 128, 128, 128);
+        let frame = I420Frame::packed(32, 32, &y, &u, &v);
+        let out = enc.encode_frame(&frame).expect("encode first frame");
+        assert!(out.is_keyframe(), "first frame must be a key frame");
+        assert_eq!(out.frame_index, 0);
+        // §9.1 bit 0 of byte 0 = frame_type; key frame ⇒ 0.
+        assert_eq!(out.bytes[0] & 0x01, 0, "key frame frame_type bit");
+        // §9.1 keyframe start code at bytes 3..6.
+        assert_eq!(
+            &out.bytes[3..6],
+            &[0x9d, 0x01, 0x2a],
+            "key frame start code"
+        );
+        assert_eq!(enc.last_keyframe_index(), Some(0));
+    }
+
+    #[test]
+    fn inter_stream_picks_p_after_first_with_interval_4() {
+        let mut enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 4).expect("non-zero interval");
+        let (y, u, v) = flat_frame(32, 32, 64, 128, 192);
+        let frame = I420Frame::packed(32, 32, &y, &u, &v);
+
+        // Frame 0 — K
+        let f0 = enc.encode_frame(&frame).expect("frame 0");
+        assert_eq!(f0.kind, FrameKind::Key);
+        // Frame 1, 2, 3 — P
+        for i in 1..=3u64 {
+            assert_eq!(
+                enc.next_frame_is_keyframe(),
+                FrameKind::InterZeroMv,
+                "frame {i} should be P"
+            );
+            let f = enc.encode_frame(&frame).expect("p frame");
+            assert_eq!(f.kind, FrameKind::InterZeroMv, "frame {i}");
+            assert_eq!(f.frame_index, i);
+            // §9.1 bit 0 of byte 0 = 1 for inter.
+            assert_eq!(f.bytes[0] & 0x01, 0x01, "P-frame frame_type bit");
+        }
+        // Frame 4 — K again.
+        assert_eq!(enc.next_frame_is_keyframe(), FrameKind::Key);
+        let f4 = enc.encode_frame(&frame).expect("frame 4");
+        assert!(f4.is_keyframe(), "frame 4 must be K at interval 4");
+        assert_eq!(enc.last_keyframe_index(), Some(4));
+    }
+
+    #[test]
+    fn inter_stream_force_keyframe_reanchors_interval() {
+        let mut enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 4).expect("non-zero interval");
+        let (y, u, v) = flat_frame(32, 32, 100, 110, 120);
+        let frame = I420Frame::packed(32, 32, &y, &u, &v);
+
+        // K, P, P-forced-K, P, P, P, K (re-anchored at frame 2)
+        let kinds = [
+            (false, FrameKind::Key),         // 0 — first-ever
+            (false, FrameKind::InterZeroMv), // 1
+            (true, FrameKind::Key),          // 2 — forced
+            (false, FrameKind::InterZeroMv), // 3
+            (false, FrameKind::InterZeroMv), // 4 (would be K w/o re-anchor)
+            (false, FrameKind::InterZeroMv), // 5
+            (false, FrameKind::Key),         // 6 — re-anchored interval
+        ];
+        for (i, (force, expected)) in kinds.iter().enumerate() {
+            let out = enc
+                .encode_frame_with_force(&frame, *force)
+                .unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!(out.kind, *expected, "frame {i} kind mismatch");
+        }
+        assert_eq!(enc.last_keyframe_index(), Some(6));
+    }
+
+    #[test]
+    fn inter_stream_p_frame_refreshes_last_only() {
+        let mut enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 100).expect("non-zero interval");
+        let (y0, u0, v0) = flat_frame(32, 32, 60, 130, 200);
+        let frame0 = I420Frame::packed(32, 32, &y0, &u0, &v0);
+        enc.encode_frame(&frame0).expect("frame 0 K");
+        let golden_after_k = enc.golden().expect("golden after K").clone();
+        let altref_after_k = enc.altref().expect("altref after K").clone();
+
+        // Big content change so the P-frame residual genuinely reshapes
+        // LAST.
+        let (y1, u1, v1) = flat_frame(32, 32, 200, 50, 90);
+        let frame1 = I420Frame::packed(32, 32, &y1, &u1, &v1);
+        enc.encode_frame(&frame1).expect("frame 1 P");
+
+        // GOLDEN and ALTREF must be byte-identical to their state
+        // after the K (the P-frame's §9.7 ladder leaves them alone).
+        assert_eq!(enc.golden().expect("golden present").y, golden_after_k.y);
+        assert_eq!(enc.golden().expect("golden present").u, golden_after_k.u);
+        assert_eq!(enc.golden().expect("golden present").v, golden_after_k.v);
+        assert_eq!(enc.altref().expect("altref present").y, altref_after_k.y);
+        assert_eq!(enc.altref().expect("altref present").u, altref_after_k.u);
+        assert_eq!(enc.altref().expect("altref present").v, altref_after_k.v);
+
+        // LAST should now reflect the P-frame's reconstruction, which
+        // for this big content change is no longer equal to the K's
+        // reconstruction (= golden's contents).
+        let last_after_p = enc.last().expect("last after P");
+        assert_ne!(
+            last_after_p.y, golden_after_k.y,
+            "LAST must change after a P-frame, GOLDEN must not"
+        );
+    }
+
+    #[test]
+    fn golden_interval_zero_is_default_and_disables_auto_refresh() {
+        let enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 100).expect("non-zero interval");
+        assert_eq!(enc.golden_interval(), 0, "default cadence is disabled");
+        assert!(
+            !enc.next_p_frame_refreshes_golden(),
+            "first frame is a key frame, never an auto golden refresh"
+        );
+    }
+
+    #[test]
+    fn auto_golden_refresh_updates_golden_on_scheduled_p_frame() {
+        // keyframe_interval large so frames 1.. are all P; golden every
+        // 2nd P-frame after the key frame.
+        let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("non-zero interval")
+            .with_golden_interval(2);
+        assert_eq!(enc.golden_interval(), 2);
+
+        // Frame 0: key — refreshes every slot, resets the cadence.
+        let (y0, u0, v0) = flat_frame(32, 32, 60, 130, 200);
+        let f0 = I420Frame::packed(32, 32, &y0, &u0, &v0);
+        assert!(!enc.next_p_frame_refreshes_golden(), "next is a key frame");
+        enc.encode_frame(&f0).expect("frame 0 K");
+        let golden_after_k = enc.golden().expect("golden after K").y.clone();
+
+        // Frame 1: 1st P after K (1 % 2 != 0) — golden NOT refreshed.
+        assert!(
+            !enc.next_p_frame_refreshes_golden(),
+            "1st P-frame is not a golden boundary"
+        );
+        let (y1, u1, v1) = flat_frame(32, 32, 200, 50, 90);
+        let f1 = I420Frame::packed(32, 32, &y1, &u1, &v1);
+        enc.encode_frame(&f1).expect("frame 1 P");
+        assert_eq!(
+            enc.golden().expect("golden present").y,
+            golden_after_k,
+            "GOLDEN must stay frozen on the 1st P-frame"
+        );
+
+        // Frame 2: 2nd P after K (2 % 2 == 0) — golden refreshed to this
+        // frame's reconstruction.
+        assert!(
+            enc.next_p_frame_refreshes_golden(),
+            "2nd P-frame is a golden boundary"
+        );
+        let (y2, u2, v2) = flat_frame(32, 32, 30, 220, 40);
+        let f2 = I420Frame::packed(32, 32, &y2, &u2, &v2);
+        enc.encode_frame(&f2).expect("frame 2 P");
+        let golden_after_p2 = enc.golden().expect("golden present").y.clone();
+        assert_ne!(
+            golden_after_p2, golden_after_k,
+            "GOLDEN must change on the 2nd P-frame (auto refresh)"
+        );
+        // GOLDEN now equals LAST: both took this frame's reconstruction.
+        assert_eq!(
+            golden_after_p2,
+            enc.last().expect("last present").y,
+            "scheduled golden refresh writes the same reconstruction as LAST"
+        );
+    }
+
+    #[test]
+    fn auto_golden_refresh_cadence_resets_on_keyframe() {
+        // interval 3 keyframes, golden every 2nd P-frame. The forced
+        // key frame mid-stream must restart the P-frame counter so the
+        // golden boundary re-anchors to the new key frame.
+        let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("non-zero interval")
+            .with_golden_interval(2);
+        let (y, u, v) = flat_frame(32, 32, 128, 128, 128);
+        let f = I420Frame::packed(32, 32, &y, &u, &v);
+
+        // Key frame, then one P-frame (P#1 — not a golden boundary).
+        enc.encode_frame(&f).expect("f0 K");
+        enc.encode_frame(&f).expect("f1 P");
+        // Force a key frame; cadence resets.
+        enc.encode_frame_with_force(&f, true).expect("f2 forced K");
+        // Now P#1 after the new key frame — must NOT be a golden boundary.
+        assert!(
+            !enc.next_p_frame_refreshes_golden(),
+            "cadence must re-anchor after a key frame"
+        );
+        enc.encode_frame(&f).expect("f3 P#1"); // no golden
+        assert!(
+            enc.next_p_frame_refreshes_golden(),
+            "P#2 after the re-anchored key frame is a golden boundary"
+        );
+    }
+
+    #[test]
+    fn auto_golden_refresh_stream_decodes_through_state_driver() {
+        // The encoder writes refresh_golden_frame = 1 on scheduled
+        // P-frames; the decoder must read it back and keep its own GOLDEN
+        // slot in lockstep. A 1K + 4P stream with golden every 2nd P
+        // exercises one scheduled refresh; all frames must decode.
+        let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("non-zero interval")
+            .with_golden_interval(2);
+        let mut dec = Vp8DecoderState::new();
+        for i in 0..5u8 {
+            let (yp, up, vp) = flat_frame(32, 32, 40 + i * 30, 120, 110 + i * 20);
+            let frame = I420Frame::packed(32, 32, &yp, &up, &vp);
+            let out = enc.encode_frame(&frame).expect("encode");
+            let decoded = dec.decode_frame(&out.bytes).expect("decode");
+            assert_eq!(decoded.width, 32);
+            assert_eq!(decoded.height, 32);
+        }
+    }
+
+    #[test]
+    fn auto_golden_refresh_disabled_matches_plain_auto_path_byte_for_byte() {
+        // golden_interval = 0 must reproduce the historical
+        // refresh_last-only auto path exactly. Encode the same stream
+        // with the default encoder and confirm every emitted frame is
+        // byte-identical.
+        let mut plain =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 100).expect("interval");
+        let mut also_disabled = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("interval")
+            .with_golden_interval(0);
+        for i in 0..4u8 {
+            let (yp, up, vp) = flat_frame(32, 32, 50 + i * 25, 130, 90 + i * 15);
+            let frame = I420Frame::packed(32, 32, &yp, &up, &vp);
+            let a = plain.encode_frame(&frame).expect("plain");
+            let b = also_disabled.encode_frame(&frame).expect("disabled");
+            assert_eq!(a.bytes, b.bytes, "golden_interval=0 must be byte-identical");
+        }
+    }
+
+    #[test]
+    fn inter_stream_dimensions_change_rejected() {
+        let mut enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 4).expect("non-zero interval");
+        let (y, u, v) = flat_frame(32, 32, 128, 128, 128);
+        let frame = I420Frame::packed(32, 32, &y, &u, &v);
+        enc.encode_frame(&frame).expect("first");
+        let (y2, u2, v2) = flat_frame(48, 48, 64, 200, 50);
+        let frame2 = I420Frame::packed(48, 48, &y2, &u2, &v2);
+        let err = enc
+            .encode_frame(&frame2)
+            .expect_err("resize should be rejected");
+        assert!(matches!(
+            err,
+            StreamEncodeError::DimensionsChanged {
+                first: (32, 32),
+                got: (48, 48),
+            }
+        ));
+        assert_eq!(enc.frame_count(), 1);
+    }
+
+    #[test]
+    fn slot_state_replaced_each_frame() {
+        // Each frame should overwrite the previous slot contents
+        // (not append, not preserve). Encode two distinctly-colored
+        // flat frames and confirm the slots reflect the *second*
+        // frame's reconstruction.
+        let mut enc = Vp8KeyframeStreamEncoder::new(KeyframeParams::default());
+        let (y1, u1, v1) = flat_frame(16, 16, 50, 50, 50);
+        let frame1 = I420Frame::packed(16, 16, &y1, &u1, &v1);
+        enc.encode_frame(&frame1).expect("frame 1");
+        let after_first = enc.last().unwrap().y.clone();
+
+        let (y2, u2, v2) = flat_frame(16, 16, 200, 200, 200);
+        let frame2 = I420Frame::packed(16, 16, &y2, &u2, &v2);
+        enc.encode_frame(&frame2).expect("frame 2");
+        let after_second = enc.last().unwrap().y.clone();
+
+        assert_ne!(
+            after_first, after_second,
+            "slot must reflect the second frame, not the first"
+        );
+    }
+}

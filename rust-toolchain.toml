@@ -1,0 +1,6 @@
+# Nightly: the adopted codecs gate portable_simd paths on it (oxideav-vp8's
+# `simd` feature, vendored oxideav-h264's `nightly`). The devshell (flake.nix)
+# provides the same via rust-overlay; this file covers plain rustup users.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "clippy", "rustfmt"]

@@ -1,0 +1,22 @@
+[package]
+name = "pf-rtp"
+description = "Hand-written, dependency-free RTP/RTCP (RFC 3550) plugin for profluens: packets, jitter buffer, payload formats, and the session/depayload elements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_rtp"
+
+[dependencies]
+# std-only networking — no RTP/networking crate. The protocol modules
+# (packet/seq/jitter/rtcp/depay/pay) are pure and framework-free; only the
+# element wiring uses profluens-core.
+profluens-core = { path = "../core" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }
+# The rtsp_serve example: MKV in, RTSP-controlled RTP out (pure-sc e2e).
+pf-mkv = { path = "../mkv" }
+pf-rtsp = { path = "../rtsp" }

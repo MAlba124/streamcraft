@@ -1,0 +1,23 @@
+[package]
+name = "pf-ogg"
+description = "Hand-written, dependency-free Ogg (RFC 3533) container plugin for profluens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_ogg"
+
+[dependencies]
+# Hand-written container — the whole point is zero container/codec dependencies.
+# Only the framework's core vocabulary (buffers, batches, the element contract) is
+# pulled in, and only if/when elements are added; the reader/writer library is
+# core-independent.
+profluens-core = { path = "../core" }
+
+[dev-dependencies]
+# Only for `examples/read_alloc_check.rs`: the `filesrc` that drives the demuxer through the
+# real scheduler, so the allocation audit measures the pipeline read path and not just the
+# standalone reader. No cycle: profluens-elements depends on core only.
+profluens-elements = { path = "../elements" }

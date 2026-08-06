@@ -1,0 +1,21 @@
+[package]
+name = "pf-mpeg4p2"
+description = "Pure-Rust MPEG-4 Part 2 (Visual) Advanced Simple Profile decoder plugin for profluens (the XviD/DivX codec)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_mpeg4p2"
+
+[dependencies]
+# Unlike pf-vp8 / pf-h264 this codec is HAND-WRITTEN, clean-room from ISO/IEC
+# 14496-2 — no backing library, no FFI, no libav. The decode core is pure Rust
+# with only profluens-core (the element trait + buffer/pool) and
+# profluens-video (colorimetry passthrough) as deps.
+profluens-core = { path = "../core" }
+profluens-video = { path = "../video" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

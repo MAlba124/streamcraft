@@ -1,0 +1,30 @@
+[package]
+name = "profluens-nvr"
+description = "NVR milestone app: N RTSP cameras → segmented MKV recording + live mosaic (the framework's broadest stress test)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "profluens_nvr"
+
+[[bin]]
+name = "pf-nvr"
+path = "src/main.rs"
+
+[dependencies]
+profluens-core = { path = "../core" }
+profluens-elements = { path = "../elements" }
+pf-mkv = { path = "../mkv" }
+# H.264 bitstream helpers (Annex-B NAL split, SPS dimensions) — shared with the
+# hardware decoder the mosaic branch prefers.
+pf-vaapi = { path = "../vaapi" }
+pf-rtp = { path = "../rtp" }
+pf-rtsp = { path = "../rtsp" }
+pf-h264 = { path = "../h264" }
+pf-sdl3 = { path = "../sdl3" }
+# The app pins mimalloc for the adopted decoder's allocation churn (the
+# play_file lesson); the library targets stay allocator-agnostic.
+mimalloc = "0.1.52"
+

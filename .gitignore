@@ -1,2 +1,15 @@
 /target
-/libav/target
+.claude/
+
+# Profiling artifacts
+heaptrack.*
+perf.data*
+*.zst
+
+# Transcode/playback output written into the repo root
+/output.*
+
+# Editor lock/autosave files
+\#*\#
+.\#*
+*~

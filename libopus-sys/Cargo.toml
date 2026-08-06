@@ -1,0 +1,20 @@
+[package]
+name = "libopus-sys"
+description = "Static FFI bindings to a vendored libopus (RFC 6716) C source, compiled with cc — no cmake, no system library, statically linked."
+version.workspace = true
+edition.workspace = true
+# Crate binding code: workspace license (GPL-3.0-or-later). The vendored libopus C source under
+# vendor/opus/ is BSD-3-Clause (see vendor/opus/COPYING) — GPL-compatible.
+license.workspace = true
+repository.workspace = true
+# Declares the native `opus` static lib this crate provides, so Cargo enforces one build per link
+# and downstream crates can find it.
+links = "opus"
+build = "build.rs"
+
+[lib]
+name = "libopus_sys"
+
+[build-dependencies]
+# The only build tool: compile the vendored C to a static archive. No cmake/autotools.
+cc = "1"

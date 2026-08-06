@@ -1,0 +1,98 @@
+[package]
+name = "pf-play"
+description = "General-purpose media player for profluens: probe a container, autoplug the pipeline, and play"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_play"
+
+[[bin]]
+name = "pfplay"
+path = "src/bin/pfplay.rs"
+
+[dependencies]
+# The framework: pipeline, negotiation-driven linking, the seek index, the tap/pause/
+# stop handles the controller drives.
+profluens-core = { path = "../core" }
+# The byte source and the drop sink (headless / no-decoder pads).
+profluens-elements = { path = "../elements" }
+# Audio glue for the "decoder → sink negotiation failed" fallback (convert, then
+# convert+resample) and the WAV parser for elementary .wav files.
+profluens-audio = { path = "../audio" }
+# The headless video drop sink: `VideoCkSink` accepts `video/raw`, which `TestSink`
+# (bytes only) cannot — a decoded frame must land somewhere on `--no-window`. Only ever
+# reachable behind a *linked video decoder*, so it rides the `video` feature: a build with no
+# decoders never produces a `video/raw` frame, and its video pads take the plain `bytes` drop.
+profluens-video = { path = "../video", optional = true }
+# Demuxers. All four stay unconditional — a container is not a codec. `pf-avi` in particular
+# is kept even without `video`: AVI carries MP3/AC-3 audio tracks beside its video, and an
+# audio-only consumer must still be able to open one and play the audio (only the MPEG-4
+# Part 2 *decoder* below is video-gated).
+pf-mkv = { path = "../mkv" }
+pf-mp4 = { path = "../mp4" }
+pf-ogg = { path = "../ogg" }
+pf-avi = { path = "../avi" }
+# Audio decoders.
+pf-aac = { path = "../aac" }
+pf-flac = { path = "../flac" }
+pf-opus = { path = "../opus" }
+pf-mp3 = { path = "../mp3" }
+# AC-3 (ATSC A/52) + E-AC-3 (Dolby Digital Plus) — the 5.1 tracks in BluRay/WEB-DL rips.
+pf-ac3 = { path = "../ac3" }
+# Subtitles: the SRT/WebVTT/ASS parser + the non-blocking overlay compositor the autoplug
+# controller inserts between the video decoder and the sink when a file carries subtitles.
+# The overlay composites *onto a decoded frame*, so it is meaningless without a video decoder.
+pf-text = { path = "../text", optional = true }
+# Software video decoders.
+pf-vp8 = { path = "../vp8", optional = true }
+pf-vp9 = { path = "../vp9", optional = true }
+pf-av1 = { path = "../av1", optional = true }
+pf-h264 = { path = "../h264", optional = true }
+pf-h265 = { path = "../h265", optional = true }
+# MPEG-4 Part 2 (ASP / XviD / DivX) — the video in classic `.avi` rips.
+pf-mpeg4p2 = { path = "../mpeg4p2", optional = true }
+# Hardware-first video decode, capability-gated (respects PF_NO_VAAPI). This is the one dep
+# that reaches *outside* the tree — it links the system `libva`, which is why an audio-only
+# consumer wants it gone rather than merely unused.
+pf-vaapi = { path = "../vaapi", optional = true }
+# The raw-wire Wayland presenter: `waylandvideosink` (zero-copy dmabuf) + `waylandrawsink`
+# (software video/raw → wl_shm). No SDL — this is the whole window path now.
+pf-present = { path = "../present", optional = true }
+pf-pipewire = { path = "../pipewire" }
+# The h264 decoder churns malloc internally (see sdl3/examples/play_file.rs) — the `pfplay`
+# binary swaps the global allocator to mimalloc for playback headroom. Only the binary uses
+# it (`#[global_allocator]`); the library stays allocator-agnostic. Gated behind the default
+# `mimalloc` feature so an allocation profile can build with the system allocator
+# (`--no-default-features`) — heaptrack interposes libc malloc and cannot see mimalloc.
+mimalloc = { version = "0.1.52", optional = true }
+
+[features]
+default = ["mimalloc", "video"]
+# Enables the mimalloc global allocator in the `pfplay` binary. Turn off
+# (`cargo build -p pf-play --no-default-features`) for heaptrack/valgrind, which need the
+# system allocator to observe the decode-path allocations.
+mimalloc = ["dep:mimalloc"]
+# The whole video stack: six software decoders, the VA-API hardware decoders (and with them
+# the system `libva`), the raw-wire Wayland presenter, the subtitle overlay, and the headless
+# `video/raw` drop sink. **On by default** — every existing consumer is unchanged.
+#
+# Turning it off (`default-features = false`) leaves a player that still opens every container
+# it opened before, including video-bearing MKV/MP4/AVI/WebM: the demuxers are all
+# unconditional, and a video pad with no decoder simply takes the same `bytes` drop sink that
+# an extra audio track takes, reported as `(dropped: no decoder for <family>)`. That is the
+# mode a music player wants — see the crate docs, "The `video` feature".
+video = [
+    "dep:pf-vp8",
+    "dep:pf-vp9",
+    "dep:pf-av1",
+    "dep:pf-h264",
+    "dep:pf-h265",
+    "dep:pf-mpeg4p2",
+    "dep:pf-vaapi",
+    "dep:pf-present",
+    "dep:pf-text",
+    "dep:profluens-video",
+]

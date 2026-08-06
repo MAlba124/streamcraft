@@ -1,0 +1,31 @@
+[package]
+name = "pf-h264"
+description = "H.264 / AVC (ITU-T H.264 | ISO/IEC 14496-10) codec plugin for profluens, backed by the pure-Rust oxideav-h264"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_h264"
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The one sanctioned kind of dependency for a plugin crate (like libpipewire for
+# pf-pipewire): pure Rust, no build.rs, zero unsafe, MIT. See lib.rs for the
+# adoption rationale, the wire-or-reject evidence, and the dependency situation —
+# unlike pf-vp8, oxideav-h264 0.1.7 pulls oxideav-core + thiserror + serde_json
+# mandatorily (the decoder is consumed via oxideav-core's Decoder trait).
+# `nightly`: the upstream SIMD gate (its portable path currently defers to the
+# LLVM-autovectorised chunked path; enabling costs nothing and picks the fast
+# path up as the vendored crate grows one).
+oxideav-h264 = { version = "0.1", default-features = false, features = ["nightly"] }
+# Consumed types (Packet / Frame / VideoFrame / Decoder trait / CodecId). Pinned
+# to the same 0.1.x line oxideav-h264 resolves so no duplicate copy is linked.
+oxideav-core = { version = "0.1", default-features = false }
+# The video/raw vocabulary (pixel formats + the H.273 color mapping used for the
+# colorimetry passthrough) — pure vocab, no heavier than core.
+profluens-video = { path = "../video" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

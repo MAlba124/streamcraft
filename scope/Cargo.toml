@@ -1,0 +1,30 @@
+[package]
+name = "profluens-scope"
+description = "Immediate-mode SDL3 inspector GUI + MCP server over the core introspection protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "profluens_scope"
+
+[[bin]]
+name = "pf-scope"
+path = "src/main.rs"
+
+# Standalone demo of the immediate-mode UI layer with fake pipeline data.
+# Headless: `SDL_VIDEODRIVER=dummy … cargo run --bin ui_demo -- --frames 60`.
+[[bin]]
+name = "ui_demo"
+path = "src/bin/ui_demo.rs"
+
+[dependencies]
+profluens-core = { path = "../core", features = ["introspect"] }
+# The scope UI rides SDL3, exactly as the video sink does: pure auto-generated
+# bindings linked against the system libSDL3 via pkg-config (the `ash`/`pipewire`
+# pattern; never `build-from-source` — the repo toolchain has no SDL cmake/clang
+# build). All `unsafe` FFI is confined to `ui::backend`.
+sdl3-sys = { version = "0.6", features = ["use-pkg-config"] }
+# TODO: an MCP server implementation rides the same protocol client (deferred).
+# Scope is optional to the framework — apps that don't attach pay nothing.

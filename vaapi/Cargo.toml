@@ -1,0 +1,38 @@
+[package]
+name = "pf-vaapi"
+description = "VA-API hardware video plugin for profluens (hand-rolled libva FFI; vaapih264dec + h264/h265/vp8 encoders)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Links the system libva/libva-drm shared libraries — declared so cargo can flag a
+# double-link and so a future -sys crate can coexist (`links` is a global key).
+links = "va"
+
+[lib]
+name = "pf_vaapi"
+
+[dependencies]
+# The only hard dependency is the framework core (buffers, batches, the element
+# contract, dynamic-caps announcement). The VA-API surface itself is hand-rolled
+# FFI against the system libva (the device boundary, like pf-pipewire wraps
+# libpipewire) — no -sys crate, no bindgen; see src/ffi.rs.
+profluens-core = { path = "../core" }
+
+[dev-dependencies]
+# End-to-end decode gate: pull the first access units of a real H.264-in-MKV file
+# through the element and assert plausible NV12 frames. pf-mkv gives us the
+# incremental reader + the AVCC→Annex-B reframer + the parameter-set head; no
+# dependency cycle (pf-mkv does not depend on pf-vaapi). Skipped when the fixture
+# is absent.
+pf-mkv = { path = "../mkv" }
+# Encode round-trip gates: each hardware encoder's output is decoded by the
+# workspace's independent pure-Rust decoder and PSNR-checked against the source
+# (tests/hw_encode_roundtrip.rs). No dependency cycles — none depend on pf-vaapi.
+pf-h264 = { path = "../h264" }
+pf-h265 = { path = "../h265" }
+pf-vp8 = { path = "../vp8" }
+# The hw_encode_mkv example: testsrc → hardware encoder → mkvmuxn → filesink,
+# the external-validation vehicle (ffprobe + headless mpv on the output).
+profluens-elements = { path = "../elements" }
+profluens-video = { path = "../video" }

@@ -1,0 +1,25 @@
+[package]
+name = "pf-av1"
+description = "AV1 (AOMedia Video 1) codec plugin for profluens, backed by the pure-Rust oxideav-av1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_av1"
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The one sanctioned kind of dependency for a plugin crate (like libpipewire for
+# pf-pipewire): pure Rust, no build.rs, one line of unsafe in the whole tree, MIT,
+# spec-annotated. Unlike pf-vp8 this pulls a mandatory `oxideav-core` (serde_json +
+# thiserror + bytemuck) only for a runtime registry we do not use — `default-features
+# = false` is set in anticipation of an upstream feature to drop it, but 0.1.16 gates
+# nothing, so the transitive deps still ride along (already in our lockfile). See
+# lib.rs for the adoption rationale, the enforced output subset, and the debt list.
+oxideav-av1 = { version = "0.1", default-features = false }
+profluens-video = { path = "../video" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

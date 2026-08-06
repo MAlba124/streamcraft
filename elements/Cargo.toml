@@ -1,0 +1,18 @@
+[package]
+name = "profluens-elements"
+description = "Built-in pure-Rust elements (filesrc, filesink, queue, tee, testsrc, sinks)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../core" }
+# Only for the io_uring reactor backend (Linux); the syscall ABI, nothing heavier.
+libc = { version = "0.2", optional = true }
+
+[features]
+default = []
+# A hand-rolled io_uring reactor (spec: IO). Off by default; the dependency-free
+# SyncReactor in core is the portable fallback.
+io-uring = ["dep:libc"]

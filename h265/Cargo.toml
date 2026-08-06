@@ -1,0 +1,23 @@
+[package]
+name = "pf-h265"
+description = "H.265 / HEVC (ITU-T H.265 | ISO/IEC 23008-2) codec plugin for profluens, backed by the pure-Rust oxideav-h265"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_h265"
+
+[dependencies]
+profluens-video = { path = "../video" }
+profluens-core = { path = "../core" }
+# A sanctioned plugin-crate dependency (like libpipewire for pf-pipewire): pure
+# Rust, no build.rs, no unsafe, MIT. Unlike pf-vp8 it is NOT zero-dep — at 0.0.9 it
+# pulls oxideav-core (serde_json/thiserror/bytemuck) transitively for its registry
+# glue, which the decode path we call does not touch. See lib.rs for the adoption
+# rationale, the dependency wart, and the planned nativization steps.
+oxideav-h265 = { version = "0.0.9", default-features = false }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

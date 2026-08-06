@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-opus"
+version = "0.0.13"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-opus"
+authors = ["Mark Karpeles"]
+description = "Opus audio codec — orphan-rebuild scaffold pending clean-room re-implementation."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-opus"
+keywords = ["multimedia", "audio", "opus", "codec", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"

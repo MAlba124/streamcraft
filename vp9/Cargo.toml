@@ -1,0 +1,24 @@
+[package]
+name = "pf-vp9"
+description = "VP9 (bitstream spec v0.7) codec plugin for profluens, backed by the pure-Rust oxideav-vp9"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_vp9"
+
+[dependencies]
+profluens-core = { path = "../core" }
+# The one sanctioned kind of dependency for a plugin crate (like libpipewire for
+# pf-pipewire): pure Rust, no build.rs, no unsafe, MIT. See lib.rs for the adoption
+# verdict (WIRE — an intra-only decoder subset), the capability matrix, and the tracked
+# debt (inter decode, decode-into-pool-memory, the oxideav-core tail). 0.0.12 pulls
+# oxideav-core (serde_json/thiserror/bytemuck) unconditionally; there is no feature to
+# turn it off, so `default-features = false` is a no-op kept for symmetry with pf-vp8.
+oxideav-vp9 = { version = "0.0.12", default-features = false }
+profluens-video = { path = "../video" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }

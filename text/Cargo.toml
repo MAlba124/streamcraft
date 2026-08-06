@@ -1,0 +1,27 @@
+[package]
+name = "pf-text"
+description = "Subtitle support for profluens: SRT/WebVTT/ASS cue parsing + a non-blocking, controller-friendly overlay compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pf_text"
+
+[dependencies]
+# The framework core (element contract, buffers, ctx, timestamps) — the same
+# minimal surface every plugin crate pulls in.
+profluens-core = { path = "../core" }
+# Typed video-frame views (plane_mut / plane_row_mut / pixfmt) + PixelFormat +
+# plane geometry — the overlay blits onto luma/chroma planes through these, so
+# it never does raw offset math (mirrors pf-vp8 / pf-h264 depending on -video).
+profluens-video = { path = "../video" }
+
+[dev-dependencies]
+# End-to-end proof: filesrc ! mkvdemux ! h264dec ! suboverlay, subtitle pad ! subparse.
+profluens-elements = { path = "../elements" }
+# The container the soft subtitle track rides in, and the video decoder that feeds
+# the overlay's `video` pad (both one-directional dev-deps: neither depends on pf-text).
+pf-mkv = { path = "../mkv" }
+pf-h264 = { path = "../h264" }

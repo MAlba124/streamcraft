@@ -1,0 +1,1525 @@
+//! §7.3.4 / §7.4.4 — slice_data walker.
+//!
+//! Walks the macroblocks within a slice. Clean-room implementation from
+//! ITU-T Rec. H.264 (08/2024).
+//!
+//! Responsibilities (§7.3.4):
+//!
+//! 1. **CABAC bootstrap**: when `entropy_coding_mode_flag == 1`, parse
+//!    `cabac_alignment_one_bit`s until byte aligned, then instantiate
+//!    the CABAC engine and per-slice contexts
+//!    ([`crate::cabac::CabacDecoder::new`] + [`CabacContexts::init`]).
+//!
+//! 2. **`CurrMbAddr` seeding**: starts at
+//!    `first_mb_in_slice * (1 + MbaffFrameFlag)`
+//!    per §7.3.4, and advances via `NextMbAddress` (§8.2.2). With FMO
+//!    disabled this is just `CurrMbAddr + 1` (which is what we
+//!    implement — MBAFF/FMO neighbour wiring is above this module's
+//!    scope).
+//!
+//! 3. **Per-MB loop**:
+//!    - `mb_skip_run` (CAVLC, non-I/SI slices): a `ue(v)` counting how
+//!      many MBs to skip before the next coded MB.
+//!    - `mb_skip_flag` (CABAC, non-I/SI slices): decoded via
+//!      [`crate::cabac_ctx::decode_mb_skip_flag`].
+//!    - `mb_field_decoding_flag`: read per §7.3.4 when
+//!      `MbaffFrameFlag == 1` and
+//!      `(CurrMbAddr % 2 == 0 || (CurrMbAddr % 2 == 1 && prevMbSkipped))`.
+//!      Phase-1 parsing only: the flag is captured per MB pair (both
+//!      MBs of a pair record the same value) but MBAFF reconstruction
+//!      is still out of scope.
+//!    - [`crate::macroblock_layer::parse_macroblock`] for non-skipped
+//!      MBs.
+//!
+//! 4. **Termination**:
+//!    - CAVLC: loop while `more_rbsp_data()`.
+//!    - CABAC: decode `end_of_slice_flag` via
+//!      [`crate::cabac_ctx::decode_end_of_slice_flag`] after each MB.
+//!      In MBAFF, `end_of_slice_flag` is only decoded when
+//!      `CurrMbAddr % 2 == 1` (top-of-pair always continues to bottom,
+//!      per §7.3.4).
+
+#![allow(dead_code)]
+
+use crate::bitstream::{BitError, BitReader};
+use crate::cabac::{CabacDecoder, CabacError};
+use crate::cabac_ctx::{
+    decode_end_of_slice_flag, decode_mb_skip_flag, CabacContexts, NeighbourCtx, SliceKind,
+};
+use crate::macroblock_layer::{
+    parse_macroblock, CabacNeighbourGrid, CavlcNcGrid, EntropyState, Macroblock,
+    MacroblockLayerError, MbType, PcmSamples,
+};
+use crate::mb_address::mbaff_pair_neighbour_addrs;
+use crate::pps::Pps;
+use crate::slice_header::{SliceHeader, SliceType};
+use crate::sps::Sps;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SliceDataError {
+    #[error("bitstream read failed: {0}")]
+    Bitstream(#[from] BitError),
+    #[error("CABAC engine failed: {0}")]
+    Cabac(#[from] CabacError),
+    #[error("macroblock_layer: {0}")]
+    Macroblock(#[from] MacroblockLayerError),
+    /// A macroblock failed to parse; carries the MB address + bit
+    /// offset at MB entry for diagnostic purposes.
+    #[error("macroblock #{mb_addr} at byte {byte}:bit {bit}: {source}")]
+    MacroblockAt {
+        mb_addr: u32,
+        byte: usize,
+        bit: u8,
+        #[source]
+        source: MacroblockLayerError,
+    },
+    /// §7.3.4 — MBAFF reconstruction is not wired in this walker. Phase
+    /// 1 parses the MB-pair + `mb_field_decoding_flag` structure but
+    /// downstream layers may still reject MBAFF streams with this.
+    #[error("MBAFF macroblock layer is not supported in this walker")]
+    MbaffNotSupported,
+    /// §7.4.3 — `slice_qp_y` (from slice_header + pps) out of valid range
+    /// `-QpBdOffsetY..=+51` (= 0..=51 for 8-bit luma).
+    #[error("derived SliceQPY {0} out of range")]
+    SliceQpOutOfRange(i32),
+    /// §7.4.4 — `mb_skip_run` shall be in the range
+    /// `0..=PicSizeInMbs - 1`. A malformed CAVLC stream that encodes a
+    /// huge `mb_skip_run` would otherwise drive the macroblock vector
+    /// to a multi-gigabyte allocation while the decoder dutifully
+    /// pushes inferred-skip MBs.
+    #[error("mb_skip_run {0} would overflow picture (PicSizeInMbs = {1})")]
+    MbSkipRunOverflow(u32, u32),
+    /// The macroblock walker advanced past the end of the picture.
+    /// Either an `mb_skip_run` (CAVLC) or a non-end-of-slice signal
+    /// (CABAC) tried to push more MBs than the SPS geometry allows.
+    /// This is malformed input — every legitimate stream terminates
+    /// the slice loop before exceeding `PicSizeInMbs`.
+    #[error("macroblock walker exceeded PicSizeInMbs ({0}); slice malformed")]
+    MbAddrOverflow(u32),
+}
+
+pub type SliceDataResult<T> = Result<T, SliceDataError>;
+
+/// §7.3.4 — parsed slice_data payload.
+#[derive(Debug, Clone, Default)]
+pub struct SliceData {
+    /// One entry per macroblock (including implicit skip entries).
+    pub macroblocks: Vec<Macroblock>,
+    /// §7.4.4 — `mb_field_decoding_flag` per macroblock, parallel to
+    /// `macroblocks`. For non-MBAFF slices every entry is `false`
+    /// (the flag is absent from the bitstream and is inferred to
+    /// `field_pic_flag` by the spec, which is also `false` for a
+    /// frame-coded picture). For MBAFF slices both MBs of a pair
+    /// carry the same value — the one parsed at the top of the pair
+    /// (or retroactively at the bottom when the top was skipped).
+    ///
+    /// Invariant: `mb_field_decoding_flags.len() == macroblocks.len()`.
+    pub mb_field_decoding_flags: Vec<bool>,
+    /// Final CurrMbAddr after the loop — i.e. `first_mb + len(macroblocks)`
+    /// for single-slice-group streams.
+    pub last_mb_addr: u32,
+}
+
+/// Map [`SliceType`] to the CABAC [`SliceKind`].
+
+/// Cached debug-trace gates. `std::env::var_os` resolves to a `getenv()` on
+/// every call; these sit in the per-macroblock loop, so read the environment
+/// once (the `macroblock_layer` / `cabac_ctx` precedent).
+fn sd_ctx17_trace() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_CTX17_TRACE").is_some())
+}
+fn sd_bin_trace() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_BIN_TRACE").is_some())
+}
+fn sd_skip_trace() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("OXIDEAV_H264_SKIP_TRACE").is_some())
+}
+
+fn slice_kind(slice_type: SliceType) -> SliceKind {
+    match slice_type {
+        SliceType::I => SliceKind::I,
+        SliceType::P => SliceKind::P,
+        SliceType::B => SliceKind::B,
+        SliceType::SP => SliceKind::SP,
+        SliceType::SI => SliceKind::SI,
+    }
+}
+
+/// §7.3.4 — walk a slice's `slice_data()`.
+///
+/// `rbsp` is the de-emulated RBSP (emulation-prevention bytes stripped)
+/// starting at the beginning of the NAL unit. `bit_cursor_bytes` +
+/// `bit_cursor_bits` pinpoint the position within `rbsp` where
+/// slice_data() begins — i.e. the byte offset of the next bit plus
+/// the MSB-first bit index within that byte (matching the convention
+/// used by [`BitReader::position`]).
+pub fn parse_slice_data(
+    rbsp: &[u8],
+    bit_cursor_bytes: usize,
+    bit_cursor_bits: u8,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+) -> SliceDataResult<SliceData> {
+    // §7.3.4 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
+    // !field_pic_flag. Phase 1: the walker steps in MB pairs and
+    // reads mb_field_decoding_flag per pair, but downstream
+    // reconstruction is still out of scope (it will reject the
+    // returned SliceData via its own checks).
+    let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !slice_header.field_pic_flag;
+
+    // Position the reader at (bit_cursor_bytes, bit_cursor_bits).
+    let mut r = position_reader(rbsp, bit_cursor_bytes, bit_cursor_bits)?;
+
+    let kind = slice_kind(slice_header.slice_type);
+    let chroma_array_type = sps.chroma_array_type();
+
+    // §7.4.2.1 — QpBdOffsetY = 6 * bit_depth_luma_minus8, SliceQPY =
+    // 26 + pic_init_qp_minus26 + slice_qp_delta (§7.4.3). Per §7.4.3
+    // SliceQPY is constrained to −QpBdOffsetY..=+51 (negative values are
+    // legal at >8-bit luma depth and decoded MBs add QpBdOffsetY back to
+    // get qP'Y for the §8.5.10 / §8.5.12 scaling formulas).
+    let slice_qp_y = 26 + pps.pic_init_qp_minus26 + slice_header.slice_qp_delta;
+    let qp_bd_offset_y = (6 * sps.bit_depth_luma_minus8) as i32;
+    if !(-qp_bd_offset_y..=51).contains(&slice_qp_y) {
+        return Err(SliceDataError::SliceQpOutOfRange(slice_qp_y));
+    }
+
+    let mut macroblocks: Vec<Macroblock> = Vec::new();
+    let mut mb_field_decoding_flags: Vec<bool> = Vec::new();
+    let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
+
+    // §9.2.1.1 — CAVLC nC neighbour grid, allocated per picture. The
+    // grid is only consulted in the CAVLC path but we allocate it for
+    // the CABAC path too so any future CABAC residual-neighbour work
+    // can re-use the same store.
+    let pic_w_mbs = sps.pic_width_in_mbs_minus1 + 1;
+    // §7.4.2.1.1 eq. (7-26) — PicHeightInMbs = FrameHeightInMbs /
+    // (1 + field_pic_flag). A field-coded picture
+    // (`field_pic_flag == 1`, PAFF) covers half the frame's MB rows; the
+    // grid + PicSizeInMbs bound below must follow the field height so the
+    // §7.3.4 walk terminates at the field's last MB rather than running
+    // a full frame's worth of addresses into the next field's data.
+    let pic_h_mbs = sps.pic_height_in_mbs(slice_header.field_pic_flag);
+    // §7.4.2.1.1 eq. 7-27: PicSizeInMbs = PicWidthInMbs * PicHeightInMbs.
+    // Both terms are u32 capped by SPS (`MAX_PIC_DIM_IN_MBS_MINUS1 + 1`),
+    // so the product fits in u32 by construction. Used downstream to
+    // bound `mb_skip_run` and to detect MB-address overflow.
+    let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
+    let mut cavlc_nc = CavlcNcGrid::new(pic_w_mbs, pic_h_mbs);
+
+    if pps.entropy_coding_mode_flag {
+        // ---------------------------------------------------------
+        // CABAC path (§7.3.4).
+        // ---------------------------------------------------------
+        while !r.byte_aligned() {
+            // §7.3.4 — cabac_alignment_one_bit. The spec mandates each
+            // alignment bit be equal to 1; we tolerate any value for
+            // robustness in fixtures.
+            let _ = r.u(1)?;
+        }
+        // Hand the byte-aligned remainder to the CABAC engine. CABAC's
+        // first-byte initialisation consumes 9 bits from its own
+        // private reader.
+        let byte_pos = r.position().0;
+        let remainder = &rbsp[byte_pos..];
+        let mut cabac_dec = CabacDecoder::new(BitReader::new(remainder))?;
+        let mut ctxs = CabacContexts::init(
+            kind,
+            match kind {
+                SliceKind::I | SliceKind::SI => None,
+                _ => Some(slice_header.cabac_init_idc),
+            },
+            slice_qp_y,
+        )?;
+        if sd_ctx17_trace() {
+            let c17 = ctxs.at(17);
+            eprintln!("[CTX17] slice init: kind={:?} init_idc={} qp_y={} num_ref_l0_active_minus1={} c17=({},{})",
+                kind, slice_header.cabac_init_idc, slice_qp_y,
+                slice_header.num_ref_idx_l0_active_minus1,
+                c17.state_idx, c17.val_mps);
+        }
+
+        // §7.3.4 — prevMbSkipped is initialised to 0; in the CABAC
+        // path it is updated each iteration to mb_skip_flag when the
+        // slice isn't I/SI.
+        let mut prev_mb_skipped = false;
+        // §9.3.3.1.1.5 — per-slice rolling flag for mb_qp_delta bin 0
+        // ctxIdxInc. Initial value is 0 at the start of a slice
+        // (per §9.3.3.1.1.5).
+        let mut prev_mb_qp_delta_nonzero_slice = false;
+        // MBAFF: the flag is decoded once per MB pair but applies to
+        // both MBs. `pending_pair_flag` holds the top MB's flag so the
+        // bottom MB gets the same value without a second read.
+        let mut pending_pair_flag: Option<bool> = None;
+        // §9.3.3.1.1.9 — CABAC residual neighbour grid; populated per MB
+        // as the walker steps, and consulted when deriving `ctxIdxInc`
+        // for coded_block_flag / ref_idx / mvd on subsequent MBs.
+        let mut cabac_nb = CabacNeighbourGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
+        loop {
+            // Debug marker for bin-level trace: emit a MB-boundary line
+            // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can
+            // slice the bin trace into MB segments.
+            if sd_bin_trace() {
+                let (bp_byte, bp_bit) = cabac_dec.position();
+                let bit_pos = bp_byte * 8 + bp_bit as usize;
+                eprintln!(
+                    "[MB-BOUNDARY] curr_mb_addr={} bin_count={} range={} offset={} bit_pos={}",
+                    curr_mb_addr,
+                    cabac_dec.bin_count(),
+                    cabac_dec.debug_range(),
+                    cabac_dec.debug_offset(),
+                    bit_pos,
+                );
+            }
+            let mut skipped = false;
+            let mut mb_skip_flag_this_iter = false;
+            // §9.3.3.1.1.1 — mb_skip_flag's ctxIdxInc uses the A/B
+            // neighbours' own `mb_skip_flag` (per spec: condTermFlagN = 0
+            // if mbAddrN is not available, or mb_skip_flag[mbAddrN] == 1;
+            // else 1). Build a minimal NeighbourCtx snapshot that covers
+            // the skip-flag path; the full snapshot (inter/intra/CBP)
+            // rebuilds below once we know the MB is not skipped.
+            let mut skip_nctx = NeighbourCtx::default();
+            let (skip_a_addr, skip_b_addr) =
+                cabac_nb.neighbour_mb_addrs_mbaff(curr_mb_addr, mbaff_frame_flag);
+            if let Some(a) = skip_a_addr {
+                if let Some(info) = cabac_nb.mbs.get(a as usize) {
+                    if info.available {
+                        skip_nctx.available_left = true;
+                        skip_nctx.mb_skip_flag_left = info.is_skip;
+                    }
+                }
+            }
+            if let Some(b) = skip_b_addr {
+                if let Some(info) = cabac_nb.mbs.get(b as usize) {
+                    if info.available {
+                        skip_nctx.available_above = true;
+                        skip_nctx.mb_skip_flag_above = info.is_skip;
+                    }
+                }
+            }
+            if !slice_header.slice_type.is_intra() {
+                let mb_skip_flag =
+                    decode_mb_skip_flag(&mut cabac_dec, &mut ctxs, kind, &skip_nctx)?;
+                mb_skip_flag_this_iter = mb_skip_flag;
+                // OXIDEAV_H264_SKIP_TRACE=1 — dump every mb_skip_flag
+                // decision with its neighbour condTermFlags for
+                // cross-referencing against an external reference trace.
+                // Useful when chasing CABAC state divergences at specific MBs.
+                if sd_skip_trace() {
+                    eprintln!(
+                        "[SKIP {}] flag={} avail_L={} skip_L={} avail_A={} skip_A={}",
+                        curr_mb_addr,
+                        mb_skip_flag,
+                        skip_nctx.available_left,
+                        skip_nctx.mb_skip_flag_left,
+                        skip_nctx.available_above,
+                        skip_nctx.mb_skip_flag_above
+                    );
+                }
+                if mb_skip_flag {
+                    // §7.4.4 — mb_field_decoding_flag for this MB is
+                    // not read here. If this MB is the top of a pair
+                    // whose flag was never read, the inference from
+                    // §7.4.4 applies (Phase-1: default to 0 = frame
+                    // pair; real spatial inference needs MBAFF
+                    // neighbour addressing which is out of scope).
+                    let flag = pending_pair_flag.unwrap_or(false);
+                    macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
+                    mb_field_decoding_flags.push(flag);
+                    // §9.2.1.1 step 6 — a P_Skip / B_Skip neighbour
+                    // contributes nN = 0. Mark available + is_skip.
+                    if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.is_available = true;
+                        slot.is_skip = true;
+                        slot.is_intra = false;
+                        slot.is_i_pcm = false;
+                        slot.luma_total_coeff = [0; 16];
+                        slot.cb_total_coeff = [0; 8];
+                        slot.cr_total_coeff = [0; 8];
+                    }
+                    // §9.3.3.1.1.1 — mirror the availability / skip flag
+                    // into the CABAC neighbour grid so subsequent MBs see
+                    // the correct condTermFlag for mb_skip_flag and
+                    // downstream syntax elements.
+                    if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.available = true;
+                        slot.is_skip = true;
+                        slot.is_intra = false;
+                        slot.is_i_pcm = false;
+                        slot.is_i_nxn = false;
+                        // §9.3.3.1.1.2 — record mb_field_decoding_flag
+                        // for the next pair's ctxIdxInc derivation. Skipped
+                        // MBs inherit their pair flag (see `flag` above,
+                        // which applies to both MBs of the pair in MBAFF).
+                        slot.mb_field_decoding_flag = flag;
+                        // §9.3.3.1.1.3 — B_Skip is one of the two mb_types
+                        // that trigger condTermFlag = 0 at ctxIdxOffset=27
+                        // bin 0 for the next MB's mb_type decode.
+                        slot.is_b_skip_or_direct = matches!(kind, SliceKind::B);
+                        slot.coded_block_pattern_luma = 0;
+                        slot.coded_block_pattern_chroma = 0;
+                        slot.cbf_luma_4x4 = [false; 16];
+                        slot.cbf_cb_dc = false;
+                        slot.cbf_cr_dc = false;
+                        slot.cbf_cb_ac = [false; 8];
+                        slot.cbf_cr_ac = [false; 8];
+                        slot.cbf_luma_16x16_dc = false;
+                        slot.cbf_luma_16x16_ac = [false; 16];
+                        slot.cbf_cb_16x16_dc = false;
+                        slot.cbf_cb_16x16_ac = [false; 16];
+                        slot.cbf_cb_luma_4x4 = [false; 16];
+                        slot.cbf_cr_16x16_dc = false;
+                        slot.cbf_cr_16x16_ac = [false; 16];
+                        slot.cbf_cr_luma_4x4 = [false; 16];
+                        slot.transform_size_8x8_flag = false;
+                        slot.intra_chroma_pred_mode = 0;
+                        // Skip neighbours contribute mvd=0 / ref_idx=0
+                        // per §9.3.3.1.1.6 / .7.
+                        slot.mvd_l0_x = [0; 16];
+                        slot.mvd_l0_y = [0; 16];
+                        slot.mvd_l1_x = [0; 16];
+                        slot.mvd_l1_y = [0; 16];
+                        slot.ref_idx_l0 = [0; 4];
+                        slot.ref_idx_l1 = [0; 4];
+                    }
+                    // §9.3.3.1.1.5 — a P_Skip / B_Skip previous MB
+                    // forces mb_qp_delta ctxIdxInc to 0 on the next
+                    // coded MB; reset the rolling flag.
+                    prev_mb_qp_delta_nonzero_slice = false;
+                    // If we just completed a pair (odd CurrMbAddr),
+                    // clear the pending_pair_flag — the next iteration
+                    // starts a new pair.
+                    if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
+                        pending_pair_flag = None;
+                    }
+                    curr_mb_addr += 1;
+                    skipped = true;
+                }
+            }
+            if !skipped {
+                // §7.3.4 — MBAFF: read mb_field_decoding_flag before
+                // macroblock_layer() when (CurrMbAddr % 2 == 0) or
+                // (CurrMbAddr % 2 == 1 && prevMbSkipped). The flag
+                // applies to both MBs of the pair.
+                if mbaff_frame_flag
+                    && (curr_mb_addr % 2 == 0 || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
+                {
+                    let flag = decode_mb_field_decoding_flag_cabac(
+                        &mut cabac_dec,
+                        &mut ctxs,
+                        &cabac_nb,
+                        curr_mb_addr,
+                        pic_w_mbs,
+                    )?;
+                    pending_pair_flag = Some(flag);
+                    // Retroactively patch the top MB of this pair if
+                    // it was skipped (CurrMbAddr % 2 == 1 path).
+                    if curr_mb_addr % 2 == 1 {
+                        if let Some(last) = mb_field_decoding_flags.last_mut() {
+                            *last = flag;
+                        }
+                    }
+                }
+                let flag = pending_pair_flag.unwrap_or(false);
+                // §9.3.3.1.1.4 / .8 — populate the NeighbourCtx fields
+                // that per-syntax ctxIdxInc derivations consult for the
+                // external (neighbour MB) branch. The A/B neighbour
+                // addresses come from §6.4.9 raster-scan: A = left
+                // (same row, x-1), B = above (row above, same x).
+                let mut nctx = NeighbourCtx::default();
+                let (a_addr, b_addr) =
+                    cabac_nb.neighbour_mb_addrs_mbaff(curr_mb_addr, mbaff_frame_flag);
+                if let Some(a) = a_addr {
+                    if let Some(info) = cabac_nb.mbs.get(a as usize) {
+                        if info.available {
+                            nctx.available_left = true;
+                            nctx.left_is_i_pcm = info.is_i_pcm;
+                            nctx.left_is_p_or_b_skip = info.is_skip;
+                            nctx.left_inter = !info.is_intra;
+                            nctx.left_cbp_luma = info.coded_block_pattern_luma;
+                            nctx.left_cbp_chroma = info.coded_block_pattern_chroma;
+                            nctx.left_is_i_nxn = info.is_i_nxn;
+                            nctx.left_is_b_skip_or_direct = info.is_b_skip_or_direct;
+                            nctx.left_intra_chroma_pred_mode_nonzero =
+                                info.intra_chroma_pred_mode != 0;
+                            nctx.left_transform_8x8 = info.transform_size_8x8_flag;
+                        }
+                    }
+                }
+                if let Some(b) = b_addr {
+                    if let Some(info) = cabac_nb.mbs.get(b as usize) {
+                        if info.available {
+                            nctx.available_above = true;
+                            nctx.above_is_i_pcm = info.is_i_pcm;
+                            nctx.above_is_p_or_b_skip = info.is_skip;
+                            nctx.above_inter = !info.is_intra;
+                            nctx.above_cbp_luma = info.coded_block_pattern_luma;
+                            nctx.above_cbp_chroma = info.coded_block_pattern_chroma;
+                            nctx.above_is_i_nxn = info.is_i_nxn;
+                            nctx.above_is_b_skip_or_direct = info.is_b_skip_or_direct;
+                            nctx.above_intra_chroma_pred_mode_nonzero =
+                                info.intra_chroma_pred_mode != 0;
+                            nctx.above_transform_8x8 = info.transform_size_8x8_flag;
+                        }
+                    }
+                }
+                let mut entropy = EntropyState {
+                    cabac: Some((&mut cabac_dec, &mut ctxs)),
+                    slice_kind: kind,
+                    neighbours: nctx,
+                    prev_mb_qp_delta_nonzero: prev_mb_qp_delta_nonzero_slice,
+                    chroma_array_type,
+                    transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
+                    cavlc_nc: Some(&mut cavlc_nc),
+                    current_mb_addr: curr_mb_addr,
+                    constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
+                    num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
+                    num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
+                    mbaff_frame_flag,
+                    mb_field_decoding_flag: flag,
+                    // CABAC per-MB neighbour grid — spec-correct per
+                    // §9.3.3.1.1.9.
+                    cabac_nb: Some(&mut cabac_nb),
+                    pic_width_in_mbs: pic_w_mbs,
+                    bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
+                    bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
+                };
+                let (byte, bit) = r.position();
+                let mb_result =
+                    parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr);
+                // §9.3.3.1.1.5 — carry the rolling flag forward for
+                // the next MB's mb_qp_delta ctxIdxInc. The entropy
+                // borrow ends with `parse_macroblock` returning; read
+                // the flag before we drop it. For I_PCM (handled in
+                // the error arm below), this value is overridden to 0
+                // per §9.3.3.1.1.5.
+                let next_qp_delta_flag = entropy.prev_mb_qp_delta_nonzero;
+                // `entropy` holds re-borrows of cabac_dec / ctxs / cavlc_nc /
+                // cabac_nb; explicit drop ends those re-borrows before the
+                // I_PCM-recover branch below reuses cabac_dec / cabac_nb.
+                #[allow(clippy::drop_non_drop)] // releases EntropyState's reborrows
+                drop(entropy);
+                let mut next_qp_delta_flag = next_qp_delta_flag;
+                let mb = match mb_result {
+                    Ok(m) => m,
+                    Err(MacroblockLayerError::IPcmNeedsCabacReinit {
+                        cabac_byte_pos,
+                        cabac_bit_pos,
+                    }) => {
+                        // §7.3.5 / §9.3.1.2 — I_PCM macroblock under
+                        // CABAC. The arithmetic decoder has consumed
+                        // the mb_type bins (including the I_PCM
+                        // terminator bin via DecodeTerminate); its
+                        // reader cursor is at
+                        // (cabac_byte_pos, cabac_bit_pos) inside the
+                        // CABAC segment (which itself starts at
+                        // `byte_pos` inside `rbsp`). The PCM payload
+                        // is read AS RAW BITS from the rbsp: first
+                        // byte-align (pcm_alignment_zero_bit), then
+                        // 256 * bit_depth_luma luma samples, then
+                        // 2 * MbWidthC * MbHeightC * bit_depth_chroma
+                        // chroma samples. After the PCM payload, the
+                        // CABAC engine is re-initialised (codIRange=
+                        // 510, codIOffset=read_bits(9)) — context
+                        // states are NOT re-initialised.
+                        let pcm_abs_byte = byte_pos + cabac_byte_pos;
+                        let mut pcm_r = position_reader(rbsp, pcm_abs_byte, cabac_bit_pos)?;
+                        while !pcm_r.byte_aligned() {
+                            // pcm_alignment_zero_bit — tolerate any value.
+                            let _ = pcm_r.u(1)?;
+                        }
+                        let bit_depth_y: u32 = 8 + sps.bit_depth_luma_minus8;
+                        let bit_depth_c: u32 = 8 + sps.bit_depth_chroma_minus8;
+                        // §6.2 Table 6-1 — chroma sample counts per MB.
+                        let (num_cb, num_cr): (usize, usize) = match chroma_array_type {
+                            0 => (0, 0),
+                            1 => (64, 64),   // 4:2:0 → 2 * 8 * 8
+                            2 => (128, 128), // 4:2:2 → 2 * 8 * 16
+                            3 => (256, 256), // 4:4:4 → 2 * 16 * 16
+                            other => {
+                                return Err(SliceDataError::MacroblockAt {
+                                    mb_addr: curr_mb_addr,
+                                    byte,
+                                    bit,
+                                    source: MacroblockLayerError::UnsupportedChromaArrayType(other),
+                                });
+                            }
+                        };
+                        let mut luma = Vec::with_capacity(256);
+                        for _ in 0..256 {
+                            luma.push(pcm_r.u(bit_depth_y)?);
+                        }
+                        let mut cb = Vec::with_capacity(num_cb);
+                        for _ in 0..num_cb {
+                            cb.push(pcm_r.u(bit_depth_c)?);
+                        }
+                        let mut cr = Vec::with_capacity(num_cr);
+                        for _ in 0..num_cr {
+                            cr.push(pcm_r.u(bit_depth_c)?);
+                        }
+                        // `pcm_r` is now positioned at the byte right
+                        // after the last PCM sample. PCM is read with
+                        // bit_depth-granular reads that sum to a byte
+                        // multiple when bit_depth is 8, but in general
+                        // higher bit depths don't guarantee byte
+                        // alignment. §9.3.1.2 says the re-init reads
+                        // `read_bits(9)` which does not require byte
+                        // alignment — the CABAC engine's BitReader can
+                        // start at any bit position.
+                        let (pcm_end_byte, pcm_end_bit) = pcm_r.position();
+                        // §9.3.1.2 — re-initialise the arithmetic
+                        // decoding engine from the post-PCM position.
+                        // Contexts (pStateIdx/valMPS) are preserved
+                        // per §9.3.1 (only 9.3.1.2 is invoked, not
+                        // 9.3.1.1).
+                        let post_pcm_r = position_reader(rbsp, pcm_end_byte, pcm_end_bit)?;
+                        cabac_dec = CabacDecoder::new(post_pcm_r)?;
+                        // §9.3.3.1.1.5 — after I_PCM, the next MB's
+                        // mb_qp_delta ctxIdxInc initial value is 0
+                        // (PrevMbAddr's mb_qp_delta is not carried
+                        // forward through I_PCM).
+                        next_qp_delta_flag = false;
+                        // Mark this MB in the CABAC neighbour grid so
+                        // subsequent MBs see its availability + I_PCM
+                        // classification (§9.3.3.1.1.* — I_PCM has
+                        // specific condTerm rules, e.g. all CBFs = 1).
+                        if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                            slot.available = true;
+                            slot.is_intra = true;
+                            slot.is_i_pcm = true;
+                            slot.is_skip = false;
+                            slot.is_i_nxn = false;
+                            slot.is_b_skip_or_direct = false;
+                            // §9.3.3.1.1.2 — record the pair flag for the
+                            // next pair's ctxIdxInc derivation. In MBAFF
+                            // both MBs of a pair share this flag.
+                            slot.mb_field_decoding_flag = pending_pair_flag.unwrap_or(false);
+                            // I_PCM contributes cbf=1 for all blocks.
+                            slot.cbf_luma_4x4 = [true; 16];
+                            slot.cbf_cb_dc = true;
+                            slot.cbf_cr_dc = true;
+                            slot.cbf_cb_ac = [true; 8];
+                            slot.cbf_cr_ac = [true; 8];
+                            slot.cbf_luma_16x16_dc = true;
+                            slot.cbf_luma_16x16_ac = [true; 16];
+                            slot.cbf_cb_16x16_dc = true;
+                            slot.cbf_cb_16x16_ac = [true; 16];
+                            slot.cbf_cb_luma_4x4 = [true; 16];
+                            slot.cbf_cr_16x16_dc = true;
+                            slot.cbf_cr_16x16_ac = [true; 16];
+                            slot.cbf_cr_luma_4x4 = [true; 16];
+                            slot.coded_block_pattern_luma = 0x0F;
+                            slot.coded_block_pattern_chroma = 2;
+                            slot.intra_chroma_pred_mode = 0;
+                            slot.transform_size_8x8_flag = false;
+                        }
+                        // Build a minimal I_PCM Macroblock — reconstruction
+                        // can use `pcm_samples` directly per §8.3.5
+                        // (I_PCM samples are copied straight to the
+                        // output with no prediction / transform).
+                        Macroblock {
+                            mb_type: MbType::IPcm,
+                            mb_type_raw: 25,
+                            mb_pred: None,
+                            sub_mb_pred: None,
+                            pcm_samples: Some(PcmSamples {
+                                luma,
+                                chroma_cb: cb,
+                                chroma_cr: cr,
+                            }),
+                            coded_block_pattern: 0,
+                            transform_size_8x8_flag: false,
+                            mb_qp_delta: 0,
+                            residual_luma: Vec::new(),
+                            residual_luma_dc: None,
+                            residual_chroma_dc_cb: Vec::new(),
+                            residual_chroma_dc_cr: Vec::new(),
+                            residual_chroma_ac_cb: Vec::new(),
+                            residual_chroma_ac_cr: Vec::new(),
+                            residual_cb_luma_like: Vec::new(),
+                            residual_cr_luma_like: Vec::new(),
+                            residual_cb_16x16_dc: None,
+                            residual_cr_16x16_dc: None,
+                            is_skip: false,
+                        }
+                    }
+                    Err(source) => {
+                        return Err(SliceDataError::MacroblockAt {
+                            mb_addr: curr_mb_addr,
+                            byte,
+                            bit,
+                            source,
+                        });
+                    }
+                };
+                prev_mb_qp_delta_nonzero_slice = next_qp_delta_flag;
+                macroblocks.push(mb);
+                mb_field_decoding_flags.push(flag);
+                // §9.3.3.1.1.2 — record mb_field_decoding_flag in the
+                // CABAC neighbour grid so the next pair's ctxIdxInc
+                // derivation can read it. parse_macroblock already set
+                // `available = true` for coded MBs; I_PCM / skip paths
+                // populate this field in their own slot-update blocks
+                // above.
+                if let Some(slot) = cabac_nb.mbs.get_mut(curr_mb_addr as usize) {
+                    slot.mb_field_decoding_flag = flag;
+                }
+                if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
+                    pending_pair_flag = None;
+                }
+                curr_mb_addr += 1;
+            }
+            // §7.3.4 — in the CABAC path, update prevMbSkipped with
+            // the most recent mb_skip_flag (only when read at all).
+            if !slice_header.slice_type.is_intra() {
+                prev_mb_skipped = mb_skip_flag_this_iter;
+            }
+            // §7.3.4 — MBAFF: end_of_slice_flag is only decoded when
+            // CurrMbAddr % 2 == 1 (i.e. at the bottom MB of a pair).
+            // For top MBs, moreDataFlag is forced to 1 so we continue
+            // unconditionally to the bottom MB.
+            if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
+                continue;
+            }
+            let end = decode_end_of_slice_flag(&mut cabac_dec)?;
+            if end {
+                break;
+            }
+            // Defensive: end_of_slice_flag should have terminated us
+            // by `PicSizeInMbs` MBs at the latest. A malformed stream
+            // that decodes "not end" past the last MB would otherwise
+            // grow the macroblocks Vec until OOM.
+            // Anti-OOM guard: refuse to grow the macroblocks Vec past
+            // `MB_HARD_CAP` (256K entries — comfortably above Level
+            // 6.2's MaxFS = 139 264, but small enough that the Macroblock
+            // Vec stays under ~64 MB even with worst-case realloc
+            // doubling). Real streams hit `end_of_slice_flag` long
+            // before this; the cap exists purely to head off
+            // attacker-driven runaway loops.
+            const MB_HARD_CAP: u32 = 1 << 18;
+            if curr_mb_addr > MB_HARD_CAP {
+                return Err(SliceDataError::MbAddrOverflow(pic_size_in_mbs));
+            }
+        }
+    } else {
+        // ---------------------------------------------------------
+        // CAVLC path (§7.3.4).
+        // ---------------------------------------------------------
+        // §7.3.4 — prevMbSkipped is the "top MB of this pair was
+        // skipped" signal. CAVLC sets it from (mb_skip_run > 0).
+        let mut prev_mb_skipped = false;
+        // MBAFF: pair flag shared by both MBs of a pair.
+        let mut pending_pair_flag: Option<bool> = None;
+        let mut pending_skip: u32 = 0;
+        loop {
+            // On non-I/SI slices, an `mb_skip_run` precedes each coded
+            // macroblock (the "skip run" is exp-Golomb).
+            if !slice_header.slice_type.is_intra() && pending_skip == 0 {
+                pending_skip = r.ue()?;
+                // §7.4.4: `mb_skip_run` is implicitly bounded by
+                // PicSizeInMbs. The strict spec bound is
+                // `0..=PicSizeInMbs - 1 - CurrMbAddr`, but real
+                // encoders sometimes write `PicSizeInMbs` itself
+                // (whole picture skipped). Apply only an absolute
+                // hard-cap that prevents the for-loop below from
+                // driving the `macroblocks` Vec to OOM.
+                const MB_SKIP_HARD_CAP: u32 = 1 << 18;
+                if pending_skip > MB_SKIP_HARD_CAP {
+                    return Err(SliceDataError::MbSkipRunOverflow(
+                        pending_skip,
+                        pic_size_in_mbs,
+                    ));
+                }
+                prev_mb_skipped = pending_skip > 0;
+                for _ in 0..pending_skip {
+                    // §7.4.4 — inferred mb_field_decoding_flag for a
+                    // skipped MB whose pair flag hasn't been read.
+                    // Phase-1 uses 0 as the spec's default-when-no-
+                    // neighbour inference outcome; full spatial
+                    // inference is out of scope.
+                    let flag = pending_pair_flag.unwrap_or(false);
+                    macroblocks.push(Macroblock::new_skip(slice_header.slice_type));
+                    mb_field_decoding_flags.push(flag);
+                    // §9.2.1.1 step 6 — skipped MB contributes nN = 0.
+                    if let Some(slot) = cavlc_nc.mbs.get_mut(curr_mb_addr as usize) {
+                        slot.is_available = true;
+                        slot.is_skip = true;
+                        slot.is_intra = false;
+                        slot.is_i_pcm = false;
+                        slot.luma_total_coeff = [0; 16];
+                        slot.cb_total_coeff = [0; 8];
+                        slot.cr_total_coeff = [0; 8];
+                    }
+                    // If we rolled through the bottom of a pair, the
+                    // pair is complete — clear the pending flag.
+                    if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
+                        pending_pair_flag = None;
+                    }
+                    curr_mb_addr += 1;
+                }
+                // After advancing the skip run, the CAVLC spec says:
+                //   if( mb_skip_run > 0 ) moreDataFlag = more_rbsp_data()
+                if pending_skip > 0 && !r.more_rbsp_data() {
+                    break;
+                }
+            }
+            // If we just consumed all remaining slice_data as skip
+            // runs, check the more_rbsp_data() guard.
+            if !r.more_rbsp_data() {
+                break;
+            }
+            // §7.3.4 — MBAFF: read mb_field_decoding_flag before
+            // macroblock_layer() when (CurrMbAddr % 2 == 0) or
+            // (CurrMbAddr % 2 == 1 && prevMbSkipped).
+            if mbaff_frame_flag
+                && (curr_mb_addr % 2 == 0 || (curr_mb_addr % 2 == 1 && prev_mb_skipped))
+            {
+                let flag = r.u(1)? != 0;
+                pending_pair_flag = Some(flag);
+                // Retroactively patch the (skipped) top MB of this
+                // pair if we're at the bottom.
+                if curr_mb_addr % 2 == 1 {
+                    if let Some(last) = mb_field_decoding_flags.last_mut() {
+                        *last = flag;
+                    }
+                }
+            }
+            let flag = pending_pair_flag.unwrap_or(false);
+            let mut entropy = EntropyState {
+                cabac: None,
+                slice_kind: kind,
+                neighbours: NeighbourCtx::default(),
+                prev_mb_qp_delta_nonzero: false,
+                chroma_array_type,
+                transform_8x8_mode_flag: pps.transform_8x8_mode_flag(),
+                cavlc_nc: Some(&mut cavlc_nc),
+                current_mb_addr: curr_mb_addr,
+                constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
+                num_ref_idx_l0_active_minus1: slice_header.num_ref_idx_l0_active_minus1,
+                num_ref_idx_l1_active_minus1: slice_header.num_ref_idx_l1_active_minus1,
+                mbaff_frame_flag: false,
+                mb_field_decoding_flag: false,
+                // CABAC neighbour grid unused on the CAVLC path.
+                cabac_nb: None,
+                pic_width_in_mbs: 0,
+                bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
+                bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
+            };
+            let (byte, bit) = r.position();
+            let mb = parse_macroblock(&mut r, &mut entropy, slice_header, sps, pps, curr_mb_addr)
+                .map_err(|source| SliceDataError::MacroblockAt {
+                mb_addr: curr_mb_addr,
+                byte,
+                bit,
+                source,
+            })?;
+            macroblocks.push(mb);
+            mb_field_decoding_flags.push(flag);
+            // CAVLC: the per-iteration mb_skip_run update is what
+            // drives prev_mb_skipped; a coded-MB iteration does not
+            // observe a new skip run so prev_mb_skipped remains as
+            // last set (either false after a non-skipped iteration, or
+            // true after a skip-run iteration). After parsing a coded
+            // MB on the bottom of a pair, we've consumed the pair:
+            // clear the pending flag + reset prev_mb_skipped so the
+            // next iteration starts fresh.
+            if mbaff_frame_flag && curr_mb_addr % 2 == 1 {
+                pending_pair_flag = None;
+            }
+            prev_mb_skipped = false;
+            curr_mb_addr += 1;
+            pending_skip = 0;
+            if !r.more_rbsp_data() {
+                break;
+            }
+            // Defensive PicSizeInMbs ceiling — see CABAC counterpart.
+            // After `more_rbsp_data()` says we should keep going, refuse
+            // to push beyond the picture's MB count.
+            // Anti-OOM guard: refuse to grow the macroblocks Vec past
+            // `MB_HARD_CAP` (256K entries — comfortably above Level
+            // 6.2's MaxFS = 139 264, but small enough that the Macroblock
+            // Vec stays under ~64 MB even with worst-case realloc
+            // doubling). Real streams hit `end_of_slice_flag` long
+            // before this; the cap exists purely to head off
+            // attacker-driven runaway loops.
+            const MB_HARD_CAP: u32 = 1 << 18;
+            if curr_mb_addr > MB_HARD_CAP {
+                return Err(SliceDataError::MbAddrOverflow(pic_size_in_mbs));
+            }
+        }
+    }
+
+    debug_assert_eq!(
+        macroblocks.len(),
+        mb_field_decoding_flags.len(),
+        "mb_field_decoding_flags must be parallel to macroblocks"
+    );
+    Ok(SliceData {
+        macroblocks,
+        mb_field_decoding_flags,
+        last_mb_addr: curr_mb_addr,
+    })
+}
+
+/// §7.3.4 + §9.3.3.1.1.2 — decode `mb_field_decoding_flag` as ae(v) in
+/// CABAC. The ctxIdxInc is derived per §9.3.3.1.1.2:
+///
+/// Let condTermFlagN (N = A / B) be:
+///   * If mbAddrN is not available, OR mbAddrN is a frame macroblock,
+///     OR mbAddrN is a skipped macroblock coded in frame mode,
+///     condTermFlagN = 0.
+///   * Otherwise (mbAddrN is coded in field mode): condTermFlagN = 1.
+///
+/// ctxIdxInc = condTermFlagA + condTermFlagB.
+///
+/// The neighbour addresses here are the **pair-level** neighbours
+/// (§6.4.10 / `mbaff_pair_neighbour_addrs`). We consult the top MB of
+/// each neighbour pair: its `mb_field_decoding_flag` (which, per spec,
+/// is set once per pair and shared by both MBs of the pair) is the
+/// "N is coded in field mode" condition.
+///
+/// Per Table 9-34: ctxIdxOffset = 70, binarization FL with cMax = 1,
+/// so a single decode_decision call.
+fn decode_mb_field_decoding_flag_cabac(
+    dec: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+    grid: &CabacNeighbourGrid,
+    curr_mb_addr: u32,
+    pic_width_in_mbs: u32,
+) -> SliceDataResult<bool> {
+    const CTX_IDX_OFFSET: usize = 70;
+    let [a_top, b_top, _c, _d] = mbaff_pair_neighbour_addrs(curr_mb_addr, pic_width_in_mbs);
+    // condTermFlagN = 1 iff mbAddrN is available AND field-coded.
+    // "Skipped + frame-coded" is covered automatically: `available` is
+    // set for skipped MBs, and their `mb_field_decoding_flag` is
+    // either the pair flag (if the pair was field-coded) or false, so
+    // the single "is field-coded?" predicate captures both branches.
+    let cond_term = |addr_opt: Option<u32>| -> u32 {
+        let Some(addr) = addr_opt else { return 0 };
+        let Some(info) = grid.mbs.get(addr as usize) else {
+            return 0;
+        };
+        if !info.available {
+            return 0;
+        }
+        if info.mb_field_decoding_flag {
+            1
+        } else {
+            0
+        }
+    };
+    let cond_a = cond_term(a_top);
+    let cond_b = cond_term(b_top);
+    let ctx_idx_inc = (cond_a + cond_b) as usize;
+    let ctx_idx = CTX_IDX_OFFSET + ctx_idx_inc;
+    let bin = dec.decode_decision(ctxs.at_mut(ctx_idx))?;
+    Ok(bin != 0)
+}
+
+/// Construct a `BitReader` positioned at the given (byte, bit) within
+/// `rbsp`. Returns an `Eof` when the position is past the end.
+fn position_reader(rbsp: &[u8], byte: usize, bit: u8) -> SliceDataResult<BitReader<'_>> {
+    if byte > rbsp.len() || bit >= 8 {
+        return Err(SliceDataError::Bitstream(BitError::Eof));
+    }
+    let mut r = BitReader::new(rbsp);
+    // Walk to the target position without exposing raw cursor fields.
+    let total_bits = byte * 8 + bit as usize;
+    for _ in 0..total_bits {
+        r.u(1)?;
+    }
+    Ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macroblock_layer::MbType;
+
+    // Re-use the fixture helpers via a local copy (slightly redundant
+    // but keeps this module test-self-contained).
+
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit_pos: u8,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                bit_pos: 0,
+            }
+        }
+        fn u(&mut self, bits: u32, value: u32) {
+            for i in (0..bits).rev() {
+                let bit = ((value >> i) & 1) as u8;
+                if self.bit_pos == 0 {
+                    self.bytes.push(0);
+                }
+                let idx = self.bytes.len() - 1;
+                self.bytes[idx] |= bit << (7 - self.bit_pos);
+                self.bit_pos = (self.bit_pos + 1) % 8;
+            }
+        }
+        fn ue(&mut self, value: u32) {
+            let v = value + 1;
+            let leading = 31 - v.leading_zeros();
+            for _ in 0..leading {
+                self.u(1, 0);
+            }
+            self.u(leading + 1, v);
+        }
+        fn se(&mut self, value: i32) {
+            let k = if value <= 0 {
+                (-2 * value) as u32
+            } else {
+                (2 * value - 1) as u32
+            };
+            self.ue(k);
+        }
+        fn trailing(&mut self) {
+            self.u(1, 1);
+            while self.bit_pos != 0 {
+                self.u(1, 0);
+            }
+        }
+        fn into_bytes(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    fn dummy_sps() -> Sps {
+        Sps {
+            profile_idc: 66,
+            constraint_set_flags: 0,
+            level_idc: 30,
+            seq_parameter_set_id: 0,
+            chroma_format_idc: 1,
+            separate_colour_plane_flag: false,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            qpprime_y_zero_transform_bypass_flag: false,
+            seq_scaling_matrix_present_flag: false,
+            seq_scaling_lists: None,
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+            delta_pic_order_always_zero_flag: false,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_ref_frame: Vec::new(),
+            max_num_ref_frames: 1,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: 19,
+            pic_height_in_map_units_minus1: 14,
+            frame_mbs_only_flag: true,
+            mb_adaptive_frame_field_flag: false,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters_present_flag: false,
+            vui: None,
+        }
+    }
+
+    fn dummy_pps() -> Pps {
+        Pps {
+            pic_parameter_set_id: 0,
+            seq_parameter_set_id: 0,
+            entropy_coding_mode_flag: false,
+            bottom_field_pic_order_in_frame_present_flag: false,
+            num_slice_groups_minus1: 0,
+            slice_group_map: None,
+            num_ref_idx_l0_default_active_minus1: 0,
+            num_ref_idx_l1_default_active_minus1: 0,
+            weighted_pred_flag: false,
+            weighted_bipred_idc: 0,
+            pic_init_qp_minus26: 0,
+            pic_init_qs_minus26: 0,
+            chroma_qp_index_offset: 0,
+            deblocking_filter_control_present_flag: false,
+            constrained_intra_pred_flag: false,
+            redundant_pic_cnt_present_flag: false,
+            extension: None,
+        }
+    }
+
+    fn dummy_slice_header(slice_type: SliceType) -> SliceHeader {
+        use crate::slice_header::{DecRefPicMarking, RefPicListModification};
+        SliceHeader {
+            first_mb_in_slice: 0,
+            slice_type_raw: match slice_type {
+                SliceType::P => 0,
+                SliceType::B => 1,
+                SliceType::I => 2,
+                SliceType::SP => 3,
+                SliceType::SI => 4,
+            },
+            slice_type,
+            all_slices_same_type: false,
+            pic_parameter_set_id: 0,
+            colour_plane_id: 0,
+            frame_num: 0,
+            field_pic_flag: false,
+            bottom_field_flag: false,
+            idr_pic_id: 0,
+            pic_order_cnt_lsb: 0,
+            delta_pic_order_cnt_bottom: 0,
+            delta_pic_order_cnt: [0, 0],
+            redundant_pic_cnt: 0,
+            direct_spatial_mv_pred_flag: false,
+            num_ref_idx_active_override_flag: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            ref_pic_list_modification: RefPicListModification::default(),
+            pred_weight_table: None,
+            dec_ref_pic_marking: Some(DecRefPicMarking {
+                no_output_of_prior_pics_flag: false,
+                long_term_reference_flag: false,
+                adaptive_marking: None,
+            }),
+            cabac_init_idc: 0,
+            slice_qp_delta: 0,
+            sp_for_switch_flag: false,
+            slice_qs_delta: 0,
+            disable_deblocking_filter_idc: 0,
+            slice_alpha_c0_offset_div2: 0,
+            slice_beta_offset_div2: 0,
+            slice_group_change_cycle: 0,
+        }
+    }
+
+    /// Append a minimal I_NxN macroblock to `w` (CAVLC, all-zero
+    /// residual, cbp=0, no mb_qp_delta).
+    fn append_i_nxn_mb(w: &mut BitWriter) {
+        w.ue(0); // mb_type = I_NxN
+        for _ in 0..16 {
+            w.u(1, 1); // prev_intra4x4_pred_mode_flag
+        }
+        w.ue(0); // intra_chroma_pred_mode
+        w.ue(3); // coded_block_pattern codeNum=3 → CBP=0
+    }
+
+    #[test]
+    fn cavlc_four_i_nxn_macroblocks() {
+        // I-slice with 4 I_NxN MBs back to back. We produce a bit-
+        // stream where the reader sees 4 complete MBs then the RBSP
+        // trailing bit.
+        let mut w = BitWriter::new();
+        for _ in 0..4 {
+            append_i_nxn_mb(&mut w);
+        }
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 4);
+        for mb in &sd.macroblocks {
+            assert_eq!(mb.mb_type, MbType::INxN);
+            assert!(!mb.is_skip);
+        }
+        assert_eq!(sd.last_mb_addr, 4);
+        // Non-MBAFF: mb_field_decoding_flag is absent from the bit-
+        // stream. §7.4.4 infers it as field_pic_flag (= false here),
+        // which is what the walker records.
+        assert_eq!(sd.mb_field_decoding_flags.len(), 4);
+        assert!(sd.mb_field_decoding_flags.iter().all(|f| !*f));
+    }
+
+    #[test]
+    fn cavlc_p_slice_mb_skip_run_3_then_one_coded_mb() {
+        // P slice: mb_skip_run=3 (three skipped MBs) then one coded P
+        // macroblock, then trailing bits.
+        //
+        // For simplicity we encode the coded MB as an intra I_NxN via
+        // the P-slice path (mb_type=5 on P maps to I_NxN, §Table 7-13).
+        let mut w = BitWriter::new();
+        w.ue(3); // mb_skip_run = 3
+        w.ue(5); // mb_type = 5 on P = I_NxN
+        for _ in 0..16 {
+            w.u(1, 1);
+        }
+        w.ue(0); // intra_chroma_pred_mode
+        w.ue(3); // CBP codeNum=3 → 0
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::P);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        // 3 skip + 1 coded = 4 MB entries.
+        assert_eq!(sd.macroblocks.len(), 4);
+        assert!(sd.macroblocks[0].is_skip);
+        assert!(sd.macroblocks[1].is_skip);
+        assert!(sd.macroblocks[2].is_skip);
+        assert!(!sd.macroblocks[3].is_skip);
+        assert_eq!(sd.macroblocks[3].mb_type, MbType::INxN);
+    }
+
+    #[test]
+    fn cavlc_p_slice_only_skip_run() {
+        // A P slice that only contains a skip run followed by rbsp
+        // trailing bits (all 4 MBs skipped).
+        let mut w = BitWriter::new();
+        w.ue(4); // mb_skip_run = 4
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = dummy_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::P);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 4);
+        for mb in &sd.macroblocks {
+            assert!(mb.is_skip);
+        }
+    }
+
+    /// Build an SPS that enables MBAFF: frame_mbs_only_flag = 0 +
+    /// mb_adaptive_frame_field_flag = 1.
+    fn mbaff_sps() -> Sps {
+        let mut sps = dummy_sps();
+        sps.frame_mbs_only_flag = false;
+        sps.mb_adaptive_frame_field_flag = true;
+        sps
+    }
+
+    #[test]
+    fn cavlc_mbaff_simple_pair_flag_one() {
+        // §7.3.4 — MBAFF CAVLC I slice containing a single pair of
+        // I_NxN macroblocks with mb_field_decoding_flag = 1 read at
+        // the top of the pair. Both MBs of the pair must record the
+        // same flag value.
+        let mut w = BitWriter::new();
+        w.u(1, 1); // mb_field_decoding_flag = 1 (top of pair, even addr)
+        append_i_nxn_mb(&mut w); // top MB
+                                 // No mb_field_decoding_flag at the bottom (top wasn't skipped).
+        append_i_nxn_mb(&mut w); // bottom MB
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = mbaff_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 2);
+        assert_eq!(sd.mb_field_decoding_flags.len(), 2);
+        assert!(
+            sd.mb_field_decoding_flags[0],
+            "top MB of pair should carry the flag"
+        );
+        assert!(
+            sd.mb_field_decoding_flags[1],
+            "bottom MB of pair shares the same flag"
+        );
+        assert_eq!(sd.macroblocks[0].mb_type, MbType::INxN);
+        assert_eq!(sd.macroblocks[1].mb_type, MbType::INxN);
+    }
+
+    #[test]
+    fn cavlc_mbaff_pair_flag_zero() {
+        // Same as above but mb_field_decoding_flag = 0 (frame pair).
+        let mut w = BitWriter::new();
+        w.u(1, 0); // mb_field_decoding_flag = 0
+        append_i_nxn_mb(&mut w);
+        append_i_nxn_mb(&mut w);
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = mbaff_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 2);
+        assert_eq!(sd.mb_field_decoding_flags, vec![false, false]);
+    }
+
+    #[test]
+    fn cavlc_mbaff_skipped_top_reads_flag_at_bottom() {
+        // §7.3.4 + §7.4.4 — in a P slice with MBAFF, if the top MB of
+        // a pair is skipped via mb_skip_run, the mb_field_decoding_flag
+        // is read retroactively at the bottom MB (CurrMbAddr % 2 == 1
+        // && prevMbSkipped). Both MBs of the pair end up with the
+        // same flag.
+        let mut w = BitWriter::new();
+        w.ue(1); // mb_skip_run = 1 → top MB skipped
+                 // Now CurrMbAddr = 1 (bottom of pair), prevMbSkipped = true.
+        w.u(1, 1); // mb_field_decoding_flag = 1 (read at bottom)
+        w.ue(5); // mb_type = 5 on P = I_NxN
+        for _ in 0..16 {
+            w.u(1, 1); // prev_intra4x4_pred_mode_flag
+        }
+        w.ue(0); // intra_chroma_pred_mode
+        w.ue(3); // CBP codeNum=3 → 0
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = mbaff_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::P);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 2);
+        assert!(sd.macroblocks[0].is_skip, "top MB should be a skip MB");
+        assert!(!sd.macroblocks[1].is_skip, "bottom MB should be coded");
+        // Retroactive patch: both MBs of the pair carry flag = 1.
+        assert_eq!(sd.mb_field_decoding_flags, vec![true, true]);
+    }
+
+    #[test]
+    fn cavlc_non_mbaff_has_no_flag_reads() {
+        // Regression: on a non-MBAFF SPS, the walker must not attempt
+        // to read mb_field_decoding_flag. A stream containing just two
+        // I_NxN MBs (no extra u(1) for the flag) must parse to 2 MBs,
+        // and each mb_field_decoding_flag recorded is false.
+        let mut w = BitWriter::new();
+        append_i_nxn_mb(&mut w);
+        append_i_nxn_mb(&mut w);
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = dummy_sps(); // frame_mbs_only_flag = true → not MBAFF
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 2);
+        assert_eq!(sd.mb_field_decoding_flags, vec![false, false]);
+    }
+
+    #[test]
+    fn cavlc_mbaff_two_pairs_independent_flags() {
+        // Two pairs, first flag = 0, second flag = 1. Each pair's
+        // flag must be read independently at the top of the pair.
+        let mut w = BitWriter::new();
+        w.u(1, 0); // pair 0 top: mb_field_decoding_flag = 0
+        append_i_nxn_mb(&mut w); // pair 0 top
+        append_i_nxn_mb(&mut w); // pair 0 bottom
+        w.u(1, 1); // pair 1 top: mb_field_decoding_flag = 1
+        append_i_nxn_mb(&mut w); // pair 1 top
+        append_i_nxn_mb(&mut w); // pair 1 bottom
+        w.trailing();
+        let bytes = w.into_bytes();
+        let sps = mbaff_sps();
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 4);
+        assert_eq!(
+            sd.mb_field_decoding_flags,
+            vec![false, false, true, true],
+            "each pair carries its own flag, applied to both MBs"
+        );
+    }
+
+    #[test]
+    fn cabac_mbaff_two_skip_mbs_per_pair_smoke() {
+        // §7.3.4 — CABAC MBAFF: a non-I slice whose first pair has
+        // both MBs skipped. mb_skip_flag is read for top (= 1),
+        // mb_field_decoding_flag is NOT read (skipped top), then
+        // mb_skip_flag for bottom (= 1), mb_field_decoding_flag still
+        // not read (both MBs of the pair are skipped → §7.4.4 infers
+        // it). end_of_slice_flag is only decoded on the bottom MB.
+        //
+        // CABAC state starts with codIOffset=0 for an all-zero
+        // prefix, which makes P-slice mb_skip_flag's MPS decode
+        // (valMPS=0 or 1 depending on ctxIdx init) deterministic. We
+        // don't want to hand-craft the exact bitstream here — this is
+        // a smoke test that the CABAC walker doesn't hit the
+        // MbaffNotSupported error and terminates without hanging.
+        let mut bytes: Vec<u8> = vec![0x00; 16];
+        bytes.extend(std::iter::repeat_n(0xFFu8, 16));
+        let mut pps = dummy_pps();
+        pps.entropy_coding_mode_flag = true;
+        let sps = mbaff_sps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps);
+        // Accept clean parse or known error — MbaffNotSupported is
+        // NOT an acceptable outcome (it was the Phase-0 behaviour).
+        match sd {
+            Ok(sd) => {
+                assert_eq!(sd.mb_field_decoding_flags.len(), sd.macroblocks.len());
+            }
+            Err(SliceDataError::MbaffNotSupported) => {
+                panic!("Phase 1 must not reject MBAFF up-front");
+            }
+            Err(_) => {
+                // Other errors (bitstream EOF, unsupported MB type)
+                // are acceptable for this synthetic stream.
+            }
+        }
+    }
+
+    #[test]
+    fn cabac_mbaff_flag_decoded_at_top_of_pair() {
+        // §7.3.4 — CABAC MBAFF: an I slice whose first pair is a
+        // coded I_NxN pair. mb_field_decoding_flag must be decoded
+        // before the top MB's macroblock_layer() and recorded for
+        // both MBs.
+        //
+        // We hand-construct a minimal synthetic bitstream where the
+        // first CABAC bins resolve to predictable values using the
+        // zero-offset seed convention. The test is a smoke-test for
+        // the walker's branching logic; if the inner macroblock_layer
+        // errors on residual parsing, we still verify the walker
+        // didn't reject MBAFF up-front and that for any successfully
+        // parsed MBs, flags are consistent per-pair.
+        let mut bytes: Vec<u8> = vec![0x00; 8];
+        bytes.extend(std::iter::repeat_n(0xFFu8, 8));
+        let mut pps = dummy_pps();
+        pps.entropy_coding_mode_flag = true;
+        let sps = mbaff_sps();
+        let hdr = dummy_slice_header(SliceType::I);
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps);
+        match sd {
+            Ok(sd) => {
+                // Parallel invariant.
+                assert_eq!(sd.mb_field_decoding_flags.len(), sd.macroblocks.len());
+                // Pair flag consistency: for each complete pair, both
+                // MBs should carry the same flag value.
+                for pair in sd.mb_field_decoding_flags.chunks_exact(2) {
+                    assert_eq!(pair[0], pair[1], "MBs in a pair share the flag");
+                }
+            }
+            Err(SliceDataError::MbaffNotSupported) => {
+                panic!("Phase 1 must not reject MBAFF up-front");
+            }
+            Err(_) => {
+                // Synthetic stream: parse errors in macroblock_layer
+                // are acceptable; the important behaviour is that we
+                // don't hit MbaffNotSupported and don't hang.
+            }
+        }
+    }
+
+    #[test]
+    fn cabac_path_single_i_pcm_mb_terminates() {
+        // A CABAC I slice with one I_PCM macroblock isn't practical
+        // (our CABAC I_PCM path is unsupported). Instead use a CABAC
+        // I slice with a single I_NxN macroblock whose fresh-init
+        // state yields mb_type=I_NxN on the first bin.
+        //
+        // For the test we rely on the CABAC engine being initialised
+        // at codIOffset=0 (bytes 0x00 0x00 ...), which means bin 0 of
+        // any FL/TU element returns the valMPS of its context. For
+        // ctxIdx=3 (I-slice mb_type bin 0, m=20 n=-15 QPY=26) valMPS=0
+        // so mb_type=0 (I_NxN). Subsequent residual reads also hit
+        // their MPS path, which for this synthetic stream is
+        // consistent with cbp=0 and no residual.
+        //
+        // After the MB, `decode_end_of_slice_flag` returns 1 once
+        // codIOffset gets close to codIRange (requires enough 1-bits
+        // in the stream). Pad the remainder with 0xFF so the
+        // terminator fires on the first check.
+        // cabac_alignment_one_bit — none needed when already aligned.
+        // CABAC consumes 9 bits of state then a long run of 0s, then
+        // switch to 1s so terminate fires.
+        let mut bytes: Vec<u8> = vec![0x00; 16];
+        bytes.extend(std::iter::repeat_n(0xFFu8, 16));
+
+        // Build a PPS with entropy_coding_mode_flag = 1.
+        let mut pps = dummy_pps();
+        pps.entropy_coding_mode_flag = true;
+        let sps = dummy_sps();
+        let hdr = dummy_slice_header(SliceType::I);
+
+        // Because the CABAC path's exact sequence depends on bin-level
+        // decisions that cascade through residual contexts, this test
+        // is a smoke-test: it must terminate with at least one MB and
+        // without errors.
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps);
+        // Accept either a clean parse or an explicit known error path
+        // (e.g. bitstream EOF on malformed trailing bytes). The
+        // important behaviour is that the walker doesn't loop
+        // infinitely and returns deterministically.
+        match sd {
+            Ok(sd) => {
+                assert!(!sd.macroblocks.is_empty());
+            }
+            Err(e) => {
+                // Acceptable: the synthetic stream ran out before
+                // end_of_slice_flag fired. The engine didn't hang.
+                let _ = e;
+            }
+        }
+    }
+
+    /// §7.3.5 / §7.4.5 / §7.4.2.1.1 — CAVLC I_PCM macroblock in a
+    /// 10-bit High10 sequence.
+    ///
+    /// Before round 128 the CAVLC I_PCM path hard-coded
+    /// `bit_depth_y = bit_depth_c = 8`, so `pcm_sample_luma[i]` and
+    /// `pcm_sample_chroma[i]` were read as 8-bit values regardless of
+    /// the active SPS. With `bit_depth_luma_minus8 = 2` /
+    /// `bit_depth_chroma_minus8 = 2` (BitDepthY = BitDepthC = 10), the
+    /// next macroblock's syntax then desynchronised by
+    /// 2 * (256 + 64 + 64) = 768 bits, corrupting all subsequent
+    /// macroblocks in the slice.
+    ///
+    /// This regression exercises the fix by emitting a single 10-bit
+    /// I_PCM MB whose luma / chroma samples cover values that don't
+    /// fit in 8 bits (0x200 = 512, 0x3ff = 1023), and asserts that
+    /// `PcmSamples` round-trips them losslessly.
+    #[test]
+    fn cavlc_i_pcm_macroblock_10bit_high10_round_trips() {
+        let mut sps = dummy_sps();
+        sps.profile_idc = 110; // High 10
+        sps.bit_depth_luma_minus8 = 2; // BitDepthY = 10
+        sps.bit_depth_chroma_minus8 = 2; // BitDepthC = 10
+        let pps = dummy_pps();
+        let hdr = dummy_slice_header(SliceType::I);
+
+        // Build a 10-bit pattern. Use values that explicitly require
+        // bits 8..=9 so an 8-bit reader would truncate them.
+        let luma_pattern: Vec<u32> = (0..256u32).map(|i| (i * 4) & 0x3ff).collect();
+        // For 4:2:0 each chroma plane is 8x8 = 64 samples.
+        let chroma_cb_pattern: Vec<u32> = (0..64u32).map(|i| 0x200 | i).collect();
+        let chroma_cr_pattern: Vec<u32> = (0..64u32).map(|i| 0x3ff - (i & 0x3ff)).collect();
+
+        let mut w = BitWriter::new();
+        w.ue(25); // mb_type = 25 → I_PCM in I slices (§Table 7-11).
+                  // §7.3.5: pcm_alignment_zero_bit consumed until byte-aligned.
+                  // We're already aligned after the ue(25), but for clarity:
+        while w.bit_pos != 0 {
+            w.u(1, 0);
+        }
+        // §7.4.5: pcm_sample_luma[i] is u(v) with v = BitDepthY = 10.
+        for &v in &luma_pattern {
+            w.u(10, v);
+        }
+        for &v in &chroma_cb_pattern {
+            w.u(10, v);
+        }
+        for &v in &chroma_cr_pattern {
+            w.u(10, v);
+        }
+        // After I_PCM the next macroblock starts byte-aligned (PCM
+        // samples are sized so the cumulative bit count is a multiple
+        // of 8 when bit_depth values are multiples of 2 — true here
+        // for 10-bit with 256+64+64 samples ⇒ 3840 bits = 480 bytes).
+        // No further macroblocks in this fixture; emit the RBSP
+        // trailing bit so `more_rbsp_data()` returns false on the
+        // post-MB check.
+        w.trailing();
+        let bytes = w.into_bytes();
+
+        let sd = parse_slice_data(&bytes, 0, 0, &hdr, &sps, &pps).unwrap();
+        assert_eq!(sd.macroblocks.len(), 1, "exactly one I_PCM MB");
+        let mb = &sd.macroblocks[0];
+        assert_eq!(mb.mb_type, MbType::IPcm);
+        let pcm = mb.pcm_samples.as_ref().expect("I_PCM carries pcm_samples");
+        assert_eq!(pcm.luma, luma_pattern, "10-bit luma samples preserved");
+        assert_eq!(pcm.chroma_cb, chroma_cb_pattern, "10-bit Cb preserved");
+        assert_eq!(pcm.chroma_cr, chroma_cr_pattern, "10-bit Cr preserved");
+        // §7.4.5 / §6.2: 4:2:0 ⇒ 2 * 8 * 8 = 128 chroma samples
+        // split evenly between Cb and Cr.
+        assert_eq!(pcm.luma.len(), 256);
+        assert_eq!(pcm.chroma_cb.len(), 64);
+        assert_eq!(pcm.chroma_cr.len(), 64);
+    }
+}

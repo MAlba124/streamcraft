@@ -1,0 +1,13 @@
+[package]
+name = "profluens-video"
+description = "POD video format descriptions and typed views over the opaque buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+profluens-core = { path = "../core" }
+
+[dev-dependencies]
+profluens-elements = { path = "../elements" }
